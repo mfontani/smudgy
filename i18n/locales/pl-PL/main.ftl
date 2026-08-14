@@ -3,7 +3,7 @@ locale-system = Język systemowy
 locale-english = Angielski (Stany Zjednoczone)
 locale-polish = Polski
 locale-ukrainian = Ukraiński
-locale-traditional-chinese = Chiński Tradycyjny (Taiwan)
+locale-traditional-chinese = Chiński Tradycyjny (Tajwan)
 
 # Shared actions and states
 action-apply = Zastosuj
@@ -139,6 +139,7 @@ preferences-logging-raw-help = Zapisywanie surowych logów zacznie się przy nas
 preferences-advanced = Zaawansowane
 preferences-advanced-scripting = Włącz zaawansowane funkcje skryptowe
 preferences-advanced-scripting-help = Odblokowuje opcję „Usuń sandbox" (uruchamianie zainstalowanego pakietu z pełnym dostępem)
+preferences-integrations = Integracje
 preferences-discord-rich-presence = Pokazuj grę, w którą grasz, na Discordzie
 preferences-discord-rich-presence-help = Wyświetla „Gra Smudgy” oraz nazwę serwera po połączeniu w aplikacji Discord na tym komputerze. Ustawienia prywatności Discorda decydują, kto widzi Twój status.
 preferences-updates = Aktualizacje
@@ -238,7 +239,7 @@ server-tls-insecure-help = Odznacz tylko w przypadku serwerów z certyfikatami z
 server-confirm-delete = Czy na pewno chcesz usunąć serwer „{ $name }"? Tej operacji nie można cofnąć.
 server-confirm-delete-action = Tak, usuń ten serwer
 server-error-port = Nieprawidłowy numer portu. Numer portu musi mieścić się w zakresie od 1 do 65535.
-server-error-host-empty = Okno host nie może być puste.
+server-error-host-empty = Host nie może być pusty.
 server-error-name-empty = Nazwa serwera nie może być pusta.
 server-error-name-format = Nazwa serwera może zawierać tylko litery, cyfry, podkreślenia i myślniki.
 server-error-config = Błąd konfiguracji: { $error }
@@ -468,7 +469,7 @@ mapper-save-local-signed-out = Zapisano na tym urządzeniu. Zaloguj się, aby tw
 mapper-delete-folder = Usuń folder
 mapper-delete-folder-question = Usunąć folder „{ $name }"?
 mapper-folder-empty = Ten folder jest pusty.
-mapper-folder-one-map-moves = Mapa 1 zostanie przeniesiona do Nieskatalogowanych map.
+mapper-folder-one-map-moves = 1 mapa zostanie przeniesiona do Nieskatalogowanych map.
 mapper-folder-maps-move =
     { $count ->
         [one] { $count } mapa zostanie przeniesiona do Nieskatalogowanych map.
@@ -479,6 +480,7 @@ mapper-folder-maps-move =
 mapper-loose-maps = Nieskatalogowane mapy
 mapper-move-area-to = Przenieś „{ $name }" do:
 mapper-move-to-folder = Przenieś do folderu
+mapper-relocation-duplicate-notice = { $error } — „{ $name }" mapa została w całości skopiowana do miejsca docelowego, a oryginał pozostał w folderze. Usuń jedną z dwóch kopii zamiast ponawiać przenoszenie.
 mapper-share-folder-title = Udostępnij folder „{ $name }"
 mapper-loading = Ładowanie…
 mapper-no-secrets = Brak sekretów w tym obszarze.
@@ -518,13 +520,13 @@ mapper-can-edit-area = Może edytować
 mapper-can-edit-folder = Może edytować
 mapper-can-reshare = Może ponownie udostępniać (jeden poziom w głąb, tylko do odczytu)
 mapper-can-copy-area = Może kopiować (kopie stają się ich własnością)
-mapper-can-copy-folder = Może kopiować (zachowuje własne rozwidlenie na zawsze i może je rozpowszechniać)
-mapper-include-secrets-area = Uwzględnij sekrety (tylko przy udostępnianiu obszaru)
-mapper-secrets-no-atlas = Sekrety są udostępnia tylko gdy udostępniasz komuś obszar.
+mapper-can-copy-folder = Może kopiować (kopie stają się ich własnością)
+mapper-include-secrets-area = Uwzględnij sekrety
+mapper-secrets-no-atlas = Sekrety są udostępniane tylko podczas udostępniania obszarów.
 mapper-secrets-owner-only = Tylko właściciel mapy może udostępniać jej sekrety.
 mapper-make-admin-area = Nadaj uprawnienia administratora
 mapper-disclose-servers = Ujawnij serwery
-mapper-disclose-servers-help = Odbiorcy widzą te nazwy serwerów, dzięki czemu ich klient może połączyć ich z właściwym profilem serweru.
+mapper-disclose-servers-help = Odbiorcy widzą te nazwy serwerów, dzięki czemu ich klient może dopasować mapy do właściwego profilu serwera.
 mapper-secret-count-warning = { $rooms } tajnych pokoi, { $exits } tajnych wyjść oraz { $other } tajnych notatek/etykiet/kształtów NIE zostanie udostępnionych.
 mapper-review-secrets = Przejrzyj sekrety
 mapper-no-marked-secrets = Nic w tym obszarze nie jest oznaczone jako tajne — wszystko zostanie udostępnione.
@@ -796,7 +798,7 @@ inspector-count-shapes =
 inspector-count-room-property-one = 1 właściwość pokoju
 inspector-count-room-properties =
     { $count ->
-        [one] { $count } właściwość pokój
+        [one] { $count } właściwość pokoju
         [few] { $count } właściwości pokoju
         [many] { $count } właściwości pokoju
        *[other] { $count } właściwości pokoju
@@ -804,7 +806,7 @@ inspector-count-room-properties =
 inspector-count-area-property-one = 1 właściwość obszaru
 inspector-count-area-properties =
     { $count ->
-        [one] { $count } właściwość obaszaru
+        [one] { $count } właściwość obszaru
         [few] { $count } właściwości obszaru
         [many] { $count } właściwości obszaru
        *[other] { $count } właściwości obszaru
@@ -1054,7 +1056,7 @@ manifest-serialize-failed = Nie udało się serializować manifestu: { $error }
 manifest-save-failed = Zapis nie powiódł się: { $error }
 manifest-saved = Zapisano manifest.
 manifest-edit = Edytuj manifest
-manifest-edit-help = Interfejs urzytkownika do edycji smudgy.package.json
+manifest-edit-help = Interfejs użytkownika do edycji smudgy.package.json
 manifest-version = Wersja
 manifest-version-placeholder = np. 1.0.0
 manifest-version-warning = Póki co jest to nieprawidłowa wersja semver — wymagana przed publikacją (np. 1.2.3).
@@ -1121,7 +1123,7 @@ manifest-tab-files = Pliki
 manifest-tab-system = System
 manifest-sandbox-deny-note = Instalacja w sandboxie nie ma dostępu do niczego, co nie zostało tu wymienione.
 manifest-dependency-lock-note = Publikacja blokuje dokładną wersję każdej zależności w chwili publikacji. Użytkownicy otrzymają nowsze wersje zależności dopiero po wydaniu przez Ciebie nowej wersji tego pakietu, która je zaktualizuje.
-manifest-readable-path-warning = Ścieżka do odczytu z poza $DATA sprowokuje ostrzeżenie. Preferuj $DATA, chyba że odczyt zewnętrznych plików jest niezbędny.
+manifest-readable-path-warning = Ścieżka do odczytu spoza $DATA powoduje ostrzeżenie. Preferuj $DATA, chyba że odczyt zewnętrznych plików jest niezbędny.
 manifest-dependencies-help = Inne pakiety Smudgy, które ten pakiet importuje: smudgy://owner/name@^1.2. Obecnie obsługiwane są tylko pakiety smudgy://. Zarządzanie wersjami pakietów jsr i npm jest realizowane przez ich moduły ładujące, a pakiet może je importować, gdy ma dostęp do rejestru.
 manifest-add-dependency-placeholder = Dodaj jeden ze swoich zainstalowanych lub lokalnych pakietów…
 manifest-dependency = zależność
@@ -1173,6 +1175,7 @@ manifest-cap-mapper-write = zmiana Twoich map
 manifest-cap-widgets = tworzenie i zmiana widgetów na ekranie
 manifest-cap-interop-write = rozgłaszanie zdarzeń i publikowanie współdzielonego stanu, na który mogą reagować inne pakiety
 manifest-cap-interop-read = nasłuchiwanie zdarzeń i odczyt współdzielonego stanu
+manifest-cap-interop-broadcast = używaj BroadcastChannel z pakietami w sesjach na tym serwerze
 manifest-cap-panes = tworzenie podzielonych paneli i interakcja z nimi
 manifest-cap-gmcp = wysyłanie komunikatów GMCP do gry i zarządzanie modułami GMCP
 param-value-not-choice = „{ $value }" nie jest jedną z dostępnych opcji.
@@ -1196,7 +1199,7 @@ automation-publish-failed = Publikacja nie powiodła się: { $error }
 automation-reloaded = Przeładowano skrypty dla { $server }.
 automation-nav-unsaved = Masz niezapisane zmiany.
 automation-keep-editing = Kontynuuj edycję
-editor-priority-order-help = Wyższy uruchamia się pierwszy; przy remisie zachowywana jest kolejność rejestracji.
+editor-priority-order-help = Wyższe numery mają priorytet
 
 # Package management
 package-sign-in-shared = Zaloguj się w oknie głównym w Ustawienia → Konto, aby zobaczyć pakiety, które posiadasz, oraz te udostępnione przez znajomych.
@@ -1415,6 +1418,9 @@ permission-can-map-read = Odczytywać Twoje mapy
 permission-can-map-write = Zmieniać Twoje mapy
 permission-can-widgets = Tworzyć i zmieniać widgety na ekranie
 permission-can-panes = Tworzyć panele wyjścia sesji, kierować do nich wiersze gry oraz zapisywać i stosować nazwane układy okien
+permission-can-interop-write = Rozgłaszać zdarzenia pakietu i publikować współdzielony stan, na który inne pakiety mogą reagować 
+permission-can-interop-read = Nasłuchiwać zdarzeń i odczytywać współdzielony stan
+permission-can-interop-broadcast = Używać BroadcastChannel z pakietami w sesjach na tym serwerze
 permission-can-gmcp = Wysyłać komunikaty GMCP do gry i zarządzać modułami GMCP
 permission-cannot-send = wysyłać poleceń do gry
 permission-cannot-aliases = tworzyć aliasów
@@ -1428,6 +1434,7 @@ permission-cannot-widgets = tworzyć widgetów na ekranie
 permission-cannot-panes = tworzyć innych paneli ani uzyskiwać do nich dostępu
 permission-cannot-interop-write = rozgłaszać zdarzeń ani publikować współdzielonego stanu
 permission-cannot-interop-read = nasłuchiwać zdarzeń ani odczytywać współdzielonego stanu
+permission-cannot-interop-broadcast = używać BroadcastChannel z pakietami w sesjach na tym serwerze
 permission-cannot-gmcp = wysyłać komunikatów GMCP do gry
 permission-sandbox-summary = Działa w pełnym sandboxie — bez dostępu do Twoich plików, sieci ani systemu.
 permission-never-native = ładować kodu natywnego ani uruchamiać innych programów
