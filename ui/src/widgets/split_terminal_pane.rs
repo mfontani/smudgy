@@ -22,6 +22,32 @@ mod terminal_pane;
 
 use terminal_pane::{TerminalPane, terminal_pane};
 
+const SPLIT_LIVE_TAIL_MAX_HEIGHT: f32 = 200.0;
+
+/// How scrollback is presented after the user scrolls away from the latest
+/// line. The main terminal keeps its live tail, while script-created terminal
+/// panes use the whole pane for the historical view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrolledLayout {
+    /// Preserve the existing live-output region beneath the historical view.
+    SplitWithLiveTail,
+    /// Give the historical view the full terminal region.
+    FullPane,
+}
+
+impl ScrolledLayout {
+    const fn live_tail_max_height(self) -> f32 {
+        match self {
+            Self::SplitWithLiveTail => SPLIT_LIVE_TAIL_MAX_HEIGHT,
+            Self::FullPane => 0.0,
+        }
+    }
+
+    const fn keeps_live_tail(self) -> bool {
+        matches!(self, Self::SplitWithLiveTail)
+    }
+}
+
 struct SplitTerminalPane<'a, Message> {
     pub selection: Rc<RefCell<Selection>>,
     pub buffer: Ref<'a, TerminalBuffer>,
@@ -37,10 +63,15 @@ struct SplitTerminalPane<'a, Message> {
     /// preference. This widget applies it to scrollback; the pane composition
     /// applies the same value to any input line.
     pub font_size: Option<f32>,
+    pub scrolled_layout: ScrolledLayout,
 }
 
 impl<'a, Message> SplitTerminalPane<'a, Message> {
-    pub fn new(buffer: Ref<'a, TerminalBuffer>, selection: Rc<RefCell<Selection>>) -> Self {
+    pub fn new(
+        buffer: Ref<'a, TerminalBuffer>,
+        selection: Rc<RefCell<Selection>>,
+        scrolled_layout: ScrolledLayout,
+    ) -> Self {
         Self {
             selection,
             buffer,
@@ -48,6 +79,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
             on_link_tooltip: None,
             on_grid_change: None,
             font_size: None,
+            scrolled_layout,
         }
     }
 
@@ -231,9 +263,12 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
         let scrollback_layout = layouts.next().unwrap();
         let main_layout = layouts.next().unwrap();
 
-        // Above the pane, extend within whichever pane is at the top of the
-        // widget; below, always within the bottom (live) pane.
-        let (pane_index, pane_layout) = if overshoot < 0.0 && was_split {
+        // A full-pane historical view owns both edges. With a live tail,
+        // preserve the split behavior: the historical view owns the top edge
+        // and the live pane owns the bottom edge.
+        let use_scrollback =
+            was_split && (overshoot < 0.0 || !self.scrolled_layout.keeps_live_tail());
+        let (pane_index, pane_layout) = if use_scrollback {
             (0, scrollback_layout)
         } else {
             (1, main_layout)
@@ -383,7 +418,9 @@ where
         let scrollbar_limits = limits.shrink(Size::new(terminal_pane_limits.max().width, 0.0));
 
         let (main_pane_node, scrollback_pane_node) = if state.borrow().is_split() {
-            let main_pane_limits = terminal_pane_limits.loose().max_height(200.0);
+            let main_pane_limits = terminal_pane_limits
+                .loose()
+                .max_height(self.scrolled_layout.live_tail_max_height());
 
             let mut main_pane_node =
                 <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::layout(
@@ -643,6 +680,7 @@ pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
     font_size: Option<f32>,
+    scrolled_layout: ScrolledLayout,
 ) -> Element<'a, Message, Theme, Renderer>
 where
     Renderer: text::Renderer<Font = iced::Font> + 'a,
@@ -651,10 +689,30 @@ where
     Theme: iced::widget::text::Catalog + 'a,
     Message: 'a,
 {
-    let mut pane = SplitTerminalPane::new(buffer, selection);
+    let mut pane = SplitTerminalPane::new(buffer, selection, scrolled_layout);
     pane.on_link = on_link;
     pane.on_link_tooltip = on_link_tooltip;
     pane.on_grid_change = on_grid_change;
     pane.font_size = font_size;
     Element::new(pane)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SPLIT_LIVE_TAIL_MAX_HEIGHT, ScrolledLayout};
+
+    #[test]
+    fn full_pane_scrollback_reserves_no_live_tail() {
+        assert_eq!(ScrolledLayout::FullPane.live_tail_max_height(), 0.0);
+        assert!(!ScrolledLayout::FullPane.keeps_live_tail());
+    }
+
+    #[test]
+    fn split_scrollback_preserves_the_existing_live_tail() {
+        assert_eq!(
+            ScrolledLayout::SplitWithLiveTail.live_tail_max_height(),
+            SPLIT_LIVE_TAIL_MAX_HEIGHT
+        );
+        assert!(ScrolledLayout::SplitWithLiveTail.keeps_live_tail());
+    }
 }

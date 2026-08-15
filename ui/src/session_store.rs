@@ -1107,6 +1107,9 @@ impl ManagedSession {
                             // NAWS describes the main terminal; script panes don't report.
                             None,
                             pane.def.font_size,
+                            // Script-created terminal panes scroll as one full
+                            // surface instead of retaining a live tail.
+                            split_terminal_pane::ScrolledLayout::FullPane,
                         );
                         if pane.input.is_some() {
                             stack![
@@ -2204,6 +2207,7 @@ impl ManagedSession {
             self.link_tooltip_handler(),
             self.grid_change_handler(),
             self.main_font_size,
+            split_terminal_pane::ScrolledLayout::SplitWithLiveTail,
         ))
         .on_release(Message::TerminalClicked);
 
