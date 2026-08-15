@@ -44,7 +44,7 @@ use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use smudgy_bench::{
-    log_corpora,
+    load_log_lines,
     wire::{WireProfile, chunk, dress_lines},
 };
 use smudgy_core::session::{
@@ -717,13 +717,12 @@ fn bench_sgr(c: &mut Criterion) {
 }
 
 fn ingest(c: &mut Criterion) {
-    // First log in `bench/logs/` (name-sorted, so deterministic): one corpus
-    // is enough here because the wire profiles, not the prose, are the axis
-    // under test.
-    let (corpus_name, lines) = log_corpora()
-        .into_iter()
-        .next()
-        .expect("bench/logs has at least one log file");
+    // Keep the longitudinal input pinned to the canonical plain-text corpus.
+    // `bench/logs/` also contains raw terminal-protocol fixtures, and choosing
+    // its first name-sorted entry would let an unrelated fixture addition
+    // silently change both the workload and the text-fidelity expectation.
+    let corpus_name = "synthetic-long-session.log";
+    let lines = load_log_lines();
     let corpus_bytes: u64 = lines.iter().map(|l| l.len() as u64).sum();
     eprintln!(
         "corpus {corpus_name}: {} lines / {corpus_bytes} bytes of display text",
