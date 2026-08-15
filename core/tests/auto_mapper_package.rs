@@ -281,15 +281,29 @@ async fn auto_mapper_maps_follows_and_promotes() {
     // ---- savemap: promote to the local tier, drop the session original. ----
     tx.send(RuntimeAction::Send(Arc::new("savemap".to_string())))
         .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
+
+    // Promotion performs asynchronous copy, acknowledgement, and source-delete work.
+    // It can legitimately emit no buffer updates for longer than the ordinary quiet
+    // period, so silence is not a completion signal here. Wait for the package's
+    // acknowledgement, which it emits only after the mapper state has been rebound.
+    let savemap_wait = tokio::time::timeout(Duration::from_mins(1), async {
+        loop {
+            let Some(event) = events.next().await else {
+                return false;
+            };
+            if let SessionEvent::UpdateBuffer(updates) = event.event {
+                collect(&updates, &mut lines);
+                if lines.iter().any(|line| line.contains("saved 1 map(s)")) {
+                    return true;
+                }
+            }
         }
-    }
+    })
+    .await;
     let transcript = lines.join("\n");
     assert!(
-        lines.iter().any(|l| l.contains("saved 1 map(s)")),
-        "savemap reports the promotion.\n{transcript}"
+        matches!(savemap_wait, Ok(true)),
+        "savemap reports the promotion before the deadline.\n{transcript}"
     );
 
     let atlas = mapper.get_current_atlas();
