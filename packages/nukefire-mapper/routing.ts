@@ -2,6 +2,20 @@ import type { GridPosition } from "./layout.ts";
 
 export type RouteSide = "North" | "East" | "South" | "West";
 
+/**
+ * Stored geometry for a generated connection route. Generated paths prefer
+ * orthogonal turn points, but `Direct` keeps that preference from becoming a
+ * persistence invariant when endpoints move or no Manhattan path is found.
+ */
+export interface PlannedConnectionRoute {
+  startSide: RouteSide;
+  endSide: RouteSide;
+  routing: "Manual" | "Automatic";
+  segmentShape: "Direct";
+  corner: "Rounded";
+  routePoints: { x: number; y: number }[];
+}
+
 interface Step {
   x: number;
   y: number;
@@ -266,4 +280,42 @@ export function routeEndSide(path: readonly GridPosition[]): RouteSide | undefin
   const dx = before.x - end.x;
   const dy = before.y - end.y;
   return STEPS.find((step) => step.x === dx && step.y === dy)?.side;
+}
+
+/**
+ * Prefer a Manhattan route around occupied rooms without requiring stored
+ * segments to remain perfectly axis-aligned. The renderer still follows the
+ * generated turn points; `Direct` permits a diagonal fallback or harmless
+ * endpoint drift, while `Rounded` fillets every resulting turn.
+ */
+export function planConnectionRoute(
+  from: GridPosition,
+  to: GridPosition,
+  rooms: readonly GridPosition[],
+  preferredStart: RouteSide,
+  preferredEnd: RouteSide,
+  knownObstructed?: boolean,
+): PlannedConnectionRoute {
+  const obstructed = knownObstructed ?? directRoomObstructions(from, to, rooms).length > 0;
+  if (obstructed) {
+    const path = routeAroundRooms(from, to, rooms, preferredStart, preferredEnd);
+    if (path) {
+      return {
+        startSide: routeStartSide(path) ?? preferredStart,
+        endSide: routeEndSide(path) ?? preferredEnd,
+        routing: "Manual",
+        segmentShape: "Direct",
+        corner: "Rounded",
+        routePoints: routeTurnPoints(path),
+      };
+    }
+  }
+  return {
+    startSide: preferredStart,
+    endSide: preferredEnd,
+    routing: "Automatic",
+    segmentShape: "Direct",
+    corner: "Rounded",
+    routePoints: [],
+  };
 }

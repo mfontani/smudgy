@@ -24,7 +24,9 @@ import {
 } from "smudgy://kapusniak/nukefire-gmcp";
 import { widgetTextSize } from "./config.ts";
 import {
+  CURRENT_ROOM_STYLE,
   ROUTE_STYLE,
+  currentRoomMapViewApply,
   gpsRouteRaw,
   mapViewRoute,
   type RouteRoom,
@@ -58,21 +60,28 @@ function currentMappedRoom(): Room | undefined {
 
 function refreshGpsRoute(): void {
   const routeRaw = gpsRouteRaw(latestGps);
+  const current = currentMappedRoom();
+  const currentRoomApply = currentRoomMapViewApply(
+    current as RouteRoom | undefined,
+  );
   if (!latestGps?.active || !routeRaw) {
-    gpsMapApply.set([]);
+    gpsMapApply.set(currentRoomApply);
     return;
   }
   try {
-    gpsMapApply.set(mapViewRoute(
-      currentMappedRoom() as RouteRoom | undefined,
-      routeRaw,
-      (areaId, roomNumber) =>
-        mapper.getAreaById(areaId).room(roomNumber) as RouteRoom | undefined,
-    ));
+    gpsMapApply.set([
+      ...currentRoomApply,
+      ...mapViewRoute(
+        current as RouteRoom | undefined,
+        routeRaw,
+        (areaId, roomNumber) =>
+          mapper.getAreaById(areaId).room(roomNumber) as RouteRoom | undefined,
+      ),
+    ]);
   } catch {
     // The mapper can be between area snapshots while movement GMCP arrives.
     // Its subsequent map:room event retries against the settled topology.
-    gpsMapApply.set([]);
+    gpsMapApply.set(currentRoomApply);
   }
 }
 
@@ -113,12 +122,20 @@ function mount(): void {
         </Text>
       </Row>
       <MapView
+        defaultStyle={{
+          crossAreaLabelVisibility: "hover",
+          crossAreaLabelBackground: UI.navyDeep,
+        }}
         styles={{
+          [CURRENT_ROOM_STYLE]: {
+            crossAreaLabelVisibility: "always",
+          },
           [ROUTE_STYLE]: {
             connectionColor: UI.gold,
             connectionWidth: 2,
             roomStroke: UI.gold,
             roomStrokeWidth: 2,
+            crossAreaLabelVisibility: "always",
           },
         }}
         apply={gpsMapApply.bind()}

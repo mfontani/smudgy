@@ -3,6 +3,7 @@ import test from "node:test";
 import type { GridPosition } from "./layout.ts";
 import {
   directRoomObstructions,
+  planConnectionRoute,
   routeAroundRooms,
   routeEndSide,
   routeStartSide,
@@ -39,4 +40,30 @@ test("keeps an unobstructed cardinal route straight", () => {
 
 test("does not treat rooms on another level as obstacles", () => {
   assert.deepEqual(directRoomObstructions(at(0, 0), at(3, 0), [at(1, 0, 1)]), []);
+});
+
+test("stores a generated Manhattan path as diagonal-tolerant with rounded corners", () => {
+  const rooms = [at(1, 0), at(2, 0), at(3, 0), at(4, 0)];
+  const route = planConnectionRoute(at(0, 0), at(5, 0), rooms, "East", "West");
+
+  assert.equal(route.routing, "Manual");
+  assert.equal(route.segmentShape, "Direct");
+  assert.equal(route.corner, "Rounded");
+  assert.ok(route.routePoints.length >= 2);
+  for (let index = 1; index < route.routePoints.length; index += 1) {
+    const previous = route.routePoints[index - 1];
+    const current = route.routePoints[index];
+    assert.ok(previous.x === current.x || previous.y === current.y);
+  }
+});
+
+test("uses a rounded direct fallback when no detour is needed", () => {
+  assert.deepEqual(planConnectionRoute(at(0, 0), at(4, 0), [], "East", "West"), {
+    startSide: "East",
+    endSide: "West",
+    routing: "Automatic",
+    segmentShape: "Direct",
+    corner: "Rounded",
+    routePoints: [],
+  });
 });

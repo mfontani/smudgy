@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  currentRoomMapViewApply,
   gpsRouteRaw,
   mapViewRoute,
   type RouteDirection,
@@ -28,6 +29,21 @@ function exit(
 function room(room_number: number, exits: RouteExit[] = []): RouteRoom {
   return { area_id: AREA, room_number, exits };
 }
+
+test("selects every exit at the current room for persistent labels", () => {
+  const current = room(7, [
+    exit("North", 8),
+    exit("East", 9, null, OTHER_AREA),
+  ]);
+  assert.deepEqual(currentRoomMapViewApply(current), [{
+    style: "current-room",
+    exits: [
+      { room: 7, direction: "North" },
+      { room: 7, direction: "East" },
+    ],
+  }]);
+  assert.deepEqual(currentRoomMapViewApply(undefined), []);
+});
 
 test("walks compact GPS directions through cardinal and vertical topology", () => {
   const rooms = new Map<number, RouteRoom>([

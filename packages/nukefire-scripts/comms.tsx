@@ -25,7 +25,6 @@ import {
   auctionPresentation,
   isAuctionCommand,
   isAuctioneer,
-  messageIncludesAuthor,
 } from "./comms-format.ts";
 import { RawCommLogger } from "./comms-log.ts";
 import { chatFontSize, chatRendering, widgetMetric, widgetTextSize } from "./config.ts";
@@ -210,10 +209,7 @@ function renderMessage(message: Message): StyledText {
     isAuctioneer(message.player)
   ) return renderAuction(message);
 
-  const speaker = message.player === "" || messageIncludesAuthor(message.player, message.plain)
-    ? ""
-    : style` ${style.white`${message.player}:`}`;
-  return style`${renderTag(message)}${speaker} ${renderBody(message)}`;
+  return style`${renderTag(message)} ${renderBody(message)}`;
 }
 
 function visible(message: Message): boolean {
@@ -222,8 +218,8 @@ function visible(message: Message): boolean {
 
 function append(message: Message): void {
   if (!visible(message) || !pane) return;
-  pane.echo(renderMessage(message));
   pane.echo("");
+  pane.echo(renderMessage(message));
 }
 
 function replay(): void {
@@ -407,7 +403,7 @@ function speak(text: string): void {
 }
 
 export function open(): void {
-  const parent = session.panes.get("Affects") ?? session.mainPane;
+  const parent = session.panes.get("Map") ?? session.panes.get("Atlas") ?? session.mainPane;
 
   // `terminal` is immutable after a pane is created. Replace the old
   // widgets-only Comms pane when this version first loads.

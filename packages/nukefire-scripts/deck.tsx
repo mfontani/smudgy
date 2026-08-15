@@ -1,5 +1,5 @@
 // =============================================================================
-//  Context Deck — the room's services as a horizontal card strip
+//  Context Deck — the room's services as a compact vertical rail
 // =============================================================================
 //  NukeFire.Context describes what you can do *here* (remorter, packrat vault,
 //  zone intelligence, …) as titled blocks with status lines and invocable
@@ -22,6 +22,7 @@ import {
   createWidget,
 } from "smudgy:widgets";
 import {
+  nukefire,
   watchMessage,
   type NukeFireContextAction,
   type NukeFireContextEntry,
@@ -32,7 +33,9 @@ import { UI, kindColor, themeBackground, toneColor } from "./theme.ts";
 
 const PANE = "Deck";
 
-let contexts: readonly NukeFireContextEntry[] = [];
+let contexts: readonly NukeFireContextEntry[] = visibleContexts(
+  nukefire.value?.NukeFire?.Context?.contexts ?? [],
+);
 let pendingConfirm: { action: NukeFireContextAction; from: string } | null = null;
 let shown = false;
 
@@ -63,48 +66,75 @@ function execute(action: NukeFireContextAction): void {
   send(action.command);
 }
 
+function actionContent(action: NukeFireContextAction, color: string, disabled = false) {
+  return (
+    <Row width="fill" spacing={6}>
+      <Text size={widgetTextSize(10)} color={color}>{action.label}</Text>
+      <Space width="fill" />
+      {disabled
+        ? <Text size={widgetTextSize(9)} color={UI.faint}>unavailable</Text>
+        : action.arguments && action.arguments.length > 0
+          ? <Text size={widgetTextSize(9)} color={UI.faint}>input …</Text>
+          : null}
+    </Row>
+  );
+}
+
+function actionTooltip(action: NukeFireContextAction): string | undefined {
+  if (action.enabled === false) return action.disabledReason || "unavailable";
+  if (!action.arguments || action.arguments.length === 0) return action.help;
+
+  const inputHint = "Continues in the command input so you can supply arguments.";
+  return action.help ? `${action.help}\n${inputHint}` : inputHint;
+}
+
 function actionButton(entry: NukeFireContextEntry, action: NukeFireContextAction) {
   if (action.enabled === false) {
     return (
-      <Tooltip tip={action.disabledReason || "unavailable"}>
-        <Text size={widgetTextSize(10)} color={UI.faint}>{action.label}</Text>
+      <Tooltip tip={actionTooltip(action) ?? "unavailable"}>
+        <Button width="fill" variant="subtle">
+          {actionContent(action, UI.faint, true)}
+        </Button>
       </Tooltip>
     );
   }
-  const color = action.style === "danger" ? UI.danger : action.style === "primary" ? UI.header : UI.text;
   const button = (
     <Button
-      variant={action.style === "primary" ? "primary" : "subtle"}
+      width="fill"
+      variant="subtle"
       onPress={() => runAction(action, entry.title)}
     >
-      <Text size={widgetTextSize(10)} color={color}>{action.label}</Text>
+      {actionContent(action, UI.text)}
     </Button>
   );
-  return action.help ? <Tooltip tip={action.help}>{button}</Tooltip> : button;
+  const tip = actionTooltip(action);
+  return tip ? <Tooltip tip={tip}>{button}</Tooltip> : button;
 }
 
-const CARD_W = widgetMetric(270);
+function contextTitle(entry: NukeFireContextEntry) {
+  const title = <Text size={widgetTextSize(12)} color={kindColor(entry.kind)}>{entry.title}</Text>;
+  return entry.summary ? <Tooltip tip={entry.summary}>{title}</Tooltip> : title;
+}
 
 function card(entry: NukeFireContextEntry) {
   return (
-    <Container width={CARD_W} height="fill" background={themeBackground.bind()}>
-      <Column width="fill" height="fill" padding={10} spacing={4}>
+    <Container width="fill">
+      <Column width="fill" padding={10} spacing={6}>
         {[
-          <Row spacing={6}>
-            <Text size={widgetTextSize(12)} color={kindColor(entry.kind)}>{entry.title}</Text>
+          <Row width="fill" spacing={6}>
+            {contextTitle(entry)}
             <Space width="fill" />
-            <Text size={widgetTextSize(9)} color={UI.faint}>{entry.kind}</Text>
+            <Text size={widgetTextSize(9)} color={UI.faint}>{entry.kind.toUpperCase()}</Text>
           </Row>,
-          entry.id?.toLowerCase() === "zone-intelligence" ? null : (
-            <Text size={widgetTextSize(10)} color={UI.dim}>{entry.summary}</Text>
-          ),
           ...entry.status.map((s) => (
-            <Row spacing={6}>
+            <Row width="fill" spacing={6}>
               <Text size={widgetTextSize(10)} color={UI.dim}>{s.label}:</Text>
-              <Text size={widgetTextSize(10)} color={toneColor(s.tone)}>{String(s.value)}</Text>
+              <Container width="fill" align_x="right">
+                <Text size={widgetTextSize(10)} color={toneColor(s.tone)}>{String(s.value)}</Text>
+              </Container>
             </Row>
           )),
-          <Column spacing={4}>
+          <Column width="fill" spacing={4}>
             {entry.actions.map((action) => actionButton(entry, action))}
           </Column>,
         ]}
@@ -122,8 +152,8 @@ function confirmModal() {
   };
   return (
     <Modal onDismiss={dismiss}>
-      <Container background={themeBackground.bind()}>
-        <Column width={widgetMetric(340)} padding={14} spacing={10}>
+      <Container width="fill" background={themeBackground.bind()}>
+        <Column width="fill" padding={14} spacing={10}>
           <Text size={widgetTextSize(12)} color={UI.header}>{pending.from}</Text>
           <Text size={widgetTextSize(12)} color={UI.text}>{pending.action.confirm}</Text>
           <Row spacing={8}>
@@ -161,8 +191,8 @@ function mount(): void {
             <Text size={widgetTextSize(11)} color={UI.faint}>No services in this room.</Text>
           </Container>
         ) : (
-          <Scrollable width="fill" height="fill" direction="horizontal">
-            <Row spacing={8}>{contexts.map(card)}</Row>
+          <Scrollable width="fill" height="fill">
+            <Column width="fill" spacing={8}>{contexts.map(card)}</Column>
           </Scrollable>
         ),
         confirmModal(),
@@ -173,9 +203,10 @@ function mount(): void {
 }
 
 export function open(): void {
-  session.mainPane.split("bottom", {
+  const parent = session.panes.get("Affects") ?? session.mainPane;
+  parent.split("bottom", {
     name: PANE,
-    height: widgetMetric(185),
+    height: widgetMetric(280),
     terminal: false,
   });
   shown = true;

@@ -5,7 +5,6 @@ import { filteredGpsDestinations } from "./atlas-model.ts";
 import {
   auctionPresentation,
   isAuctioneer,
-  messageIncludesAuthor,
 } from "./comms-format.ts";
 import { visibleContexts } from "./context-model.ts";
 import { fragmentsFromStyleSpans } from "./line-style.ts";
@@ -58,12 +57,6 @@ test("zone intelligence omits its BIGMAP action", () => {
       actions: [{ id: "zinfo" }, { id: "huntme" }],
     },
   ]);
-});
-
-test("server-rendered authors are not considered missing", () => {
-  assert.equal(messageIncludesAuthor("Alice", "Alice gossips, 'hello'"), true);
-  assert.equal(messageIncludesAuthor("Al", "Alice gossips, 'hello'"), false);
-  assert.equal(messageIncludesAuthor("Alice", "Someone else gossips, 'hello'"), false);
 });
 
 test("only the Auctioneer is classified as an auction update", () => {

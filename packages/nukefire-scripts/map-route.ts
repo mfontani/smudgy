@@ -34,11 +34,18 @@ export type RouteRoomLookup = (
 
 /** The name this module's output expects in the MapView styles palette. */
 export const ROUTE_STYLE = "route";
+/** The style which keeps cross-area labels at the current room visible. */
+export const CURRENT_ROOM_STYLE = "current-room";
 
 /** One resolved application of {@link ROUTE_STYLE}, in MapView `apply` shape. */
 export interface RouteStyleApplication {
   style: typeof ROUTE_STYLE;
   rooms: number[];
+  exits: { room: number; direction: RouteDirection }[];
+}
+
+export interface CurrentRoomStyleApplication {
+  style: typeof CURRENT_ROOM_STYLE;
   exits: { room: number; direction: RouteDirection }[];
 }
 
@@ -69,6 +76,22 @@ function exitForStep(room: RouteRoom, step: string): RouteExit | undefined {
   // exit alongside an ordinary direction which happens to share its command.
   return room.exits.find((exit) => normalizedCommand(exit.command) === step) ??
     room.exits.find((exit) => exit.from_direction.toLowerCase() === direction);
+}
+
+/** Select every exit anchored at the current room. The associated style only
+ * changes cross-area label visibility, so ordinary exits are harmless here
+ * and redacted/dangling destinations do not need to be distinguished. */
+export function currentRoomMapViewApply(
+  room: RouteRoom | undefined,
+): CurrentRoomStyleApplication[] {
+  if (!room || room.exits.length === 0) return [];
+  return [{
+    style: CURRENT_ROOM_STYLE,
+    exits: room.exits.map((exit) => ({
+      room: room.room_number,
+      direction: exit.from_direction,
+    })),
+  }];
 }
 
 /**
