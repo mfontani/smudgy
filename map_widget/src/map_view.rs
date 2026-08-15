@@ -16,8 +16,8 @@ use smudgy_cloud::{
 use iced_anim::{Animated, spring::Motion, transition::Easing};
 
 use crate::{
-    MapExitRef, MapViewPresentation, ResolvedPresentation, Update, presentation::DEFAULT_DOOR_COLOR,
-    render, viewport::Viewport,
+    CrossAreaLabelVisibility, MapExitRef, MapViewPresentation, ResolvedPresentation, Update,
+    presentation::DEFAULT_DOOR_COLOR, render, viewport::Viewport,
 };
 use iced::event::Event as IcedEvent;
 use std::time::{Duration, Instant};
@@ -452,6 +452,15 @@ impl MapView {
             state.modifiers = *modifiers;
         }
 
+        // `cursor.position_in` is unavailable after the pointer leaves the
+        // canvas, so clear the retained hover before that gate. Hover-driven
+        // cross-area labels must not stick at the edge of the widget.
+        if matches!(event, IcedEvent::Mouse(mouse::Event::CursorLeft))
+            && self.hovered_room.is_some()
+        {
+            return Some(canvas::Action::publish(Message::SetHoveredRoom(None)));
+        }
+
         let cursor_position = cursor.position_in(bounds)?;
 
         match event {
@@ -572,6 +581,7 @@ impl MapView {
 
                         frame.with_save(|frame| {
                             frame.translate(offset);
+                            let mut cross_area_labels = Vec::new();
                             area.with_room_connections_in(
                                 min_x,
                                 min_y,
@@ -580,14 +590,32 @@ impl MapView {
                                 |connection| {
                                     if connection.from_level == ghost_level {
                                         let connection = connection.with_room_spacing(spacing);
-                                        render::draw_connection(
+                                        let paint = resolved.base_conn;
+                                        let label_visible = cross_area_label_visible(
+                                            paint.cross_area_label_visibility,
+                                            self.hovered_room.as_ref(),
+                                            self.active_area_id,
+                                            connection.room.get_room_number(),
+                                        );
+                                        render::draw_connection_styled(
                                             frame,
                                             &atlas,
                                             &connection,
                                             ghost_opacity,
                                             false,
                                             true,
+                                            None,
+                                            None,
+                                            None,
+                                            false,
+                                            paint.cross_area_label_background,
                                         );
+                                        if label_visible && is_cross_area_connection(&connection) {
+                                            cross_area_labels.push((
+                                                connection,
+                                                paint.cross_area_label_background,
+                                            ));
+                                        }
                                     }
                                 },
                             );
@@ -607,6 +635,16 @@ impl MapView {
                                     );
                                 }
                             });
+                            for (connection, background) in &cross_area_labels {
+                                render::draw_cross_area_connection_label(
+                                    frame,
+                                    &atlas,
+                                    connection,
+                                    ghost_opacity,
+                                    false,
+                                    *background,
+                                );
+                            }
                         });
                     }
                 }
@@ -637,11 +675,18 @@ impl MapView {
                 // practice; a second accent-only pass would fix full
                 // stacking if it ever matters.
                 let connections_drawn = Cell::new(0_usize);
+                let mut cross_area_labels = Vec::new();
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level {
                         let connection = connection.with_room_spacing(spacing);
                         let (anchor, far) = connection_exit_keys(&connection);
                         let paint = resolved.conn_paint(anchor, far);
+                        let label_visible = cross_area_label_visible(
+                            paint.cross_area_label_visibility,
+                            self.hovered_room.as_ref(),
+                            self.active_area_id,
+                            connection.room.get_room_number(),
+                        );
                         let door = resolved.show_doors.then(|| {
                             let state = resolved.door_override(anchor, far);
                             (
@@ -660,7 +705,13 @@ impl MapView {
                             paint.color,
                             paint.width,
                             door,
+                            false,
+                            paint.cross_area_label_background,
                         );
+                        if label_visible && is_cross_area_connection(&connection) {
+                            cross_area_labels
+                                .push((connection, paint.cross_area_label_background));
+                        }
                         connections_drawn.set(connections_drawn.get() + 1);
                     }
                 });
@@ -681,6 +732,20 @@ impl MapView {
                         rooms_drawn.set(rooms_drawn.get() + 1);
                     }
                 });
+
+                // Destination labels are an overlay: their optional
+                // backgrounds and text must remain legible even when the
+                // outward label anchor overlaps a room glyph.
+                for (connection, background) in &cross_area_labels {
+                    render::draw_cross_area_connection_label(
+                        frame,
+                        &atlas,
+                        connection,
+                        opacity,
+                        false,
+                        *background,
+                    );
+                }
 
                 if let Some(player_room_number) = player_room_number
                     && let Some(room) = area.get_room(&player_room_number)
@@ -720,6 +785,26 @@ impl MapView {
 
         vec![frame.into_geometry()]
     }
+}
+
+/// Resolve one connection style's label policy against the currently hovered
+/// in-area anchor room. The default remains the legacy always-visible mode.
+fn cross_area_label_visible(
+    visibility: Option<CrossAreaLabelVisibility>,
+    hovered_room: Option<&RoomKey>,
+    active_area_id: AreaId,
+    anchor_room: RoomNumber,
+) -> bool {
+    let anchor_hovered = hovered_room
+        .is_some_and(|room| room.area_id == active_area_id && room.room_number == anchor_room);
+    visibility.unwrap_or_default().is_visible(anchor_hovered)
+}
+
+fn is_cross_area_connection(connection: &RoomConnection) -> bool {
+    matches!(
+        &connection.to,
+        RoomConnectionEnd::External { .. } | RoomConnectionEnd::Unknown { .. }
+    )
 }
 
 /// The far-endpoint summary of a connection half, reduced to what exit-ref
@@ -990,6 +1075,55 @@ mod tests {
         );
         assert_eq!(keys.0, exit(5, ExitDirection::East));
         assert_eq!(keys.1, None);
+    }
+
+    #[test]
+    fn cross_area_label_visibility_matches_only_the_anchor_room() {
+        let active = AreaId(Uuid::from_u64_pair(0, 1));
+        let other = AreaId(Uuid::from_u64_pair(0, 2));
+        let hovered = RoomKey {
+            area_id: active,
+            room_number: RoomNumber(5),
+        };
+        let elsewhere = RoomKey {
+            area_id: other,
+            room_number: RoomNumber(5),
+        };
+
+        assert!(cross_area_label_visible(
+            Some(CrossAreaLabelVisibility::Always),
+            None,
+            active,
+            RoomNumber(5),
+        ));
+        assert!(cross_area_label_visible(
+            Some(CrossAreaLabelVisibility::Hover),
+            Some(&hovered),
+            active,
+            RoomNumber(5),
+        ));
+        assert!(!cross_area_label_visible(
+            Some(CrossAreaLabelVisibility::Hover),
+            Some(&hovered),
+            active,
+            RoomNumber(6),
+        ));
+        assert!(!cross_area_label_visible(
+            Some(CrossAreaLabelVisibility::Hover),
+            Some(&elsewhere),
+            active,
+            RoomNumber(5),
+        ));
+        assert!(!cross_area_label_visible(
+            Some(CrossAreaLabelVisibility::Never),
+            Some(&hovered),
+            active,
+            RoomNumber(5),
+        ));
+        assert!(
+            cross_area_label_visible(None, None, active, RoomNumber(5)),
+            "an omitted style preserves the legacy always-visible behavior"
+        );
     }
 
     /// A normal in-area connection is selectable from either endpoint's

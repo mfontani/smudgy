@@ -21,6 +21,32 @@ use smudgy_cloud::{AreaId, ExitDirection, RoomNumber};
 /// Rendered fallback for door glyphs when no style names a `door_color`.
 pub const DEFAULT_DOOR_COLOR: Color = Color::from_rgb8(63, 63, 70);
 
+/// When a cross-area destination label is rendered. This is a connection
+/// style channel so a route can promote only its selected exits to
+/// [`Always`](Self::Always) over a hover-only `defaultStyle`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrossAreaLabelVisibility {
+    /// Preserve the legacy behavior: draw the destination label every frame.
+    #[default]
+    Always,
+    /// Draw the label only while its in-area anchor room is hovered.
+    Hover,
+    /// Keep the connection marker discoverable but never draw its label.
+    Never,
+}
+
+impl CrossAreaLabelVisibility {
+    /// Resolve the policy for one connection's current hover state.
+    #[must_use]
+    pub const fn is_visible(self, anchor_hovered: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Hover => anchor_hovered,
+            Self::Never => false,
+        }
+    }
+}
+
 /// Log a warning exactly once per distinct message. Presentation inputs come
 /// from scripts and mutable stores, so the same bad value is re-resolved on
 /// every area switch and presentation change; without the gate one malformed
@@ -36,9 +62,9 @@ fn warn_once(message: &str) {
     }
 }
 
-/// Paintable channels for individual rooms, connections, and doors. Absent
-/// fields inherit `default_style`, then the widget default. Colors stay as
-/// authored strings here; they are parsed (and validated) at resolution.
+/// Presentation channels for individual rooms, connections, and doors.
+/// Absent fields inherit `default_style`, then the widget default. Colors stay
+/// as authored strings here; they are parsed (and validated) at resolution.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MapStyle {
     pub room_fill: Option<String>,
@@ -49,6 +75,11 @@ pub struct MapStyle {
     pub connection_color: Option<String>,
     pub connection_width: Option<f32>,
     pub door_color: Option<String>,
+    /// Visibility policy for named and redacted cross-area destination
+    /// labels. The connection stub and marker remain visible in every mode.
+    pub cross_area_label_visibility: Option<CrossAreaLabelVisibility>,
+    /// Optional CSS color for a padded background behind cross-area labels.
+    pub cross_area_label_background: Option<String>,
 }
 
 impl MapStyle {
@@ -239,6 +270,11 @@ fn resolve_style(style: &MapStyle, name: &str) -> (ResolvedRoomStyle, ResolvedCo
             color: color(&style.connection_color, "connectionColor"),
             width: style.connection_width,
             door_color: color(&style.door_color, "doorColor"),
+            cross_area_label_visibility: style.cross_area_label_visibility,
+            cross_area_label_background: color(
+                &style.cross_area_label_background,
+                "crossAreaLabelBackground",
+            ),
         },
     )
 }
@@ -271,13 +307,15 @@ impl ResolvedRoomStyle {
     }
 }
 
-/// A connection's paint channels with colors parsed. `None` fields fall
-/// through to the Connection's stored color/thickness.
+/// A connection's appearance channels with colors parsed. `None` fields fall
+/// through to the Connection's stored color/thickness and legacy label policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ResolvedConnStyle {
     pub color: Option<Color>,
     pub width: Option<f32>,
     pub door_color: Option<Color>,
+    pub cross_area_label_visibility: Option<CrossAreaLabelVisibility>,
+    pub cross_area_label_background: Option<Color>,
 }
 
 impl ResolvedConnStyle {
@@ -291,6 +329,12 @@ impl ResolvedConnStyle {
         }
         if patch.door_color.is_some() {
             self.door_color = patch.door_color;
+        }
+        if patch.cross_area_label_visibility.is_some() {
+            self.cross_area_label_visibility = patch.cross_area_label_visibility;
+        }
+        if patch.cross_area_label_background.is_some() {
+            self.cross_area_label_background = patch.cross_area_label_background;
         }
     }
 }
@@ -579,6 +623,53 @@ mod tests {
         let paint = resolved.room_paint(RoomNumber(2));
         assert_eq!(paint.stroke, None);
         assert_eq!(paint.stroke_width, Some(5.0));
+    }
+
+    #[test]
+    fn route_style_promotes_one_cross_area_label_over_hover_only_default() {
+        let routed = exit(3, ExitDirection::North);
+        let presentation = MapViewPresentation {
+            default_style: MapStyle {
+                cross_area_label_visibility: Some(CrossAreaLabelVisibility::Hover),
+                cross_area_label_background: Some("rgba(7, 7, 6, 0.88)".to_string()),
+                ..MapStyle::default()
+            },
+            styles: HashMap::from([(
+                "route".to_string(),
+                MapStyle {
+                    cross_area_label_visibility: Some(CrossAreaLabelVisibility::Always),
+                    ..MapStyle::default()
+                },
+            )]),
+            apply: vec![MapStyleApplication {
+                style: "route".to_string(),
+                rooms: vec![RoomNumber(3)],
+                exits: vec![routed],
+                area: None,
+            }],
+            ..MapViewPresentation::default()
+        };
+        let resolved = presentation.resolve(area(1));
+
+        let routed_paint = resolved.conn_paint(routed, None);
+        assert_eq!(
+            routed_paint.cross_area_label_visibility,
+            Some(CrossAreaLabelVisibility::Always)
+        );
+        assert_eq!(
+            routed_paint.cross_area_label_background,
+            smudgy_cloud::parse_css_color("rgba(7, 7, 6, 0.88)")
+        );
+
+        let ordinary = resolved.conn_paint(exit(4, ExitDirection::East), None);
+        assert_eq!(
+            ordinary.cross_area_label_visibility,
+            Some(CrossAreaLabelVisibility::Hover)
+        );
+        assert_eq!(
+            ordinary.cross_area_label_background,
+            smudgy_cloud::parse_css_color("rgba(7, 7, 6, 0.88)")
+        );
     }
 
     #[test]

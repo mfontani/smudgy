@@ -8,8 +8,8 @@ pub mod viewport;
 pub use map_editor::MapEditor;
 pub use map_view::{Event, MapView, Message, Renderer, Theme};
 pub use presentation::{
-    MapDoorState, MapExitRef, MapStyle, MapStyleApplication, MapViewPresentation,
-    ResolvedConnStyle, ResolvedPresentation, ResolvedRoomStyle,
+    CrossAreaLabelVisibility, MapDoorState, MapExitRef, MapStyle, MapStyleApplication,
+    MapViewPresentation, ResolvedConnStyle, ResolvedPresentation, ResolvedRoomStyle,
 };
 pub use update::Update;
 pub use viewport::Viewport;

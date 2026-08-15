@@ -2041,7 +2041,7 @@ fn get_static_styles(
     }
 }
 
-/// Per-item paint channels, camelCase from JS. Absent fields inherit
+/// Per-item presentation channels, camelCase from JS. Absent fields inherit
 /// `defaultStyle`, then the widget default.
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -2053,6 +2053,26 @@ struct MapStyleProp {
     connection_color: Option<String>,
     connection_width: Option<f32>,
     door_color: Option<String>,
+    cross_area_label_visibility: Option<CrossAreaLabelVisibilityProp>,
+    cross_area_label_background: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CrossAreaLabelVisibilityProp {
+    Always,
+    Hover,
+    Never,
+}
+
+impl From<CrossAreaLabelVisibilityProp> for smudgy_map_widget::CrossAreaLabelVisibility {
+    fn from(value: CrossAreaLabelVisibilityProp) -> Self {
+        match value {
+            CrossAreaLabelVisibilityProp::Always => Self::Always,
+            CrossAreaLabelVisibilityProp::Hover => Self::Hover,
+            CrossAreaLabelVisibilityProp::Never => Self::Never,
+        }
+    }
 }
 
 impl From<MapStyleProp> for smudgy_map_widget::MapStyle {
@@ -2065,6 +2085,8 @@ impl From<MapStyleProp> for smudgy_map_widget::MapStyle {
             connection_color: value.connection_color,
             connection_width: value.connection_width,
             door_color: value.door_color,
+            cross_area_label_visibility: value.cross_area_label_visibility.map(Into::into),
+            cross_area_label_background: value.cross_area_label_background,
         }
     }
 }
@@ -3369,11 +3391,21 @@ mod tests {
         let style = map_style_from_node(&Node::from(json!({
             "roomStroke": "#ff00ff",
             "connectionWidth": 2.0,
+            "crossAreaLabelVisibility": "hover",
+            "crossAreaLabelBackground": "rgba(7, 7, 6, 0.88)",
         })))
         .expect("style parses");
         assert_eq!(style.room_stroke.as_deref(), Some("#ff00ff"));
         assert_eq!(style.connection_width, Some(2.0));
         assert_eq!(style.room_fill, None);
+        assert_eq!(
+            style.cross_area_label_visibility,
+            Some(smudgy_map_widget::CrossAreaLabelVisibility::Hover)
+        );
+        assert_eq!(
+            style.cross_area_label_background.as_deref(),
+            Some("rgba(7, 7, 6, 0.88)")
+        );
     }
 
     /// The `area` scope in both accepted spellings: the `[hi, lo]` pair and
@@ -3504,6 +3536,12 @@ mod tests {
         // The whole prop having the wrong shape fails.
         assert!(style_applications_from_node(&Node::from(json!({ "style": "route" }))).is_err());
         assert!(map_style_from_node(&Node::from(json!("gold"))).is_err());
+        assert!(
+            map_style_from_node(&Node::from(json!({
+                "crossAreaLabelVisibility": "sometimes"
+            })))
+            .is_err()
+        );
     }
 
     /// The bound-prop memo: an unchanged store snapshot must not re-parse
