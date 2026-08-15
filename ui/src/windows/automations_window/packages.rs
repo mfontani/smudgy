@@ -311,9 +311,8 @@ pub type InstalledDetail = (
 /// install-consent flow needs — the **closure** permission union (what the sandboxed isolate
 /// will be granted, `PACKAGE-ISOLATES-CONSENT-TRUST.md`), the root manifest's declared params
 /// (so a Grant can chain into the required-params prompt without re-resolving), and the
-/// transitively-walked `requires`-closure (the required roots co-installed with this package,
-/// any cycle warnings, and a peer-conflict refusal when one applies). See
-/// `script/REQUIRED-PACKAGES.md`.
+/// transitively-walked `requires`-closure (the required roots co-installed with this package and a
+/// peer-conflict refusal when one applies). See `script/REQUIRED-PACKAGES.md`.
 #[derive(Debug, Clone)]
 pub struct InstallResolution {
     pub specifier: String,
@@ -328,9 +327,6 @@ pub struct InstallResolution {
     /// whether it is already installed/satisfied, its own permission closure, and its missing
     /// required params. Empty when the package requires nothing.
     pub required_roots: Vec<RequiredRoot>,
-    /// Cycle warnings from the `requires` walk (a back-edge in the requires graph). Advisory — a
-    /// cycle warns, never blocks (`script/REQUIRED-PACKAGES.md`).
-    pub cycle_warnings: Vec<String>,
     /// A peer-conflict refusal: when set, the install is **blocked** because no single version of a
     /// required library satisfies every current requirer's range. Carries the explanation.
     pub conflict: Option<String>,
@@ -383,8 +379,6 @@ pub struct ConsentPrompt {
     /// this package (`script/REQUIRED-PACKAGES.md`). A single grant covers the whole set; on Grant
     /// each not-already-satisfied root is installed via `install_required_package` and consented.
     pub required_roots: Vec<RequiredRoot>,
-    /// Cycle warnings from the requires walk — shown advisory; a cycle never blocks the install.
-    pub cycle_warnings: Vec<String>,
     /// A peer-conflict refusal: when set, Install is disabled and this message explains why (no
     /// single version of a required library satisfies every requirer's range).
     pub conflict: Option<String>,
@@ -539,13 +533,12 @@ async fn resolve_install_closure(
             permissions,
             params,
             required_roots: Vec::new(),
-            cycle_warnings: Vec::new(),
             conflict: None,
             needs_smudgy: Some(reason),
         });
     }
     // Walk this root's `requires`-closure transitively — the required top-level roots co-installed
-    // alongside it, any cycle warnings, and a peer-conflict or version-floor refusal if one applies.
+    // alongside it and any peer-conflict or version-floor refusal.
     let closure = resolve_required_closure(client, &root, installed).await;
     Ok(InstallResolution {
         specifier,
@@ -555,7 +548,6 @@ async fn resolve_install_closure(
         permissions,
         params,
         required_roots: closure.roots,
-        cycle_warnings: closure.cycle_warnings,
         conflict: closure.conflict,
         needs_smudgy: closure.needs_smudgy,
     })
@@ -564,7 +556,6 @@ async fn resolve_install_closure(
 /// The accumulated result of the `requires`-closure walk.
 struct RequiredClosure {
     roots: Vec<RequiredRoot>,
-    cycle_warnings: Vec<String>,
     conflict: Option<String>,
     /// A required root's closure declares a `min_smudgy_version` above this smudgy — the
     /// whole install is refused (the grant is all-or-nothing and the root couldn't load).
@@ -582,12 +573,12 @@ enum RequiredRefusal {
 
 /// Walks `root`'s `requires` **transitively** (`script/REQUIRED-PACKAGES.md`): for each
 /// `smudgy://owner/name[@range]` in a manifest's `requires`, resolve it, read ITS `requires`, and
-/// recurse — de-duping required roots by package key and turning a back-edge (a cycle) into a
-/// warning line rather than aborting. For each required root it gathers every requirer's declared
-/// range (including the new root's and the still-installed packages' manifests) and applies the
-/// peer-conflict policy: a satisfied existing install is reused as-is; an unsatisfied one is
-/// upgraded to a single version meeting every range when one exists; if no version satisfies all,
-/// the whole install is **refused** (`conflict` set, `script/REQUIRED-PACKAGES.md`).
+/// recurse — de-duping required roots by package key so back-edges terminate without aborting. For
+/// each required root it gathers every requirer's declared range (including the new root's and the
+/// still-installed packages' manifests) and applies the peer-conflict policy: a satisfied existing
+/// install is reused as-is; an unsatisfied one is upgraded to a single version meeting every range
+/// when one exists; if no version satisfies all, the whole install is **refused** (`conflict` set,
+/// `script/REQUIRED-PACKAGES.md`).
 ///
 /// Best-effort like the rest of the install path: a required root that fails to resolve is skipped
 /// (it can't be co-installed if the registry won't return it) rather than aborting the user's
@@ -633,7 +624,6 @@ async fn resolve_required_closure(
 
     let mut closure = RequiredClosure {
         roots: Vec::new(),
-        cycle_warnings: Vec::new(),
         conflict: None,
         needs_smudgy: None,
     };
@@ -660,15 +650,8 @@ async fn resolve_required_closure(
                 requirer: requirer.clone(),
                 range: edge.range.clone(),
             });
-        // A back-edge to something already walked (incl. the root) is a cycle — warn, don't block.
+        // A back-edge to something already walked (including the root) is already accounted for.
         if walked.contains(&key) {
-            let line = format!(
-                "{} requires {} \u{2014} a requires cycle (already in the set; not re-walked)",
-                requirer, edge.name
-            );
-            if !closure.cycle_warnings.contains(&line) {
-                closure.cycle_warnings.push(line);
-            }
             continue;
         }
         if !emitted.insert(key.clone()) {
@@ -3596,7 +3579,7 @@ impl AutomationsWindow {
         let seq = self.install_seq;
         let client = self.package_client();
         // Resolve the root, fold the whole dependency-closure permission union, AND walk the
-        // `requires`-closure (required roots + cycle warnings + peer-conflict check) before showing
+        // `requires`-closure (required roots + peer-conflict check) before showing
         // the consent window — the sandboxed isolate is granted exactly that union, and the user
         // grants the whole required set at once.
         let installed = self.installed_packages.clone();
@@ -3629,7 +3612,6 @@ impl AutomationsWindow {
                     permissions: res.permissions,
                     params: res.params,
                     required_roots: res.required_roots,
-                    cycle_warnings: res.cycle_warnings,
                     conflict: res.conflict,
                     needs_smudgy: res.needs_smudgy,
                     error: None,
@@ -6030,24 +6012,6 @@ impl AutomationsWindow {
         // own permission closure; already-satisfied roots show as a reuse note, not a fresh install.
         if let Some(section) = self.view_required_roots_section(&prompt.required_roots) {
             form = form.push(section);
-        }
-
-        // Cycle warnings (advisory — a requires cycle never blocks the install).
-        if !prompt.cycle_warnings.is_empty() {
-            let mut warnings = Column::new()
-                .spacing(4.0)
-                .push(text(crate::i18n::t!("package-note")).size(13.0).style(common::muted));
-            for line in &prompt.cycle_warnings {
-                warnings = warnings.push(
-                    row![
-                        text("\u{26A0}").size(12.0).style(common::muted),
-                        text(line.clone()).size(12.0).style(common::muted),
-                    ]
-                    .spacing(8.0)
-                    .align_y(Vertical::Center),
-                );
-            }
-            form = form.push(warnings);
         }
 
         // A peer conflict refuses the install: explain it and disable the install buttons.
