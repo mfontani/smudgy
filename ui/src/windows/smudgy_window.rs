@@ -3034,16 +3034,6 @@ impl SmudgyWindow {
                 // earlier in the same update batch removed it; the lookup
                 // guard makes that a no-op.
                 if let Some(session_id) = clicked_session {
-                    // Clicking into a pane returns to the distraction-free
-                    // state — except while headers are toolbar-gated and the
-                    // toolbar is expanded (rearrange mode): pane_grid
-                    // publishes `on_click` for every press, including the one
-                    // that begins a header drag, so collapsing here would
-                    // hide every drag handle mid-gesture. Rearrange mode ends
-                    // via the toolbar toggle instead.
-                    if !(crate::prefs::current().hide_pane_headers && self.toolbar_expanded) {
-                        self.set_toolbar_expanded(false);
-                    }
                     // Re-activating the already-active session would run the
                     // focus operation again, stealing keyboard focus from any
                     // focusable overlay widget the user just clicked into
