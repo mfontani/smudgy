@@ -5717,33 +5717,28 @@ impl AutomationsWindow {
             star_color,
         ));
         let meta_line: Elem = rich_text(meta_spans).size(11.0).style(common::faint).into();
-        container(
-            row![
-                column![
-                    row![
-                        text(result.name.clone()).size(15.0),
-                        if installed {
-                            common::badge("Installed")
-                        } else {
-                            iced::widget::space::horizontal()
-                                .width(Length::Shrink)
-                                .into()
-                        },
-                    ]
-                    .spacing(8.0)
-                    .align_y(Vertical::Center),
-                    text(result.description.clone())
-                        .size(12.0)
-                        .style(common::muted),
-                    meta_line,
+        container(card_with_trailing_action(
+            column![
+                row![
+                    text(result.name.clone()).size(15.0),
+                    if installed {
+                        common::badge("Installed")
+                    } else {
+                        iced::widget::space::horizontal()
+                            .width(Length::Shrink)
+                            .into()
+                    },
                 ]
-                .spacing(3.0),
-                iced::widget::space::horizontal(),
-                action,
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+                text(result.description.clone())
+                    .size(12.0)
+                    .style(common::muted),
+                meta_line,
             ]
-            .spacing(10.0)
-            .align_y(Vertical::Center),
-        )
+            .spacing(3.0),
+            action,
+        ))
         .padding(12.0)
         .width(Length::Fill)
         .style(common::card_style)
@@ -6710,27 +6705,22 @@ impl AutomationsWindow {
                         title_row = title_row.push(common::badge(crate::i18n::t!("package-private")));
                     }
                     body = body.push(
-                        container(
-                            row![
-                                column![
-                                    title_row,
-                                    text(detail.package.description.clone())
-                                        .size(12.0)
-                                        .style(common::muted),
-                                    text(format!(
-                                        "v{}",
-                                        detail.latest_version.as_deref().unwrap_or("—")
-                                    ))
-                                    .size(11.0)
-                                    .style(common::faint),
-                                ]
-                                .spacing(3.0),
-                                iced::widget::space::horizontal(),
-                                action,
+                        container(card_with_trailing_action(
+                            column![
+                                title_row,
+                                text(detail.package.description.clone())
+                                    .size(12.0)
+                                    .style(common::muted),
+                                text(format!(
+                                    "v{}",
+                                    detail.latest_version.as_deref().unwrap_or("—")
+                                ))
+                                .size(11.0)
+                                .style(common::faint),
                             ]
-                            .spacing(10.0)
-                            .align_y(Vertical::Center),
-                        )
+                            .spacing(3.0),
+                            action,
+                        ))
                         .padding(12.0)
                         .width(Length::Fill)
                         .style(common::card_style),
@@ -6779,27 +6769,22 @@ impl AutomationsWindow {
                             .into()
                     };
                     body = body.push(
-                        container(
-                            row![
-                                column![
-                                    text(detail.package.name.clone()).size(15.0),
-                                    text(detail.package.description.clone())
-                                        .size(12.0)
-                                        .style(common::muted),
-                                    text(format!(
-                                        "{owner} · v{}",
-                                        detail.latest_version.as_deref().unwrap_or("—")
-                                    ))
-                                    .size(11.0)
-                                    .style(common::faint),
-                                ]
-                                .spacing(3.0),
-                                iced::widget::space::horizontal(),
-                                action,
+                        container(card_with_trailing_action(
+                            column![
+                                text(detail.package.name.clone()).size(15.0),
+                                text(detail.package.description.clone())
+                                    .size(12.0)
+                                    .style(common::muted),
+                                text(format!(
+                                    "{owner} · v{}",
+                                    detail.latest_version.as_deref().unwrap_or("—")
+                                ))
+                                .size(11.0)
+                                .style(common::faint),
                             ]
-                            .spacing(10.0)
-                            .align_y(Vertical::Center),
-                        )
+                            .spacing(3.0),
+                            action,
+                        ))
                         .padding(12.0)
                         .width(Length::Fill)
                         .style(common::card_style),
@@ -6812,6 +6797,28 @@ impl AutomationsWindow {
 }
 
 // ---- view helpers ----------------------------------------------------------
+
+/// A card row whose trailing controls keep their intrinsic width while the leading content wraps
+/// into the space that remains. In iced's flex layout, a shrink-width text column is measured before
+/// later siblings and can consume their room; making the content fluid causes the action rail to be
+/// measured first instead.
+fn card_with_trailing_action<'a, Message, Theme, Renderer>(
+    content: impl Into<iced::Element<'a, Message, Theme, Renderer>>,
+    action: impl Into<iced::Element<'a, Message, Theme, Renderer>>,
+) -> iced::Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: iced::widget::container::Catalog + 'a,
+    Renderer: iced::advanced::Renderer + 'a,
+{
+    row![
+        container(content).width(Length::Fill),
+        container(action).width(Length::Shrink),
+    ]
+    .spacing(10.0)
+    .align_y(Vertical::Center)
+    .into()
+}
 
 /// The rating spans for a [`rich_text`] run: a ★ glyph tinted `star_color`, then the average and
 /// count — or a single `unrated` span. Shared by the installed-pane [`rating_metric`] and the
@@ -7031,7 +7038,35 @@ fn installed_file_tab_button<'a>(
 
 #[cfg(test)]
 mod tests {
+    use iced::Size;
+    use iced::advanced::layout;
+    use iced::advanced::widget::tree::Tree;
+
     use super::*;
+
+    #[test]
+    fn card_action_keeps_its_width_when_content_is_long() {
+        type TestElement = iced::Element<'static, (), iced::Theme, ()>;
+
+        let content: TestElement = iced::widget::Space::new()
+            .width(Length::Fixed(1_000.0))
+            .height(10.0)
+            .into();
+        let action: TestElement = iced::widget::Space::new()
+            .width(Length::Fixed(96.0))
+            .height(10.0)
+            .into();
+        let mut row = card_with_trailing_action(content, action);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(500.0, 100.0));
+        let mut tree = Tree::new(row.as_widget());
+        let node = row.as_widget_mut().layout(&mut tree, &(), &limits);
+        let children = node.children();
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[1].bounds().width, 96.0);
+        assert_eq!(children[1].bounds().x + children[1].bounds().width, 500.0);
+        assert_eq!(children[0].bounds().width, 394.0);
+    }
 
     #[test]
     fn owned_share_result_refreshes_only_the_open_package() {
