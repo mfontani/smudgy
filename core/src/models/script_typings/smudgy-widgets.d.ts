@@ -176,7 +176,7 @@ declare module "smudgy:widgets" {
         children?: WidgetChildren;
     }
 
-    /** Paintable channels for individual rooms, connections, and doors. Absent fields
+    /** Presentation channels for individual rooms, connections, and doors. Absent fields
      *  inherit defaultStyle, then the widget default. Colors are CSS color strings.
      *  Nothing here modifies or syncs the underlying map. */
     export interface MapStyle {
@@ -188,6 +188,11 @@ declare module "smudgy:widgets" {
         connectionColor?: string;
         connectionWidth?: number;
         doorColor?: string;
+        /** When to draw named and redacted cross-area destination labels. The
+         *  connection stub and marker remain visible. Default "always". */
+        crossAreaLabelVisibility?: "always" | "hover" | "never";
+        /** Optional CSS color for a padded background behind cross-area labels. */
+        crossAreaLabelBackground?: string;
     }
 
     /** One Connection selected from either endpoint. room+direction (never ConnectionId)

@@ -8,7 +8,7 @@
 
 use iced::{
     Color, Point, Size, Vector,
-    advanced::text::Alignment,
+    advanced::text::{Alignment, Paragraph},
     alignment::Vertical,
     widget::canvas::{self, LineDash, Stroke, gradient, stroke},
 };
@@ -70,6 +70,10 @@ const CROSS_LEVEL_STUB_REACH: f32 = 0.5;
 /// Opacity multiplier for "Unknown map" stubs — dimmer than real exits so
 /// redacted links read as placeholders, never as named destinations.
 const UNKNOWN_MAP_OPACITY: f32 = 0.6;
+/// Padding and corner radius for an authored cross-area label background, in
+/// map units (2.4 px at the default 40 px/unit zoom).
+const CROSS_AREA_LABEL_PADDING: f32 = 0.06;
+const CROSS_AREA_LABEL_RADIUS: f32 = 0.06;
 /// Opacity multiplier applied to secret labels/shapes (and the fill-only
 /// parts of secret connections, which cannot be dashed).
 const SECRET_OPACITY: f32 = 0.6;
@@ -534,6 +538,8 @@ pub fn draw_connection(
         None,
         None,
         None,
+        true,
+        None,
     );
 }
 
@@ -550,6 +556,8 @@ pub fn draw_connection_styled(
     color_override: Option<Color>,
     width_override: Option<f32>,
     door: Option<(bool, bool, Color)>,
+    show_cross_area_label: bool,
+    cross_area_label_background: Option<Color>,
 ) {
     let is_secret = show_secrets && connection.is_secret;
     let base_color = color_override.unwrap_or(connection.color);
@@ -593,24 +601,11 @@ pub fn draw_connection_styled(
                 );
             }
         }
-        RoomConnectionEnd::External { area_id } => {
-            let area_name = atlas.get_area(area_id).map_or_else(
-                || "(unknown area)".to_string(),
-                |area| area.get_name().to_string(),
-            );
+        RoomConnectionEnd::External { .. } => {
             frame.stroke(&path_from_primitives(&geometry.primitives), stroke);
 
-            let (tip, text_anchor, align_x, align_y) = marker_anchor(geometry);
+            let (tip, _, _, _) = marker_anchor(geometry);
             frame.fill(&canvas::Path::circle(tip, 0.075), fill_color);
-            frame.fill_text(canvas::Text {
-                content: area_name,
-                position: text_anchor,
-                align_x,
-                align_y,
-                color: apply_opacity(AREA_NAME_FONT_COLOR, fill_opacity),
-                size: 0.375.into(),
-                ..Default::default()
-            });
         }
         RoomConnectionEnd::Unknown { .. } => {
             // Redacted destination: the link exists but its target was not
@@ -630,7 +625,7 @@ pub fn draw_connection_styled(
                 ),
             );
 
-            let (tip, text_anchor, align_x, align_y) = marker_anchor(geometry);
+            let (tip, _, _, _) = marker_anchor(geometry);
             // A small "?" stands in for the usual stub dot.
             frame.fill_text(canvas::Text {
                 content: "?".to_string(),
@@ -639,21 +634,6 @@ pub fn draw_connection_styled(
                 align_y: Vertical::Center,
                 color: apply_opacity(base_color, dim),
                 size: 0.3.into(),
-                ..Default::default()
-            });
-
-            // Push the label one extra step out so it clears the "?" glyph.
-            let label_anchor = Point {
-                x: text_anchor.x + (text_anchor.x - tip.x),
-                y: text_anchor.y + (text_anchor.y - tip.y),
-            };
-            frame.fill_text(canvas::Text {
-                content: "Unknown map".to_string(),
-                position: label_anchor,
-                align_x,
-                align_y,
-                color: apply_opacity(AREA_NAME_FONT_COLOR, dim),
-                size: 0.375.into(),
                 ..Default::default()
             });
         }
@@ -681,6 +661,17 @@ pub fn draw_connection_styled(
         }
     }
 
+    if show_cross_area_label {
+        draw_cross_area_connection_label(
+            frame,
+            atlas,
+            connection,
+            opacity,
+            show_secrets,
+            cross_area_label_background,
+        );
+    }
+
     // Up/down stub exits: the geometry swapped their wall stubs for corner
     // level markers — drawn stroke-only, so a hollow ▲/▼ reads "an exit
     // leaves this way" against the filled triangle of a linked cross-level
@@ -700,6 +691,62 @@ pub fn draw_connection_styled(
             apply_opacity(door_color, opacity),
         );
     }
+}
+
+/// Draw only a cross-area connection's destination label. Keeping this
+/// separate from the connection stroke/marker lets viewers paint labels in a
+/// final overlay pass above room glyphs without redrawing the connection.
+pub fn draw_cross_area_connection_label(
+    frame: &mut canvas::Frame,
+    atlas: &AtlasCache,
+    connection: &RoomConnection,
+    opacity: f32,
+    show_secrets: bool,
+    background: Option<Color>,
+) {
+    let fill_opacity = if show_secrets && connection.is_secret {
+        opacity * SECRET_OPACITY
+    } else {
+        opacity
+    };
+    let geometry = &connection.geometry;
+
+    let (content, position, align_x, align_y, label_opacity) = match &connection.to {
+        RoomConnectionEnd::External { area_id } => {
+            let area_name = atlas.get_area(area_id).map_or_else(
+                || "(unknown area)".to_string(),
+                |area| area.get_name().to_string(),
+            );
+            let (_, text_anchor, align_x, align_y) = marker_anchor(geometry);
+            (area_name, text_anchor, align_x, align_y, fill_opacity)
+        }
+        RoomConnectionEnd::Unknown { .. } => {
+            let (tip, text_anchor, align_x, align_y) = marker_anchor(geometry);
+            // Push the label one extra step out so it clears the "?" glyph.
+            let label_anchor = Point {
+                x: text_anchor.x + (text_anchor.x - tip.x),
+                y: text_anchor.y + (text_anchor.y - tip.y),
+            };
+            (
+                "Unknown map".to_string(),
+                label_anchor,
+                align_x,
+                align_y,
+                fill_opacity * UNKNOWN_MAP_OPACITY,
+            )
+        }
+        _ => return,
+    };
+
+    draw_cross_area_label(
+        frame,
+        content,
+        position,
+        align_x,
+        align_y,
+        apply_opacity(AREA_NAME_FONT_COLOR, label_opacity),
+        background.map(|color| apply_opacity(color, label_opacity)),
+    );
 }
 
 fn draw_door_state(
@@ -812,6 +859,72 @@ fn marker_anchor(geometry: &ConnectionGeometry) -> (Point, Point, Alignment, Ver
         Vertical::Center
     };
     (tip, text_anchor, align_x, align_y)
+}
+
+/// Draw one cross-area destination label, measuring the exact paragraph used
+/// by iced before placing an optional padded background behind it. Character
+/// counts are not a safe width proxy here: area names may contain proportional
+/// fonts, combining marks, or wide glyphs.
+fn draw_cross_area_label(
+    frame: &mut canvas::Frame,
+    content: String,
+    position: Point,
+    align_x: Alignment,
+    align_y: Vertical,
+    color: Color,
+    background: Option<Color>,
+) {
+    let text = canvas::Text {
+        content,
+        position,
+        align_x,
+        align_y,
+        color,
+        size: 0.375.into(),
+        ..Default::default()
+    };
+
+    if let Some(background) = background {
+        let size = canvas_text_size(&text);
+        let x = match align_x {
+            Alignment::Default | Alignment::Left | Alignment::Justified => position.x,
+            Alignment::Center => position.x - size.width / 2.0,
+            Alignment::Right => position.x - size.width,
+        };
+        let y = match align_y {
+            Vertical::Top => position.y,
+            Vertical::Center => position.y - size.height / 2.0,
+            Vertical::Bottom => position.y - size.height,
+        };
+        let padding = CROSS_AREA_LABEL_PADDING;
+        frame.fill(
+            &canvas::Path::rounded_rectangle(
+                Point::new(x - padding, y - padding),
+                Size::new(size.width + padding * 2.0, size.height + padding * 2.0),
+                CROSS_AREA_LABEL_RADIUS.into(),
+            ),
+            background,
+        );
+    }
+
+    frame.fill_text(text);
+}
+
+fn canvas_text_size(text: &canvas::Text) -> Size {
+    type RendererParagraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+    let paragraph = RendererParagraph::with_text(iced::advanced::text::Text {
+        content: text.content.as_str(),
+        bounds: Size::new(text.max_width, f32::INFINITY),
+        size: text.size,
+        line_height: text.line_height,
+        font: text.font,
+        align_x: text.align_x,
+        align_y: text.align_y,
+        shaping: text.shaping,
+        wrapping: iced::advanced::text::Wrapping::default(),
+    });
+    Size::new(paragraph.min_width(), paragraph.min_height())
 }
 
 /// Draws a room as a filled, outlined rounded square centered on its

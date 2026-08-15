@@ -1572,8 +1572,10 @@ export function make() { return createEvent('dynamic'); }
                    <MapView />\n\
                    <MapView\n\
                      roomSpacing={1.25} playerColor=\"#fff\" showDoors={true}\n\
-                     defaultStyle={{ connectionColor: \"#888\" }}\n\
-                     styles={{ route: { connectionColor: \"gold\", connectionWidth: 2, roomStroke: \"gold\", roomStrokeWidth: 2 },\n\
+                     defaultStyle={{ connectionColor: \"#888\", crossAreaLabelVisibility: \"hover\",\n\
+                                     crossAreaLabelBackground: \"rgba(0,0,0,0.8)\" }}\n\
+                     styles={{ route: { connectionColor: \"gold\", connectionWidth: 2, roomStroke: \"gold\", roomStrokeWidth: 2,\n\
+                                        crossAreaLabelVisibility: \"always\" },\n\
                                visited: { roomFill: \"#223\", roomBorderRadius: 0.2, doorColor: \"#f00\" } }}\n\
                      apply={[{ style: \"route\", rooms: [1, 2], exits: [{ room: 1, direction: \"North\" }] },\n\
                              { style: \"visited\", rooms: [9], area: [1, 2] },\n\

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-area map labels can stay out of the way.** `MapView` styles can
+  show destination names always, only while their connected room is hovered,
+  or never, with an optional padded background painted above room glyphs.
+  Because visibility is a connection style, a loaded route can keep its own
+  destination visible over a hover-only `defaultStyle`.
 - **Panes stack into tabs.** Drop a pane onto another pane's header and
   they share that spot as a tabbed group — one region, a tab per pane.
   Tabs carry their controls (connect/reconnect on a session's main tab,
