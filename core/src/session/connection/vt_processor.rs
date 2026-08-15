@@ -1313,20 +1313,22 @@ mod tests {
 
         h.feed(b"Welcome\r\n");
         h.processor.notify_end_of_buffer();
-        assert!(h.actions().iter().any(|action| matches!(
-            action,
-            RuntimeAction::IncomingPacketProcessed { .. }
-        )));
+        assert!(
+            h.actions()
+                .iter()
+                .any(|action| matches!(action, RuntimeAction::IncomingPacketProcessed { .. }))
+        );
 
         // The runtime disarms after releasing the deferred send; from then on
         // batch boundaries stay off the marker channel entirely.
         armed.store(false, std::sync::atomic::Ordering::Relaxed);
         h.feed(b"steady state\r\n");
         h.processor.notify_end_of_buffer();
-        assert!(!h.actions().iter().any(|action| matches!(
-            action,
-            RuntimeAction::IncomingPacketProcessed { .. }
-        )));
+        assert!(
+            !h.actions()
+                .iter()
+                .any(|action| matches!(action, RuntimeAction::IncomingPacketProcessed { .. }))
+        );
     }
 
     #[test]

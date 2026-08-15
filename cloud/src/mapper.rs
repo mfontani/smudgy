@@ -853,6 +853,13 @@ pub struct Inner {
     atlas_cache: ArcSwap<AtlasCache>,
 
     backend: Arc<dyn MapperBackend + Send + Sync>,
+    /// Last authoritative atlas inventory, including each known atlas's tier.
+    /// Cloud atlas ids are not represented in the area cache, so absence from
+    /// the local-id set alone cannot prove that an arbitrary id is cloud-owned.
+    atlas_storage_by_id: Mutex<HashMap<AtlasId, MapStorage>>,
+    /// Serializes authoritative atlas listings with direct atlas mutations so
+    /// a list snapshot cannot erase a concurrently-created id from the tier map.
+    atlas_catalog_gate: tokio::sync::Mutex<()>,
 
     // Sync diagnostics
     sync_stats: Arc<SyncStats>,
@@ -982,6 +989,8 @@ impl Mapper {
             atlas_id: ArcSwap::from_pointee(None),
             atlas_cache: ArcSwap::from_pointee(cache),
             backend,
+            atlas_storage_by_id: Mutex::new(HashMap::new()),
+            atlas_catalog_gate: tokio::sync::Mutex::new(()),
             sync_stats,
             sync_status: ArcSwap::from_pointee(SyncStatus {
                 state: initial_state,
@@ -1027,8 +1036,9 @@ impl Mapper {
         SyncStatus::clone(&self.inner.sync_status.load())
     }
 
-    /// Monotonic counter bumped each time the sync engine swaps the atlas
-    /// cache; UIs can poll it cheaply to detect background changes.
+    /// Monotonic counter bumped whenever the visible map/atlas projection
+    /// changes, whether through background sync or a direct API mutation.
+    /// UIs can poll it cheaply to refresh inventories changed by scripts.
     #[must_use]
     pub fn sync_revision(&self) -> u64 {
         self.inner.sync_revision.load(Ordering::Acquire)
@@ -1197,14 +1207,11 @@ impl Mapper {
         }
     }
 
-    /// The authoritative storage tier for an owned atlas.
+    /// The authoritative storage tier for an atlas in the last successful
+    /// inventory, or `None` when the id is unknown or has been deleted.
     #[must_use]
-    pub fn atlas_storage(&self, atlas_id: &AtlasId) -> MapStorage {
-        if self.inner.backend.local_atlas_ids().contains(atlas_id) {
-            MapStorage::Local
-        } else {
-            MapStorage::Cloud
-        }
+    pub fn atlas_storage(&self, atlas_id: &AtlasId) -> Option<MapStorage> {
+        self.inner.atlas_storage_by_id.lock().get(atlas_id).copied()
     }
 
     /// The next free room number for an area, skipping numbers reserved by
@@ -1379,16 +1386,19 @@ impl Mapper {
         document.area = header;
         document.area.rev += 1;
         crate::backends::area_edits::validate_connection_graph(&mut document)?;
-        self.inner.backend.import_local_area(document.clone()).await?;
+        self.inner
+            .backend
+            .import_local_area(document.clone())
+            .await?;
         self.inner.pending.note_confirmed_rev(
             area_id,
             document.area.rev,
             document.area.access.map(|access| access.fingerprint()),
         );
         let populated = Arc::new(AreaCache::new_with_area(document));
-        self.inner.atlas_cache.rcu(|cache| {
-            Arc::new(cache.with_areas_updated(vec![(area_id, populated.clone())]))
-        });
+        self.inner
+            .atlas_cache
+            .rcu(|cache| Arc::new(cache.with_areas_updated(vec![(area_id, populated.clone())])));
         Ok(true)
     }
 
@@ -1420,7 +1430,10 @@ impl Mapper {
         name: &str,
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<Option<Area>> {
-        self.inner.backend.copy_cloud_area(&source, name, atlas_id).await
+        self.inner
+            .backend
+            .copy_cloud_area(&source, name, atlas_id)
+            .await
     }
 
     /// Registers a fresh server-side cloud copy in the live cache: one
@@ -1522,8 +1535,24 @@ impl Mapper {
     /// # Errors
     /// Propagates the backend's list error (e.g. unauthorized, network).
     pub fn list_atlases(&self) -> impl Future<Output = CloudResult<Vec<AtlasListItem>>> {
-        let backend = self.inner.backend.clone();
-        async move { backend.list_atlases().await }
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            let atlases = inner.backend.list_atlases().await?;
+            let local_ids = inner.backend.local_atlas_ids();
+            let mut storage = inner.atlas_storage_by_id.lock();
+            storage.clear();
+            storage.extend(atlases.iter().map(|atlas| {
+                let tier = if local_ids.contains(&atlas.id) {
+                    MapStorage::Local
+                } else {
+                    MapStorage::Cloud
+                };
+                (atlas.id, tier)
+            }));
+            drop(storage);
+            Ok(atlases)
+        }
     }
 
     /// List every area row visible to the viewer, straight from the backend
@@ -1547,8 +1576,19 @@ impl Mapper {
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
     pub fn create_atlas(&self, name: String) -> impl Future<Output = CloudResult<Atlas>> {
-        let backend = self.inner.backend.clone();
-        async move { backend.create_atlas(&name).await }
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            let atlas = inner.backend.create_atlas(&name).await?;
+            let storage = if inner.backend.local_atlas_ids().contains(&atlas.id) {
+                MapStorage::Local
+            } else {
+                MapStorage::Cloud
+            };
+            inner.atlas_storage_by_id.lock().insert(atlas.id, storage);
+            inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+            Ok(atlas)
+        }
     }
 
     /// Create an empty atlas with an explicit tier preference (`prefer_local`).
@@ -1562,8 +1602,19 @@ impl Mapper {
         name: String,
         prefer_local: bool,
     ) -> impl Future<Output = CloudResult<Atlas>> {
-        let backend = self.inner.backend.clone();
-        async move { backend.create_atlas_in(&name, prefer_local).await }
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            let atlas = inner.backend.create_atlas_in(&name, prefer_local).await?;
+            let storage = if inner.backend.local_atlas_ids().contains(&atlas.id) {
+                MapStorage::Local
+            } else {
+                MapStorage::Cloud
+            };
+            inner.atlas_storage_by_id.lock().insert(atlas.id, storage);
+            inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+            Ok(atlas)
+        }
     }
 
     /// Create an atlas in an explicit durable storage tier.
@@ -1572,8 +1623,14 @@ impl Mapper {
         name: String,
         storage: MapStorage,
     ) -> impl Future<Output = CloudResult<Atlas>> {
-        let backend = self.inner.backend.clone();
-        async move { backend.create_atlas_at(&name, storage).await }
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            let atlas = inner.backend.create_atlas_at(&name, storage).await?;
+            inner.atlas_storage_by_id.lock().insert(atlas.id, storage);
+            inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+            Ok(atlas)
+        }
     }
 
     /// Rename an atlas.
@@ -1586,8 +1643,19 @@ impl Mapper {
         atlas_id: AtlasId,
         name: String,
     ) -> impl Future<Output = CloudResult<Atlas>> {
-        let backend = self.inner.backend.clone();
-        async move { backend.rename_atlas(&atlas_id, &name).await }
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            let atlas = inner.backend.rename_atlas(&atlas_id, &name).await?;
+            let storage = if inner.backend.local_atlas_ids().contains(&atlas.id) {
+                MapStorage::Local
+            } else {
+                MapStorage::Cloud
+            };
+            inner.atlas_storage_by_id.lock().insert(atlas.id, storage);
+            inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+            Ok(atlas)
+        }
     }
 
     /// Delete an atlas. Its member areas survive and become loose.
@@ -1596,8 +1664,29 @@ impl Mapper {
     /// Propagates the backend's delete error (owner-only; uniform 404
     /// otherwise).
     pub fn delete_atlas(&self, atlas_id: AtlasId) -> impl Future<Output = CloudResult<()>> {
-        let backend = self.inner.backend.clone();
-        async move { backend.delete_atlas(&atlas_id).await }
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            inner.backend.delete_atlas(&atlas_id).await?;
+            inner.atlas_cache.rcu(|cache| {
+                let areas = cache
+                    .areas()
+                    .map(|area| {
+                        let area_id = *area.get_id();
+                        let area = if area.meta().atlas_id == Some(atlas_id) {
+                            Arc::new(area.with_atlas(None))
+                        } else {
+                            area
+                        };
+                        (area_id, area)
+                    })
+                    .collect();
+                Arc::new(cache.rebuild_with_areas(areas))
+            });
+            inner.atlas_storage_by_id.lock().remove(&atlas_id);
+            inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
     }
 
     /// File an owned area into `atlas_id` (`Some`) or pull it loose
@@ -2232,6 +2321,7 @@ impl Inner {
         // Carry every exclusion axis across the wholesale rebuild.
         let new_cache = Arc::new(self.atlas_cache.load().rebuild_with_areas(new_cache));
         self.atlas_cache.store(new_cache);
+        self.sync_revision.fetch_add(1, Ordering::AcqRel);
         drop(_mutation_guard);
 
         // The wholesale store can race the sync engine (e.g. re-inserting an
@@ -2353,6 +2443,7 @@ impl Inner {
                 })),
             ))
         });
+        self.sync_revision.fetch_add(1, Ordering::AcqRel);
 
         Ok(area_id)
     }
@@ -4150,7 +4241,8 @@ impl Mapper {
 mod tests {
     use super::*;
     use crate::{
-        Area, AreaAccess, AreaWithDetails, CloudError, CreateAreaRequest, Exit, RoomWithDetails,
+        Area, AreaAccess, AreaWithDetails, CloudError, CreateAreaRequest, Exit, LocalBackend,
+        RoomWithDetails,
     };
     use async_trait::async_trait;
     use chrono::Utc;
@@ -4329,6 +4421,94 @@ mod tests {
 
     fn temp_cache_dir() -> PathBuf {
         std::env::temp_dir().join(format!("smudgy-mapper-test-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn direct_catalog_mutations_publish_revision_and_track_known_atlas_tiers() {
+        let root = temp_cache_dir();
+        let mapper = Mapper::new(
+            Arc::new(LocalBackend::new(root.join("local"))),
+            root.join("cache"),
+        );
+        mapper.load_all_areas().await.expect("initial load");
+        let unknown = AtlasId(Uuid::new_v4());
+        assert_eq!(mapper.atlas_storage(&unknown), None);
+
+        let revision = mapper.sync_revision();
+        let atlas = mapper
+            .create_atlas_at("Nukefire".to_string(), MapStorage::Local)
+            .await
+            .expect("create atlas");
+        assert!(mapper.sync_revision() > revision);
+        assert_eq!(mapper.atlas_storage(&atlas.id), Some(MapStorage::Local));
+
+        let revision = mapper.sync_revision();
+        let area = mapper
+            .create_area_at(
+                "Tek Angeles".to_string(),
+                MapDestination::in_atlas(MapStorage::Local, atlas.id),
+            )
+            .await
+            .expect("create area");
+        assert!(mapper.sync_revision() > revision);
+        assert_eq!(
+            mapper
+                .get_current_atlas()
+                .get_area(&area)
+                .expect("created area")
+                .meta()
+                .atlas_id,
+            Some(atlas.id)
+        );
+
+        let revision = mapper.sync_revision();
+        mapper.delete_atlas(atlas.id).await.expect("delete atlas");
+        assert!(mapper.sync_revision() > revision);
+        assert_eq!(mapper.atlas_storage(&atlas.id), None);
+        assert_eq!(
+            mapper
+                .get_current_atlas()
+                .get_area(&area)
+                .expect("member survives")
+                .meta()
+                .atlas_id,
+            None,
+            "gentle delete updates the live area projection too"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn refresh_areas_loads_durable_writes_from_another_mapper_instance() {
+        let root = temp_cache_dir();
+        let reader = Mapper::new(
+            Arc::new(LocalBackend::new(root.join("local"))),
+            root.join("reader-cache"),
+        );
+        reader.load_all_areas().await.expect("reader initial load");
+
+        let writer = Mapper::new(
+            Arc::new(LocalBackend::new(root.join("local"))),
+            root.join("writer-cache"),
+        );
+        writer.load_all_areas().await.expect("writer initial load");
+        let area = writer
+            .create_area_at(
+                "Tek Angeles".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("writer creates area");
+        assert!(reader.get_current_atlas().get_area(&area).is_none());
+
+        reader.load_all_areas().await.expect("reader refresh");
+        assert!(
+            reader.get_current_atlas().get_area(&area).is_some(),
+            "the ownership successor sees maps written after its initial load"
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// A relocation-commit delete carries the move snapshot's revision to the
@@ -6116,7 +6296,11 @@ mod tests {
 
         // The ambient allocator skips the drafted range.
         let ambient = mapper.next_room_number(&a_id).expect("area loaded");
-        assert_eq!(ambient, RoomNumber(4), "ambient create lands past the drafts");
+        assert_eq!(
+            ambient,
+            RoomNumber(4),
+            "ambient create lands past the drafts"
+        );
         mapper
             .upsert_room(RoomKey::new(a_id, ambient), RoomUpdates::default())
             .expect("enqueue ambient room");

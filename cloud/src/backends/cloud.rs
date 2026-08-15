@@ -573,7 +573,9 @@ impl MapperBackend for CloudMapper {
             name: Some(name.to_string()),
             atlas_id,
         };
-        let area: Area = self.post(&format!("/areas/{source}/copy"), &request).await?;
+        let area: Area = self
+            .post(&format!("/areas/{source}/copy"), &request)
+            .await?;
         Ok(Some(area))
     }
 

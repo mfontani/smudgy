@@ -8,6 +8,7 @@ import {
     op_smudgy_mapper_set_current_location,
     op_smudgy_mapper_get_current_location,
     op_smudgy_mapper_list_area_ids,
+    op_smudgy_mapper_refresh_areas,
     op_smudgy_mapper_list_area_room_numbers,
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
@@ -201,6 +202,13 @@ function destinationForOp(destination: MapDestination) {
 }
 
 const mapper = {
+    /** Refresh every visible area from durable storage. Use this before a
+     * presence-based package upsert that can run during startup or after a
+     * mapping-owner handoff. Requires `mapper:read`. */
+    refreshAreas(): Promise<void> {
+        return op_smudgy_mapper_refresh_areas();
+    },
+
     async createArea(name: string, options?: CreateAreaOptions) {
         // The deprecated ephemeral flag is forwarded only when the caller
         // actually supplied it, so the runtime can tell "flag passed" from
@@ -1039,9 +1047,8 @@ class Atlas {
         readonly name: string,
     ) {}
 
-    /** Live tier read, like `Area.storage`: a handle held across a
-     * `moveAtlas` reports the atlas's current tier, not a snapshot taken
-     * when the handle was built. */
+    /** Live tier read. `moveAtlas` replaces the atlas with a new id, so the
+     * old source handle becomes invalid; use the handle returned by the move. */
     get storage(): MapStorage {
         return op_smudgy_mapper_get_atlas_storage(this.id);
     }

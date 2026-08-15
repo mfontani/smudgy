@@ -296,11 +296,14 @@ pub(super) fn create_room_exit(
     if exit_data.connection_id.is_some() && exit_data.new_connection_id.is_some() {
         return Err(invalid_connection("ambiguous_connection"));
     }
-    if exit_data.new_connection_id.is_some_and(|new_connection_id| {
-        area.connections
-            .iter()
-            .any(|connection| connection.id == new_connection_id)
-    }) {
+    if exit_data
+        .new_connection_id
+        .is_some_and(|new_connection_id| {
+            area.connections
+                .iter()
+                .any(|connection| connection.id == new_connection_id)
+        })
+    {
         return Err(invalid_connection("duplicate_connection"));
     }
     let connection_id = if let Some(connection_id) = exit_data.connection_id {
@@ -521,9 +524,7 @@ fn member_matches_endpoints(
             let dangling =
                 !exit.to_unknown && exit.to_area_id.is_none() && exit.to_room_number.is_none();
             let known_external = !exit.to_unknown
-                && exit
-                    .to_area_id
-                    .is_some_and(|to_area| to_area != area_id)
+                && exit.to_area_id.is_some_and(|to_area| to_area != area_id)
                 && exit.to_room_number.is_some();
             let redacted_external =
                 exit.to_unknown && exit.to_area_id.is_none() && exit.to_room_number.is_none();
@@ -802,7 +803,9 @@ pub(crate) fn maintain_routes_after_room_moves(
         let Some(endpoint_b) = connection.endpoint_b else {
             continue;
         };
-        if !capture.preexisting.contains(&connection.endpoint_a.room_number)
+        if !capture
+            .preexisting
+            .contains(&connection.endpoint_a.room_number)
             || !capture.preexisting.contains(&endpoint_b.room_number)
         {
             continue;

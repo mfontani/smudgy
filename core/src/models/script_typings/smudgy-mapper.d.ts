@@ -503,6 +503,10 @@ interface CreateAreaOptions {
 interface Atlas {
     readonly id: AtlasId;
     readonly name: string;
+    /**
+     * The atlas's live tier. Moving an atlas creates a new id and invalidates
+     * the source handle; use the `Atlas` returned by `moveAtlas` afterward.
+     */
     readonly storage: MapStorage;
     toString(): string;
 }
@@ -523,6 +527,12 @@ interface CreateAtlasOptions {
  * location; changes to persistent areas sync to the cloud in the background.
  */
 interface Mapper {
+    /**
+     * Refresh every visible area from durable storage. Package entry points
+     * should await this before a presence-based upsert that can run during
+     * startup or after mapping ownership moves between sessions.
+     */
+    refreshAreas(): Promise<void>;
     /**
      * Create a new area and return its handle. Without an explicit `storage`
      * (or an `atlas` to inherit a tier from), the area is durable in the

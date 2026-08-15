@@ -5,9 +5,11 @@
 //! copy-then-delete transaction: create all destination headers, copy all
 //! rooms, remap in-set cross-area links, copy the remaining content, wait for
 //! backend acknowledgement, and only then delete the sources for a move.
-//! Failures before commit clean up destination objects best-effort; failures
-//! while deleting a source leave a complete destination copy and a harmless
-//! duplicate rather than losing data.
+//! Failures before commit clean up destination objects; if cleanup or
+//! same-tier member work remains, [`PartialRelocation`] identifies it and the
+//! error explicitly forbids a blind retry. Failures while deleting a source
+//! leave a complete destination copy and a harmless duplicate rather than
+//! losing data.
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,13 +63,31 @@ pub struct AtlasRelocation {
 /// was fully created and acknowledged (the source-delete commit phase),
 /// `completed` carries that result so callers can point the user at the
 /// existing copy — retrying the whole relocation would mint a second one.
+/// Work known to remain after a relocation failed before destination
+/// completion. Callers must reconcile it rather than retrying blindly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialRelocation {
+    pub destination: MapDestination,
+    /// Fresh destination objects which cleanup could not remove, or complete
+    /// copies awaiting the remaining same-tier member work.
+    pub copied_destination_ids: Vec<AreaId>,
+    /// Same-tier source objects already refiled into the destination.
+    pub refiled_source_ids: Vec<AreaId>,
+    /// Same-tier source objects whose destination work did not finish.
+    pub pending_source_ids: Vec<AreaId>,
+}
+
 #[derive(Debug)]
 pub struct RelocationError<T> {
     pub error: CloudError,
-    /// The fully created destination, or `None` when the failure preceded
-    /// destination completion (partially created objects are cleaned up
-    /// best-effort and a retry is safe).
+    /// The fully created destination when no destination-side work remains.
+    /// A source delete may still have failed, so callers reconcile the
+    /// resulting duplicate instead of retrying the relocation.
     pub completed: Option<T>,
+    /// Destination or same-tier member work remains but is not complete.
+    /// When both outcome fields are `None`, all created destination objects
+    /// were cleaned up and retrying is safe.
+    pub partial: Option<PartialRelocation>,
 }
 
 impl<T> From<CloudError> for RelocationError<T> {
@@ -75,6 +95,7 @@ impl<T> From<CloudError> for RelocationError<T> {
         Self {
             error,
             completed: None,
+            partial: None,
         }
     }
 }
@@ -85,6 +106,12 @@ impl<T> std::fmt::Display for RelocationError<T> {
             write!(
                 f,
                 "{}. The copy at the destination is complete; the source was left in place — remove it there instead of retrying the move",
+                self.error
+            )
+        } else if self.partial.is_some() {
+            write!(
+                f,
+                "{}. The destination is only partially updated; inspect and reconcile it before retrying the relocation",
                 self.error
             )
         } else {
@@ -114,13 +141,25 @@ impl Mapper {
             )
             .into());
         }
-        if let Some(atlas_id) = destination.atlas_id
-            && self.atlas_storage(&atlas_id) != destination.storage
-        {
-            return Err(CloudError::InvalidInput(
-                "the destination atlas belongs to a different storage tier".to_string(),
-            )
-            .into());
+        if let Some(atlas_id) = destination.atlas_id {
+            if self.atlas_storage(&atlas_id).is_none() {
+                self.list_atlases().await?;
+            }
+            match self.atlas_storage(&atlas_id) {
+                Some(storage) if storage == destination.storage => {}
+                Some(_) => {
+                    return Err(CloudError::InvalidInput(
+                        "the destination atlas belongs to a different storage tier".to_string(),
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(CloudError::InvalidInput(
+                        "destination atlas not found".to_string(),
+                    )
+                    .into());
+                }
+            }
         }
         if source_ids.is_empty() {
             return Ok(MapRelocation {
@@ -188,9 +227,24 @@ impl Mapper {
         // merely a folder change. Preserve ids and avoid copying bytes;
         // this is the fast path the old move API exposed.
         if copied_ids.is_empty() {
-            for source_id in &source_ids {
-                self.move_area_to_atlas(*source_id, destination.atlas_id)
-                    .await?;
+            let mut refiled = Vec::with_capacity(source_ids.len());
+            for (index, source_id) in source_ids.iter().enumerate() {
+                if let Err(error) = self
+                    .move_area_to_atlas(*source_id, destination.atlas_id)
+                    .await
+                {
+                    return Err(RelocationError {
+                        error,
+                        completed: None,
+                        partial: (!refiled.is_empty()).then(|| PartialRelocation {
+                            destination,
+                            copied_destination_ids: Vec::new(),
+                            refiled_source_ids: refiled,
+                            pending_source_ids: source_ids[index..].to_vec(),
+                        }),
+                    });
+                }
+                refiled.push(*source_id);
             }
             return Ok(MapRelocation {
                 source_ids: source_ids.clone(),
@@ -240,8 +294,8 @@ impl Mapper {
                 {
                     Ok(copied) => copied,
                     Err(error) => {
-                        cleanup_areas(self, &copy_destination_ids).await;
-                        return Err(error.into());
+                        let stranded = cleanup_areas(self, &copy_destination_ids).await;
+                        return Err(cleanup_error(error, destination, stranded, &source_ids));
                     }
                 }
             } else {
@@ -251,8 +305,8 @@ impl Mapper {
                 copy_destination_ids.push(area.id);
                 server_copied[index] = true;
                 if let Err(error) = self.adopt_cloud_copy(area.id).await {
-                    cleanup_areas(self, &copy_destination_ids).await;
-                    return Err(error.into());
+                    let stranded = cleanup_areas(self, &copy_destination_ids).await;
+                    return Err(cleanup_error(error, destination, stranded, &source_ids));
                 }
                 continue;
             }
@@ -268,8 +322,8 @@ impl Mapper {
             {
                 Ok(id) => copy_destination_ids.push(id),
                 Err(error) => {
-                    cleanup_areas(self, &copy_destination_ids).await;
-                    return Err(error.into());
+                    let stranded = cleanup_areas(self, &copy_destination_ids).await;
+                    return Err(cleanup_error(error, destination, stranded, &source_ids));
                 }
             }
         }
@@ -307,19 +361,13 @@ impl Mapper {
         );
 
         if let Err(error) = self.populate_documents(&documents).await {
-            cleanup_areas(self, &copy_destination_ids).await;
-            return Err(error.into());
+            let stranded = cleanup_areas(self, &copy_destination_ids).await;
+            return Err(cleanup_error(error, destination, stranded, &source_ids));
         }
 
-        // From here every destination copy is complete: later failures carry
-        // the completed result so callers point at the existing copies
-        // instead of retrying into duplicates.
-        let completed = || MapRelocation {
-            source_ids: source_ids.clone(),
-            destination_ids: destination_ids.clone(),
-            destination,
-        };
-
+        // From here every destination copy is populated, but the relocation
+        // is not complete until marker renames and any same-tier member work
+        // also finish. Failures in that interval report `PartialRelocation`.
         // Fully populated destinations shed the in-progress marker. A
         // rename failure leaves a complete copy under the marker name —
         // recoverable, so it carries the completed result.
@@ -333,7 +381,13 @@ impl Mapper {
             {
                 return Err(RelocationError {
                     error,
-                    completed: Some(completed()),
+                    completed: None,
+                    partial: Some(PartialRelocation {
+                        destination,
+                        copied_destination_ids: copy_destination_ids.clone(),
+                        refiled_source_ids: Vec::new(),
+                        pending_source_ids: kept_ids.clone(),
+                    }),
                 });
             }
         }
@@ -345,20 +399,40 @@ impl Mapper {
         if let Err(error) = self.retarget_exits_to_copies(&kept_ids, &id_map).await {
             return Err(RelocationError {
                 error,
-                completed: Some(completed()),
+                completed: None,
+                partial: Some(PartialRelocation {
+                    destination,
+                    copied_destination_ids: copy_destination_ids.clone(),
+                    refiled_source_ids: Vec::new(),
+                    pending_source_ids: kept_ids.clone(),
+                }),
             });
         }
-        for kept_id in &kept_ids {
+        let mut refiled = Vec::with_capacity(kept_ids.len());
+        for (index, kept_id) in kept_ids.iter().enumerate() {
             if let Err(error) = self
                 .move_area_to_atlas(*kept_id, destination.atlas_id)
                 .await
             {
                 return Err(RelocationError {
                     error,
-                    completed: Some(completed()),
+                    completed: None,
+                    partial: Some(PartialRelocation {
+                        destination,
+                        copied_destination_ids: copy_destination_ids.clone(),
+                        refiled_source_ids: refiled,
+                        pending_source_ids: kept_ids[index..].to_vec(),
+                    }),
                 });
             }
+            refiled.push(*kept_id);
         }
+
+        let completed = || MapRelocation {
+            source_ids: source_ids.clone(),
+            destination_ids: destination_ids.clone(),
+            destination,
+        };
 
         if mode == RelocationMode::Move {
             // Destination content is fully acknowledged before the first
@@ -374,6 +448,7 @@ impl Mapper {
                     return Err(RelocationError {
                         error,
                         completed: Some(completed()),
+                        partial: None,
                     });
                 }
             }
@@ -401,21 +476,20 @@ impl Mapper {
             )
             .into());
         }
-        if mode == RelocationMode::Move
-            && self.atlas_storage(&source_atlas_id) == destination_storage
-        {
-            return Err(CloudError::InvalidInput(
-                "the atlas is already in that storage tier".to_string(),
-            )
-            .into());
-        }
-
         let source = self
             .list_atlases()
             .await?
             .into_iter()
             .find(|atlas| atlas.id == source_atlas_id)
             .ok_or_else(|| CloudError::InvalidInput("atlas not found".to_string()))?;
+        if mode == RelocationMode::Move
+            && self.atlas_storage(&source_atlas_id) == Some(destination_storage)
+        {
+            return Err(CloudError::InvalidInput(
+                "the atlas is already in that storage tier".to_string(),
+            )
+            .into());
+        }
         if !source.is_owner {
             return Err(CloudError::InvalidInput(
                 "a shared atlas cannot be copied or moved".to_string(),
@@ -474,20 +548,48 @@ impl Mapper {
             .await?;
         let destination = MapDestination::in_atlas(destination_storage, destination_atlas.id);
         let areas = match self
-            .relocate_areas(member_ids, destination, RelocationMode::Copy)
+            .relocate_areas(member_ids.clone(), destination, RelocationMode::Copy)
             .await
         {
             Ok(areas) => areas,
             Err(failure) => {
+                let RelocationError { error, partial, .. } = failure;
+                let cleanup_ids = partial
+                    .as_ref()
+                    .map_or_else(Vec::new, |partial| partial.copied_destination_ids.clone());
+                let stranded = cleanup_areas(self, &cleanup_ids).await;
+                if !stranded.is_empty() {
+                    return Err(RelocationError {
+                        error,
+                        completed: None,
+                        partial: Some(PartialRelocation {
+                            destination,
+                            copied_destination_ids: stranded,
+                            refiled_source_ids: partial.as_ref().map_or_else(Vec::new, |partial| {
+                                partial.refiled_source_ids.clone()
+                            }),
+                            pending_source_ids: partial
+                                .map_or(member_ids, |partial| partial.pending_source_ids),
+                        }),
+                    });
+                }
                 if let Err(cleanup_error) = self.delete_atlas(destination_atlas.id).await {
                     warn!(
                         "failed to clean up destination atlas {} after relocation error: {cleanup_error}",
                         destination_atlas.id
                     );
+                    return Err(RelocationError {
+                        error,
+                        completed: None,
+                        partial: Some(PartialRelocation {
+                            destination,
+                            copied_destination_ids: Vec::new(),
+                            refiled_source_ids: Vec::new(),
+                            pending_source_ids: member_ids,
+                        }),
+                    });
                 }
-                // Copy mode never reaches the source-delete phase, so no
-                // completed destination survives the cleanup above.
-                return Err(failure.error.into());
+                return Err(error.into());
             }
         };
 
@@ -506,6 +608,7 @@ impl Mapper {
                     return Err(RelocationError {
                         error,
                         completed: Some(completed()),
+                        partial: None,
                     });
                 }
             }
@@ -513,6 +616,7 @@ impl Mapper {
                 return Err(RelocationError {
                     error,
                     completed: Some(completed()),
+                    partial: None,
                 });
             }
         }
@@ -948,12 +1052,34 @@ pub(crate) fn freshen_documents(
     }
 }
 
-async fn cleanup_areas(mapper: &Mapper, area_ids: &[AreaId]) {
+fn cleanup_error<T>(
+    error: CloudError,
+    destination: MapDestination,
+    stranded: Vec<AreaId>,
+    pending_sources: &[AreaId],
+) -> RelocationError<T> {
+    RelocationError {
+        error,
+        completed: None,
+        partial: (!stranded.is_empty()).then(|| PartialRelocation {
+            destination,
+            copied_destination_ids: stranded,
+            refiled_source_ids: Vec::new(),
+            pending_source_ids: pending_sources.to_vec(),
+        }),
+    }
+}
+
+async fn cleanup_areas(mapper: &Mapper, area_ids: &[AreaId]) -> Vec<AreaId> {
+    let mut stranded = Vec::new();
     for area_id in area_ids.iter().rev() {
         if let Err(error) = mapper.delete_area_and_wait(*area_id).await {
             warn!("failed to clean up relocated area {area_id}: {error}");
+            stranded.push(*area_id);
         }
     }
+    stranded.reverse();
+    stranded
 }
 
 #[cfg(test)]
@@ -1545,12 +1671,10 @@ mod tests {
             doc_b.rooms.push(plain_room(5));
             vec![doc_a, doc_b]
         };
-        let id_map: HashMap<AreaId, AreaId> = [
-            (a, AreaId(Uuid::new_v4())),
-            (b, AreaId(Uuid::new_v4())),
-        ]
-        .into_iter()
-        .collect();
+        let id_map: HashMap<AreaId, AreaId> =
+            [(a, AreaId(Uuid::new_v4())), (b, AreaId(Uuid::new_v4()))]
+                .into_iter()
+                .collect();
 
         let mut preserved = build();
         freshen_documents(
@@ -1820,7 +1944,10 @@ mod tests {
             "the same-tier member keeps its id"
         );
         let local_copy = moved.destination_ids[0];
-        assert_ne!(local_copy, local_member, "cross-tier members mint fresh ids");
+        assert_ne!(
+            local_copy, local_member,
+            "cross-tier members mint fresh ids"
+        );
         assert_eq!(mapper.area_storage(&local_copy), MapStorage::Cloud);
 
         let atlas = mapper.get_current_atlas();
@@ -1881,7 +2008,7 @@ mod tests {
             .await
             .expect("create second");
 
-        cleanup_areas(&mapper, &[first, second]).await;
+        assert!(cleanup_areas(&mapper, &[first, second]).await.is_empty());
         let atlas = mapper.get_current_atlas();
         assert!(atlas.get_area(&first).is_none());
         assert!(atlas.get_area(&second).is_none());
@@ -1913,7 +2040,10 @@ mod tests {
             wait(
                 &mapper,
                 mapper
-                    .upsert_room(RoomKey::new(area, RoomNumber(number)), RoomUpdates::default())
+                    .upsert_room(
+                        RoomKey::new(area, RoomNumber(number)),
+                        RoomUpdates::default(),
+                    )
                     .expect("enqueue room"),
             )
             .await;
@@ -2151,6 +2281,7 @@ mod tests {
             Err(RelocationError {
                 error: CloudError::InvalidInput(_),
                 completed: None,
+                partial: None,
             })
         ));
 
@@ -2203,6 +2334,7 @@ mod tests {
             Err(RelocationError {
                 error: CloudError::PendingOperations(_),
                 completed: None,
+                partial: None,
             })
         ));
         assert!(

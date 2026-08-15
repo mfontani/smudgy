@@ -13,7 +13,6 @@ use std::{
     thread::{self},
 };
 
-
 use tokio::{
     select,
     sync::{
@@ -36,20 +35,20 @@ pub use trigger::{
     BenchActionQueue, Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry,
 };
 pub mod catalogue;
+mod gmcp;
 pub mod image_assets;
 pub mod input;
 pub mod line_operation;
 mod message_bus;
-pub mod pane;
-mod gmcp;
 mod msdp;
+pub mod pane;
 mod remote_interop;
 mod script_action;
 mod script_engine;
 mod store;
 
-use catalogue::{CadenceDecision, CatalogueCadence, CatalogueEvent, RuntimeCatalogue};
 pub(crate) use catalogue::SharedCatalogue;
+use catalogue::{CadenceDecision, CatalogueCadence, CatalogueEvent, RuntimeCatalogue};
 use input::InputMirror;
 pub(crate) use input::{
     SharedInputMirror, SharedInputSubmission, SharedInputWordSets, SharedPaneInputCallbacks,
@@ -57,8 +56,8 @@ pub(crate) use input::{
 use line_operation::LineOperation;
 use message_bus::MessageBus;
 pub(crate) use message_bus::SharedMessageBus;
+use pane::{MAIN_PANE_KEY, PaneKey, PaneRegistry};
 pub(crate) use remote_interop::SharedRemoteStateRegistry;
-use pane::{PaneKey, PaneRegistry, MAIN_PANE_KEY};
 
 pub use script_action::ScriptAction;
 pub use script_engine::layout_fold;
@@ -73,13 +72,13 @@ use store::SessionStore;
 // engine behind it. `FunctionId` itself is re-exported below; benches mint synthetic ids
 // via `FunctionId::from_raw`.
 #[cfg(feature = "bench-api")]
+pub use script_engine::FunctionId;
+pub(crate) use store::SharedSessionStore;
+#[cfg(feature = "bench-api")]
 pub use store::{
     BudgetExceeded, PathError, PlatformProducer, ProducerKey, SessionStore, SetOutcome,
     StoreBudgets, StorePath, Usage, WatchCadence,
 };
-#[cfg(feature = "bench-api")]
-pub use script_engine::FunctionId;
-pub(crate) use store::SharedSessionStore;
 
 use crate::get_smudgy_home;
 use crate::models::settings::load_settings;
@@ -100,8 +99,7 @@ pub use action::RuntimeAction;
 pub(crate) use action::{ActionQueue, ActionResult, RunAction};
 pub use origin::{
     AutomationBody, AutomationDelta, AutomationEvent, AutomationKind, AutomationSummary, IsolateId,
-    Origin,
-    SingletonKey, SingletonOrigin, SingletonRegistry,
+    Origin, SingletonKey, SingletonOrigin, SingletonRegistry,
 };
 
 /// Cap on host-routed delivery recursion (event emit chains and session-store watch chains
@@ -324,8 +322,7 @@ pub fn join_runtime_threads() {
     }
 }
 
-type SentSessionEvent<'a> =
-    futures::sink::Send<'a, Sender<TaggedSessionEvent>, TaggedSessionEvent>;
+type SentSessionEvent<'a> = futures::sink::Send<'a, Sender<TaggedSessionEvent>, TaggedSessionEvent>;
 
 /// Minimum time between flushes of the session log's `BufWriter`. Flushing on
 /// every buffer update would defeat the 64 KiB write buffer on every network
@@ -505,10 +502,9 @@ impl Runtime {
             // Script-visible settings snapshot backing `getSettings()`, seeded from disk before
             // the engine is built so even a module's top-level `getSettings()` sees real values.
             // The UI fills in the resolved palette and refreshes this via `ApplySettings`.
-            let settings_snapshot: SettingsSnapshot =
-                Rc::new(RefCell::new(crate::models::settings::ScriptSettings::from(
-                    &load_settings(),
-                )));
+            let settings_snapshot: SettingsSnapshot = Rc::new(RefCell::new(
+                crate::models::settings::ScriptSettings::from(&load_settings()),
+            ));
 
             let spawned_actions: ActionQueue = Rc::new(RefCell::default());
 
@@ -908,7 +904,7 @@ impl Runtime {
                     emitted_line_count: emitted_line_count.clone(),
                     recent_lines: recent_lines.clone(), // Preserve the recent-lines ring across reload
                     current_location: current_location.clone(), // Preserve current location across reload
-                    pane_registry: pane_registry.clone(), // Panes survive script reloads
+                    pane_registry: pane_registry.clone(),       // Panes survive script reloads
                     line_routing: line_routing.clone(),
                     input_mirror: input_mirror.clone(), // Mirror + interest survive reload
                     pane_size_mirror: pane_size_mirror.clone(),
@@ -918,7 +914,7 @@ impl Runtime {
                     session_store: session_store.clone(), // Committed store state survives reload
                     published_store: Arc::clone(&local_published_store),
                     connected: Arc::clone(&local_connected),
-                    catalogue: catalogue.clone(),         // Samples are session history
+                    catalogue: catalogue.clone(), // Samples are session history
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
                     msdp: old_msdp, // Same: server facts, no engine facts
                     main_open_line: old_main_open_line
@@ -926,7 +922,7 @@ impl Runtime {
                     replacing_main_open_line: false,
                     open_line: old_open_line,
                     log_open_line: Vec::new(), // The reload flushed the old log; the new file starts a fresh line
-                    log_committed_len: 0, // A new log file is opened on reconnect
+                    log_committed_len: 0,      // A new log file is opened on reconnect
                     log_open_on_disk: false,
                     mapper: mapper.clone(),
                     command_separator,
@@ -1183,7 +1179,9 @@ impl Inner<'_> {
         let count = self.automation_tx.receiver_count();
         if count > self.last_automation_receivers {
             let reset = self.trigger_manager.automation_reset();
-            let _ = self.automation_tx.send(AutomationEvent::Reset(Arc::new(reset)));
+            let _ = self
+                .automation_tx
+                .send(AutomationEvent::Reset(Arc::new(reset)));
         }
         self.last_automation_receivers = count;
         self.trigger_manager.set_recording(count > 0);
@@ -1311,8 +1309,7 @@ impl Inner<'_> {
             redirected_to_main = true;
         }
 
-        let mut main_included =
-            (!routing.gag && routing.redirect.is_none()) || redirected_to_main;
+        let mut main_included = (!routing.gag && routing.redirect.is_none()) || redirected_to_main;
 
         let mut sinks: Vec<PaneKey> = Vec::new();
         if let Some(key) = redirect {
@@ -1737,9 +1734,7 @@ impl Inner<'_> {
         self.session_store.borrow_mut().drop_retired_generations();
     }
 
-    fn flush_buffer_updates(
-        &mut self,
-    ) -> Result<Option<SentSessionEvent<'_>>, anyhow::Error> {
+    fn flush_buffer_updates(&mut self) -> Result<Option<SentSessionEvent<'_>>, anyhow::Error> {
         if self.pending_buffer_updates.is_empty() {
             return Ok(None);
         }
@@ -1824,7 +1819,6 @@ impl Inner<'_> {
             )),
         })))
     }
-
 
     pub async fn run(&mut self) -> RunAction {
         // The UI subscription is the session's lifetime owner. It may be
@@ -2039,9 +2033,7 @@ impl Inner<'_> {
                             .ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
-                                event: SessionEvent::RuntimeReady(
-                                    self.session_runtime_tx.clone(),
-                                ),
+                                event: SessionEvent::RuntimeReady(self.session_runtime_tx.clone()),
                             })
                             .await
                         {

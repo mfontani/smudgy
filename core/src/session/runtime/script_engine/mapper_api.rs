@@ -27,6 +27,7 @@ deno_core::extension!(
   smudgy_mapper,
   ops = [
       op_smudgy_mapper_list_area_ids,
+      op_smudgy_mapper_refresh_areas,
       op_smudgy_mapper_create_area,
       op_smudgy_mapper_get_area_storage,
       op_smudgy_mapper_get_atlas_storage,
@@ -127,6 +128,9 @@ pub enum MapperError {
     #[error("Area not found")]
     AreaNotFound,
     #[class(generic)]
+    #[error("Atlas not found")]
+    AtlasNotFound,
+    #[class(generic)]
     #[error("Failed to create map: {0}")]
     FailedToCreate(String),
     /// A non-creation mapper operation failed. `operation` is the
@@ -171,9 +175,7 @@ fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
 }
 
 /// Build a [`MapperError::OperationFailed`] mapper for a named operation.
-fn operation_failed<E: std::fmt::Display>(
-    operation: &'static str,
-) -> impl Fn(E) -> MapperError {
+fn operation_failed<E: std::fmt::Display>(operation: &'static str) -> impl Fn(E) -> MapperError {
     move |error| MapperError::OperationFailed {
         operation,
         message: error.to_string(),
@@ -234,6 +236,27 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>
     }
 }
 
+/// Refresh the mapper's complete area projection from its authoritative
+/// backends. Package entry points use this before presence-based upserts so
+/// startup order or a mapping-owner handoff cannot make a resident map look
+/// absent in a stale per-session cache.
+#[op2(async(lazy), fast)]
+async fn op_smudgy_mapper_refresh_areas(state: Rc<RefCell<OpState>>) -> Result<(), MapperError> {
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, false)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    mapper
+        .load_all_areas()
+        .await
+        .map(|_| ())
+        .map_err(operation_failed("refresh areas"))
+}
+
 #[op2(async(lazy))]
 #[cppgc]
 async fn op_smudgy_mapper_create_area(
@@ -258,8 +281,19 @@ async fn op_smudgy_mapper_create_area(
         let atlas_id = options
             .atlas_id
             .map(|(hi, lo)| AtlasId(Uuid::from_u64_pair(hi, lo)));
+        if let Some(atlas_id) = atlas_id
+            && mapper.atlas_storage(&atlas_id).is_none()
+        {
+            mapper
+                .list_atlases()
+                .await
+                .map_err(operation_failed("validate destination atlas"))?;
+            if mapper.atlas_storage(&atlas_id).is_none() {
+                return Err(MapperError::AtlasNotFound);
+            }
+        }
         let storage = resolve_create_storage(options.storage, options.ephemeral)
-            .or_else(|| atlas_id.map(|id| mapper.atlas_storage(&id)));
+            .or_else(|| atlas_id.and_then(|id| mapper.atlas_storage(&id)));
         let id = if let Some(storage) = storage {
             mapper
                 .create_area_at(name, MapDestination { storage, atlas_id })
@@ -315,7 +349,10 @@ struct EphemeralCreateAreaWarnIssued;
 /// never repeats within an isolate's lifetime.
 fn warn_ephemeral_create_area_once(state: &Rc<RefCell<OpState>>) {
     let mut state = state.borrow_mut();
-    if state.try_borrow::<EphemeralCreateAreaWarnIssued>().is_some() {
+    if state
+        .try_borrow::<EphemeralCreateAreaWarnIssued>()
+        .is_some()
+    {
         return;
     }
     state.put(EphemeralCreateAreaWarnIssued);
@@ -405,9 +442,9 @@ fn op_smudgy_mapper_get_area_storage(
     Ok(storage_str(mapper.area_storage(area_id)))
 }
 
-/// Live tier read backing `Atlas.storage`, so a handle held across a
-/// `moveAtlas` reports the atlas's current tier instead of a snapshot taken
-/// when the handle was built.
+/// Live tier read backing `Atlas.storage`. A relocation mints a new atlas id,
+/// so a stale source handle errors after a move instead of lying that every
+/// unknown id is cloud-owned; callers use the `Atlas` returned by `moveAtlas`.
 #[op2]
 #[string]
 fn op_smudgy_mapper_get_atlas_storage(
@@ -419,7 +456,10 @@ fn op_smudgy_mapper_get_atlas_storage(
         .try_borrow::<Mapper>()
         .ok_or(MapperError::MapperNotEnabled)?;
     let atlas_id = AtlasId(Uuid::from_u64_pair(atlas_id.0, atlas_id.1));
-    Ok(storage_str(mapper.atlas_storage(&atlas_id)))
+    mapper
+        .atlas_storage(&atlas_id)
+        .map(storage_str)
+        .ok_or(MapperError::AtlasNotFound)
 }
 
 #[op2(async(lazy), fast)]
@@ -444,7 +484,9 @@ async fn op_smudgy_mapper_list_atlases(
         .map(|atlas| JsAtlas {
             id: atlas.id.0.as_u64_pair(),
             name: atlas.name,
-            storage: mapper.atlas_storage(&atlas.id),
+            storage: mapper
+                .atlas_storage(&atlas.id)
+                .expect("list_atlases records every returned atlas tier"),
         })
         .collect())
 }
@@ -795,7 +837,10 @@ fn op_smudgy_mapper_get_area_next_room_number(
     state
         .try_borrow::<Mapper>()
         .and_then(|mapper| mapper.next_room_number(area_wrapper.0.get_id()))
-        .map_or_else(|| area_wrapper.0.get_max_room_number().0 + 1, |number| number.0)
+        .map_or_else(
+            || area_wrapper.0.get_max_room_number().0 + 1,
+            |number| number.0,
+        )
 }
 
 /// Reserve the next free room number for an open scripted mutator. Ambient

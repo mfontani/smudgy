@@ -11,7 +11,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
-use std::sync::Mutex;
 use smudgy_cloud::{
     AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError,
     CloudResult, CreateAreaRequest, MapStorage, Mapper, MapperBackend, Uuid,
@@ -19,6 +18,7 @@ use smudgy_cloud::{
 };
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
+use std::sync::Mutex;
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
 
@@ -103,7 +103,8 @@ impl MapperBackend for BudgetedBackend {
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
         self.areas
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .iter()
             .find(|area| area.id == *area_id)
             .cloned()
@@ -116,12 +117,20 @@ impl MapperBackend for BudgetedBackend {
     }
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
-        self.areas.lock().unwrap().retain(|area| area.id != *area_id);
+        self.areas
+            .lock()
+            .unwrap()
+            .retain(|area| area.id != *area_id);
         Ok(())
     }
 
     fn local_area_ids(&self) -> std::collections::HashSet<AreaId> {
-        self.areas.lock().unwrap().iter().map(|area| area.id).collect()
+        self.areas
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|area| area.id)
+            .collect()
     }
 
     async fn execute_mutation(
@@ -145,7 +154,8 @@ impl MapperBackend for BudgetedBackend {
                 "room_number_exists".to_string(),
             ));
         }
-        self.allowed_mutations.store(remaining - 1, Ordering::SeqCst);
+        self.allowed_mutations
+            .store(remaining - 1, Ordering::SeqCst);
         let rev = {
             let mut areas = self.areas.lock().unwrap();
             let area = areas
