@@ -127,6 +127,26 @@ export interface LayoutQuality {
   footprintPerimeter: number;
 }
 
+const QUALITY_FIELDS: readonly (keyof LayoutQuality)[] = [
+  "cardinalRayViolations",
+  "roomObstructions",
+  "linkCrossings",
+  "cardinalSlack",
+  "footprintArea",
+  "footprintPerimeter",
+];
+
+/**
+ * Compare two public quality tuples using the planner's exact lexicographic
+ * ordering. Positive means `a` is better, zero means geometrically tied.
+ */
+export function compareLayoutQuality(a: LayoutQuality, b: LayoutQuality): number {
+  for (const field of QUALITY_FIELDS) {
+    if (a[field] !== b[field]) return b[field] - a[field];
+  }
+  return 0;
+}
+
 export interface LayoutTraceCandidate {
   quality: LayoutQuality;
   movedExisting: string[];
@@ -735,6 +755,14 @@ function edgeRayQuality(
     : { cardinalRayViolations: 0, cardinalSlack: Math.max(0, distance - 1) };
 }
 
+/** Protected directional constraints which are off their required ray. */
+export function directionalViolationEdges(
+  positions: ReadonlyMap<string, GridPosition>,
+  edges: readonly LayoutEdge[],
+): LayoutEdge[] {
+  return edges.filter((edge) => edgeRayQuality(positions, edge).cardinalRayViolations > 0);
+}
+
 function fullRayQuality(
   positions: ReadonlyMap<string, GridPosition>,
   edges: readonly LayoutEdge[],
@@ -1189,16 +1217,33 @@ function anchorOrigins(
 ): Origin[] {
   const adjacent = new Set<string>();
   const adjacencyCount = new Map<string, number>();
+  const seamOrigins: Origin[] = [];
   const recordAdjacent = (id: string): void => {
     adjacent.add(id);
     adjacencyCount.set(id, (adjacencyCount.get(id) ?? 0) + 1);
   };
   for (const edge of edges) {
-    if (component.has(edge.from) && !component.has(edge.to) && nodes.has(edge.to) && positions.has(edge.to)) {
-      recordAdjacent(edge.to);
+    if (component.has(edge.from) && !component.has(edge.to) && positions.has(edge.to)) {
+      if (nodes.has(edge.to)) recordAdjacent(edge.to);
+      const vector = protectedVector(edge);
+      const fromNode = nodes.get(edge.from);
+      if (vector && fromNode && !nodes.has(edge.to)) {
+        seamOrigins.push(subtract(
+          subtract(positions.get(edge.to) as GridPosition, vector),
+          fromNode.relative,
+        ));
+      }
     }
-    if (component.has(edge.to) && !component.has(edge.from) && nodes.has(edge.from) && positions.has(edge.from)) {
-      recordAdjacent(edge.from);
+    if (component.has(edge.to) && !component.has(edge.from) && positions.has(edge.from)) {
+      if (nodes.has(edge.from)) recordAdjacent(edge.from);
+      const vector = protectedVector(edge);
+      const toNode = nodes.get(edge.to);
+      if (vector && toNode && !nodes.has(edge.from)) {
+        seamOrigins.push(subtract(
+          add(positions.get(edge.from) as GridPosition, vector),
+          toNode.relative,
+        ));
+      }
     }
   }
 
@@ -1216,11 +1261,17 @@ function anchorOrigins(
   // anchors are noise. Seed it exclusively from the rooms at that seam.
   if (adjacent.size > 0) anchors = anchors.filter((id) => adjacent.has(id));
 
-  return uniqueOffsets(anchors.slice(0, 8).map((id) => {
-    const position = positions.get(id) as GridPosition;
-    const node = nodes.get(id) as LayoutNode;
-    return subtract(position, node.relative);
-  }));
+  return uniqueOffsets([
+    // A directional edge to a resident omitted from the incoming chart is a
+    // complete placement seam: its vector supplies the missing relative
+    // coordinate. Prefer those exact origins before weaker chart anchors.
+    ...seamOrigins,
+    ...anchors.slice(0, 8).map((id) => {
+      const position = positions.get(id) as GridPosition;
+      const node = nodes.get(id) as LayoutNode;
+      return subtract(position, node.relative);
+    }),
+  ]);
 }
 
 function knownOrigins(

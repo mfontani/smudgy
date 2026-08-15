@@ -21,15 +21,6 @@ export function isAuctioneer(player: string): boolean {
   return /^(?:the\s+)?auctioneer$/i.test(player.trim());
 }
 
-/** Whether the server-rendered message already begins with its author. */
-export function messageIncludesAuthor(player: string, plainMessage: string): boolean {
-  const author = player.replace(/\s+/g, " ").trim().toLowerCase();
-  const message = plainMessage.replace(/\s+/g, " ").trim().toLowerCase();
-  if (!author || !message.startsWith(author)) return false;
-  const boundary = message[author.length];
-  return boundary === undefined || !/[\p{L}\p{N}_]/u.test(boundary);
-}
-
 /** Locate item names in the streamlined auction text for Codex links. */
 export function auctionItemSpans(text: string): AuctionItemSpan[] {
   const patterns = [

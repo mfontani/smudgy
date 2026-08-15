@@ -65,6 +65,25 @@ test("places an up exit on the next level without an x/y offset", () => {
   assert.deepEqual(result.positions.get("upper"), at(4, 7, 1));
 });
 
+test("anchors a new chart from a vertical resident omitted by the source", () => {
+  const result = planIntegralLayout({
+    centerId: "upper",
+    allowExistingMoves: false,
+    residents: [resident("lower", 4, 7, false, 3)],
+    nodes: [node("upper", 0, 0, 4), node("east", 1, 0, 4)],
+    edges: [
+      edge("lower", "upper", "Up"),
+      edge("upper", "lower", "Down"),
+      edge("upper", "east", "East"),
+    ],
+  });
+
+  assert.deepEqual(result.positions.get("lower"), at(4, 7, 3));
+  assert.deepEqual(result.positions.get("upper"), at(4, 7, 4));
+  assert.deepEqual(result.positions.get("east"), at(5, 7, 4));
+  assert.equal(result.quality.cardinalRayViolations, 0);
+});
+
 test("treats a projected up/down pair as an authoritative diagonal", () => {
   const result = plan({
     centerId: "lower",
@@ -96,6 +115,33 @@ test("reflows a down-exit destination onto the level below its source", () => {
   assert.deepEqual(result.positions.get("a"), at(2, 3));
   assert.deepEqual(result.positions.get("lower"), at(2, 3, -1));
   assert.equal(result.movedExisting.has("lower"), true);
+});
+
+test("keeps a same-level vertical flow the chart requested when moves are disallowed", () => {
+  // Level policy belongs to callers: a chart may deliberately flow an up/down
+  // destination on its source's plane, and stable placement preserves that.
+  const result = planIntegralLayout({
+    centerId: "a",
+    allowExistingMoves: false,
+    residents: [resident("a", 0, 0)],
+    nodes: [node("a", 0, 0), node("b", 1, 0)],
+    edges: [edge("a", "b", "Up")],
+  });
+
+  assert.deepEqual(result.positions.get("b"), at(1, 0));
+});
+
+test("satisfies a cross-level chart's vertical ray without reflowing existing rooms", () => {
+  const result = planIntegralLayout({
+    centerId: "a",
+    allowExistingMoves: false,
+    residents: [resident("a", 2, 3, true, 5)],
+    nodes: [node("a", 0, 0), node("b", 1, 0, 1)],
+    edges: [edge("a", "b", "Up")],
+  });
+
+  assert.deepEqual(result.positions.get("b"), at(2, 3, 6));
+  assert.equal(result.quality.cardinalRayViolations, 0);
 });
 
 test("moves an isolated blocker when that preserves exact cardinal adjacency", () => {
