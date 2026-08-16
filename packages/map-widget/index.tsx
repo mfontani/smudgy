@@ -1,4 +1,6 @@
 import {
+    createState,
+    getSettings,
     mapper,
     session,
     type Pane,
@@ -18,6 +20,7 @@ import {
     Scrollable,
     Text,
     TextEditor,
+    type MapStyleApplication,
 } from "smudgy:widgets";
 
 type Position = "top" | "left" | "bottom" | "right";
@@ -29,6 +32,32 @@ const INFO_WIDGET = "01-map-info";
 const EDITOR_WIDGET = "02-notes-editor";
 const LAYOUT_STORAGE_KEY = "map-widget-layout";
 const MIN_SIZE = 160;
+const CURRENT_ROOM_STYLE = "current-room";
+const currentRoomMapApply = createState<MapStyleApplication[]>("currentRoomMapApply");
+
+function refreshMapStyles() {
+    try {
+        const location = mapper.getCurrentLocation();
+        if (!location || location.room === undefined) {
+            currentRoomMapApply.set([]);
+            return;
+        }
+        const room = mapper.getAreaById(location.area).room(location.room);
+        if (!room || room.exits.length === 0) {
+            currentRoomMapApply.set([]);
+            return;
+        }
+        currentRoomMapApply.set([{
+            style: CURRENT_ROOM_STYLE,
+            exits: room.exits.map((exit) => ({
+                room: room.room_number,
+                direction: exit.from_direction,
+            })),
+        }]);
+    } catch {
+        currentRoomMapApply.set([]);
+    }
+}
 
 function positionParam(): Position {
     const value = get("position");
@@ -298,10 +327,25 @@ function renderInfoWidget() {
 createWidget(
     MAP_WIDGET,
     <Container width="fill" height="fill">
-        <MapView />
+        <MapView
+            defaultStyle={{
+                crossAreaLabelVisibility: "hover",
+                crossAreaLabelBackground: getSettings().palette?.background,
+            }}
+            styles={{
+                [CURRENT_ROOM_STYLE]: {
+                    crossAreaLabelVisibility: "always",
+                },
+            }}
+            apply={currentRoomMapApply.bind()}
+        />
     </Container>,
     { pane: mapPane },
 );
 
+refreshMapStyles();
 renderInfoWidget();
-roomChanged.on(renderInfoWidget);
+roomChanged.on(() => {
+    refreshMapStyles();
+    renderInfoWidget();
+});

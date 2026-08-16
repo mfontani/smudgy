@@ -5,7 +5,7 @@
 //  the GPS line from a small derived state), so the widget mounts once and
 //  never rebuilds — the MapView keeps its zoom and pan across room changes.
 
-import { createState, mapper, send, session } from "smudgy:core";
+import { createState, mapper, send, session, getSettings } from "smudgy:core";
 import { room as mapRoomChanged } from "smudgy:events/map";
 import {
   Button,
@@ -124,7 +124,8 @@ function mount(): void {
       <MapView
         defaultStyle={{
           crossAreaLabelVisibility: "hover",
-          crossAreaLabelBackground: UI.navyDeep,
+          crossAreaLabelBackground: getSettings().palette?.background,
+          
         }}
         styles={{
           [CURRENT_ROOM_STYLE]: {

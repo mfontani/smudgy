@@ -1,8 +1,11 @@
 {
     "name": "auto-mapper",
-    "version": "0.3.1",
-    "description": "Follows your position from GMCP or MSDP room data and auto-draws a session map as you explore. Type `savemap` to keep what you've mapped.",
+    "version": "0.3.5",
+    "description": "Follows your position from GMCP or MSDP room data and auto-draws durable local maps as you explore.",
     "min_smudgy_version": "0.5.3",
+    "dependencies": [
+        "smudgy://kapusniak/map-layout@^0.2.0"
+    ],
     "permissions": {
         "smudgy": {
             "interop": ["read"],

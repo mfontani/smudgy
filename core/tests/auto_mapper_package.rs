@@ -6,9 +6,9 @@
 //! The real package source is copied from the repo into the test server's local-package
 //! override dir, a real `Mapper` (composite backend, in-memory + local tiers, dead cloud)
 //! is attached to the session, and GMCP `Room.Info` messages drive it: walk two rooms
-//! (auto-create in an ephemeral zone area, arrival exits linked both ways, stubs for
-//! unexplored exits), revisit the first (follow, no duplicate), then `savemap` promotes
-//! the session map to the local tier and drops the original.
+//! (auto-create in a durable local zone area, arrival exits linked both ways, stubs for
+//! unexplored exits), revisit the first (follow, no duplicate), and verify the map is
+//! available to a fresh mapper on the next run.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,20 +28,35 @@ use std::collections::HashSet;
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
 const SERVER: &str = "AutoMapperTest";
 
-fn copy_package_source(server: &str) {
+fn copy_package(server: &str, name: &str) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("packages")
-        .join("auto-mapper");
-    let dest = packages_dir(server)
-        .expect("packages dir")
-        .join("auto-mapper");
+        .join(name);
+    let dest = packages_dir(server).expect("packages dir").join(name);
     std::fs::create_dir_all(&dest).unwrap();
-    for entry in std::fs::read_dir(&source).expect("read packages/auto-mapper") {
+    for entry in std::fs::read_dir(&source).unwrap_or_else(|_| panic!("read package {name}")) {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {
             std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
         }
+    }
+}
+
+fn copy_package_source(server: &str) {
+    copy_package(server, "map-layout");
+    copy_package(server, "auto-mapper");
+    let directory = packages_dir(server)
+        .expect("packages dir")
+        .join("auto-mapper");
+    for name in ["engine.ts", "smudgy.package.json"] {
+        let path = directory.join(name);
+        let source = std::fs::read_to_string(&path).expect("read auto-mapper dependency");
+        std::fs::write(
+            path,
+            source.replace("smudgy://kapusniak/map-layout", "smudgy://local/map-layout"),
+        )
+        .expect("localize auto-mapper dependency");
     }
 }
 
@@ -61,7 +76,7 @@ fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
 }
 
 #[tokio::test]
-async fn auto_mapper_maps_follows_and_promotes() {
+async fn auto_mapper_maps_follows_and_persists() {
     // ---- Home + package install (untrusted → sandboxed to its manifest). ----
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -83,7 +98,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
     )
     .unwrap();
 
-    // ---- A real mapper: local tier on temp disk, dead cloud, internal ephemeral tier. ----
+    // ---- A real mapper: local tier on temp disk, dead cloud, internal session tier. ----
     let map_root = smudgy_home.join("map-test");
     let local = Arc::new(LocalBackend::new(map_root.join("local")));
     let cloud = Arc::new(CloudMapper::new(
@@ -93,6 +108,35 @@ async fn auto_mapper_maps_follows_and_promotes() {
     let backend: Arc<dyn MapperBackend + Send + Sync> =
         Arc::new(CompositeBackend::new(local, cloud));
     let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    // Seed an unrelated room into the cell immediately east of the first observed room.
+    // map-layout should preserve the cardinal adjacency by reflowing this blocker; the
+    // old collision nudge stretched the east link past it to x=2.
+    let seeded_midgaard = mapper
+        .create_area_at(
+            "midgaard".to_string(),
+            MapDestination::loose(MapStorage::Session),
+        )
+        .await
+        .expect("create seeded session area");
+    let blocker_number = RoomNumber(1);
+    let blocker = mapper
+        .upsert_room(
+            RoomKey::new(seeded_midgaard, blocker_number),
+            RoomUpdates {
+                title: Some("Layout blocker".to_string()),
+                x: Some(1.0),
+                y: Some(0.0),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("seed layout blocker");
+    if let Some(operation_id) = blocker.operation_id() {
+        mapper
+            .wait_for_mutation(operation_id)
+            .await
+            .expect("layout blocker acknowledged");
+    }
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9333_u32),
@@ -129,32 +173,37 @@ async fn auto_mapper_maps_follows_and_promotes() {
     // capture shows adjacent rooms sharing x:30,y:20), and placing by it stacks the zone
     // on one spot; (b) a cached `Area` handle is an immutable snapshot, so a chain of
     // creations that reads the previous room's position through a stale handle collapses
-    // onto the origin cell. Either bug stacks rooms 101 and 103.
+    // onto the origin cell. Either bug stacks rooms 101 and 103. The three rooms also use
+    // `num`, `vnum`, and `id` respectively; conflicting lower-priority fields prove the
+    // generic identity precedence is num -> vnum -> id.
     tx.send(RuntimeAction::GmcpEnabled).unwrap();
     tx.send(gmcp(
         "Room.Info",
-        r#"{ "num": 100, "name": "Temple Square", "zone": "midgaard", "terrain": "city",
+        r#"{ "num": 100, "vnum": "wrong-vnum-100", "id": "wrong-id-100",
+             "name": "Temple Square", "zone": "midgaard", "terrain": "city",
              "exits": { "e": 101, "n": 102 },
              "coord": { "id": 0, "x": 30, "y": 20, "cont": 0 } }"#,
     ))
     .unwrap();
     tx.send(gmcp(
         "Room.Info",
-        r#"{ "num": 101, "name": "Market Street", "zone": "midgaard", "terrain": "city",
+        r#"{ "vnum": 101, "id": "wrong-id-101",
+             "name": "Market Street", "zone": "midgaard", "terrain": "city",
              "exits": { "w": 100, "e": 103 },
              "coord": { "id": 0, "x": 30, "y": 20, "cont": 0 } }"#,
     ))
     .unwrap();
     tx.send(gmcp(
         "Room.Info",
-        r#"{ "num": 103, "name": "East Gate", "zone": "midgaard", "terrain": "city",
+        r#"{ "id": "103", "name": "East Gate", "zone": "midgaard", "terrain": "city",
              "exits": { "w": 101 },
              "coord": { "id": 0, "x": 30, "y": 20, "cont": 0 } }"#,
     ))
     .unwrap();
     tx.send(gmcp(
         "Room.Info",
-        r#"{ "num": 100, "name": "Temple Square", "zone": "midgaard", "terrain": "city",
+        r#"{ "num": 100, "vnum": "wrong-vnum-100", "id": "wrong-id-100",
+             "name": "Temple Square", "zone": "midgaard", "terrain": "city",
              "exits": { "e": 101, "n": 102 },
              "coord": { "id": 0, "x": 30, "y": 20, "cont": 0 } }"#,
     ))
@@ -168,7 +217,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
     }
     let transcript = lines.join("\n");
 
-    // ---- The session map: one ephemeral zone area, two rooms, bound ids, linked exits. ----
+    // ---- The durable map: one local zone area, bound ids, linked exits. ----
     let atlas = mapper.get_current_atlas();
     let (key100, room100) = atlas
         .find_room_by_external_id("100")
@@ -181,21 +230,43 @@ async fn auto_mapper_maps_follows_and_promotes() {
         .unwrap_or_else(|| panic!("room 103 was auto-created.\n{transcript}"));
     assert_eq!(key100.area_id, key101.area_id, "one area per zone");
     assert_eq!(key100.area_id, key103.area_id, "one area per zone");
-    assert!(
-        mapper.area_storage(&key100.area_id) == MapStorage::Session,
-        "auto-mapped rooms land in the ephemeral tier"
+    assert_eq!(mapper.area_storage(&key100.area_id), MapStorage::Local);
+    assert_ne!(
+        key100.area_id, seeded_midgaard,
+        "the legacy session area was promoted before auto-mapping"
+    );
+    assert_eq!(
+        mapper.session_area_ids().len(),
+        0,
+        "auto-mapper must not leave an ephemeral map behind"
     );
     let area = atlas.get_area(&key100.area_id).expect("zone area");
     assert_eq!(area.get_name(), "midgaard");
     // 100, 101, 103 visited + the unvisited placeholder for 102 (every room the server
-    // names is on the map); revisiting room 100 must not duplicate anything.
+    // names is on the map), plus the seeded layout blocker. Revisiting room 100 must not
+    // duplicate anything.
     assert_eq!(
         area.room_count(),
-        4,
-        "three visited rooms + the 102 placeholder"
+        5,
+        "three visited rooms + the 102 placeholder + the seeded blocker"
     );
     assert_eq!(room100.get_title(), "Temple Square");
     assert_eq!(room101.get_title(), "Market Street");
+    assert_eq!(room103.get_title(), "East Gate");
+    assert!(
+        (room101.get_x() - (room100.get_x() + 1.0)).abs() < f32::EPSILON
+            && (room101.get_y() - room100.get_y()).abs() < f32::EPSILON,
+        "map-layout keeps the east room adjacent instead of nudging it past the blocker"
+    );
+    let blocker = area
+        .get_room(&blocker_number)
+        .expect("seeded layout blocker remains in the area");
+    assert!(
+        (blocker.get_x() - room101.get_x()).abs() > 0.5
+            || (blocker.get_y() - room101.get_y()).abs() > 0.5
+            || blocker.get_level() != room101.get_level(),
+        "map-layout reflows the blocker out of the new east room's cell"
+    );
     // No two rooms may stack: catches both trusting the zone-granular Aardwolf
     // coord and reading placement through a stale area-handle snapshot.
     let positions = [("100", &room100), ("101", &room101), ("103", &room103)];
@@ -278,53 +349,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
         "100's north exit links to the 102 placeholder.\n{transcript}"
     );
 
-    // ---- savemap: promote to the local tier, drop the session original. ----
-    tx.send(RuntimeAction::Send(Arc::new("savemap".to_string())))
-        .unwrap();
-
-    // Promotion performs asynchronous copy, acknowledgement, and source-delete work.
-    // It can legitimately emit no buffer updates for longer than the ordinary quiet
-    // period, so silence is not a completion signal here. Wait for the package's
-    // acknowledgement, which it emits only after the mapper state has been rebound.
-    let savemap_wait = tokio::time::timeout(Duration::from_mins(1), async {
-        loop {
-            let Some(event) = events.next().await else {
-                return false;
-            };
-            if let SessionEvent::UpdateBuffer(updates) = event.event {
-                collect(&updates, &mut lines);
-                if lines.iter().any(|line| line.contains("saved 1 map(s)")) {
-                    return true;
-                }
-            }
-        }
-    })
-    .await;
-    let transcript = lines.join("\n");
-    assert!(
-        matches!(savemap_wait, Ok(true)),
-        "savemap reports the promotion before the deadline.\n{transcript}"
-    );
-
-    let atlas = mapper.get_current_atlas();
-    let (promoted_key, promoted_room) = atlas
-        .find_room_by_external_id("100")
-        .expect("room 100 still resolves after promotion");
-    assert_ne!(
-        promoted_key.area_id, key100.area_id,
-        "a fresh (imported) area"
-    );
-    assert!(
-        mapper.area_storage(&promoted_key.area_id) != MapStorage::Session,
-        "the promoted area is no longer ephemeral"
-    );
-    assert_eq!(promoted_room.get_title(), "Temple Square");
-    assert!(
-        atlas.get_area(&key100.area_id).is_none(),
-        "the session original was dropped"
-    );
-
-    // ---- Mapping continues into the promoted area (zone rebind). ----
+    // ---- Mapping continues directly in the durable local area. ----
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 102, "name": "North Road", "zone": "midgaard", "terrain": "road",
@@ -340,34 +365,32 @@ async fn auto_mapper_maps_follows_and_promotes() {
     let atlas = mapper.get_current_atlas();
     let (key102, _) = atlas
         .find_room_by_external_id("102")
-        .unwrap_or_else(|| panic!("room 102 mapped after promotion.\n{transcript}"));
+        .unwrap_or_else(|| panic!("room 102 mapped in the durable area.\n{transcript}"));
     assert_eq!(
-        key102.area_id, promoted_key.area_id,
-        "post-promotion rooms land in the promoted area"
+        key102.area_id, key100.area_id,
+        "new rooms stay in the durable zone area"
     );
-    // The north stub minted before savemap survived promotion as a pending waiter
-    // (re-keyed onto the imported copy's exit): discovering 102 upgrades it to a real
-    // link, and the reciprocal exits pair onto one Connection.
-    let (_, promoted_100) = atlas
+    // Discovering 102 upgrades the waiting north placeholder to a real room, and the
+    // reciprocal exits pair onto one Connection.
+    let (_, durable_100) = atlas
         .find_room_by_external_id("100")
-        .expect("room 100 resolves in the promoted area");
-    let exits_100 = promoted_100.get_exits();
+        .expect("room 100 resolves in the durable area");
+    let exits_100 = durable_100.get_exits();
     let north = exits_100
         .iter()
         .find(|e| e.to_room_number == Some(key102.room_number))
-        .unwrap_or_else(|| panic!("promoted 100's north stub upgraded to link 102.\n{transcript}"));
+        .unwrap_or_else(|| panic!("100's north placeholder links to 102.\n{transcript}"));
     let (_, room102) = atlas.find_room_by_external_id("102").expect("room 102");
     let exits_102 = room102.get_exits();
     let south = exits_102
         .iter()
-        .find(|e| e.to_room_number == Some(promoted_key.room_number))
+        .find(|e| e.to_room_number == Some(key100.room_number))
         .unwrap_or_else(|| panic!("102 links south back to 100.\n{transcript}"));
     assert_eq!(
         north.connection_id, south.connection_id,
-        "100<->102 reciprocal exits pair onto one Connection across promotion.\n{transcript}"
+        "100<->102 reciprocal exits pair onto one Connection.\n{transcript}"
     );
-    // The placeholder (exported unvisited, imported by savemap) materialized on its
-    // first real visit.
+    // The placeholder materialized on its first real visit.
     assert_ne!(
         room102.get_property("unvisited"),
         Some("true"),
@@ -380,7 +403,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
 
     // ---- A NEW RUN: fresh Mapper over the same on-disk local tier, fresh session.
     // The saved "midgaard" map must be ADOPTED, not redrawn: a known room follows into
-    // it, a new room is created inside it, and no session (ephemeral) area appears.
+    // it, a new room is created inside it, and no session area appears.
     let local = Arc::new(LocalBackend::new(map_root.join("local")));
     let cloud = Arc::new(CloudMapper::new(
         "http://127.0.0.1:0".to_string(),
@@ -492,7 +515,7 @@ async fn auto_mapper_maps_follows_and_promotes() {
     tx.send(RuntimeAction::Shutdown).ok();
 }
 
-/// The zone-crossing walk: entering a new zone opens exactly one new session area,
+/// The zone-crossing walk: entering a new zone opens exactly one new durable local area,
 /// exits across the border link area-to-area (the pending stub upgrades into the
 /// other area), and coming BACK to the first zone — both revisiting a known room and
 /// discovering a new one — reuses the original zone area instead of minting
@@ -622,9 +645,11 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
     );
     assert_eq!(
         mapper.session_area_ids().len(),
-        2,
-        "exactly two session areas: old-town and wildwood.\n{transcript}"
+        0,
+        "old-town and wildwood must not use session storage.\n{transcript}"
     );
+    assert_eq!(mapper.area_storage(&key200.area_id), MapStorage::Local);
+    assert_eq!(mapper.area_storage(&key300.area_id), MapStorage::Local);
     assert_eq!(
         atlas
             .get_area(&key200.area_id)
@@ -695,7 +720,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
     );
     assert_eq!(
         mapper.session_area_ids().len(),
-        2,
+        0,
         "an unmappable fix opens no area.\n{transcript}"
     );
     assert_eq!(
@@ -790,7 +815,7 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
     let (key, room) = atlas
         .find_room_by_external_id("4711")
         .unwrap_or_else(|| panic!("IRE room was auto-created.\n{transcript}"));
-    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Session);
+    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Local);
     assert_eq!(
         atlas.get_area(&key.area_id).expect("area").get_name(),
         "the village of Tasur'ke",
@@ -876,7 +901,7 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
 
 /// The MSDP half of the dual-protocol contract: the golden's composite `ROOM` table
 /// (Luminari shape — string vnums, full-word directions, COORDS) creates rooms placed by
-/// server coordinates in an ephemeral zone area.
+/// server coordinates in a durable local zone area.
 #[tokio::test]
 async fn auto_mapper_maps_msdp_composite_room() {
     const MSDP_SERVER: &str = "AutoMapperMsdp";
@@ -999,7 +1024,7 @@ async fn auto_mapper_maps_msdp_composite_room() {
     let (key, room) = atlas
         .find_room_by_external_id("14100")
         .unwrap_or_else(|| panic!("MSDP room was auto-created.\n{transcript}"));
-    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Session);
+    assert_eq!(mapper.area_storage(&key.area_id), MapStorage::Local);
     let area = atlas.get_area(&key.area_id).expect("zone area");
     assert_eq!(area.get_name(), "Training Halls");
     assert_eq!(room.get_title(), "A Small Island Beach");
@@ -1318,7 +1343,7 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
     let mesolar = mapper
         .create_area_at(
             "Mesolar".to_string(),
-            MapDestination::loose(MapStorage::Session),
+            MapDestination::loose(MapStorage::Local),
         )
         .await
         .expect("create the overland area");
@@ -1406,7 +1431,7 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
     );
     assert_eq!(
         mapper.session_area_ids().len(),
-        1,
+        0,
         "no zone area was opened for continent fixes.\n{transcript}"
     );
 
@@ -1454,7 +1479,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     let elsewhere = mapper
         .create_area_at(
             "Other Server Map".to_string(),
-            MapDestination::loose(MapStorage::Session),
+            MapDestination::loose(MapStorage::Local),
         )
         .await
         .expect("create the stand-in area");
@@ -1476,7 +1501,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
             .is_none(),
         "the scope-excluded room is absent from normal identification"
     );
-    let ephemeral_before = mapper.session_area_ids().len();
+    let area_count_before = mapper.get_current_atlas().areas().len();
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9335_u32),
@@ -1529,11 +1554,11 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
         rescue_offered,
         "a room mapped on another entry raises the cross-entry rescue offer.\n{transcript}"
     );
-    // No duplicate was minted: no new ephemeral zone area appeared, and "9500"
+    // No duplicate was minted: no new durable zone area appeared, and "9500"
     // still resolves nowhere in normal identification.
     assert_eq!(
-        mapper.session_area_ids().len(),
-        ephemeral_before,
+        mapper.get_current_atlas().areas().len(),
+        area_count_before,
         "the rescue path must not auto-create a duplicate zone area.\n{transcript}"
     );
     assert!(
@@ -1549,12 +1574,12 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
 
 /// The unwritable-map fallback: an adopted durable zone map whose backend
 /// refuses the write must be detached and the SAME fix retried into a fresh
-/// session area. The mutator's draft room number resolves before submission,
+/// local area. The mutator's draft room number resolves before submission,
 /// so a failed submit must not leave the retry loop believing a room exists —
 /// that phantom would end the loop early and links/current-location would
 /// bind a room number the fallback area never held.
 #[tokio::test]
-async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writes() {
+async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes() {
     const RETRY_SERVER: &str = "AutoMapperRetry";
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -1607,25 +1632,6 @@ async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writ
             .expect("seed room acknowledged");
     }
 
-    // Make the local tier refuse further writes to the area document: the
-    // atomic rewrite cannot replace a read-only file (Windows) or create its
-    // temp in a read-only directory (Unix).
-    let areas_dir = map_root.join("local").join("areas-v2");
-    for entry in std::fs::read_dir(&areas_dir).expect("list local area files") {
-        let path = entry.expect("area file entry").path();
-        if path.extension().is_some_and(|extension| extension == "json") {
-            let mut permissions = std::fs::metadata(&path).expect("area file metadata").permissions();
-            permissions.set_readonly(true);
-            std::fs::set_permissions(&path, permissions).expect("set area file read-only");
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&areas_dir, std::fs::Permissions::from_mode(0o555))
-            .expect("set areas dir read-only");
-    }
-
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9341_u32),
         server_name: Arc::new(RETRY_SERVER.to_string()),
@@ -1654,9 +1660,32 @@ async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writ
         }
     };
 
+    // Let initial map loading finish while the document is still readable, then make this
+    // one area read-only to the backend without disabling new local map creation. A
+    // future-format document is deliberately refused on every platform.
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let bound_path = map_root
+        .join("local")
+        .join("areas-v2")
+        .join(format!("{bound}.json"));
+    let mut document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&bound_path).expect("read bound local area document"),
+    )
+    .expect("parse bound local area document");
+    document["format_version"] = serde_json::json!(smudgy_cloud::AREA_FORMAT_VERSION + 1);
+    std::fs::write(
+        &bound_path,
+        serde_json::to_vec_pretty(&document).expect("serialize future-format area document"),
+    )
+    .expect("replace bound map with future-format document");
+
     // A NEW room in the adopted zone: the first attempt drafts into the bound
     // local map and fails at submit; the retry must land a REAL room in a
-    // fresh session area.
+    // fresh local area.
     tx.send(RuntimeAction::GmcpEnabled).unwrap();
     tx.send(gmcp(
         "Room.Info",
@@ -1676,15 +1705,25 @@ async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writ
         lines.iter().any(|line| line.contains("not writable")),
         "the unwritable adoption is announced once.\n{transcript}"
     );
-    let session_areas = mapper.session_area_ids();
     assert_eq!(
-        session_areas.len(),
-        1,
-        "the fallback opens exactly one session area.\n{transcript}"
+        mapper.session_area_ids().len(),
+        0,
+        "the fallback must never open a session area.\n{transcript}"
     );
-    let fallback = *session_areas.iter().next().expect("fallback area id");
     let atlas = mapper.get_current_atlas();
-    let fallback_area = atlas.get_area(&fallback).expect("fallback area");
+    let fallback_area = atlas
+        .areas()
+        .find(|area| {
+            *area.get_id() != bound
+                && area
+                    .get_rooms()
+                    .iter()
+                    .any(|room| room.get_external_id() == Some("701"))
+        })
+        .unwrap_or_else(|| panic!("the fallback local area was created.\n{transcript}"));
+    let fallback = *fallback_area.get_id();
+    assert_ne!(fallback, bound, "the unwritable map was detached");
+    assert_eq!(mapper.area_storage(&fallback), MapStorage::Local);
     assert_eq!(
         fallback_area.room_count(),
         1,
@@ -1693,7 +1732,8 @@ async fn auto_mapper_retries_into_a_session_area_when_the_bound_map_refuses_writ
     );
     let fallback_room = fallback_area
         .get_rooms()
-        .first()
+        .iter()
+        .find(|room| room.get_external_id() == Some("701"))
         .expect("the retried room exists");
     assert_eq!(fallback_room.get_external_id(), Some("701"));
     assert_eq!(fallback_room.get_title(), "Overgrown Path");

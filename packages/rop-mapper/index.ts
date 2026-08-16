@@ -10,6 +10,7 @@ import {
     type NeighborhoodRoomFix,
     type RoomFix,
 } from "smudgy://official/auto-mapper/engine.ts";
+import { createAlias } from "smudgy:core";
 
 const MAX_EXITS = 64;
 const MAX_MAP_ROOMS = 512;
@@ -159,11 +160,17 @@ function adaptRoomMap(map: unknown): NeighborhoodFix | null {
     return { centerId, rooms };
 }
 
-createAutoMapper({
+const ropMapper = createAutoMapper({
     roomInfo: adaptRoomInfo,
     roomMap: adaptRoomMap,
     msdp: false,
     // RoP provides destination ids in Room.Info. Outgoing command inference would only
     // introduce ambiguity after a closed door or another refused movement.
     inferMovementFromCommands: false,
-}).start();
+});
+
+ropMapper.start();
+
+createAlias(/^ropmap\s+upgrade(?:\s+(?<zone>.+))?$/i, ({ zone }: { zone?: string }) => {
+    ropMapper.upgradeToCloud(zone);
+});

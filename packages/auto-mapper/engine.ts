@@ -1,10 +1,8 @@
 // Injectable auto-mapper engine: protocol-driven mapping over normalized room observations.
 // (docs/gmcp-mapping.md section 5.3). Known rooms are followed; unknown rooms are
-// auto-created, one area per server-reported zone. A zone the player has never kept maps
-// into a session (ephemeral) area, so nothing a server sends can touch durable state
-// uninvited; `savemap` promotes those areas to explicit local or cloud storage. A zone whose map was kept —
-// this session or any earlier one (matched by name) — is adopted and mapped into
-// directly: opting in once keeps the zone durable.
+// auto-created, one durable local area per server-reported zone. A saved map from this
+// session or any earlier one (matched by name) is adopted and mapped into directly;
+// `savemap cloud` remains available to move locally auto-mapped zones into cloud storage.
 //
 // Room identity is the server's own room id, bound as each room's externalId and resolved
 // through mapper.findRoomByExternalId (O(1)). Ids are opaque strings end to end: hash ids
@@ -21,6 +19,11 @@ import msdp from "smudgy:state/msdp";
 import { mapper, createAlias, echo, gmcp as gmcpCtl } from "smudgy:core";
 import { send as sysSend, connect as sysConnect, disconnect as sysDisconnect } from "smudgy:events/sys";
 import { closed as gmcpClosed } from "smudgy:events/gmcp";
+import {
+    planAreaChange,
+    type AreaChangePlan,
+    type LayoutDirection,
+} from "smudgy://kapusniak/map-layout";
 
 // ---------------------------------------------------------------------------------------
 // The normalized room fix every dialect reduces to.
@@ -78,6 +81,8 @@ export interface AutoMapperOptions {
 
 export interface AutoMapper {
     start(): void;
+    /** Move every bound session/local zone (or one named zone) into cloud storage. */
+    upgradeToCloud(zone?: string): void;
 }
 
 // Map-unit spacing between adjacent rooms (both for server grids and walk inference).
@@ -86,6 +91,8 @@ export interface AutoMapper {
 const GRID = 1.0;
 // Collision nudges tried along the movement vector before giving up and stacking.
 const MAX_NUDGES = 50;
+const PROPOSED_ROOM_ID = "$auto-mapper:new-room";
+const SERVER_COORDINATES_PROPERTY = "auto-mapper.server-coordinates";
 
 // Adapter input bounds (docs/gmcp-mapping.md section 7): a hostile or buggy server must
 // not mint unbounded ids/names or NaN-adjacent geometry. Over-limit ids read as withheld
@@ -208,7 +215,7 @@ function adaptGmcp(info: unknown): RoomFix | null {
     if (info === null || typeof info !== "object") return null;
     const fields = info as Record<string, unknown>;
 
-    const id = asId(fields.num);
+    const id = asId(fields.num) ?? asId(fields.vnum) ?? asId(fields.id);
     // Aardwolf's explicit "don't map here" sentinel.
     const unmappable = id === null || id === "-1";
 
@@ -349,6 +356,8 @@ let queue: Promise<void> = Promise.resolve();
 let sawCompositeRoom = false;
 /** Neighborhoods received before their center room exists, latest update per center wins. */
 const pendingNeighborhoods = new Map<string, NeighborhoodFix>();
+/** The newest not-yet-started Room.Map task, for adjacent same-center coalescing. */
+let coalescibleNeighborhood: { fix: NeighborhoodFix } | null = null;
 let started = false;
 
 const FALLBACK_ZONE = "Uncharted";
@@ -372,12 +381,10 @@ async function zoneArea(zone: string | null): Promise<AreaId> {
     const key = zoneKey(zone);
     const bound = zoneAreas.get(key);
     if (bound) return bound;
-    // Adopt an existing map of this zone before minting a fresh one: the saved map an
-    // earlier run promoted with `savemap` (a zone the player already opted into keeping
-    // stays durable), or this session's own area from before a script-engine rebuild
-    // (module state resets; the Mapper's areas survive). Matching is by folded name —
-    // renaming a map is how a player detaches it from auto-mapping. Saved maps win
-    // over session maps.
+    // Adopt an existing durable map of this zone before minting a fresh one. Matching is
+    // by folded name — renaming a map is how a player detaches it from auto-mapping.
+    // A legacy session map can survive a script-engine rebuild, so promote it immediately
+    // rather than continuing to write ephemeral map data.
     let sessionArea: AreaId | undefined;
     for (const area of mapper.areas) {
         if (zoneKey(area.name) !== key) continue;
@@ -389,11 +396,13 @@ async function zoneArea(zone: string | null): Promise<AreaId> {
         sessionArea ??= area.id;
     }
     if (sessionArea) {
-        zoneAreas.set(key, sessionArea);
-        return sessionArea;
+        const [promoted] = await mapper.moveAreas([sessionArea], { storage: "local" });
+        if (!promoted) throw new Error("could not promote the legacy session map");
+        zoneAreas.set(key, promoted.id);
+        return promoted.id;
     }
     const area = await mapper.createArea((zone ?? FALLBACK_ZONE).trim() || FALLBACK_ZONE, {
-        storage: "session",
+        storage: "local",
     });
     zoneAreas.set(key, area.id);
     return area.id;
@@ -482,6 +491,81 @@ function resetWalkState() {
 // Placement.
 // ---------------------------------------------------------------------------------------
 
+function propertyIsTrue(value: string | null | undefined): boolean {
+    return value?.trim().toLowerCase() === "true";
+}
+
+/** Respect map-layout's generic manual locks and keep authoritative server grids fixed. */
+function isLayoutRoomMovable(room: Room): boolean {
+    return !room.hasTag("LAYOUT_LOCKED")
+        && !propertyIsTrue(room.data("layoutLocked"))
+        && !propertyIsTrue(room.data(SERVER_COORDINATES_PROPERTY));
+}
+
+function layoutDirection(dir: string): LayoutDirection | null {
+    return (EXIT_DIRECTION[dir] as LayoutDirection | undefined) ?? null;
+}
+
+async function applyLayoutMoves(
+    areaId: AreaId,
+    result: AreaChangePlan,
+    mutation?: AreaMutator,
+): Promise<void> {
+    const updates: [RoomNumber, UpdateRoomParams][] = result.patch.moves.map((move) => {
+        if (move.roomNumber === undefined) {
+            throw new Error(`layout move ${move.id} has no Smudgy room number`);
+        }
+        return [move.roomNumber, {
+            x: move.to.x,
+            y: move.to.y,
+            level: move.to.level,
+        }];
+    });
+    if (updates.length === 0) return;
+    if (mutation) await mutation.updateRooms(updates);
+    else await mapper.updateRooms(areaId, updates);
+}
+
+async function planRoomAddition(
+    areaId: AreaId,
+    fromRoom: RoomNumber,
+    dir: string,
+): Promise<{ result: AreaChangePlan; position: { x: number; y: number; level: number } } | null> {
+    const direction = layoutDirection(dir);
+    if (!direction) return null;
+    const result = await planAreaChange(areaId, {
+        type: "add-room",
+        from: fromRoom,
+        direction,
+        temporaryId: PROPOSED_ROOM_ID,
+        createReturnEdge: false,
+    }, { isRoomMovable: isLayoutRoomMovable });
+    const placement = result.patch.placements.find((candidate) => candidate.id === PROPOSED_ROOM_ID);
+    if (!placement) throw new Error("map-layout did not place the new auto-mapper room");
+    return { result, position: placement.position };
+}
+
+/** Reflow movement-placed rooms before adding a newly discovered same-area connection. */
+async function planRoomConnection(
+    areaId: AreaId,
+    fromRoom: RoomNumber,
+    toRoom: RoomNumber,
+    dir: string,
+    mutation?: AreaMutator,
+): Promise<void> {
+    if (fromRoom === toRoom) return;
+    const direction = layoutDirection(dir);
+    if (!direction) return;
+    const result = await planAreaChange(areaId, {
+        type: "connect-rooms",
+        from: fromRoom,
+        to: toRoom,
+        direction,
+        createReturnEdge: false,
+    }, { isRoomMovable: isLayoutRoomMovable });
+    await applyLayoutMoves(areaId, result, mutation);
+}
+
 function occupied(area: Area, x: number, y: number, level: number): boolean {
     for (const number of area.room_numbers) {
         const room = area.room(number);
@@ -559,9 +643,11 @@ async function relinkExit(
     exit: Exit,
     toAreaId: AreaId,
     toRoomNumber: RoomNumber,
+    mutation?: AreaMutator,
 ): Promise<ExitId> {
-    await mapper.deleteRoomExit(areaId, room, exit.id);
-    return await mapper.createRoomExit(areaId, room, {
+    if (mutation) await mutation.deleteRoomExit(room, exit.id);
+    else await mapper.deleteRoomExit(areaId, room, exit.id);
+    const fields: ExitArgs = {
         from_direction: exit.from_direction,
         to_area_id: toAreaId,
         to_room_number: toRoomNumber,
@@ -570,7 +656,10 @@ async function relinkExit(
         is_locked: exit.is_locked,
         weight: exit.weight,
         command: exit.command ?? undefined,
-    });
+    };
+    return mutation
+        ? await mutation.createRoomExit(room, fields)
+        : await mapper.createRoomExit(areaId, room, fields);
 }
 
 function trackPending(destId: string, areaId: AreaId, room: RoomNumber, exitId: ExitId, dir: string) {
@@ -578,6 +667,49 @@ function trackPending(destId: string, areaId: AreaId, room: RoomNumber, exitId: 
     if (!waiters.some((waiter) => sameExit(waiter.exitId, exitId))) {
         waiters.push({ areaId, room, exitId, dir });
         pendingLinks.set(destId, waiters);
+    }
+}
+
+type PendingLinkEffect =
+    | { type: "drop"; exitId: ExitId }
+    | {
+        type: "track";
+        destId: string;
+        areaId: AreaId;
+        room: RoomNumber;
+        exitId: ExitId;
+        dir: string;
+    };
+
+function recordPendingDrop(effects: PendingLinkEffect[] | undefined, exitId: ExitId) {
+    if (effects) effects.push({ type: "drop", exitId });
+    else dropPendingExit(exitId);
+}
+
+function recordPendingTrack(
+    effects: PendingLinkEffect[] | undefined,
+    destId: string,
+    areaId: AreaId,
+    room: RoomNumber,
+    exitId: ExitId,
+    dir: string,
+) {
+    if (effects) effects.push({ type: "track", destId, areaId, room, exitId, dir });
+    else trackPending(destId, areaId, room, exitId, dir);
+}
+
+function applyPendingEffects(effects: PendingLinkEffect[]) {
+    for (const effect of effects) {
+        if (effect.type === "drop") dropPendingExit(effect.exitId);
+        else {
+            trackPending(
+                effect.destId,
+                effect.areaId,
+                effect.room,
+                effect.exitId,
+                effect.dir,
+            );
+        }
     }
 }
 
@@ -601,21 +733,27 @@ async function createPlaceholder(
         const area = mapper.getAreaById(fromAreaId);
         const from = area.room(fromRoom);
         if (!from) return undefined;
-        const [dx, dy, dz] = OFFSETS[dir] ?? [1, 1, 0];
-        let x = from.x + dx * GRID;
-        let y = from.y + dy * GRID;
-        const level = from.level + dz;
-        for (let nudge = 0; nudge < MAX_NUDGES && occupied(area, x, y, level); nudge += 1) {
-            x += (dx || 1) * GRID;
-            y += dy * GRID;
-        }
+        const planned = await planRoomAddition(fromAreaId, fromRoom, dir);
+        const fallback = (() => {
+            const [dx, dy, dz] = OFFSETS[dir] ?? [1, 1, 0];
+            let x = from.x + dx * GRID;
+            let y = from.y + dy * GRID;
+            const level = from.level + dz;
+            for (let nudge = 0; nudge < MAX_NUDGES && occupied(area, x, y, level); nudge += 1) {
+                x += (dx || 1) * GRID;
+                y += dy * GRID;
+            }
+            return { x, y, level };
+        })();
+        const at = planned?.position ?? fallback;
         let number!: RoomNumber;
         await mapper.mutateArea(fromAreaId, async (mutation) => {
+            if (planned) await applyLayoutMoves(fromAreaId, planned.result, mutation);
             number = await mutation.createRoom({
                 externalId: destId,
-                x,
-                y,
-                level,
+                x: at.x,
+                y: at.y,
+                level: at.level,
                 color: PLACEHOLDER_COLOR,
             });
             await mutation.setRoomProperty(number, "unvisited", "true");
@@ -632,16 +770,27 @@ async function linkOrStub(
     dir: string,
     destId: string | null,
     door?: DoorFix,
+    mutation?: AreaMutator,
+    pendingEffects?: PendingLinkEffect[],
 ) {
     const from_direction = EXIT_DIRECTION[dir] ?? "Special";
     const command = dir;
     if (destId !== null) {
         // A named destination is always a room on the map: the mapped one, or a fresh
         // unvisited placeholder.
-        const dest = mapper.findRoomByExternalId(destId)
-            ?? await createPlaceholder(areaId, room, dir, destId);
+        let dest = mapper.findRoomByExternalId(destId);
+        const alreadyMapped = dest !== undefined;
+        if (!dest && mutation) {
+            // A callback-scoped mutator cannot safely open a nested room-creation batch.
+            // Abort this topology batch and let its caller retry the link individually.
+            throw new Error(`destination ${destId} is unavailable for batched linking`);
+        }
+        dest ??= await createPlaceholder(areaId, room, dir, destId);
         if (dest) {
-            const exitId = await mapper.createRoomExit(areaId, room, {
+            if (alreadyMapped && sameArea(areaId, dest.area_id)) {
+                await planRoomConnection(areaId, room, dest.room_number, dir, mutation);
+            }
+            const fields: ExitArgs = {
                 from_direction,
                 to_area_id: dest.area_id,
                 to_room_number: dest.room_number,
@@ -649,26 +798,32 @@ async function linkOrStub(
                 is_locked: door?.locked,
                 command,
                 weight: 1,
-            });
+            };
+            const exitId = mutation
+                ? await mutation.createRoomExit(room, fields)
+                : await mapper.createRoomExit(areaId, room, fields);
             // Exits into unvisited rooms stay tracked: materialization may rebuild the
             // room in a different zone's area, and every tracked exit follows it there.
             if (isUnvisited(dest)) {
-                trackPending(destId, areaId, room, exitId, dir);
+                recordPendingTrack(pendingEffects, destId, areaId, room, exitId, dir);
             }
             return;
         }
     }
     // No identity (or the placeholder could not be minted): a dangling stub until the
     // far room is discovered.
-    const exitId = await mapper.createRoomExit(areaId, room, {
+    const fields: ExitArgs = {
         from_direction,
         is_closed: door?.closed,
         is_locked: door?.locked,
         command,
         weight: 1,
-    });
+    };
+    const exitId = mutation
+        ? await mutation.createRoomExit(room, fields)
+        : await mapper.createRoomExit(areaId, room, fields);
     if (destId !== null) {
-        trackPending(destId, areaId, room, exitId, dir);
+        recordPendingTrack(pendingEffects, destId, areaId, room, exitId, dir);
     }
 }
 
@@ -697,6 +852,9 @@ async function resolvePending(
                 && sameArea(exit.to_area_id, replacing.areaId)
                 && exit.to_room_number === replacing.room;
             if (exit.to_room_number !== null && !pointsAtReplaced) continue;
+            if (sameArea(waiter.areaId, areaId)) {
+                await planRoomConnection(waiter.areaId, waiter.room, room, waiter.dir);
+            }
             await relinkExit(waiter.areaId, waiter.room, exit, areaId, room);
         } catch {
             // Skip the casualty; the remaining waiters still deserve their links.
@@ -715,6 +873,7 @@ async function reconcileTraversal(
     dir: string,
     toAreaId: AreaId,
     toRoomNumber: RoomNumber,
+    topologyPlanned = false,
 ) {
     if (sameArea(prev.areaId, toAreaId) && prev.room === toRoomNumber) return;
     const prevRoom = mapper.getAreaById(prev.areaId).room(prev.room);
@@ -722,9 +881,15 @@ async function reconcileTraversal(
     const existing = exitFor(prevRoom, dir);
     if (existing) {
         if (existing.to_room_number === null && !exitIsPending(existing.id)) {
+            if (!topologyPlanned && sameArea(prev.areaId, toAreaId)) {
+                await planRoomConnection(prev.areaId, prev.room, toRoomNumber, dir);
+            }
             await relinkExit(prev.areaId, prev.room, existing, toAreaId, toRoomNumber);
         }
     } else {
+        if (!topologyPlanned && sameArea(prev.areaId, toAreaId)) {
+            await planRoomConnection(prev.areaId, prev.room, toRoomNumber, dir);
+        }
         await mapper.createRoomExit(prev.areaId, prev.room, {
             from_direction: EXIT_DIRECTION[dir] ?? "Special",
             to_area_id: toAreaId,
@@ -750,26 +915,43 @@ async function reconcileReportedExit(
     dir: string,
     destId: string | null,
     door?: DoorFix,
+    mutation?: AreaMutator,
+    planTopology = true,
+    pendingEffects?: PendingLinkEffect[],
 ) {
     const owner = mapper.getAreaById(areaId).room(roomNumber);
     const existing = owner ? exitFor(owner, dir) : undefined;
     if (!existing) {
-        await linkOrStub(areaId, roomNumber, dir, destId, door);
+        await linkOrStub(
+            areaId,
+            roomNumber,
+            dir,
+            destId,
+            door,
+            mutation,
+            pendingEffects,
+        );
         return;
     }
 
     if (destId === null) {
         if (door && (existing.is_closed !== door.closed || existing.is_locked !== door.locked)) {
-            await mapper.setRoomExit(areaId, roomNumber, existing.id, {
+            const fields: ExitUpdates = {
                 is_closed: door.closed,
                 is_locked: door.locked,
-            });
+            };
+            if (mutation) await mutation.setRoomExit(roomNumber, existing.id, fields);
+            else await mapper.setRoomExit(areaId, roomNumber, existing.id, fields);
         }
         return;
     }
 
-    const destination = mapper.findRoomByExternalId(destId)
-        ?? await createPlaceholder(areaId, roomNumber, dir, destId);
+    let destination = mapper.findRoomByExternalId(destId);
+    const alreadyMapped = destination !== undefined;
+    if (!destination && mutation) {
+        throw new Error(`destination ${destId} is unavailable for batched reconciliation`);
+    }
+    destination ??= await createPlaceholder(areaId, roomNumber, dir, destId);
     if (!destination) {
         if (!exitIsPending(existing.id)) {
             trackPending(destId, areaId, roomNumber, existing.id, dir);
@@ -783,23 +965,42 @@ async function reconcileReportedExit(
         && existing.to_room_number === destination.room_number;
     let exitId = existing.id;
     if (!alreadyLinked) {
-        dropPendingExit(existing.id);
+        if (planTopology && alreadyMapped && sameArea(areaId, destination.area_id)) {
+            await planRoomConnection(
+                areaId,
+                roomNumber,
+                destination.room_number,
+                dir,
+                mutation,
+            );
+        }
+        recordPendingDrop(pendingEffects, existing.id);
         exitId = await relinkExit(
             areaId,
             roomNumber,
             existing,
             destination.area_id,
             destination.room_number,
+            mutation,
         );
     }
     if (door && (existing.is_closed !== door.closed || existing.is_locked !== door.locked)) {
-        await mapper.setRoomExit(areaId, roomNumber, exitId, {
+        const fields: ExitUpdates = {
             is_closed: door.closed,
             is_locked: door.locked,
-        });
+        };
+        if (mutation) await mutation.setRoomExit(roomNumber, exitId, fields);
+        else await mapper.setRoomExit(areaId, roomNumber, exitId, fields);
     }
     if (isUnvisited(destination)) {
-        trackPending(destId, areaId, roomNumber, exitId, dir);
+        recordPendingTrack(
+            pendingEffects,
+            destId,
+            areaId,
+            roomNumber,
+            exitId,
+            dir,
+        );
     }
 }
 
@@ -820,6 +1021,9 @@ async function reconcileKnownRoom(room: Room, fix: RoomFix) {
             const at = placement(areaId, fix, null);
             if (room.x !== at.x || room.y !== at.y || room.level !== at.level) {
                 await mutation.updateRoom(roomNumber, at);
+            }
+            if (!propertyIsTrue(room.data(SERVER_COORDINATES_PROPERTY))) {
+                await mutation.setRoomProperty(roomNumber, SERVER_COORDINATES_PROPERTY, "true");
             }
         }
         if (fix.terrain && room.data("terrain") !== fix.terrain) {
@@ -857,6 +1061,11 @@ async function materialize(room: Room, fix: RoomFix, dir: string | null): Promis
             if (fix.coords) {
                 const at = placement(room.area_id, fix, null);
                 await mutation.updateRoom(room.room_number, { x: at.x, y: at.y, level: at.level });
+                await mutation.setRoomProperty(
+                    room.room_number,
+                    SERVER_COORDINATES_PROPERTY,
+                    "true",
+                );
             }
             await mutation.setRoomProperty(room.room_number, "unvisited", "");
         }, { description: "Materialize GMCP map placeholder" });
@@ -865,12 +1074,18 @@ async function materialize(room: Room, fix: RoomFix, dir: string | null): Promis
         return mapper.findRoomByExternalId(id) ?? room;
     }
     const at = placement(target, fix, dir);
-    const rebuilt = await mapper.createRoom(target, {
-        title: fix.name,
-        x: at.x,
-        y: at.y,
-        level: at.level,
-    });
+    let rebuilt!: RoomNumber;
+    await mapper.mutateArea(target, async (mutation) => {
+        rebuilt = await mutation.createRoom({
+            title: fix.name,
+            x: at.x,
+            y: at.y,
+            level: at.level,
+        });
+        if (fix.coords) {
+            await mutation.setRoomProperty(rebuilt, SERVER_COORDINATES_PROPERTY, "true");
+        }
+    }, { description: "Relocate GMCP map placeholder" });
     await resolvePending(id, target, rebuilt, { areaId: room.area_id, room: room.room_number });
     await mapper.deleteRoom(room.area_id, room.room_number);
     await mapper.setRoomExternalId(target, rebuilt, id);
@@ -893,9 +1108,16 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
     let areaId = await zoneArea(fix.zone);
 
     let room: RoomNumber | null = null;
+    let topologyPlanned = false;
     for (let attempt = 0; attempt < 2 && room === null; attempt += 1) {
         try {
-            const at = placement(areaId, fix, placementDir);
+            const source = !fix.coords && placementDir && lastRoom && sameArea(lastRoom.areaId, areaId)
+                ? mapper.getAreaById(areaId).room(lastRoom.room)
+                : null;
+            const planned = source && placementDir
+                ? await planRoomAddition(areaId, source.room_number, placementDir)
+                : null;
+            const at = planned?.position ?? placement(areaId, fix, placementDir);
             const params: CreateRoomParams = {
                 title: fix.name,
                 externalId: fix.id,
@@ -906,11 +1128,16 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
             const color = fix.terrain ? TERRAIN_COLORS[fix.terrain.toLowerCase()] : undefined;
             if (color) params.color = color;
             await mapper.mutateArea(areaId, async (mutation) => {
+                if (planned) await applyLayoutMoves(areaId, planned.result, mutation);
                 room = await mutation.createRoom(params);
                 if (fix.terrain) {
                     await mutation.setRoomProperty(room, "terrain", fix.terrain);
                 }
+                if (fix.coords) {
+                    await mutation.setRoomProperty(room, SERVER_COORDINATES_PROPERTY, "true");
+                }
             }, { description: "Create GMCP map room" });
+            topologyPlanned = planned !== null;
         } catch (err) {
             // The draft number resolves before submission, so a failed submit
             // leaves `room` pointing at a room that never existed; clear it or
@@ -919,10 +1146,10 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
             if (attempt === 1) throw err;
             // The bound map refused the write: an adopted map we cannot write (a
             // read-only share), or an area deleted mid-session. Detach it for good and
-            // fall back to a fresh session area so mapping continues.
+            // fall back to a fresh local area so mapping continues durably.
             rejectedAreas.push(areaId);
             zoneAreas.delete(zoneKey(fix.zone));
-            echo(`[auto-mapper] the map for zone "${(fix.zone ?? FALLBACK_ZONE).trim() || FALLBACK_ZONE}" is not writable - continuing in a session map.`);
+            echo(`[auto-mapper] the map for zone "${(fix.zone ?? FALLBACK_ZONE).trim() || FALLBACK_ZONE}" is not writable - continuing in a new local map.`);
             areaId = await zoneArea(fix.zone);
         }
     }
@@ -941,7 +1168,7 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
     // When the walk was attributed by an observed command rather than exit ids, the
     // command is the only evidence connecting the previous room to this one.
     if (movementDir && lastRoom) {
-        await reconcileTraversal(lastRoom, movementDir, areaId, room);
+        await reconcileTraversal(lastRoom, movementDir, areaId, room, topologyPlanned);
     }
     mapper.setCurrentLocation(areaId, room);
     lastRoom = { areaId, room, fix };
@@ -1011,6 +1238,11 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
                     };
                     const roomNumber = await mutation.createRoom(params);
                     await mutation.setRoomProperty(roomNumber, "unvisited", "true");
+                    await mutation.setRoomProperty(
+                        roomNumber,
+                        SERVER_COORDINATES_PROPERTY,
+                        "true",
+                    );
                     if (reported.terrain) {
                         await mutation.setRoomProperty(roomNumber, "terrain", reported.terrain);
                     }
@@ -1019,6 +1251,13 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
 
                 if (room.level === level && (room.x !== x || room.y !== y)) {
                     await mutation.updateRoom(room.room_number, { x, y });
+                }
+                if (!propertyIsTrue(room.data(SERVER_COORDINATES_PROPERTY))) {
+                    await mutation.setRoomProperty(
+                        room.room_number,
+                        SERVER_COORDINATES_PROPERTY,
+                        "true",
+                    );
                 }
                 if (isUnvisited(room) && reported.terrain) {
                     await mutation.setRoomProperty(room.room_number, "terrain", reported.terrain);
@@ -1053,12 +1292,60 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
         }
     }
 
-    // All rooms now exist, so same-update exits can link directly instead of becoming stubs.
+    // All rooms now exist, so same-update exits can link directly instead of becoming
+    // stubs. Group topology by owning area: the host applies reciprocal CreateExit
+    // operations sequentially inside one envelope, so they auto-pair onto one Connection
+    // without one durable acknowledgement per advertised direction. A failed batch is
+    // retried link-by-link against the refreshed host snapshot, preserving the generic
+    // mapper's unusual/cross-area fallback behavior.
+    const exitGroups = new Map<string, {
+        areaId: AreaId;
+        work: { roomNumber: RoomNumber; dir: string; dest: string | null }[];
+    }>();
     for (const reported of fix.rooms) {
         const room = mapper.findRoomByExternalId(reported.id);
         if (!room) continue;
         for (const [dir, dest] of Object.entries(reported.exits)) {
-            await reconcileReportedExit(room.area_id, room.room_number, dir, dest);
+            const key = `${room.area_id[0]}:${room.area_id[1]}`;
+            const group = exitGroups.get(key) ?? { areaId: room.area_id, work: [] };
+            group.work.push({ roomNumber: room.room_number, dir, dest });
+            exitGroups.set(key, group);
+        }
+    }
+    for (const group of exitGroups.values()) {
+        const pendingEffects: PendingLinkEffect[] = [];
+        try {
+            await mapper.mutateArea(group.areaId, async (mutation) => {
+                for (const item of group.work) {
+                    // Room.Map coordinates are authoritative and all affected rooms were
+                    // locked above, so per-edge map-layout planning would only repeat the
+                    // same no-move analysis. The room batch has already placed them.
+                    await reconcileReportedExit(
+                        group.areaId,
+                        item.roomNumber,
+                        item.dir,
+                        item.dest,
+                        undefined,
+                        mutation,
+                        false,
+                        pendingEffects,
+                    );
+                }
+            }, { description: "Apply GMCP neighborhood exits" });
+            applyPendingEffects(pendingEffects);
+        } catch {
+            for (const item of group.work) {
+                try {
+                    await reconcileReportedExit(
+                        group.areaId,
+                        item.roomNumber,
+                        item.dir,
+                        item.dest,
+                    );
+                } catch (err) {
+                    warnUnwritable(group.areaId, err);
+                }
+            }
         }
     }
 }
@@ -1120,9 +1407,32 @@ async function handleFix(fix: RoomFix | null, fixAt: number): Promise<void> {
     }
 }
 
-function enqueue(task: () => Promise<void>) {
+function appendQueue(task: () => Promise<void>) {
     queue = queue.then(task).catch((err) => {
         echo(`[auto-mapper] ${err}`);
+    });
+}
+
+function enqueue(task: () => Promise<void>) {
+    // Do not coalesce Room.Map snapshots across an intervening Room.Info, storage move,
+    // or other ordered mapper task: arrival order can carry movement meaning.
+    coalescibleNeighborhood = null;
+    appendQueue(task);
+}
+
+function enqueueNeighborhood(fix: NeighborhoodFix | null) {
+    if (!fix) return;
+    if (coalescibleNeighborhood?.fix.centerId === fix.centerId) {
+        // Same center and no intervening task: only the newest unprocessed geometry is
+        // useful (door/overlay churn can republish the same neighborhood repeatedly).
+        coalescibleNeighborhood.fix = fix;
+        return;
+    }
+    const slot = { fix };
+    coalescibleNeighborhood = slot;
+    appendQueue(async () => {
+        if (coalescibleNeighborhood === slot) coalescibleNeighborhood = null;
+        await handleNeighborhood(slot.fix);
     });
 }
 
@@ -1131,27 +1441,28 @@ function enqueue(task: () => Promise<void>) {
 // ---------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------
-// savemap: promote session areas to local/cloud maps and keep mapping into them.
-// Runs THROUGH the fix queue: promoting an area out from under an in-flight room
-// creation would race it.
+// savemap: retain the legacy session-map promotion path and allow durable local maps to
+// move to cloud storage. Runs THROUGH the fix queue: relocating an area out from under an
+// in-flight room creation would race it.
 // ---------------------------------------------------------------------------------------
 
 async function doSavemap(storage: "local" | "cloud", zone: string | undefined) {
     const filter = zone ? zoneKey(zone) : null;
-    // Only session maps need promotion: a zone bound to an adopted saved map is already
-    // durable, and "promoting" it would duplicate the map and delete the original.
+    // Local is already the auto-mapper's durable default. A cloud request can move local
+    // zones, while the local form exists only to rescue a legacy session map.
     const chosen = [...zoneAreas.entries()].filter(([key, areaId]) => {
         if (filter !== null && key !== filter) return false;
         try {
-            return mapper.getAreaById(areaId).storage === "session";
+            const current = mapper.getAreaById(areaId).storage;
+            return current === "session" || (storage === "cloud" && current === "local");
         } catch {
             return false;
         }
     });
     if (chosen.length === 0) {
         echo(filter === null
-            ? "[auto-mapper] nothing mapped this session yet."
-            : `[auto-mapper] no session map for "${zone}".`);
+            ? `[auto-mapper] all mapped zones are already saved${storage === "cloud" ? " to cloud" : " locally"}.`
+            : `[auto-mapper] "${zone}" is already saved${storage === "cloud" ? " to cloud" : " locally"}.`);
         return;
     }
     const moved = await mapper.moveAreas(
@@ -1187,7 +1498,7 @@ async function doSavemap(storage: "local" | "cloud", zone: string | undefined) {
     if (lastRoom && chosen.some(([, areaId]) => sameArea(areaId, lastRoom!.areaId))) {
         lastRoom = null;
     }
-    echo(`[auto-mapper] saved ${destinationIds.length} map(s) to ${storage}.`);
+    echo(`[auto-mapper] moved ${destinationIds.length} map(s) to ${storage}.`);
 }
 
 function start() {
@@ -1198,7 +1509,7 @@ function start() {
         () => {},
     );
 
-    echo("[auto-mapper] active - mapping structured room data into session maps (savemap to keep).");
+    echo("[auto-mapper] active - mapping structured room data into durable local maps.");
 
     // Fixes are timestamped at ARRIVAL (the watch delivery), not at processing: handling
     // may lag on the maps-loaded barrier or a creation burst.
@@ -1208,7 +1519,7 @@ function start() {
     });
     if (roomMapAdapter) {
         gmcp.watch("Room.Map", (map: unknown) => {
-            enqueue(() => handleNeighborhood(roomMapAdapter(map)));
+            enqueueNeighborhood(roomMapAdapter(map));
         });
     }
     if (includeMsdp) {
@@ -1253,5 +1564,9 @@ function start() {
     });
 }
 
-return { start };
+function upgradeToCloud(zone?: string) {
+    enqueue(() => doSavemap("cloud", zone?.trim() || undefined));
+}
+
+return { start, upgradeToCloud };
 }
