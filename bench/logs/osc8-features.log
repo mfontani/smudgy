@@ -104,6 +104,10 @@ SUPPORTED SMUDGY EXTENSION: Mudlet currently displays embedded ANSI escapes lite
 46 KNOWN GAP no user-facing master OSC hyperlink off switch.
 47 KNOWN GAP NEW-ENVIRON INFO change notifications are not emitted.
 
+48 MUDLET-PARSE-ORDER ]8;;https://www.example.com?%63%6F%6E%66%69%67=%7B%22tooltip%22%3A%22THIS-SHOULD-BE-URL-DATA%22%7D\Example link]8;;\
+X ]8;;https://example.com/?%63%6F%6E%66%69%67=value\Encoded config]8;;\
+Y ]8;;https://api.game.com/?%70%72%65%73%65%74=normal\Encoded preset]8;;\
+
 ==================== SCRIPT-CREATED COMPANION QA ====================
 These examples are source text, not executable OSC sequences. Run them in a script
 or adapt them to line.replace(...) while viewing this fixture:
