@@ -4,12 +4,16 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::StreamExt;
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, ExitDirection, LocalBackend,
-    Mapper, MapperBackend, PackageApiClient,
+    Area, AreaId, AreaUpdates, AreaWithDetails, CloudResult, CompositeBackend, CreateAreaRequest,
+    Credential, CredentialSource, ExitDirection, LocalBackend, MapStorage, Mapper, MapperBackend,
+    PackageApiClient,
+    mutation::{MutationEnvelope, MutationResult},
 };
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
@@ -18,6 +22,70 @@ use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams,
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
 const SERVER: &str = "RopMapperTest";
+
+/// A deterministic tier stand-in: CompositeBackend determines the public storage tier
+/// from routing membership, while this backend persists acknowledged bytes in a temporary
+/// LocalBackend and counts envelopes so the package test can exercise relocation without HTTP.
+struct TestTierBackend {
+    inner: LocalBackend,
+    storage: MapStorage,
+    mutations: AtomicUsize,
+}
+
+impl TestTierBackend {
+    fn new(path: impl Into<std::path::PathBuf>, storage: MapStorage) -> Self {
+        Self {
+            inner: LocalBackend::new(path),
+            storage,
+            mutations: AtomicUsize::new(0),
+        }
+    }
+
+    fn mutation_count(&self) -> usize {
+        self.mutations.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl MapperBackend for TestTierBackend {
+    async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
+        self.inner.create_area(request).await
+    }
+
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        assert_eq!(storage, self.storage);
+        self.inner.create_area(request).await
+    }
+
+    async fn list_areas(&self) -> CloudResult<Vec<Area>> {
+        self.inner.list_areas().await
+    }
+
+    async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
+        self.inner.get_area(area_id).await
+    }
+
+    async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
+        self.inner.update_area(area_id, updates).await
+    }
+
+    async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
+        self.inner.delete_area(area_id).await
+    }
+
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        self.mutations.fetch_add(1, Ordering::Relaxed);
+        self.inner.execute_mutation(area_id, envelope).await
+    }
+}
 
 fn copy_package(server: &str, name: &str) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -50,6 +118,19 @@ fn localize_rop_dependency(server: &str) {
         )
         .unwrap();
     }
+
+    let auto_mapper = packages_dir(server)
+        .expect("packages dir")
+        .join("auto-mapper");
+    for name in ["engine.ts", "smudgy.package.json"] {
+        let path = auto_mapper.join(name);
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            path,
+            source.replace("smudgy://kapusniak/map-layout", "smudgy://local/map-layout"),
+        )
+        .unwrap();
+    }
 }
 
 fn gmcp(name: &str, data: &str) -> RuntimeAction {
@@ -77,6 +158,7 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).unwrap();
+    copy_package(SERVER, "map-layout");
     copy_package(SERVER, "auto-mapper");
     copy_package(SERVER, "rop-mapper");
     localize_rop_dependency(SERVER);
@@ -84,13 +166,16 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
         .unwrap();
 
     let map_root = smudgy_home.join("map-test");
-    let local = Arc::new(LocalBackend::new(map_root.join("local")));
-    let cloud = Arc::new(CloudMapper::new(
-        "http://127.0.0.1:0".to_string(),
-        "test-key".to_string(),
+    let local = Arc::new(TestTierBackend::new(
+        map_root.join("local"),
+        MapStorage::Local,
+    ));
+    let cloud = Arc::new(TestTierBackend::new(
+        map_root.join("cloud"),
+        MapStorage::Cloud,
     ));
     let backend: Arc<dyn MapperBackend + Send + Sync> =
-        Arc::new(CompositeBackend::new(local, cloud));
+        Arc::new(CompositeBackend::new(local.clone(), cloud));
     let mapper = Mapper::new(backend, map_root.join("cache"));
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9350_u32),
@@ -134,6 +219,14 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
              } }"#,
     ))
     .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let mutations_before_room_map = local.mutation_count();
+
     tx.send(gmcp(
         "Room.Map",
         r#"{ "px": 10, "py": 10, "rooms": [
@@ -145,6 +238,17 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
             ] }"#,
     ))
     .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    assert_eq!(
+        local.mutation_count() - mutations_before_room_map,
+        2,
+        "Room.Map commits one room/property envelope and one same-area topology envelope"
+    );
 
     // The north command is refused without a Room.Info acknowledgement. The following
     // east move must still resolve east from server ids, never as a north traversal.
@@ -160,6 +264,42 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     ))
     .unwrap();
 
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+
+    let local_atlas = mapper.get_current_atlas();
+    let (local_key, _) = local_atlas
+        .find_room_by_external_id("5539")
+        .expect("center room mapped into the initial local area");
+    assert_eq!(
+        mapper.area_storage(&local_key.area_id),
+        MapStorage::Local,
+        "RoP mapping begins in durable local storage"
+    );
+
+    tx.send(RuntimeAction::Send(Arc::new("ropmap upgrade".to_string())))
+        .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+
+    // A post-upgrade revisit must write through the rebound cloud area, proving the
+    // mapper did not retain its deleted local-area handle after relocation.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 5539, "name": "The Bishop's Private Room (cloud)",
+             "zone": "Rites of Passage", "terrain": "inside",
+             "exits": {
+                 "n": { "v": 5540, "door": 0 },
+                 "e": { "v": 5541, "door": 2 }
+             } }"#,
+    ))
+    .unwrap();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             collect(&updates, &mut lines);
@@ -189,6 +329,16 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
         panic!("unconnected Room.Map room provisioned; transcript:\n{transcript}")
     });
     let area = atlas.get_area(&key5539.area_id).expect("RoP area");
+    assert_eq!(
+        mapper.area_storage(&key5539.area_id),
+        MapStorage::Cloud,
+        "ropmap upgrade moves the bound local map into cloud storage"
+    );
+    assert_eq!(
+        room5539.get_title(),
+        "The Bishop's Private Room (cloud)",
+        "mapping continues with cloud autosave after the upgrade"
+    );
     assert_eq!(
         area.room_count(),
         5,

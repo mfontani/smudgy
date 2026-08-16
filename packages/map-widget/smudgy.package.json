@@ -1,5 +1,5 @@
 {
-  "version": "0.0.3",
+  "version": "0.0.5",
   "description": "Adds a simple, configurable map pane to a Smudgy session.",
   "entry": "index.tsx",
   "min_smudgy_version": "0.5.0",
@@ -68,7 +68,8 @@
         "create"
       ],
       "interop": [
-        "read"
+        "read",
+        "write"
       ],
       "panes": [
         "create"
