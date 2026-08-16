@@ -27,7 +27,13 @@ import {
   isAuctioneer,
 } from "./comms-format.ts";
 import { RawCommLogger } from "./comms-log.ts";
-import { chatFontSize, chatRendering, widgetMetric, widgetTextSize } from "./config.ts";
+import {
+  chatFontSize,
+  chatRendering,
+  separateChatMessages,
+  widgetMetric,
+  widgetTextSize,
+} from "./config.ts";
 import * as codex from "./codex.tsx";
 import { fragmentsFromStyleSpans } from "./line-style.ts";
 import {
@@ -218,7 +224,7 @@ function visible(message: Message): boolean {
 
 function append(message: Message): void {
   if (!visible(message) || !pane) return;
-  pane.echo("");
+  if (separateChatMessages) pane.echo("");
   pane.echo(renderMessage(message));
 }
 

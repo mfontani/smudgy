@@ -50,6 +50,9 @@ export const panelVisibility: Readonly<Record<PanelKey, boolean>> = {
 /** Terminal scrollback size for the Comms pane. */
 export const chatFontSize = numberParam("chatFontSize", 12);
 
+/** Whether Comms leaves an empty terminal line before each chat message. */
+export const separateChatMessages = boolParam("separateChatMessages", true);
+
 /** Baseline used to scale the package's existing widget type hierarchy. */
 export const widgetFontSize = numberParam("widgetFontSize", DEFAULT_WIDGET_FONT_SIZE);
 
