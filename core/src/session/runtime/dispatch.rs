@@ -200,6 +200,15 @@ impl Inner<'_> {
         action: RuntimeAction,
     ) -> Result<ActionResult, anyhow::Error> {
         match action {
+            RuntimeAction::SyncUserAutomations => {
+                let desired = crate::session::config::load_user_automations(self.server_name);
+                let actions = crate::session::config::reconcile_automation_actions(
+                    &self.user_automations,
+                    &desired,
+                );
+                self.user_automations = desired;
+                Ok(ActionResult::Run(actions))
+            }
             RuntimeAction::RemoteStoreFlushed {
                 source,
                 published,

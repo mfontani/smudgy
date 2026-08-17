@@ -346,7 +346,7 @@ impl AutomationsWindow {
         if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
             return warn_none(crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()));
         }
-        Update::with_event(Event::ScriptsChanged {
+        Update::with_event(Event::UserAutomationsChanged {
             server_name: self.server_name.clone(),
         })
     }
@@ -479,7 +479,7 @@ impl AutomationsWindow {
         let toast = self.show_toast(crate::i18n::t!("editor-saved", "name" => name));
         Update::new(
             toast,
-            Some(Event::ScriptsChanged {
+            Some(Event::UserAutomationsChanged {
                 server_name: self.server_name.clone(),
             }),
         )
@@ -534,7 +534,7 @@ impl AutomationsWindow {
         let toast = self.show_toast(crate::i18n::t!("editor-deleted", "name" => original));
         Update::new(
             toast,
-            Some(Event::ScriptsChanged {
+            Some(Event::UserAutomationsChanged {
                 server_name: self.server_name.clone(),
             }),
         )
@@ -612,7 +612,7 @@ impl AutomationsWindow {
                 });
                 Update::new(
                     Task_batch_reload(self),
-                    Some(Event::ScriptsChanged {
+                    Some(Event::UserAutomationsChanged {
                         server_name: self.server_name.clone(),
                     }),
                 )
@@ -649,7 +649,7 @@ impl AutomationsWindow {
         self.pane = Pane::Dashboard;
         Update::new(
             Task_batch_reload(self),
-            Some(Event::ScriptsChanged {
+            Some(Event::UserAutomationsChanged {
                 server_name: self.server_name.clone(),
             }),
         )

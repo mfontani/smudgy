@@ -2617,6 +2617,22 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     .map_message(move |msg| Message::AutomationsWindowMessage(id, msg));
 
                 match update.event {
+                    Some(AutomationsWindowEvent::UserAutomationsChanged { server_name }) => {
+                        let sync_tasks = smudgy
+                            .sessions
+                            .iter()
+                            .filter(|(_, session)| {
+                                session.server_name.as_str() == server_name.as_str()
+                            })
+                            .map(|(session_id, _)| {
+                                Task::done(Message::SessionAction(
+                                    session_id,
+                                    session_store::Message::SyncUserAutomations,
+                                ))
+                            });
+
+                        Task::batch([update.task, Task::batch(sync_tasks)])
+                    }
                     Some(AutomationsWindowEvent::ScriptsChanged { server_name }) => {
                         let reload_tasks = smudgy
                             .sessions

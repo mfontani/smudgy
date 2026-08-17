@@ -574,6 +574,7 @@ impl Runtime {
                 log_enabled: settings.logging.enabled,
                 last_log_flush: Instant::now(),
                 session_id,
+                user_automations: crate::session::config::UserAutomations::default(),
                 trigger_manager,
                 hotkeys: BTreeMap::new(),
                 next_hotkey_id: HotkeyId(0),
@@ -876,6 +877,7 @@ impl Runtime {
                     log_enabled: settings.logging.enabled,
                     last_log_flush: Instant::now(),
                     session_id,
+                    user_automations: crate::session::config::UserAutomations::default(),
                     trigger_manager: new_trigger_manager,
                     hotkeys: BTreeMap::new(), // Reset hotkeys - they'll be re-registered by modules
                     next_hotkey_id: HotkeyId(0),
@@ -1014,6 +1016,7 @@ impl Runtime {
 
 struct Inner<'a> {
     session_id: SessionId,
+    user_automations: crate::session::config::UserAutomations,
     trigger_manager: trigger::Manager,
     script_engine: ScriptEngine<'a>,
     server_name: &'a Arc<String>,
