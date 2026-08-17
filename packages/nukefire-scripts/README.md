@@ -36,5 +36,19 @@ multi-session controls. Reopen it at any time with `nf welcome`.
 | Command | Action |
 | --- | --- |
 | `nf help` | Show the NukeFire Scripts utility and routing reference. |
+| `nf find <name or VNUM>` | Find mapped rooms and show clickable routes from the current room. |
+| `nf run <name, VNUM, or death> [commands]` | Walk to a mapped room, then run optional semicolon-separated commands. |
+| `nf death` | Show the last death room and a clickable route back. |
+| `nf path <FROM> <TO>` | Show a route between mapped rooms and publish it as `nfPath.commands`. |
 | `nf welcome` | Reopen the welcome and multi-session guide. |
 | `nf reflow` | Thoroughly reflow the current area across multiple violation-prioritized anchors. |
+
+Quote room names containing spaces in `run` and `path`. Routes use learned map
+topology and special-exit commands, but intentionally do not open doors or
+avoid hazardous rooms.
+
+Examples:
+
+- `nf find the temple of technology`
+- `nf run 3001 look north;look south`
+- `nf path "Central Plaza" "The Spaceport"`

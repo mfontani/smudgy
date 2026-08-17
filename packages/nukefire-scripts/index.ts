@@ -35,3 +35,4 @@ startPanes();
 export { panesOpen } from "./panes.ts";
 export { hudMeta } from "./hud.tsx";
 export { radarScene } from "./radar.tsx";
+export { lastDeath, nfPath } from "./commands.ts";
