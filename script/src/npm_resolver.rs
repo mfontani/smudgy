@@ -819,10 +819,14 @@ mod tests {
         // and the props map; this one fails if the resolve/merge of
         // member_reexports ever regresses to a wholesale re-export.
         let temp = tempfile::tempdir().unwrap();
-        let (services, _node_services) = SmudgyNpmServices::new(temp.path().to_path_buf()).unwrap();
+        // `NpmCacheDir` canonicalizes its root. macOS exposes temporary paths through
+        // `/var` while canonicalization resolves them through `/private/var`, so build
+        // every fixture path from the same canonical data directory.
+        let data_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let (services, _node_services) = SmudgyNpmServices::new(data_dir.clone()).unwrap();
         // Under the npm cache root, so both files classify as npm-package CJS
         // and recursive analysis may read them directly.
-        let pkg_dir = temp.path().join("npm").join("wrapper-pkg");
+        let pkg_dir = data_dir.join("npm").join("wrapper-pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("package.json"),
@@ -847,6 +851,10 @@ mod tests {
         .unwrap();
 
         let entry = deno_core::url::Url::from_file_path(pkg_dir.join("index.js")).unwrap();
+        assert!(
+            services.is_npm_package_specifier(&entry),
+            "fixture entry must be recognized beneath the canonical npm cache root"
+        );
         let (module_type, source) = services.load_npm_module(&entry, None).await.unwrap();
         assert!(matches!(module_type, deno_core::ModuleType::JavaScript));
         assert!(
@@ -974,8 +982,11 @@ mod tests {
         // test above covers the same policy one layer down; this one drives the
         // real `SmudgyNpmServices` call site end to end.
         let temp = tempfile::tempdir().unwrap();
-        let (services, _node_services) = SmudgyNpmServices::new(temp.path().to_path_buf()).unwrap();
-        let pkg_dir = temp.path().join("npm").join("escapist-pkg");
+        // Keep the fixture URL and `NpmCacheDir`'s canonical root in the same namespace
+        // (`/private/var`, rather than the `/var` alias, on macOS).
+        let data_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let (services, _node_services) = SmudgyNpmServices::new(data_dir.clone()).unwrap();
+        let pkg_dir = data_dir.join("npm").join("escapist-pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("package.json"),
@@ -990,12 +1001,16 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            temp.path().join("outside.js"),
+            data_dir.join("outside.js"),
             "exports.leakedOutside = function () {};\n",
         )
         .unwrap();
 
         let entry = deno_core::url::Url::from_file_path(pkg_dir.join("index.js")).unwrap();
+        assert!(
+            services.is_npm_package_specifier(&entry),
+            "fixture entry must be recognized beneath the canonical npm cache root"
+        );
         let (module_type, source) = services
             .load_npm_module(&entry, None)
             .await
