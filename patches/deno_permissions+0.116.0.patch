@@ -1,0 +1,130 @@
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -1797,6 +1797,7 @@ pub enum SubdomainWildcards {
+ 
+ #[derive(Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
+ pub enum Host {
++  Any,
+   Fqdn(FQDN),
+   FqdnWithSubdomainWildcard(FQDN),
+   Ip(IpAddr),
+@@ -1847,6 +1848,10 @@ impl Host {
+     s: &str,
+     subdomain_wildcards: SubdomainWildcards,
+   ) -> Result<Self, HostParseError> {
++    if matches!(subdomain_wildcards, SubdomainWildcards::Enabled) && s == "*" {
++      return Ok(Host::Any);
++    }
++
+     if s.starts_with('[') && s.ends_with(']') {
+       let ip_str = &s[1..s.len() - 1];
+       let ip = strip_ipv6_zone_index(ip_str)
+@@ -1952,6 +1957,13 @@ impl QueryDescriptor for NetDescriptor {
+       return false;
+     }
+     match (&other.0, &self.0) {
++      (
++        Host::Any,
++        Host::Any
++        | Host::Fqdn(_)
++        | Host::FqdnWithSubdomainWildcard(_)
++        | Host::Ip(_),
++      ) => true,
+       (Host::Fqdn(a), Host::Fqdn(b)) => a == b,
+       (Host::FqdnWithSubdomainWildcard(a), Host::Fqdn(b)) => {
+         b.is_subdomain_of(a)
+@@ -2202,6 +2214,7 @@ impl fmt::Display for NetDescriptor {
+ impl fmt::Display for NetDescriptor {
+   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     match &self.0 {
++      Host::Any => write!(f, "*"),
+       Host::Fqdn(fqdn) => write!(f, "{fqdn}"),
+       Host::FqdnWithSubdomainWildcard(fqdn) => write!(f, "*.{fqdn}"),
+       Host::IpSubnet(ip_subnet) => write!(f, "{ip_subnet}"),
+@@ -8003,6 +8017,7 @@ mod tests {
+   #[test]
+   fn test_host_parse_for_list() {
+     let hosts = &[
++      ("*", Some(Host::Any)),
+       ("deno.land", Some(Host::Fqdn(fqdn!("deno.land")))),
+       (
+         "*.deno.land",
+@@ -8111,6 +8126,8 @@ mod tests {
+   #[test]
+   fn test_net_descriptor_parse_for_list() {
+     let cases = &[
++      ("*", Some(NetDescriptor(Host::Any, None))),
++      ("*:443", Some(NetDescriptor(Host::Any, Some(443)))),
+       (
+         "deno.land",
+         Some(NetDescriptor(Host::Fqdn(fqdn!("deno.land")), None)),
+@@ -8195,6 +8212,11 @@ mod tests {
+           None,
+         )),
+       ),
++      #[cfg(unix)]
++      (
++        "vsock:2:1234",
++        Some(NetDescriptor(Host::Vsock(2), Some(1234))),
++      ),
+       ("unix:", None),
+       ("unix:relative.sock", None),
+     ];
+@@ -8207,6 +8231,56 @@ mod tests {
+     }
+   }
+ 
++  #[test]
++  fn test_any_host_is_host_scoped_and_local_transports_are_exact() {
++    let any = NetDescriptor(Host::Any, None);
++    let any_443 = NetDescriptor(Host::Any, Some(443));
++    let dns_443 = NetDescriptor(Host::must_parse("deno.land"), Some(443));
++    let ipv4_80 = NetDescriptor(
++      Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
++      Some(80),
++    );
++    let ipv6_443 = NetDescriptor(
++      Host::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
++      Some(443),
++    );
++    let subnet = NetDescriptor(
++      Host::IpSubnet("127.0.0.0/8".parse().unwrap()),
++      None,
++    );
++    let vsock = NetDescriptor(Host::Vsock(2), Some(1234));
++    let other_vsock = NetDescriptor(Host::Vsock(3), Some(1234));
++    let unix = NetDescriptor(
++      Host::UnixSocket(PathBuf::from("/var/run/example.sock")),
++      None,
++    );
++    let other_unix = NetDescriptor(
++      Host::UnixSocket(PathBuf::from("/var/run/other.sock")),
++      None,
++    );
++
++    assert!(dns_443.matches_allow(&any));
++    assert!(ipv4_80.matches_allow(&any));
++    assert!(ipv6_443.matches_allow(&any));
++    assert!(any.matches_allow(&any));
++    assert!(dns_443.matches_allow(&any_443));
++    assert!(ipv6_443.matches_allow(&any_443));
++    assert!(!ipv4_80.matches_allow(&any_443));
++
++    assert!(!subnet.matches_allow(&any));
++    assert!(!vsock.matches_allow(&any));
++    assert!(!unix.matches_allow(&any));
++    assert!(vsock.matches_allow(&vsock));
++    assert!(!vsock.matches_allow(&other_vsock));
++    assert!(unix.matches_allow(&unix));
++    assert!(!unix.matches_allow(&other_unix));
++
++    assert_eq!(any.to_string(), "*");
++    assert_eq!(any_443.to_string(), "*:443");
++    assert_eq!(vsock.to_string(), "vsock:2:1234");
++    assert_eq!(unix.to_string(), "unix:/var/run/example.sock");
++  }
++
+   #[test]
+   fn test_denies_run_name() {
+     let cases = [

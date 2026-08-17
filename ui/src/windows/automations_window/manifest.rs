@@ -24,8 +24,8 @@ use iced::{Length, Padding};
 
 use smudgy_core::models::local_packages;
 use smudgy_core::models::shared_packages::{
-    ImportPolicy, PackageManifest, PackageParameter, PackagePermissions, ParamKind, ParamOption,
-    SmudgyCapabilities, running_smudgy_release,
+    ImportPolicy, NetEntryKind, PackageManifest, PackageParameter, PackagePermissions, ParamKind,
+    ParamOption, SmudgyCapabilities, net_entry_kind, running_smudgy_release,
 };
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -985,7 +985,8 @@ impl AutomationsWindow {
             local_packages::write_local_file(&self.server_name, &name, "smudgy.package.json", &json)
         {
             if let Some(draft) = self.manifest_draft.as_mut() {
-                draft.error = Some(crate::i18n::t!("manifest-save-failed", "error" => e.to_string()));
+                draft.error =
+                    Some(crate::i18n::t!("manifest-save-failed", "error" => e.to_string()));
             }
             return Update::none();
         }
@@ -1106,10 +1107,13 @@ impl AutomationsWindow {
         // Identity / entry (pinned above the tabs).
         body = body.push(field_row(
             crate::i18n::ts!("manifest-version"),
-            text_input(crate::i18n::ts!("manifest-version-placeholder"), &draft.version)
-                .on_input(|v| Message::EditManifest(ManifestEdit::Version(v)))
-                .size(14.0)
-                .into(),
+            text_input(
+                crate::i18n::ts!("manifest-version-placeholder"),
+                &draft.version,
+            )
+            .on_input(|v| Message::EditManifest(ManifestEdit::Version(v)))
+            .size(14.0)
+            .into(),
         ));
         if !draft.version.trim().is_empty() && semver::Version::parse(draft.version.trim()).is_err()
         {
@@ -1199,7 +1203,11 @@ impl AutomationsWindow {
         if self.manifest_dirty {
             bar = bar
                 .push(text("\u{25CF}").size(9.0).style(common::accent))
-                .push(text(crate::i18n::t!("manifest-unsaved")).size(13.0).style(common::muted));
+                .push(
+                    text(crate::i18n::t!("manifest-unsaved"))
+                        .size(13.0)
+                        .style(common::muted),
+                );
         }
         bar = bar.push(iced::widget::space::horizontal());
         bar = bar.push(
@@ -1383,7 +1391,10 @@ fn ro_value_list<'a>(items: &[String], empty: &str, mono: bool) -> Elem<'a> {
 /// and a non-secret default).
 fn ro_params<'a>(params: &[PackageParameter]) -> Elem<'a> {
     if params.is_empty() {
-        return text(crate::i18n::t!("manifest-none")).size(13.0).style(common::faint).into();
+        return text(crate::i18n::t!("manifest-none"))
+            .size(13.0)
+            .style(common::faint)
+            .into();
     }
     let mut col = Column::new().spacing(4.0);
     for param in params {
@@ -1438,7 +1449,9 @@ fn kind_summary(param: &PackageParameter) -> String {
             let element = param
                 .fields
                 .first()
-                .map_or(crate::i18n::ts!("manifest-kind-text"), |f| kind_word(f.kind));
+                .map_or(crate::i18n::ts!("manifest-kind-text"), |f| {
+                    kind_word(f.kind)
+                });
             crate::i18n::t!("manifest-kind-list-summary", "kind" => element)
         }
         ParamKind::Table => {
@@ -1522,7 +1535,10 @@ fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<String> {
         out.push(cap_summary("on / get / watch", "manifest-cap-interop-read"));
     }
     if caps.interop_broadcast {
-        out.push(cap_summary("BroadcastChannel", "manifest-cap-interop-broadcast"));
+        out.push(cap_summary(
+            "BroadcastChannel",
+            "manifest-cap-interop-broadcast",
+        ));
     }
     if caps.panes {
         out.push(cap_summary("pane", "manifest-cap-panes"));
@@ -1545,14 +1561,20 @@ fn cap_summary(api: &str, gloss_key: &str) -> String {
 fn manifest_params(draft: &ManifestDraft) -> Elem<'_> {
     let mut col = Column::new()
         .spacing(8.0)
-        .push(common::section_label(crate::i18n::ts!("manifest-parameters")))
+        .push(common::section_label(crate::i18n::ts!(
+            "manifest-parameters"
+        )))
         .push(
             text(crate::i18n::t!("manifest-params-help"))
                 .size(11.0)
                 .style(common::muted),
         );
     if draft.params.is_empty() {
-        col = col.push(text(crate::i18n::t!("manifest-no-parameters")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("manifest-no-parameters"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (i, param) in draft.params.iter().enumerate() {
         col = col.push(param_card(i, param));
@@ -1574,10 +1596,13 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
     .text_size(13.0);
 
     let top = row![
-        text_input(crate::i18n::ts!("manifest-param-key-placeholder"), &param.key)
-            .on_input(move |v| Message::EditManifest(ManifestEdit::ParamKey(i, v)))
-            .size(14.0)
-            .width(Length::Fill),
+        text_input(
+            crate::i18n::ts!("manifest-param-key-placeholder"),
+            &param.key
+        )
+        .on_input(move |v| Message::EditManifest(ManifestEdit::ParamKey(i, v)))
+        .size(14.0)
+        .width(Length::Fill),
         kind_picker,
         button(
             text(bootstrap_icons::TRASH_3)
@@ -1591,9 +1616,12 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
     .spacing(8.0)
     .align_y(Vertical::Center);
 
-    let label_row = text_input(crate::i18n::ts!("manifest-param-label-placeholder"), &param.label)
-        .on_input(move |v| Message::EditManifest(ManifestEdit::ParamLabel(i, v)))
-        .size(14.0);
+    let label_row = text_input(
+        crate::i18n::ts!("manifest-param-label-placeholder"),
+        &param.label,
+    )
+    .on_input(move |v| Message::EditManifest(ManifestEdit::ParamLabel(i, v)))
+    .size(14.0);
 
     let mut body = Column::new().spacing(8.0).push(top).push(label_row);
     body = body.push(param_kind_config(i, param));
@@ -1622,7 +1650,9 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
         ParamKind::List => {
             let mut col = Column::new()
                 .spacing(8.0)
-                .push(common::section_label(crate::i18n::ts!("manifest-each-entry-is")));
+                .push(common::section_label(crate::i18n::ts!(
+                    "manifest-each-entry-is"
+                )));
             if let Some(element) = param.fields.first() {
                 col = col.push(sub_param_editor(i, 0, element, false));
             }
@@ -1727,19 +1757,29 @@ impl OptionPath {
 fn options_editor(path: OptionPath, options: &[OptionDraft]) -> Elem<'_> {
     let mut col = Column::new().spacing(6.0);
     if options.is_empty() {
-        col = col.push(text(crate::i18n::t!("manifest-no-options")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("manifest-no-options"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (k, option) in options.iter().enumerate() {
         col = col.push(
             row![
-                text_input(crate::i18n::ts!("manifest-option-value-placeholder"), &option.value)
-                    .on_input(move |v| Message::EditManifest(path.value(k, v)))
-                    .size(14.0)
-                    .width(Length::Fill),
-                text_input(crate::i18n::ts!("manifest-option-label-placeholder"), &option.label)
-                    .on_input(move |v| Message::EditManifest(path.label(k, v)))
-                    .size(14.0)
-                    .width(Length::Fill),
+                text_input(
+                    crate::i18n::ts!("manifest-option-value-placeholder"),
+                    &option.value
+                )
+                .on_input(move |v| Message::EditManifest(path.value(k, v)))
+                .size(14.0)
+                .width(Length::Fill),
+                text_input(
+                    crate::i18n::ts!("manifest-option-label-placeholder"),
+                    &option.label
+                )
+                .on_input(move |v| Message::EditManifest(path.label(k, v)))
+                .size(14.0)
+                .width(Length::Fill),
                 button(
                     text(bootstrap_icons::TRASH_3)
                         .font(fonts::BOOTSTRAP_ICONS)
@@ -1783,7 +1823,12 @@ fn dropdown_default_picker(i: usize, param: &ParamDraft) -> Elem<'_> {
         .cloned()
         .or_else(|| choices.first().cloned());
     row![
-        container(text(crate::i18n::t!("manifest-default")).size(13.0).style(common::muted)).width(Length::Fixed(72.0)),
+        container(
+            text(crate::i18n::t!("manifest-default"))
+                .size(13.0)
+                .style(common::muted)
+        )
+        .width(Length::Fixed(72.0)),
         pick_list(choices, selected, move |choice: DefaultChoice| {
             Message::EditManifest(ManifestEdit::ParamDefault(i, choice.value))
         })
@@ -1831,17 +1876,20 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
     let mut header = row![].spacing(8.0).align_y(Vertical::Center);
     if is_column {
         header = header.push(
-            text_input(crate::i18n::ts!("manifest-column-key-placeholder"), &field.key)
-                .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldKey(i, j, v)))
-                .size(14.0)
-                .width(Length::Fill),
+            text_input(
+                crate::i18n::ts!("manifest-column-key-placeholder"),
+                &field.key,
+            )
+            .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldKey(i, j, v)))
+            .size(14.0)
+            .width(Length::Fill),
         );
     } else {
         header = header.push(
             container(
                 text(crate::i18n::t!("manifest-value-of-type"))
                     .size(13.0)
-                    .style(common::muted)
+                    .style(common::muted),
             )
             .width(Length::Fill),
         );
@@ -1860,9 +1908,12 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
         );
     }
 
-    let label_row = text_input(crate::i18n::ts!("manifest-option-label-placeholder"), &field.label)
-        .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldLabel(i, j, v)))
-        .size(14.0);
+    let label_row = text_input(
+        crate::i18n::ts!("manifest-option-label-placeholder"),
+        &field.label,
+    )
+    .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldLabel(i, j, v)))
+    .size(14.0);
 
     let mut col = Column::new().spacing(6.0).push(header).push(label_row);
     if field.kind == ParamKind::Dropdown {
@@ -1979,8 +2030,8 @@ fn perm_note<'a>() -> Elem<'a> {
 fn dependency_lock_note<'a>() -> Elem<'a> {
     container(
         text(crate::i18n::t!("manifest-dependency-lock-note"))
-        .size(11.0)
-        .style(common::muted),
+            .size(11.0)
+            .style(common::muted),
     )
     .width(Length::Fill)
     .padding(Padding {
@@ -2024,14 +2075,17 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
     let mut requires_smudgy = column![
         field_row(
             crate::i18n::ts!("manifest-requires-smudgy"),
-            text_input(crate::i18n::ts!("manifest-any-version-placeholder"), &draft.min_smudgy_version)
-                .on_input(|v| Message::EditManifest(ManifestEdit::MinSmudgyVersion(v)))
-                .size(14.0)
-                .into(),
+            text_input(
+                crate::i18n::ts!("manifest-any-version-placeholder"),
+                &draft.min_smudgy_version
+            )
+            .on_input(|v| Message::EditManifest(ManifestEdit::MinSmudgyVersion(v)))
+            .size(14.0)
+            .into(),
         ),
         text(crate::i18n::t!("manifest-min-version-help"))
-        .size(12.0)
-        .style(common::muted),
+            .size(12.0)
+            .style(common::muted),
     ]
     .spacing(4.0);
     let min = draft.min_smudgy_version.trim();
@@ -2085,8 +2139,8 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
                 .text_size(13)
                 .on_toggle(|v| Message::EditManifest(ManifestEdit::Importable(v))),
             text(crate::i18n::t!("manifest-allow-import-help"))
-            .size(12.0)
-            .style(common::muted),
+                .size(12.0)
+                .style(common::muted),
         ]
         .spacing(4.0),
         manifest_params(draft),
@@ -2098,7 +2152,7 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
 /// Network tab: the `permissions.net` connection allowlist + the public-registry import toggle
 /// (`permissions.import`). Connecting to a host and downloading code from one are separate grants.
 fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
-    column![
+    let mut col = column![
         perm_note(),
         list_editor(
             crate::i18n::ts!("manifest-allowed-hosts"),
@@ -2110,8 +2164,18 @@ fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
         ),
         import_policy_picker(draft.import),
     ]
-    .spacing(16.0)
-    .into()
+    .spacing(16.0);
+    if draft.net.iter().any(|entry| {
+        matches!(
+            net_entry_kind(entry),
+            NetEntryKind::UnixSocket | NetEntryKind::Vsock
+        )
+    }) {
+        col = col.push(full_access_author_note(crate::i18n::ts!(
+            "manifest-local-transport-warning"
+        )));
+    }
+    col.into()
 }
 
 /// The tri-state `permissions.import` chooser: how far outside the smudgy ecosystem the package may
@@ -2173,8 +2237,8 @@ fn manifest_tab_files(draft: &ManifestDraft) -> Elem<'_> {
     if escapes_data(&draft.read) {
         col = col.push(
             text(crate::i18n::t!("manifest-readable-path-warning"))
-            .size(11.0)
-            .style(common::warning),
+                .size(11.0)
+                .style(common::warning),
         );
     }
     col = col.push(list_editor(
@@ -2319,38 +2383,124 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
         text(crate::i18n::t!("manifest-capabilities-help"))
             .size(11.0)
             .style(common::muted),
-        cap_group(crate::i18n::ts!("manifest-cap-group-automations"), vec![
-            cap_check("createAlias", crate::i18n::ts!("manifest-cap-create-aliases"), caps.create_aliases, Cap::CreateAliases),
-            cap_check("createTrigger / createTriggers", crate::i18n::ts!("manifest-cap-create-triggers"), caps.create_triggers, Cap::CreateTriggers),
-        ]),
-        cap_group("Session", vec![
-            cap_check("send", "send commands as if typed (runs through your aliases)", caps.send, Cap::Send),
-            cap_check("sendRaw", "send straight to the game (bypasses your aliases)", caps.send_direct, Cap::SendDirect),
-            cap_check("echo", "print text to your screen", caps.echo, Cap::Echo),
-            cap_check("input", "access, change, and focus input change; manage autocomplete list", caps.input, Cap::Input),
-            cap_check("sessions / byName", "reach your other connected sessions", caps.reach_others, Cap::ReachOthers),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-display"), vec![
-            cap_check("line / buffer", crate::i18n::ts!("manifest-cap-display"), caps.change_display, Cap::ChangeDisplay),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-mapper"), vec![
-            mapper_read,
-            cap_check("mapper", crate::i18n::ts!("manifest-cap-mapper-write"), caps.mapper_write, Cap::MapperWrite),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-widgets"), vec![
-            cap_check("createWidget", crate::i18n::ts!("manifest-cap-widgets"), caps.widgets, Cap::Widgets),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-interop"), vec![
-            cap_check("emit / set", crate::i18n::ts!("manifest-cap-interop-write"), caps.interop_write, Cap::InteropWrite),
-            cap_check("on / get / watch", crate::i18n::ts!("manifest-cap-interop-read"), caps.interop_read, Cap::InteropRead),
-            cap_check("BroadcastChannel", crate::i18n::ts!("manifest-cap-interop-broadcast"), caps.interop_broadcast, Cap::InteropBroadcast),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-panes"), vec![
-            cap_check("pane",  crate::i18n::ts!("manifest-cap-panes"), caps.panes, Cap::Panes),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-gmcp"), vec![
-            cap_check("gmcp.send", crate::i18n::ts!("manifest-cap-gmcp"), caps.gmcp_send, Cap::GmcpSend),
-        ]),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-automations"),
+            vec![
+                cap_check(
+                    "createAlias",
+                    crate::i18n::ts!("manifest-cap-create-aliases"),
+                    caps.create_aliases,
+                    Cap::CreateAliases
+                ),
+                cap_check(
+                    "createTrigger / createTriggers",
+                    crate::i18n::ts!("manifest-cap-create-triggers"),
+                    caps.create_triggers,
+                    Cap::CreateTriggers
+                ),
+            ]
+        ),
+        cap_group(
+            "Session",
+            vec![
+                cap_check(
+                    "send",
+                    "send commands as if typed (runs through your aliases)",
+                    caps.send,
+                    Cap::Send
+                ),
+                cap_check(
+                    "sendRaw",
+                    "send straight to the game (bypasses your aliases)",
+                    caps.send_direct,
+                    Cap::SendDirect
+                ),
+                cap_check("echo", "print text to your screen", caps.echo, Cap::Echo),
+                cap_check(
+                    "input",
+                    "access, change, and focus input change; manage autocomplete list",
+                    caps.input,
+                    Cap::Input
+                ),
+                cap_check(
+                    "sessions / byName",
+                    "reach your other connected sessions",
+                    caps.reach_others,
+                    Cap::ReachOthers
+                ),
+            ]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-display"),
+            vec![cap_check(
+                "line / buffer",
+                crate::i18n::ts!("manifest-cap-display"),
+                caps.change_display,
+                Cap::ChangeDisplay
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-mapper"),
+            vec![
+                mapper_read,
+                cap_check(
+                    "mapper",
+                    crate::i18n::ts!("manifest-cap-mapper-write"),
+                    caps.mapper_write,
+                    Cap::MapperWrite
+                ),
+            ]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-widgets"),
+            vec![cap_check(
+                "createWidget",
+                crate::i18n::ts!("manifest-cap-widgets"),
+                caps.widgets,
+                Cap::Widgets
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-interop"),
+            vec![
+                cap_check(
+                    "emit / set",
+                    crate::i18n::ts!("manifest-cap-interop-write"),
+                    caps.interop_write,
+                    Cap::InteropWrite
+                ),
+                cap_check(
+                    "on / get / watch",
+                    crate::i18n::ts!("manifest-cap-interop-read"),
+                    caps.interop_read,
+                    Cap::InteropRead
+                ),
+                cap_check(
+                    "BroadcastChannel",
+                    crate::i18n::ts!("manifest-cap-interop-broadcast"),
+                    caps.interop_broadcast,
+                    Cap::InteropBroadcast
+                ),
+            ]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-panes"),
+            vec![cap_check(
+                "pane",
+                crate::i18n::ts!("manifest-cap-panes"),
+                caps.panes,
+                Cap::Panes
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-gmcp"),
+            vec![cap_check(
+                "gmcp.send",
+                crate::i18n::ts!("manifest-cap-gmcp"),
+                caps.gmcp_send,
+                Cap::GmcpSend
+            ),]
+        ),
     ]
     .spacing(16.0)
     .into()
@@ -2459,7 +2609,11 @@ fn list_editor<'a>(
         col = col.push(text(hint.to_string()).size(11.0).style(common::muted));
     }
     if items.is_empty() {
-        col = col.push(text(crate::i18n::t!("manifest-none-period")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("manifest-none-period"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (i, item) in items.iter().enumerate() {
         col = col.push(
@@ -2825,6 +2979,24 @@ mod tests {
         };
         let manifest = draft.to_manifest().expect("projects");
         assert_eq!(manifest.permissions.net, vec!["host:1".to_string()]);
+    }
+
+    #[test]
+    fn local_network_transport_entries_round_trip_through_the_editor() {
+        let draft = ManifestDraft {
+            version: "1.0.0".to_string(),
+            net: vec![
+                "unix:/var/run/docker.sock".to_string(),
+                "vsock:2:1234".to_string(),
+            ],
+            ..ManifestDraft::default()
+        };
+        let manifest = draft
+            .to_manifest()
+            .expect("local transports are valid manifest entries");
+        assert_eq!(manifest.permissions.net, draft.net);
+        let round_trip = ManifestDraft::from_manifest(&manifest);
+        assert_eq!(round_trip.net, draft.net);
     }
 
     /// A draft with one parameter of a given kind, plus the supplied edits applied.

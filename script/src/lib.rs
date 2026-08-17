@@ -15,9 +15,7 @@ use std::task::{Context, Poll};
 
 use anyhow::{Context as AnyhowContext, Result};
 use deno_core::error::CoreError;
-use deno_core::{
-    JsRuntime, ModuleSpecifier, PollEventLoopOptions,
-};
+use deno_core::{JsRuntime, ModuleSpecifier, PollEventLoopOptions};
 use deno_error::JsErrorBox;
 use deno_fetch::dns::Resolver;
 use deno_fs::RealFs;
@@ -30,25 +28,24 @@ use deno_permissions::RuntimePermissionDescriptorParser;
 pub use deno_permissions::{
     PermissionDescriptorParser, Permissions, PermissionsContainer, PermissionsOptions,
 };
+use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::deno_inspector_server::{
-    create_inspector_server, InspectPublishUid, InspectorServer,
+    InspectPublishUid, InspectorServer, create_inspector_server,
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
 pub use deno_web::InMemoryBroadcastChannel;
-use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
 pub use package_resolver::{
-    canonical_url, is_any_host_net_entry, params_module_url, parse_canonical, parse_params_url,
-    platform_event_catalog, platform_state_producer,
-    CanonicalCoords,
-    ImportPolicy, InMemoryPackageProvider, PackageDependency, PackageError, PackageKey,
+    CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy, InMemoryPackageProvider,
+    MARKER_SCHEME, NetEntryKind, PARAMS_SCHEME, PackageDependency, PackageError, PackageKey,
     PackageManifest, PackageModuleSource, PackageParameter, PackagePermissions, PackageProvider,
-    ParamKind, ParamOption,
-    ReferrerRef, ResolvedPackage, SmudgyCapabilities, SmudgySpecifier, SmudgySpecifierError,
-    CANONICAL_SCHEME, EVENTS_SCHEME, MARKER_SCHEME, PARAMS_SCHEME, STATE_SCHEME,
+    ParamKind, ParamOption, ReferrerRef, ResolvedPackage, STATE_SCHEME, SmudgyCapabilities,
+    SmudgySpecifier, SmudgySpecifierError, canonical_url, is_any_host_net_entry, net_entry_kind,
+    params_module_url, parse_canonical, parse_params_url, platform_event_catalog,
+    platform_state_producer,
 };
 
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
@@ -280,22 +277,22 @@ impl ScriptRuntime {
 
         let services =
             WorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
-            blob_store: Default::default(),
-            broadcast_channel: options.broadcast_channel.unwrap_or_default(),
-            deno_rt_native_addon_loader: None,
-            feature_checker: Default::default(),
-            fs,
-            module_loader: loader,
-            node_services: Some(node_services),
-            npm_process_state_provider: None,
-            permissions,
-            root_cert_store_provider: None,
-            fetch_dns_resolver: Resolver::default(),
-            shared_array_buffer_store: None,
-            compiled_wasm_module_store: None,
-            v8_code_cache: None,
-            bundle_provider: None,
-        };
+                blob_store: Arc::new(deno_web::BlobStore::default()),
+                broadcast_channel: options.broadcast_channel.unwrap_or_default(),
+                deno_rt_native_addon_loader: None,
+                feature_checker: Default::default(),
+                fs,
+                module_loader: loader,
+                node_services: Some(node_services),
+                npm_process_state_provider: None,
+                permissions,
+                root_cert_store_provider: None,
+                fetch_dns_resolver: Resolver::default(),
+                shared_array_buffer_store: None,
+                compiled_wasm_module_store: None,
+                v8_code_cache: None,
+                bundle_provider: None,
+            };
 
         let (inspector_server, inspector_address) = if let Some(inspector) = options.inspector {
             let server = create_inspector_server(

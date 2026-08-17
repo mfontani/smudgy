@@ -21,8 +21,9 @@ use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::local_packages::{self, LocalModule, LocalPackage};
 use smudgy_core::models::naming;
 use smudgy_core::models::shared_packages::{
-    self, ImportPolicy, LockedPackage, PackageManifest, PackageParameter, PackagePermissions,
-    ParamKind, SmudgyCapabilities, UpdateMode, is_any_host_net_entry,
+    self, ImportPolicy, LockedPackage, NetEntryKind, PackageManifest, PackageParameter,
+    PackagePermissions, ParamKind, SmudgyCapabilities, UpdateMode, is_any_host_net_entry,
+    net_entry_kind,
 };
 
 use crate::assets::fonts;
@@ -1030,20 +1031,34 @@ fn import_can_line(policy: ImportPolicy) -> Option<&'static str> {
 /// banner ([`union_risk`]) agree on what's scoped and what's effectively unlimited.
 fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
     let mut lines = Vec::new();
-    // Hosts dedup case-insensitively (DNS is case-insensitive) so the list shows no near-dupes,
-    // keeping each host's first-seen spelling.
+    // Internet hosts dedup case-insensitively (DNS is case-insensitive); local transport targets
+    // retain exact spelling because Unix paths are case-sensitive and both kinds are exact grants.
     let mut seen_hosts: HashSet<String> = HashSet::new();
     for host in &perms.net {
-        if seen_hosts.insert(host.trim().to_lowercase()) {
+        let kind = net_entry_kind(host);
+        let dedup = if kind == NetEntryKind::Host {
+            host.trim().to_lowercase()
+        } else {
+            host.trim().to_string()
+        };
+        if seen_hosts.insert(dedup) {
             lines.push(PermissionLine {
-                head: crate::i18n::t!("permission-connect-to"),
+                head: match kind {
+                    NetEntryKind::Host => crate::i18n::t!("permission-connect-to"),
+                    NetEntryKind::UnixSocket => {
+                        crate::i18n::t!("permission-connect-to-unix")
+                    }
+                    NetEntryKind::Vsock => crate::i18n::t!("permission-connect-to-vsock"),
+                },
                 detail: Some(host.clone()),
-                // `*` / `*:port` lets the package choose the peer rather than constraining it to
-                // a named host. Frame that at the same caution tier as arbitrary web-code imports.
-                risk: if is_any_host_net_entry(host) {
-                    PermissionRisk::Caution
-                } else {
-                    PermissionRisk::Normal
+                risk: match kind {
+                    // A local socket can expose a privileged daemon (for example Docker) and
+                    // therefore crosses the same full-access consent cliff as run/ffi.
+                    NetEntryKind::UnixSocket | NetEntryKind::Vsock => PermissionRisk::Critical,
+                    // `*` / `*:port` lets the package choose the peer rather than constraining it
+                    // to a named host. Frame that like arbitrary web-code imports.
+                    NetEntryKind::Host if is_any_host_net_entry(host) => PermissionRisk::Caution,
+                    NetEntryKind::Host => PermissionRisk::Normal,
                 },
             });
         }
@@ -1173,6 +1188,14 @@ fn union_risk(perms: &PackagePermissions) -> PermissionRisk {
 /// {a}, {b}"). Empty iff the union has no [`PermissionRisk::Critical`] line.
 fn escape_reasons(perms: &PackagePermissions) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    if perms.net.iter().any(|entry| {
+        matches!(
+            net_entry_kind(entry),
+            NetEntryKind::UnixSocket | NetEntryKind::Vsock
+        )
+    }) {
+        reasons.push("connect to local system transports");
+    }
     if !perms.run.is_empty() {
         reasons.push("run other programs");
     }
@@ -1211,9 +1234,9 @@ fn full_access_banner<'a>(perms: &PackagePermissions) -> Option<Elem<'a>> {
                 .spacing(8.0)
                 .align_y(Vertical::Center),
                 text(format!(
-                    "Because this package can {}, which are outside of its sandbox in smudgy, it \
-                    will be able to affect your computer in ways the sandbox in smudgy cannot offer protection from. \
-                    Be certain that you trust it before enabling it.",
+                    "Because this package can {}, those capabilities can affect your computer in \
+                    ways the sandbox in smudgy cannot offer protection from. Be certain that you \
+                    trust it before enabling it.",
                     join_reasons(&reasons)
                 ))
                 .size(12.0),
@@ -1278,7 +1301,9 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
         out.push(cap_line(crate::i18n::ts!("permission-can-interop-read")));
     }
     if caps.interop_broadcast {
-        out.push(cap_line(crate::i18n::ts!("permission-can-interop-broadcast")));
+        out.push(cap_line(crate::i18n::ts!(
+            "permission-can-interop-broadcast"
+        )));
     }
     if caps.panes {
         out.push(cap_line(crate::i18n::ts!("permission-can-panes")));
@@ -2373,9 +2398,9 @@ impl AutomationsWindow {
                     });
                 }
                 let manifest: PackageManifest = serde_json::from_value(resolved.manifest.clone())
-                    .map_err(|e| {
-                        crate::i18n::t!("package-parse-manifest-failed", "error" => e.to_string())
-                    })?;
+                    .map_err(
+                    |e| crate::i18n::t!("package-parse-manifest-failed", "error" => e.to_string()),
+                )?;
                 local_packages::fork_to_local(&server, &new_name, &manifest, &modules)
                     .map_err(|e| e.to_string())?;
                 // Carry the source's README into the fork (resolve includes it), so a forked
@@ -2506,9 +2531,7 @@ impl AutomationsWindow {
             }
         };
         if !dir.exists() {
-            return Update::with_task(
-                self.show_toast(crate::i18n::t!("package-folder-missing")),
-            );
+            return Update::with_task(self.show_toast(crate::i18n::t!("package-folder-missing")));
         }
         if let Err(e) = open::that(&dir) {
             return Update::with_task(self.show_toast(crate::i18n::t!(
@@ -4068,7 +4091,10 @@ impl AutomationsWindow {
             .then(|| Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             });
-        Update::new(self.show_toast(crate::i18n::t!("package-settings-saved")), event)
+        Update::new(
+            self.show_toast(crate::i18n::t!("package-settings-saved")),
+            event,
+        )
     }
 
     /// Remove a stored secret param entirely (the only way to *unset* a secret, since the box can
@@ -4102,7 +4128,10 @@ impl AutomationsWindow {
             .then(|| Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             });
-        Update::new(self.show_toast(crate::i18n::t!("package-secret-cleared")), event)
+        Update::new(
+            self.show_toast(crate::i18n::t!("package-secret-cleared")),
+            event,
+        )
     }
 
     pub(super) fn open_shared(&mut self) -> Update<Message, Event> {
@@ -4215,26 +4244,25 @@ impl AutomationsWindow {
     }
 
     fn signed_out_banner<'a>(&self) -> Elem<'a> {
-        container(
-            text(crate::i18n::t!("package-sign-in-shared"))
-            .size(13.0),
-        )
-        .width(Length::Fill)
-        .padding(Padding {
-            top: 10.0,
-            bottom: 10.0,
-            left: 14.0,
-            right: 14.0,
-        })
-        .style(common::banner_style)
-        .into()
+        container(text(crate::i18n::t!("package-sign-in-shared")).size(13.0))
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 10.0,
+                bottom: 10.0,
+                left: 14.0,
+                right: 14.0,
+            })
+            .style(common::banner_style)
+            .into()
     }
 
     // ---- installed package pane -------------------------------------------
 
     pub(super) fn view_installed_package(&self) -> Elem<'_> {
         let Some(locked) = self.installed_open.as_deref() else {
-            return pane_scroll(column![text(crate::i18n::t!("package-no-selection")).size(13.0)]);
+            return pane_scroll(column![
+                text(crate::i18n::t!("package-no-selection")).size(13.0)
+            ]);
         };
         let specifier = &locked.specifier;
         let name = package_display_name(specifier).to_string();
@@ -4320,13 +4348,22 @@ impl AutomationsWindow {
             .map(|delta| delta.version.clone());
         let mut meta = row![].spacing(20.0).align_y(Vertical::Center);
         if let Some(detail) = self.installed_detail.as_deref() {
-            meta = meta.push(metric(crate::i18n::ts!("package-metric-author"), &detail.owner_nickname));
+            meta = meta.push(metric(
+                crate::i18n::ts!("package-metric-author"),
+                &detail.owner_nickname,
+            ));
         }
         if let Some(v) = &loaded {
-            meta = meta.push(metric(crate::i18n::ts!("package-metric-loaded"), &format!("v{v}")));
+            meta = meta.push(metric(
+                crate::i18n::ts!("package-metric-loaded"),
+                &format!("v{v}"),
+            ));
         }
         if let Some(v) = &blocked_latest {
-            meta = meta.push(metric(crate::i18n::ts!("package-metric-latest-blocked"), &format!("v{v}")));
+            meta = meta.push(metric(
+                crate::i18n::ts!("package-metric-latest-blocked"),
+                &format!("v{v}"),
+            ));
         }
         meta = meta.push(metric(
             crate::i18n::ts!("package-metric-update"),
@@ -4382,10 +4419,17 @@ impl AutomationsWindow {
         if !enabled_dependents.is_empty() || !self.graph.required_by(specifier).is_empty() {
             let mut req = Column::new()
                 .spacing(4.0)
-                .push(common::section_label(crate::i18n::ts!("package-required-by")));
+                .push(common::section_label(crate::i18n::ts!(
+                    "package-required-by"
+                )));
             for parent in self.graph.required_by(specifier) {
                 let enabled = self.graph.effectively_enabled(&parent);
-                req = req.push(self.dep_link_row(&parent, enabled, crate::i18n::ts!("package-needs"), None));
+                req = req.push(self.dep_link_row(
+                    &parent,
+                    enabled,
+                    crate::i18n::ts!("package-needs"),
+                    None,
+                ));
             }
             body = body.push(req);
         }
@@ -4434,9 +4478,12 @@ impl AutomationsWindow {
             .cloned()
             .unwrap_or_default();
         if !deps.is_empty() {
-            let mut dep_col = Column::new()
-                .spacing(4.0)
-                .push(common::section_label(crate::i18n::ts!("package-dependencies")));
+            let mut dep_col =
+                Column::new()
+                    .spacing(4.0)
+                    .push(common::section_label(crate::i18n::ts!(
+                        "package-dependencies"
+                    )));
             for edge in &deps {
                 // This row exists because the open package (`specifier`) depends on
                 // `edge.specifier`, so its dot follows the parent's context: it greys when the
@@ -4497,8 +4544,8 @@ impl AutomationsWindow {
             body = body.push(
                 container(
                     text(crate::i18n::t!("package-dependency-auto-remove"))
-                    .size(12.0)
-                    .style(common::muted),
+                        .size(12.0)
+                        .style(common::muted),
                 )
                 .padding(10.0)
                 .style(common::banner_style),
@@ -4559,8 +4606,16 @@ impl AutomationsWindow {
     fn installed_file_browser(&self) -> Elem<'_> {
         let tab = self.installed_file_tab;
         let tabs = row![
-            installed_file_tab_button(tab, InstalledFileTab::Readme, crate::i18n::ts!("package-tab-readme")),
-            installed_file_tab_button(tab, InstalledFileTab::Source, crate::i18n::ts!("package-tab-source")),
+            installed_file_tab_button(
+                tab,
+                InstalledFileTab::Readme,
+                crate::i18n::ts!("package-tab-readme")
+            ),
+            installed_file_tab_button(
+                tab,
+                InstalledFileTab::Source,
+                crate::i18n::ts!("package-tab-source")
+            ),
         ]
         .spacing(4.0)
         .align_y(Vertical::Center);
@@ -4585,9 +4640,13 @@ impl AutomationsWindow {
                 .width(Length::Fill)
                 .into()
         } else {
-            container(text(crate::i18n::t!("package-no-readme")).size(13.0).style(common::muted))
-                .padding(10.0)
-                .into()
+            container(
+                text(crate::i18n::t!("package-no-readme"))
+                    .size(13.0)
+                    .style(common::muted),
+            )
+            .padding(10.0)
+            .into()
         }
     }
 
@@ -4615,8 +4674,8 @@ impl AutomationsWindow {
                     .size(13.0)
                     .style(common::muted),
             )
-                .padding(10.0)
-                .into(),
+            .padding(10.0)
+            .into(),
             Some(detail) if detail.modules.is_empty() => container(
                 text(crate::i18n::t!("package-no-source-files"))
                     .size(13.0)
@@ -4665,7 +4724,9 @@ impl AutomationsWindow {
             return placeholder(crate::i18n::t!("package-source-missing"));
         };
         match self.installed_source.get(&module.content_hash) {
-            None | Some(FilePreview::Loading) => placeholder(crate::i18n::t!("package-source-fetching")),
+            None | Some(FilePreview::Loading) => {
+                placeholder(crate::i18n::t!("package-source-fetching"))
+            }
             Some(FilePreview::Text { source, bidi }) => {
                 let code = scrollable(
                     container(text(source.as_str()).size(12.0).font(fonts::GEIST_MONO_VF))
@@ -4680,8 +4741,8 @@ impl AutomationsWindow {
                     column![
                         container(
                             text(crate::i18n::t!("package-source-bidi-warning"))
-                            .size(11.0)
-                            .style(common::muted),
+                                .size(11.0)
+                                .style(common::muted),
                         )
                         .padding(8.0)
                         .width(Length::Fill)
@@ -4722,8 +4783,8 @@ impl AutomationsWindow {
         column![
             container(
                 text(crate::i18n::t!("package-also-installed"))
-                .size(12.0)
-                .style(common::muted),
+                    .size(12.0)
+                    .style(common::muted),
             )
             .padding(10.0)
             .style(common::banner_style),
@@ -4948,12 +5009,12 @@ impl AutomationsWindow {
             .strip_prefix("module:")
             .map(|subpath| crate::i18n::t!("package-creator-module", "name" => subpath))
             .or_else(|| {
-                creator_id
-                    .strip_prefix("package:")
-                    .map(|spec| crate::i18n::t!(
+                creator_id.strip_prefix("package:").map(|spec| {
+                    crate::i18n::t!(
                         "package-creator-package",
                         "name" => package_display_name(spec)
-                    ))
+                    )
+                })
             })
             .unwrap_or_else(|| creator_id.to_string());
 
@@ -4973,18 +5034,21 @@ impl AutomationsWindow {
 
         body = body.push(
             text(crate::i18n::t!("package-created-managed"))
-            .size(13.0)
-            .style(common::muted),
+                .size(13.0)
+                .style(common::muted),
         );
 
         if let Some(jump) = Self::creator_jump(creator_id) {
             body = body.push(
-                button(text(crate::i18n::t!(
-                    "package-open-creator",
-                    "creator" => &creator_label
-                )).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(jump),
+                button(
+                    text(crate::i18n::t!(
+                        "package-open-creator",
+                        "creator" => &creator_label
+                    ))
+                    .size(12.0),
+                )
+                .style(button_style::secondary)
+                .on_press(jump),
             );
         }
 
@@ -5019,7 +5083,9 @@ impl AutomationsWindow {
 
     pub(super) fn view_owned_package(&self) -> Elem<'_> {
         let Some(package) = self.local_package.as_deref() else {
-            return pane_scroll(column![text(crate::i18n::t!("package-no-selection")).size(13.0)]);
+            return pane_scroll(column![
+                text(crate::i18n::t!("package-no-selection")).size(13.0)
+            ]);
         };
         let manifest = &package.manifest;
         let visibility = if self.share_is_public {
@@ -5108,11 +5174,20 @@ impl AutomationsWindow {
 
         // Meta.
         let mut meta = row![].spacing(20.0).align_y(Vertical::Center);
-        meta = meta.push(metric(crate::i18n::ts!("package-metric-latest"), &format!("v{disp_version}")));
+        meta = meta.push(metric(
+            crate::i18n::ts!("package-metric-latest"),
+            &format!("v{disp_version}"),
+        ));
         let live_count = self.share_versions.iter().filter(|v| !v.deleted).count();
-        meta = meta.push(metric(crate::i18n::ts!("package-metric-versions"), &live_count.to_string()));
+        meta = meta.push(metric(
+            crate::i18n::ts!("package-metric-versions"),
+            &live_count.to_string(),
+        ));
         if disp_dep_count > 0 {
-            meta = meta.push(metric(crate::i18n::ts!("package-dependencies"), &disp_dep_count.to_string()));
+            meta = meta.push(metric(
+                crate::i18n::ts!("package-dependencies"),
+                &disp_dep_count.to_string(),
+            ));
         }
         body = body.push(meta);
 
@@ -5206,9 +5281,12 @@ impl AutomationsWindow {
         }
 
         // Published versions.
-        let mut versions = Column::new()
-            .spacing(4.0)
-            .push(common::section_label(crate::i18n::ts!("package-published-versions")));
+        let mut versions =
+            Column::new()
+                .spacing(4.0)
+                .push(common::section_label(crate::i18n::ts!(
+                    "package-published-versions"
+                )));
         if self.share_versions.is_empty() {
             versions = versions.push(
                 text(crate::i18n::t!("package-no-published-versions"))
@@ -5247,38 +5325,49 @@ impl AutomationsWindow {
                 left = left.push(common::badge(crate::i18n::t!("package-version-latest")));
             }
             if v.yanked {
-                left = left.push(text(crate::i18n::t!("package-version-yanked")).size(11.0).style(common::faint));
+                left = left.push(
+                    text(crate::i18n::t!("package-version-yanked"))
+                        .size(11.0)
+                        .style(common::faint),
+                );
             }
             let mut actions = row![
                 left,
                 iced::widget::space::horizontal(),
-                button(text(if v.yanked {
-                    crate::i18n::t!("package-version-unyank")
-                } else {
-                    crate::i18n::t!("package-version-yank")
-                }).size(11.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::YankVersion {
-                        version: v.version.clone(),
-                        yanked: !v.yanked,
-                    }),
+                button(
+                    text(if v.yanked {
+                        crate::i18n::t!("package-version-unyank")
+                    } else {
+                        crate::i18n::t!("package-version-yank")
+                    })
+                    .size(11.0)
+                )
+                .style(button_style::secondary)
+                .on_press(Message::YankVersion {
+                    version: v.version.clone(),
+                    yanked: !v.yanked,
+                }),
             ]
             .spacing(8.0)
             .align_y(Vertical::Center);
             // Delete is the heavy, deliberate step — only offered once a version is yanked.
             if v.yanked {
                 actions = actions.push(
-                    button(text(crate::i18n::t!("action-delete")).size(11.0).style(common::danger))
-                        .style(button_style::secondary)
-                        .on_press(Message::DeleteVersion(v.version.clone())),
+                    button(
+                        text(crate::i18n::t!("action-delete"))
+                            .size(11.0)
+                            .style(common::danger),
+                    )
+                    .style(button_style::secondary)
+                    .on_press(Message::DeleteVersion(v.version.clone())),
                 );
             }
             versions = versions.push(actions);
         }
         versions = versions.push(
             text(crate::i18n::t!("package-yank-help"))
-            .size(11.0)
-            .style(common::faint),
+                .size(11.0)
+                .style(common::faint),
         );
         body = body.push(versions);
 
@@ -5483,7 +5572,11 @@ impl AutomationsWindow {
         if !self.share_is_public {
             let mut friends = Column::new().spacing(4.0);
             if self.share_friends.is_empty() {
-                friends = friends.push(text(crate::i18n::t!("package-no-friends")).size(12.0).style(common::muted));
+                friends = friends.push(
+                    text(crate::i18n::t!("package-no-friends"))
+                        .size(12.0)
+                        .style(common::muted),
+                );
             }
             for friend in &self.share_friends {
                 let handle = friend
@@ -5528,16 +5621,22 @@ impl AutomationsWindow {
         }
         body = body.push(
             row![
-                container(text(crate::i18n::t!("package-name")).size(13.0).style(common::muted)).width(Length::Fixed(92.0)),
-                text_input(crate::i18n::ts!("package-name-placeholder"), name).on_input(Message::SetNewPackageName),
+                container(
+                    text(crate::i18n::t!("package-name"))
+                        .size(13.0)
+                        .style(common::muted)
+                )
+                .width(Length::Fixed(92.0)),
+                text_input(crate::i18n::ts!("package-name-placeholder"), name)
+                    .on_input(Message::SetNewPackageName),
             ]
             .spacing(12.0)
             .align_y(Vertical::Center),
         );
         body = body.push(
             text(crate::i18n::t!("package-new-help"))
-            .size(12.0)
-            .style(common::muted),
+                .size(12.0)
+                .style(common::muted),
         );
         body = body.push(
             row![
@@ -5573,9 +5672,12 @@ impl AutomationsWindow {
 
         body = body.push(
             row![
-                text_input(crate::i18n::ts!("package-search-placeholder"), &self.discover_query)
-                    .on_input(Message::DiscoverQueryChanged)
-                    .on_submit(Message::DiscoverSearch),
+                text_input(
+                    crate::i18n::ts!("package-search-placeholder"),
+                    &self.discover_query
+                )
+                .on_input(Message::DiscoverQueryChanged)
+                .on_submit(Message::DiscoverSearch),
                 button(text(crate::i18n::t!("package-search")).size(13.0))
                     .style(button_style::primary)
                     .on_press(Message::DiscoverSearch),
@@ -5622,7 +5724,11 @@ impl AutomationsWindow {
         body = body.push(scope);
 
         if self.discover_busy {
-            body = body.push(text(crate::i18n::t!("package-working")).size(13.0).style(common::muted));
+            body = body.push(
+                text(crate::i18n::t!("package-working"))
+                    .size(13.0)
+                    .style(common::muted),
+            );
         }
         if let Some(error) = &self.discover_error {
             body = body.push(text(error.clone()).size(13.0).style(common::danger));
@@ -5796,9 +5902,12 @@ impl AutomationsWindow {
         if self.signed_in() {
             col = col.push(
                 row![
-                    text_input(crate::i18n::ts!("package-comment-placeholder"), &self.discover_comment_input)
-                        .on_input(Message::CommentInputChanged)
-                        .on_submit(Message::AddComment),
+                    text_input(
+                        crate::i18n::ts!("package-comment-placeholder"),
+                        &self.discover_comment_input
+                    )
+                    .on_input(Message::CommentInputChanged)
+                    .on_submit(Message::AddComment),
                     button(text(crate::i18n::t!("package-post")).size(12.0))
                         .style(button_style::secondary)
                         .on_press(Message::AddComment),
@@ -5808,7 +5917,11 @@ impl AutomationsWindow {
             );
         }
         if self.discover_comments.is_empty() {
-            col = col.push(text(crate::i18n::t!("package-no-comments")).size(12.0).style(common::muted));
+            col = col.push(
+                text(crate::i18n::t!("package-no-comments"))
+                    .size(12.0)
+                    .style(common::muted),
+            );
         }
         for comment in &self.discover_comments {
             let who = comment
@@ -5830,11 +5943,14 @@ impl AutomationsWindow {
     fn view_param_prompt<'a>(&self, prompt: &'a ParamPrompt) -> Elem<'a> {
         let mut form = Column::new()
             .spacing(8.0)
-            .push(text(crate::i18n::t!(
-                "package-configure",
-                "name" => &prompt.name,
-                "version" => &prompt.version
-            )).size(14.0))
+            .push(
+                text(crate::i18n::t!(
+                    "package-configure",
+                    "name" => &prompt.name,
+                    "version" => &prompt.version
+                ))
+                .size(14.0),
+            )
             .push(
                 text(crate::i18n::t!("package-required-settings-help"))
                     .size(12.0)
@@ -5920,7 +6036,11 @@ impl AutomationsWindow {
         if let Some(error) = &config.error {
             form = form.push(text(error.clone()).size(12.0).style(common::danger));
         } else if config.saved {
-            form = form.push(text(crate::i18n::t!("package-saved")).size(12.0).style(common::accent));
+            form = form.push(
+                text(crate::i18n::t!("package-saved"))
+                    .size(12.0)
+                    .style(common::accent),
+            );
         }
 
         form = form.push(
@@ -5951,11 +6071,14 @@ impl AutomationsWindow {
     fn view_consent_prompt<'a>(&self, prompt: &'a ConsentPrompt) -> Elem<'a> {
         let mut form = Column::new()
             .spacing(12.0)
-            .push(text(crate::i18n::t!(
-                "package-install-title",
-                "name" => &prompt.name,
-                "version" => &prompt.version
-            )).size(16.0))
+            .push(
+                text(crate::i18n::t!(
+                    "package-install-title",
+                    "name" => &prompt.name,
+                    "version" => &prompt.version
+                ))
+                .size(16.0),
+            )
             .push(
                 text(crate::i18n::t!("package-publisher", "publisher" => &prompt.owner))
                     .size(12.0)
@@ -6017,8 +6140,7 @@ impl AutomationsWindow {
                     column![
                         row![
                             text("\u{26A0}").size(14.0).style(common::danger),
-                            text(crate::i18n::t!("package-install-conflict"))
-                                .size(14.0),
+                            text(crate::i18n::t!("package-install-conflict")).size(14.0),
                         ]
                         .spacing(8.0)
                         .align_y(Vertical::Center),
@@ -6045,7 +6167,8 @@ impl AutomationsWindow {
                         ]
                         .spacing(8.0)
                         .align_y(Vertical::Center),
-                        text(crate::i18n::t!("package-message-period", "message" => message)).size(12.0),
+                        text(crate::i18n::t!("package-message-period", "message" => message))
+                            .size(12.0),
                     ]
                     .spacing(6.0),
                 )
@@ -6195,8 +6318,8 @@ impl AutomationsWindow {
                         .spacing(8.0)
                         .align_y(Vertical::Center),
                         text(crate::i18n::t!("package-unsandboxed-owned-help"))
-                        .size(12.0)
-                        .style(common::muted),
+                            .size(12.0)
+                            .style(common::muted),
                     ]
                     .spacing(6.0),
                 )
@@ -6221,10 +6344,8 @@ impl AutomationsWindow {
         // can-lines), and point at the manifest editor as the grant mechanism. The full-access
         // banner shows here too — the author sees exactly the framing installers will get.
         let can = permission_can_lines(&package.manifest.permissions);
-        let mut card = column![
-            text(crate::i18n::t!("package-runs-manifest-sandbox")).size(14.0)
-        ]
-        .spacing(6.0);
+        let mut card =
+            column![text(crate::i18n::t!("package-runs-manifest-sandbox")).size(14.0)].spacing(6.0);
         if can.is_empty() {
             card = card.push(text(sandbox_summary()).size(12.0).style(common::muted));
         } else {
@@ -6267,20 +6388,22 @@ impl AutomationsWindow {
                         column![
                             row![
                                 text("\u{26A0}").size(14.0).style(common::danger),
-                                text(crate::i18n::t!("package-develop-unsandboxed-question")).size(14.0),
+                                text(crate::i18n::t!("package-develop-unsandboxed-question"))
+                                    .size(14.0),
                             ]
                             .spacing(8.0)
                             .align_y(Vertical::Center),
-                            text(crate::i18n::t!("package-develop-unsandboxed-warning"))
-                            .size(12.0),
+                            text(crate::i18n::t!("package-develop-unsandboxed-warning")).size(12.0),
                             row![
                                 iced::widget::space::horizontal(),
                                 button(text(crate::i18n::t!("action-cancel")).size(12.0))
                                     .style(button_style::secondary)
                                     .on_press(Message::CancelTrust),
-                                button(text(crate::i18n::t!("package-develop-unsandboxed")).size(12.0))
-                                    .style(button_style::primary)
-                                    .on_press(Message::SetLocalUnsandboxed(true)),
+                                button(
+                                    text(crate::i18n::t!("package-develop-unsandboxed")).size(12.0)
+                                )
+                                .style(button_style::primary)
+                                .on_press(Message::SetLocalUnsandboxed(true)),
                             ]
                             .spacing(8.0)
                             .align_y(Vertical::Center),
@@ -6295,16 +6418,20 @@ impl AutomationsWindow {
                 col = col.push(
                     row![
                         column![
-                            text(crate::i18n::t!("package-develop-unsandboxed-advanced")).size(13.0),
+                            text(crate::i18n::t!("package-develop-unsandboxed-advanced"))
+                                .size(13.0),
                             text(crate::i18n::t!("package-develop-unsandboxed-help"))
-                            .size(11.0)
-                            .style(common::muted),
+                                .size(11.0)
+                                .style(common::muted),
                         ]
                         .spacing(2.0),
                         iced::widget::space::horizontal(),
-                        button(text(crate::i18n::t!("package-develop-unsandboxed-ellipsis")).size(12.0))
-                            .style(button_style::secondary)
-                            .on_press(Message::RequestTrust),
+                        button(
+                            text(crate::i18n::t!("package-develop-unsandboxed-ellipsis"))
+                                .size(12.0)
+                        )
+                        .style(button_style::secondary)
+                        .on_press(Message::RequestTrust),
                     ]
                     .align_y(Vertical::Center),
                 );
@@ -6346,7 +6473,9 @@ impl AutomationsWindow {
     fn view_permissions_section(&self, locked: &LockedPackage) -> Elem<'_> {
         let mut col = Column::new()
             .spacing(8.0)
-            .push(common::section_label(crate::i18n::ts!("manifest-permissions")));
+            .push(common::section_label(crate::i18n::ts!(
+                "manifest-permissions"
+            )));
 
         if locked.trusted {
             col = col.push(
@@ -6359,8 +6488,8 @@ impl AutomationsWindow {
                         .spacing(8.0)
                         .align_y(Vertical::Center),
                         text(crate::i18n::t!("package-full-access-help"))
-                        .size(12.0)
-                        .style(common::muted),
+                            .size(12.0)
+                            .style(common::muted),
                     ]
                     .spacing(6.0),
                 )
@@ -6414,8 +6543,8 @@ impl AutomationsWindow {
         if locked.consented_permissions.is_none() {
             card = card.push(
                 text(crate::i18n::t!("package-not-consented"))
-                .size(11.0)
-                .style(common::faint),
+                    .size(11.0)
+                    .style(common::faint),
             );
         }
         col = col.push(
@@ -6439,8 +6568,7 @@ impl AutomationsWindow {
                             ]
                             .spacing(8.0)
                             .align_y(Vertical::Center),
-                            text(crate::i18n::t!("package-remove-sandbox-warning"))
-                            .size(12.0),
+                            text(crate::i18n::t!("package-remove-sandbox-warning")).size(12.0),
                             row![
                                 iced::widget::space::horizontal(),
                                 button(text(crate::i18n::t!("action-cancel")).size(12.0))
@@ -6465,8 +6593,8 @@ impl AutomationsWindow {
                         column![
                             text(crate::i18n::t!("package-remove-sandbox-advanced")).size(13.0),
                             text(crate::i18n::t!("package-remove-sandbox-help"))
-                            .size(11.0)
-                            .style(common::muted),
+                                .size(11.0)
+                                .style(common::muted),
                         ]
                         .spacing(2.0),
                         iced::widget::space::horizontal(),
@@ -6594,18 +6722,13 @@ impl AutomationsWindow {
     // ---- Shared-with-me ----------------------------------------------------
 
     pub(super) fn view_shared(&self) -> Elem<'_> {
-        let mut body =
-            column![
-                self.scene_header(
-                    None,
-                    crate::i18n::ts!("package-private-shared"),
-                    Some(
-                        crate::i18n::t!("package-private-shared-subtitle")
-                    ),
-                    None,
-                )
-            ]
-            .spacing(16.0);
+        let mut body = column![self.scene_header(
+            None,
+            crate::i18n::ts!("package-private-shared"),
+            Some(crate::i18n::t!("package-private-shared-subtitle")),
+            None,
+        )]
+        .spacing(16.0);
 
         if !self.signed_in() {
             return pane_scroll(body.push(self.signed_out_banner()));
@@ -6621,7 +6744,9 @@ impl AutomationsWindow {
         }
 
         // ---- Your packages (owned in the cloud) ----
-        body = body.push(common::section_label(crate::i18n::ts!("package-your-packages")));
+        body = body.push(common::section_label(crate::i18n::ts!(
+            "package-your-packages"
+        )));
         // Your own nickname is the owner handle for installing/resolving these — the server omits
         // owner_nickname on /packages/mine (it's you), so it isn't carried on the rows.
         let my_nick = self
@@ -6632,7 +6757,11 @@ impl AutomationsWindow {
             .unwrap_or_default();
         match &self.my_cloud_packages {
             None => {
-                body = body.push(text(crate::i18n::t!("package-loading")).size(13.0).style(common::muted));
+                body = body.push(
+                    text(crate::i18n::t!("package-loading"))
+                        .size(13.0)
+                        .style(common::muted),
+                );
             }
             Some(list) => {
                 for detail in list {
@@ -6666,7 +6795,8 @@ impl AutomationsWindow {
                         .spacing(8.0)
                         .align_y(Vertical::Center);
                     if !detail.package.is_public {
-                        title_row = title_row.push(common::badge(crate::i18n::t!("package-private")));
+                        title_row =
+                            title_row.push(common::badge(crate::i18n::t!("package-private")));
                     }
                     body = body.push(
                         container(card_with_trailing_action(
@@ -6701,10 +6831,16 @@ impl AutomationsWindow {
         }
 
         // ---- Shared with you (by friends) ----
-        body = body.push(common::section_label(crate::i18n::ts!("package-shared-with-you")));
+        body = body.push(common::section_label(crate::i18n::ts!(
+            "package-shared-with-you"
+        )));
         match &self.shared_with_me {
             None => {
-                body = body.push(text(crate::i18n::t!("package-loading")).size(13.0).style(common::muted));
+                body = body.push(
+                    text(crate::i18n::t!("package-loading"))
+                        .size(13.0)
+                        .style(common::muted),
+                );
             }
             Some(list) if list.is_empty() => {
                 body = body.push(
@@ -6807,9 +6943,13 @@ fn rating_spans<'a>(
 /// pane. The star glyphs take the terminal palette's "out" (output) color, matching outgoing text.
 fn star_rate_row<'a>(make_msg: fn(i16) -> Message) -> Elem<'a> {
     let star_color = crate::prefs::current().palette.output;
-    let mut rate = row![text(crate::i18n::t!("package-rate")).size(12.0).style(common::muted)]
-        .spacing(6.0)
-        .align_y(Vertical::Center);
+    let mut rate = row![
+        text(crate::i18n::t!("package-rate"))
+            .size(12.0)
+            .style(common::muted)
+    ]
+    .spacing(6.0)
+    .align_y(Vertical::Center);
     for stars in 1..=5_i16 {
         rate = rate.push(
             button(text("\u{2605}").size(13.0).style(move |_| text::Style {
@@ -6836,9 +6976,14 @@ fn rating_metric<'a>(avg_rating: Option<f64>, rating_count: i64, star_color: Col
         .size(20.0)
         .font(value_font)
         .into();
-    column![value, text(crate::i18n::t!("package-rating").to_uppercase()).size(10.0).style(common::faint)]
-        .spacing(2.0)
-        .into()
+    column![
+        value,
+        text(crate::i18n::t!("package-rating").to_uppercase())
+            .size(10.0)
+            .style(common::faint)
+    ]
+    .spacing(2.0)
+    .into()
 }
 
 fn metric<'a>(label: &str, value: &str) -> Elem<'a> {
@@ -7062,7 +7207,10 @@ mod tests {
             "demo",
             Ok((Uuid::new_v4(), false, vec![], vec![], Vec::new())),
         );
-        assert!(window.share_busy, "a stale result must not finish the current load");
+        assert!(
+            window.share_busy,
+            "a stale result must not finish the current load"
+        );
         assert_eq!(window.share_versions, vec![version]);
     }
 
@@ -7161,5 +7309,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(union_risk(&named_host), PermissionRisk::Normal);
+    }
+
+    #[test]
+    fn local_transport_grants_are_distinct_and_critical() {
+        let local = PackagePermissions {
+            net: vec!["unix:/var/run/docker.sock".into(), "vsock:2:1234".into()],
+            ..Default::default()
+        };
+        let lines = permission_can_lines(&local);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].head, crate::i18n::t!("permission-connect-to-unix"));
+        assert_eq!(
+            lines[0].detail.as_deref(),
+            Some("unix:/var/run/docker.sock")
+        );
+        assert_eq!(lines[0].risk, PermissionRisk::Critical);
+        assert_eq!(
+            lines[1].head,
+            crate::i18n::t!("permission-connect-to-vsock")
+        );
+        assert_eq!(lines[1].detail.as_deref(), Some("vsock:2:1234"));
+        assert_eq!(lines[1].risk, PermissionRisk::Critical);
+        assert_eq!(union_risk(&local), PermissionRisk::Critical);
+        assert_eq!(
+            escape_reasons(&local),
+            ["connect to local system transports"]
+        );
     }
 }

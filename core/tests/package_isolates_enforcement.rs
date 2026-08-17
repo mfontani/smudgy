@@ -384,8 +384,7 @@ async fn sandboxed_package_net_grant_is_enforced() {
         "the un-granted port must NOT be reachable; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "NET_OTHER_ERR:NotCapable")
-            && has_line(&lines, "net access"),
+        has_line(&lines, "NET_OTHER_ERR:NotCapable") && has_line(&lines, "net access"),
         "the un-granted port must be a permission error (NotCapable / net access), not a \
          connection error; transcript:\n{lines:#?}"
     );
@@ -396,9 +395,14 @@ async fn sandboxed_package_net_grant_is_enforced() {
 #[tokio::test]
 async fn sandboxed_package_any_host_grant_respects_port_scope() {
     let (allowed_port, _server) = spawn_http_200_server();
-    let denied_port = (1..=u16::MAX)
-        .find(|port| *port != allowed_port)
-        .expect("there is always another port");
+    // Use an ordinary ephemeral port so Fetch reaches Smudgy's permission gate instead
+    // of rejecting a browser-restricted port (for example port 1) first.
+    let denied_port = loop {
+        let port = unused_port();
+        if port != allowed_port {
+            break port;
+        }
+    };
     prepare_server("pi_enf_net_any_host");
 
     let src = r#"
@@ -511,10 +515,18 @@ async fn import_none_blocks_npm_jsr_and_web() {
 
     // No `permissions` block ⇒ import defaults to None.
     let pkg = make_package("wbk", "iso", "1.0.0", "", &src);
-    let lines =
-        collect_session_lines(9410, "pi_enf_import_none", &["smudgy://wbk/iso"], factory_for(vec![pkg])).await;
+    let lines = collect_session_lines(
+        9410,
+        "pi_enf_import_none",
+        &["smudgy://wbk/iso"],
+        factory_for(vec![pkg]),
+    )
+    .await;
 
-    assert!(has_line(&lines, "DONE"), "the package finishes (denials are caught); transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "DONE"),
+        "the package finishes (denials are caught); transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "NPM:NO_ERROR")
             && !has_line(&lines, "JSR:NO_ERROR")
@@ -548,10 +560,20 @@ async fn import_registries_blocks_arbitrary_web() {
     "#
     .replace("__PORT__", &port.to_string());
 
-    let pkg =
-        make_package("wbk", "iso", "1.0.0", r#", "permissions": { "import": "registries" }"#, &src);
-    let lines =
-        collect_session_lines(9411, "pi_enf_import_reg", &["smudgy://wbk/iso"], factory_for(vec![pkg])).await;
+    let pkg = make_package(
+        "wbk",
+        "iso",
+        "1.0.0",
+        r#", "permissions": { "import": "registries" }"#,
+        &src,
+    );
+    let lines = collect_session_lines(
+        9411,
+        "pi_enf_import_reg",
+        &["smudgy://wbk/iso"],
+        factory_for(vec![pkg]),
+    )
+    .await;
 
     assert!(
         !has_line(&lines, "WEB:NO_ERROR"),
@@ -579,9 +601,20 @@ async fn import_any_allows_arbitrary_web() {
     "#
     .replace("__PORT__", &port.to_string());
 
-    let pkg = make_package("wbk", "iso", "1.0.0", r#", "permissions": { "import": "any" }"#, &src);
-    let lines =
-        collect_session_lines(9412, "pi_enf_import_any", &["smudgy://wbk/iso"], factory_for(vec![pkg])).await;
+    let pkg = make_package(
+        "wbk",
+        "iso",
+        "1.0.0",
+        r#", "permissions": { "import": "any" }"#,
+        &src,
+    );
+    let lines = collect_session_lines(
+        9412,
+        "pi_enf_import_any",
+        &["smudgy://wbk/iso"],
+        factory_for(vec![pkg]),
+    )
+    .await;
 
     assert!(
         has_line(&lines, "WEB_OK:42"),
@@ -1002,7 +1035,10 @@ async fn unconsented_package_is_denied_everything() {
     let lines = collect_session_lines_with_consent(
         9408,
         "pi_consent_none",
-        &[("smudgy://wbk/unconsented", Some(PackagePermissions::default()))],
+        &[(
+            "smudgy://wbk/unconsented",
+            Some(PackagePermissions::default()),
+        )],
         factory_for(vec![pkg]),
     )
     .await;
@@ -1046,17 +1082,24 @@ async fn sandboxed_package_without_interop_capability_is_denied_emit_and_subscri
     )
     .await;
 
-    assert!(has_line(&lines, "DONE"), "the package must finish evaluating; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "DONE"),
+        "the package must finish evaluating; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "EMIT_OK") && !has_line(&lines, "ON_OK"),
         "a package without the events capability must not emit or subscribe; transcript:\n{lines:#?}"
     );
     assert!(
-        lines.iter().any(|l| l.starts_with("EMIT_DENIED") && l.contains("interop:write")),
+        lines
+            .iter()
+            .any(|l| l.starts_with("EMIT_DENIED") && l.contains("interop:write")),
         "emit must throw NotCapable('interop:write'); transcript:\n{lines:#?}"
     );
     assert!(
-        lines.iter().any(|l| l.starts_with("ON_DENIED") && l.contains("interop:read")),
+        lines
+            .iter()
+            .any(|l| l.starts_with("ON_DENIED") && l.contains("interop:read")),
         "on must throw NotCapable('interop:read'); transcript:\n{lines:#?}"
     );
 }
@@ -1114,7 +1157,11 @@ async fn sandboxed_package_run_and_sys_grants_are_enforced() {
     // The one program every host has: the platform shell. PATH-resolved by the container build.
     // The un-granted probe must be a program that EXISTS (deno resolves the name before the
     // permission check — an unresolvable name is `NotFound`, which wouldn't prove the gate).
-    let (shell, flag) = if cfg!(windows) { ("cmd", "/c") } else { ("sh", "-c") };
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/c")
+    } else {
+        ("sh", "-c")
+    };
     let ungranted = if cfg!(windows) { "whoami" } else { "ls" };
 
     // `clearEnv: true` on the granted spawn: deno refuses a SCOPED run grant when the subprocess
@@ -1160,8 +1207,7 @@ async fn sandboxed_package_run_and_sys_grants_are_enforced() {
         "the granted program must spawn and produce its stdout; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "RUN_OTHER:NO_ERROR")
-            && has_line(&lines, "RUN_OTHER_ERR:NotCapable"),
+        !has_line(&lines, "RUN_OTHER:NO_ERROR") && has_line(&lines, "RUN_OTHER_ERR:NotCapable"),
         "an un-granted program must be denied at the gate (NotCapable), not attempted; \
          transcript:\n{lines:#?}"
     );
@@ -1170,8 +1216,7 @@ async fn sandboxed_package_run_and_sys_grants_are_enforced() {
         "the granted sys kind must be readable; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "SYS_OTHER:NO_ERROR")
-            && has_line(&lines, "SYS_OTHER_ERR:NotCapable"),
+        !has_line(&lines, "SYS_OTHER:NO_ERROR") && has_line(&lines, "SYS_OTHER_ERR:NotCapable"),
         "an un-granted sys kind must reject NotCapable; transcript:\n{lines:#?}"
     );
 }
@@ -1183,7 +1228,11 @@ async fn sandboxed_package_run_and_sys_grants_are_enforced() {
 #[tokio::test]
 async fn sandboxed_package_with_no_permissions_denies_run_ffi_sys() {
     prepare_server("pi_enf_native_deny");
-    let (shell, flag) = if cfg!(windows) { ("cmd", "/c") } else { ("sh", "-c") };
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/c")
+    } else {
+        ("sh", "-c")
+    };
 
     let src = r#"
         import { echo } from "smudgy:core";
@@ -1211,7 +1260,10 @@ async fn sandboxed_package_with_no_permissions_denies_run_ffi_sys() {
     )
     .await;
 
-    assert!(has_line(&lines, "DONE"), "denials are caught, not fatal; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "DONE"),
+        "denials are caught, not fatal; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "RUN:NO_ERROR") && has_line(&lines, "RUN_ERR:NotCapable"),
         "a zero-permission package must not spawn subprocesses; transcript:\n{lines:#?}"
@@ -1273,12 +1325,18 @@ async fn worker_threads_broadcast_channel_cannot_bypass_interop_capability() {
     let lines = collect_session_lines_with_consent(
         9433,
         server,
-        &[("smudgy://wbk/broadcast-denied", Some(PackagePermissions::default()))],
+        &[(
+            "smudgy://wbk/broadcast-denied",
+            Some(PackagePermissions::default()),
+        )],
         factory_for(vec![pkg]),
     )
     .await;
 
-    assert!(has_line(&lines, "GLOBAL_DENIED:true"), "transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "GLOBAL_DENIED:true"),
+        "transcript:\n{lines:#?}"
+    );
     assert!(has_line(&lines, "NODE_READY"), "transcript:\n{lines:#?}");
     assert!(has_line(&lines, "MAIN_DONE"), "transcript:\n{lines:#?}");
     assert!(

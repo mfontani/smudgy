@@ -345,7 +345,7 @@ impl Drop for ScriptEngine<'_> {
         // Each isolate is left "exited" between operations (Model B), but rusty_v8's
         // `OwnedIsolate::Drop` still does real v8 teardown + an `exit()` that require the isolate
         // to be the thread's *current* one. So enter each isolate immediately before dropping it;
-        // order is then irrelevant (validated for deno_core 0.395 / v8 147). A plain drop of the
+        // order is then irrelevant (validated for deno_core 0.410 / v8 150.4). A plain drop of the
         // map would tear an isolate down while another was current → the misleading "Cannot
         // create a handle without a HandleScope" abort. Do NOT `exit` here — `OwnedIsolate::Drop`
         // performs the single matching exit.
@@ -2945,7 +2945,7 @@ fn build_script_runtime(
     // out of order, so leave the enter-stack empty between operations: exit the just-built
     // isolate now. Every later v8 op re-enters it via [`EnteredIsolate`], and teardown enters it
     // once more right before dropping (see `Drop for ScriptEngine`). This is the "Model B"
-    // lifecycle validated for deno_core 0.395 / v8 147 — teardown is order-independent.
+    // lifecycle validated for deno_core 0.410 / v8 150.4 — teardown is order-independent.
     // SAFETY: balances the construct-time enter; the new isolate is the current one here.
     unsafe {
         runtime.deno_runtime().v8_isolate().exit();
@@ -3152,8 +3152,9 @@ fn local_manifest_permissions(server_name: &str, name: &str) -> PackagePermissio
 /// # Errors
 /// Returns an error if `deno_permissions` rejects a descriptor (e.g. a malformed `net`
 /// `host:port`, an unknown `sys` kind, or an empty `run` program name); the caller skips the
-/// package rather than run it ungated. The pinned `deno_permissions` patch accepts `*` as an
-/// any-host descriptor, retaining an optional `*:port` restriction across every deno network op.
+/// package rather than run it ungated. The pinned `deno_permissions` patch accepts `*` as a
+/// host-only any-host descriptor, retaining an optional `*:port` restriction across every Deno
+/// network op without granting Unix-domain or VSock transports.
 fn build_restricted_container(
     union: &PackagePermissions,
     data_dir: &std::path::Path,
@@ -3188,12 +3189,26 @@ fn build_restricted_container(
 }
 
 /// Map an allowlist into `deno_permissions`' `Option<Vec<String>>`. **An empty list becomes
-/// `None`, not `Some(vec![])`** — in `deno_permissions` 0.101 `Some(vec![])` sets
+/// `None`, not `Some(vec![])`** — in `deno_permissions` 0.116 `Some(vec![])` sets
 /// `granted_global = true` (the bare `--allow-net` semantic = **allow all**), the opposite of
 /// the deny-by-default this enforces. `None` (no global grant, no descriptors, `prompt:false`)
 /// denies the kind entirely; a non-empty list scopes the grant to exactly those entries.
 fn to_allow_list(entries: Vec<String>) -> Option<Vec<String>> {
     (!entries.is_empty()).then_some(entries)
+}
+
+#[cfg(test)]
+mod permission_option_tests {
+    use super::to_allow_list;
+
+    #[test]
+    fn empty_manifest_axis_maps_to_none_not_deno_allow_all_sentinel() {
+        assert_eq!(to_allow_list(Vec::new()), None);
+        assert_eq!(
+            to_allow_list(vec!["example.com:443".to_string()]),
+            Some(vec!["example.com:443".to_string()])
+        );
+    }
 }
 
 /// Expand the `$DATA` placeholder in `read`/`write`/`ffi` path entries to the package's absolute
@@ -3570,6 +3585,7 @@ mod error_format_tests {
             name: Some(name.to_string()),
             message: Some(message.to_string()),
             stack: None,
+            stack_is_custom: false,
             cause: None,
             exception_message: exception_message.to_string(),
             frames,

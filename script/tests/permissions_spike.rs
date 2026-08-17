@@ -23,11 +23,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use deno_core::{serde_v8, FastString, PollEventLoopOptions};
+use deno_core::{FastString, PollEventLoopOptions, serde_v8};
 use serde_json::Value;
 use smudgy_script::{
-    permission_descriptor_parser, ModulePolicy, Permissions, PermissionsContainer,
-    PermissionsOptions, ScriptRuntime, ScriptRuntimeOptions,
+    ModulePolicy, Permissions, PermissionsContainer, PermissionsOptions, ScriptRuntime,
+    ScriptRuntimeOptions, permission_descriptor_parser,
 };
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
@@ -59,7 +59,10 @@ fn restricted_runtime(
         extensions: Vec::new(),
         data_dir: data_dir.to_path_buf(),
         webstorage_dir: None,
-        module_policy: ModulePolicy { allow_https: true, ..Default::default() },
+        module_policy: ModulePolicy {
+            allow_https: true,
+            ..Default::default()
+        },
         inspector: None,
         tokio: tokio.clone(),
         package_provider: None,
@@ -67,6 +70,13 @@ fn restricted_runtime(
         broadcast_channel: None,
     })?;
     Ok((tokio, runtime))
+}
+
+fn permissions_container(opts: &PermissionsOptions) -> Result<PermissionsContainer> {
+    let parser = permission_descriptor_parser();
+    let perms = Permissions::from_options(&*parser, opts)
+        .context("Permissions::from_options should accept the restricted options")?;
+    Ok(PermissionsContainer::new(parser, perms))
 }
 
 /// Evaluate an async IIFE and deserialize its resolved value as JSON. Mirrors
@@ -389,8 +399,16 @@ fn allow_net_any_host_wildcards_cover_outgoing_and_incoming_connections() -> Res
         "#
     );
     let out = eval_async_json(&tokio, &mut rt, &source)?;
-    assert_eq!(name(&out, "fetch"), "200:ok", "*:port must allow any hostname on that port");
-    assert_eq!(name(&out, "listen"), "OK", "*:port must allow an incoming listener on that port");
+    assert_eq!(
+        name(&out, "fetch"),
+        "200:ok",
+        "*:port must allow any hostname on that port"
+    );
+    assert_eq!(
+        name(&out, "listen"),
+        "OK",
+        "*:port must allow an incoming listener on that port"
+    );
     assert!(
         name(&out, "deniedListen").starts_with("NotCapable: "),
         "*:port must deny listeners on other ports: {out}"
@@ -413,8 +431,97 @@ fn allow_net_any_host_wildcards_cover_outgoing_and_incoming_connections() -> Res
         "#
     );
     let out = eval_async_json(&tokio, &mut rt, &source)?;
-    assert_eq!(name(&out, "listen"), "OK", "* must allow every host and port");
+    assert_eq!(
+        name(&out, "listen"),
+        "OK",
+        "* must allow every host and port"
+    );
 
+    Ok(())
+}
+
+#[test]
+fn empty_manifest_allowlist_uses_none_while_some_empty_is_deno_allow_all() -> Result<()> {
+    let denied = PermissionsOptions {
+        allow_net: None,
+        prompt: false,
+        ..Default::default()
+    };
+    let mut denied = permissions_container(&denied)?;
+    assert!(
+        denied
+            .check_net(&("127.0.0.1", Some(443)), "sentinel-test")
+            .is_err(),
+        "None must mean no network grant"
+    );
+
+    let allowed = PermissionsOptions {
+        allow_net: Some(Vec::new()),
+        prompt: false,
+        ..Default::default()
+    };
+    let mut allowed = permissions_container(&allowed)?;
+    assert!(
+        allowed
+            .check_net(&("127.0.0.1", Some(443)), "sentinel-test")
+            .is_ok(),
+        "Deno's Some(vec![]) sentinel means allow all; Smudgy must never emit it for an empty manifest"
+    );
+    Ok(())
+}
+
+#[test]
+fn any_host_wildcard_does_not_cover_local_transports() -> Result<()> {
+    let opts = PermissionsOptions {
+        allow_net: Some(vec!["*".to_string()]),
+        prompt: false,
+        ..Default::default()
+    };
+    let mut permissions = permissions_container(&opts)?;
+    assert!(
+        permissions
+            .check_net(&("example.com", Some(443)), "wildcard-test")
+            .is_ok()
+    );
+    assert!(
+        permissions
+            .check_net_vsock(2, 1234, "wildcard-test")
+            .is_err(),
+        "host wildcard must not grant VSock"
+    );
+    assert!(
+        permissions
+            .check_net_unix_socket(Path::new("/var/run/example.sock"), Some("wildcard-test"))
+            .is_err(),
+        "host wildcard must not grant Unix-domain sockets"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_local_transport_grants_match_only_the_exact_target() -> Result<()> {
+    let opts = PermissionsOptions {
+        allow_net: Some(vec![
+            "unix:/var/run/example.sock".to_string(),
+            "vsock:2:1234".to_string(),
+        ]),
+        prompt: false,
+        ..Default::default()
+    };
+    let mut permissions = permissions_container(&opts)?;
+    assert!(
+        permissions
+            .check_net_unix_socket(Path::new("/var/run/example.sock"), Some("local-test"))
+            .is_ok()
+    );
+    assert!(
+        permissions
+            .check_net_unix_socket(Path::new("/var/run/other.sock"), Some("local-test"))
+            .is_err()
+    );
+    assert!(permissions.check_net_vsock(2, 1234, "local-test").is_ok());
+    assert!(permissions.check_net_vsock(3, 1234, "local-test").is_err());
     Ok(())
 }
 
