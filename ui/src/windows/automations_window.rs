@@ -69,9 +69,13 @@ fn tab_traversal(modifiers: keyboard::Modifiers, status: Status) -> Option<bool>
 /// Convenience alias for this window's themed elements.
 pub(crate) type Elem<'a> = ThemedElement<'a, Message>;
 
-/// Events bubbled up to the daemon so live sessions reload when scripts change.
+/// Events bubbled up to the daemon when persisted runtime inputs change.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Aliases, triggers, hotkeys, or their legacy folder enablement changed. Live sessions
+    /// reconcile only the changed user-owned registrations.
+    UserAutomationsChanged { server_name: String },
+    /// Modules or script packages changed and still require the existing full engine reload.
     ScriptsChanged { server_name: String },
 }
 

@@ -24,37 +24,48 @@ const EVENT_QUIET_PERIOD: Duration = Duration::from_millis(900);
 const MODULE_TS: &str = r#"
 import { createAlias, echo, userAutomations } from "smudgy:core";
 createAlias("^makeauto$", () => {
-    const a = userAutomations.aliases.save("greet", { pattern: "^hi$", script: "wave", language: "js" });
+    const a = userAutomations.aliases.save("greet", { pattern: "^hi$", script: "echo('WAVE')", language: "js" });
     userAutomations.triggers.save("onsay", { patterns: ["^(\\w+) says"], rawPatterns: ["TICK"], script: "listen" });
     const langOk = a.def().language === "js";
     const upd = userAutomations.aliases.get("greet").update({ enabled: false });
+    userAutomations.aliases.save("live", { pattern: "^ping$", script: "echo('PONG')", language: "js" });
     const nowDisabled = userAutomations.aliases.get("greet").def().enabled === false;
     const listed = userAutomations.aliases.list().join(",");
     const trig = userAutomations.triggers.exists("onsay");
     echo("MADE lang=" + langOk + " upd=" + upd + " disabled=" + nowDisabled + " list=" + listed + " trig=" + trig);
 });
 createAlias("^delauto$", () => {
-    echo("DEL removed=" + userAutomations.aliases.delete("greet"));
+    const removed = userAutomations.aliases.delete("greet");
+    userAutomations.aliases.delete("live");
+    echo("DEL removed=" + removed);
 });
 "#;
 
 async fn drain_until_quiet(
-    events: &mut std::pin::Pin<Box<impl futures::Stream<Item = smudgy_core::session::TaggedSessionEvent>>>,
-) -> Vec<String> {
+    events: &mut std::pin::Pin<
+        Box<impl futures::Stream<Item = smudgy_core::session::TaggedSessionEvent>>,
+    >,
+) -> (Vec<String>, usize) {
     let mut lines = Vec::new();
+    let mut runtime_ready = 0;
     while let Ok(Some(event)) = tokio::time::timeout(EVENT_QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            for update in updates.iter() {
-                if let smudgy_core::session::BufferUpdate::Append(line) = update {
-                    lines.push(line.text.clone());
+        match event.event {
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let smudgy_core::session::BufferUpdate::Append(line) = update {
+                        lines.push(line.text.clone());
+                    }
                 }
             }
+            SessionEvent::RuntimeReady(_) => runtime_ready += 1,
+            _ => {}
         }
     }
-    lines
+    (lines, runtime_ready)
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn script_crud_persisted_user_automations() {
     let server_name = "test_user_automations".to_string();
     let home = tempfile::tempdir().expect("create temp home");
@@ -77,8 +88,19 @@ async fn script_crud_persisted_user_automations() {
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
     });
+    let other_params = Arc::new(SessionParams {
+        session_id: SessionId::from(9402u32),
+        server_name: Arc::new(server_name.clone()),
+        profile_name: Arc::new("other".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
 
     let mut events = Box::pin(spawn(params));
+    let mut other_events = Box::pin(spawn(other_params));
 
     let tx = loop {
         let event = tokio::time::timeout(Duration::from_secs(30), events.next())
@@ -89,41 +111,119 @@ async fn script_crud_persisted_user_automations() {
             break tx;
         }
     };
+    let other_tx = loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), other_events.next())
+            .await
+            .expect("timed out waiting for other RuntimeReady")
+            .expect("other event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
 
     // Fire the create/edit controller (the writes persist synchronously; the calling session is
     // not reloaded, so the controller aliases stay registered for the delete step below).
-    tx.send(RuntimeAction::Send(Arc::new("makeauto".to_string()))).unwrap();
-    let made = drain_until_quiet(&mut events).await;
+    tx.send(RuntimeAction::Send(Arc::new("makeauto".to_string())))
+        .unwrap();
+    let (made, own_reloads) = drain_until_quiet(&mut events).await;
     assert!(
-        made.iter().any(|l| l == "MADE lang=true upd=true disabled=true list=greet trig=true"),
+        made.iter()
+            .any(|l| l == "MADE lang=true upd=true disabled=true list=greet,live trig=true"),
         "create/edit controller did not report success: {made:?}"
     );
+    assert_eq!(
+        own_reloads, 0,
+        "user automation changes rebuilt the calling runtime"
+    );
+
+    // The same persisted snapshot reaches another live session without a RuntimeReady/rebuild.
+    let (_, other_reloads) = drain_until_quiet(&mut other_events).await;
+    assert_eq!(
+        other_reloads, 0,
+        "user automation changes rebuilt another runtime"
+    );
+    other_tx
+        .send(RuntimeAction::Send(Arc::new("ping".to_string())))
+        .unwrap();
+    let (other_ping, other_reloads) = drain_until_quiet(&mut other_events).await;
+    assert!(
+        other_ping.iter().any(|line| line == "PONG"),
+        "new alias was not synchronized to the other session: {other_ping:?}"
+    );
+    assert_eq!(other_reloads, 0);
+
+    // The disabled alias is absent from both live matchers.
+    other_tx
+        .send(RuntimeAction::Send(Arc::new("hi".to_string())))
+        .unwrap();
+    let (disabled, other_reloads) = drain_until_quiet(&mut other_events).await;
+    assert!(!disabled.iter().any(|line| line == "WAVE"));
+    assert_eq!(other_reloads, 0);
 
     // The persisted files reflect the save AND the handle.update().
     let aliases = load_aliases(&server_name).unwrap();
-    let greet = aliases.get("greet").expect("greet alias persisted to aliases.json");
+    let greet = aliases
+        .get("greet")
+        .expect("greet alias persisted to aliases.json");
     assert_eq!(greet.pattern, "^hi$");
-    assert_eq!(greet.script.as_deref(), Some("wave"));
-    assert_eq!(greet.language, ScriptLang::JS, "language round-trips js -> JS on disk");
-    assert!(!greet.enabled, "handle.update({{enabled:false}}) persisted to disk");
+    assert_eq!(greet.script.as_deref(), Some("echo('WAVE')"));
+    assert_eq!(
+        greet.language,
+        ScriptLang::JS,
+        "language round-trips js -> JS on disk"
+    );
+    assert!(
+        !greet.enabled,
+        "handle.update({{enabled:false}}) persisted to disk"
+    );
 
     let triggers = load_triggers(&server_name).unwrap();
-    let onsay = triggers.get("onsay").expect("onsay trigger persisted to triggers.json");
-    assert_eq!(onsay.patterns.as_deref(), Some(&[r"^(\w+) says".to_string()][..]));
-    assert_eq!(onsay.raw_patterns.as_deref(), Some(&["TICK".to_string()][..]));
+    let onsay = triggers
+        .get("onsay")
+        .expect("onsay trigger persisted to triggers.json");
+    assert_eq!(
+        onsay.patterns.as_deref(),
+        Some(&[r"^(\w+) says".to_string()][..])
+    );
+    assert_eq!(
+        onsay.raw_patterns.as_deref(),
+        Some(&["TICK".to_string()][..])
+    );
 
     // Fire the delete controller and settle.
-    tx.send(RuntimeAction::Send(Arc::new("delauto".to_string()))).unwrap();
-    let deleted = drain_until_quiet(&mut events).await;
+    tx.send(RuntimeAction::Send(Arc::new("delauto".to_string())))
+        .unwrap();
+    let (deleted, own_reloads) = drain_until_quiet(&mut events).await;
     assert!(
         deleted.iter().any(|l| l == "DEL removed=true"),
         "delete controller did not report success: {deleted:?}"
     );
+    assert_eq!(own_reloads, 0);
+
+    let (_, other_reloads) = drain_until_quiet(&mut other_events).await;
+    assert_eq!(other_reloads, 0);
+    other_tx
+        .send(RuntimeAction::Send(Arc::new("ping".to_string())))
+        .unwrap();
+    let (after_delete, other_reloads) = drain_until_quiet(&mut other_events).await;
+    assert!(
+        !after_delete.iter().any(|line| line == "PONG"),
+        "deleted alias remained live in the other session: {after_delete:?}"
+    );
+    assert_eq!(other_reloads, 0);
 
     tx.send(RuntimeAction::Shutdown).ok();
+    other_tx.send(RuntimeAction::Shutdown).ok();
 
     let aliases = load_aliases(&server_name).unwrap();
-    assert!(!aliases.contains_key("greet"), "greet should be deleted from aliases.json");
+    assert!(
+        !aliases.contains_key("greet"),
+        "greet should be deleted from aliases.json"
+    );
+    assert!(
+        !aliases.contains_key("live"),
+        "live should be deleted from aliases.json"
+    );
     // The untouched trigger is still there.
     assert!(load_triggers(&server_name).unwrap().contains_key("onsay"));
 }

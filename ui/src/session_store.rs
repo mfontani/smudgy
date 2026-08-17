@@ -335,6 +335,7 @@ pub enum Message {
         id: MapWidgetId,
         message: map_view::Message,
     },
+    SyncUserAutomations,
     Reload,
     Reconnect,
     Disconnect,
@@ -2055,6 +2056,12 @@ impl ManagedSession {
                         Task::none()
                     }
                 }
+            }
+            Message::SyncUserAutomations => {
+                if let Some(tx) = self.runtime_tx.as_ref() {
+                    tx.send(RuntimeAction::SyncUserAutomations).ok();
+                }
+                Task::none()
             }
             Message::Reload => {
                 self.input.clear_hotkeys();

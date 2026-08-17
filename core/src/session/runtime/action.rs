@@ -28,6 +28,9 @@ use super::trigger::MatchCapture;
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
+    /// Reconcile persisted aliases, triggers, and hotkeys against this runtime's last snapshot.
+    /// This never rebuilds a V8 isolate; only changed user-owned registrations are touched.
+    SyncUserAutomations,
     /// A same-server source committed one state turn. The receiving engine
     /// resolves only its own directed watchers and binding cells.
     RemoteStoreFlushed {

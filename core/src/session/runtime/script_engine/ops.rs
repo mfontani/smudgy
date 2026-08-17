@@ -747,22 +747,20 @@ fn op_server_name(state: &OpState) -> String {
     state.borrow::<ServerName>().0.as_str().to_string()
 }
 
-/// Reload every OTHER live session on `server` so it re-loads its automations from disk — the
-/// same effect the automations window's `ScriptsChanged` fan-out produces. The calling session is
-/// deliberately skipped: reloading the session a script is running in would re-run all its modules
-/// (and, for a top-level `save_*`, could cascade), so the change is persisted but the caller's own
-/// session picks it up on its next reload (or via an explicit `reload()`). Best-effort: a
-/// shut-down session's send is ignored and a poisoned registry lock is skipped rather than
-/// panicking inside an op.
-fn reload_other_sessions_for_server(state: &OpState, server: &str) {
+/// Ask every live session on `server` to reconcile its persisted user automations. The calling
+/// session queues the sync in its current action frame; other sessions receive it through their
+/// runtime channels. Each receiver loads the latest disk state, so concurrent writers cannot
+/// deliver an older captured snapshot after a newer one. Delivery is best-effort during shutdown.
+fn sync_user_automations_for_server(state: &mut OpState, server: &str) {
     let own = *state.borrow::<SessionId>();
     if let Ok(sessions) = registry::get_registry().lock() {
         for (id, runtime) in sessions.iter() {
             if *id != own && runtime.server_name.as_str() == server {
-                let _ = runtime.tx.send(RuntimeAction::Reload);
+                let _ = runtime.tx.send(RuntimeAction::SyncUserAutomations);
             }
         }
     }
+    queue_own_action(state, RuntimeAction::SyncUserAutomations);
 }
 
 /// Upsert `(name, def)` into the per-server alias map, persisting only when it actually changed.
@@ -832,9 +830,8 @@ fn delete_user_hotkey(server: &str, name: &str) -> Result<bool, AnyError> {
 }
 
 /// `userAutomations.saveAlias` — create or replace a persisted alias. Returns `true` when the
-/// saved set changed (a no-op equal save returns `false`). Besides persisting, the alias is made
-/// live in the calling session immediately (an upsert under the disk keying `(Main, User, name)`,
-/// so it coexists with and replaces a UI-loaded one) and the server's other sessions are reloaded.
+/// saved set changed (a no-op equal save returns `false`). A change is reconciled incrementally in
+/// every live session on the server.
 #[op2]
 fn op_smudgy_save_user_alias(
     state: &mut OpState,
@@ -844,25 +841,14 @@ fn op_smudgy_save_user_alias(
     ensure_user_automation_access(state)?;
     validate_user_automation_name(&name)?;
     let server = op_server_name(state);
-    let changed = save_user_alias(&server, &name, def.clone())?;
+    let changed = save_user_alias(&server, &name, def)?;
     if changed {
-        reload_other_sessions_for_server(state, &server);
+        sync_user_automations_for_server(state, &server);
     }
-    queue_own_action(
-        state,
-        RuntimeAction::AddAlias {
-            isolate: IsolateId::Main,
-            origin: Origin::User,
-            name: Arc::new(name),
-            alias: def,
-            fire_limit: None,
-        },
-    );
     Ok(changed)
 }
 
-/// `userAutomations.saveTrigger` — create or replace a persisted trigger (also live in the
-/// calling session, with the server's other sessions reloaded).
+/// `userAutomations.saveTrigger` — create or replace a persisted trigger in every live session.
 #[op2]
 fn op_smudgy_save_user_trigger(
     state: &mut OpState,
@@ -872,26 +858,14 @@ fn op_smudgy_save_user_trigger(
     ensure_user_automation_access(state)?;
     validate_user_automation_name(&name)?;
     let server = op_server_name(state);
-    let changed = save_user_trigger(&server, &name, def.clone())?;
+    let changed = save_user_trigger(&server, &name, def)?;
     if changed {
-        reload_other_sessions_for_server(state, &server);
+        sync_user_automations_for_server(state, &server);
     }
-    queue_own_action(
-        state,
-        RuntimeAction::AddTrigger {
-            isolate: IsolateId::Main,
-            origin: Origin::User,
-            name: Arc::new(name),
-            trigger: def,
-            fire_limit: None,
-            line_limit: None,
-        },
-    );
     Ok(changed)
 }
 
-/// `userAutomations.saveHotkey` — create or replace a persisted hotkey (also live in the calling
-/// session, with the server's other sessions reloaded).
+/// `userAutomations.saveHotkey` — create or replace a persisted hotkey in every live session.
 #[op2]
 fn op_smudgy_save_user_hotkey(
     state: &mut OpState,
@@ -901,26 +875,15 @@ fn op_smudgy_save_user_hotkey(
     ensure_user_automation_access(state)?;
     validate_user_automation_name(&name)?;
     let server = op_server_name(state);
-    let changed = save_user_hotkey(&server, &name, def.clone())?;
+    let changed = save_user_hotkey(&server, &name, def)?;
     if changed {
-        reload_other_sessions_for_server(state, &server);
+        sync_user_automations_for_server(state, &server);
     }
-    queue_own_action(
-        state,
-        RuntimeAction::AddHotkey {
-            isolate: IsolateId::Main,
-            origin: Origin::User,
-            name: Arc::new(name),
-            hotkey: def,
-            // The disk/inline-string path: dispatch compiles `hotkey.script` itself.
-            function_id: None,
-        },
-    );
     Ok(changed)
 }
 
-/// `userAutomations.deleteAlias` — remove a persisted alias (and drop it from the calling
-/// session's live set; the server's other sessions reload). Returns `true` when one existed.
+/// `userAutomations.deleteAlias` — remove a persisted alias from every live session. Returns
+/// `true` when one existed.
 #[op2(fast)]
 fn op_smudgy_delete_user_alias(
     state: &mut OpState,
@@ -930,12 +893,8 @@ fn op_smudgy_delete_user_alias(
     let server = op_server_name(state);
     let removed = delete_user_alias(&server, &name)?;
     if removed {
-        reload_other_sessions_for_server(state, &server);
+        sync_user_automations_for_server(state, &server);
     }
-    queue_own_action(
-        state,
-        RuntimeAction::RemoveAlias(IsolateId::Main, Origin::User, Arc::new(name)),
-    );
     Ok(removed)
 }
 
@@ -949,12 +908,8 @@ fn op_smudgy_delete_user_trigger(
     let server = op_server_name(state);
     let removed = delete_user_trigger(&server, &name)?;
     if removed {
-        reload_other_sessions_for_server(state, &server);
+        sync_user_automations_for_server(state, &server);
     }
-    queue_own_action(
-        state,
-        RuntimeAction::RemoveTrigger(IsolateId::Main, Origin::User, Arc::new(name)),
-    );
     Ok(removed)
 }
 
@@ -968,12 +923,8 @@ fn op_smudgy_delete_user_hotkey(
     let server = op_server_name(state);
     let removed = delete_user_hotkey(&server, &name)?;
     if removed {
-        reload_other_sessions_for_server(state, &server);
+        sync_user_automations_for_server(state, &server);
     }
-    queue_own_action(
-        state,
-        RuntimeAction::RemoveHotkey(IsolateId::Main, Origin::User, Arc::new(name)),
-    );
     Ok(removed)
 }
 
