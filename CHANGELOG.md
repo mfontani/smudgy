@@ -5,6 +5,16 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The embedded JavaScript/TypeScript runtime now follows Deno 2.9.5 (V8 150.4), including its
+  updated npm/CommonJS compatibility and matching editor declarations.
+- Package network permissions can declare exact Unix-domain (`unix:/path`) and VSock
+  (`vsock:CID:PORT`) targets. They are displayed separately from internet hosts and receive the
+  effectively-full-access consent warning; `*` and `*:port` remain internet-host-only grants.
+
 ## [0.5.3] - 2026-08-14
 
 ### Added

@@ -25,7 +25,9 @@ Output: `dist/smudgy-v<version>-<arch>.flatpak`.
 Prerequisites: `flatpak` + **network access at build time** (see strategy below).
 The build tool (`org.flatpak.Builder`), the freedesktop `25.08` runtimes, and the
 `rust-stable` + `llvm20` extensions are installed automatically from Flathub on
-first run.
+first run. Deno 2.9.5's Rust crate family requires Rust 1.95.0 or newer; the
+`rust-stable` SDK extension is used deliberately and the manifest prints its
+version before building so an unexpectedly stale SDK fails visibly.
 
 ### Architectures
 
@@ -155,13 +157,16 @@ To go **fully offline** later (reproducible / Flathub):
    (regenerate whenever `Cargo.lock` changes; it ignores path/workspace deps and
    the vendored `iced_tiny_skia` `[patch.crates-io]`).
 2. Pre-fetch the `librusty_v8` prebuilt as manifest `sources` and point the build
-   at it — `deno_core` 0.395 enables the v8 `simdutf` feature, so the assets are
-   the `_simdutf_` variants for the pinned `v8` crate version
+   at it. The Deno 2.9.5 engine chain is `deno_core 0.410 -> deno_v8 0.2 ->
+   v8 150.4.0`; `deno_v8` enables the V8 backend with `simdutf`, so the assets are
+   the `_simdutf_` variants for that pinned rusty_v8 release
    (`librusty_v8_simdutf_release_x86_64-unknown-linux-gnu.a.gz` +
    `src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs` from the matching
    `denoland/rusty_v8` release). Set `RUSTY_V8_ARCHIVE` and
    `RUSTY_V8_SRC_BINDING_PATH` (absolute); never set `V8_FROM_SOURCE`.
-   Re-check the suffix with `cargo tree -i v8 -e features` after any dep bump.
+   Re-check the suffix with `cargo tree -e features -i deno_v8` and
+   `cargo tree -i v8@150.4.0` after any dependency bump. The experimental
+   `quickjs`/`v8x` backend must remain inactive.
 3. Drop the module's `build-args: [--share=network]` and build with
    `cargo build --profile release-full --offline`.
 

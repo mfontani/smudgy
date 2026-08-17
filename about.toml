@@ -37,4 +37,6 @@ accepted = [
     "Unlicense",
     "OpenSSL",
     "CDLA-Permissive-2.0",
+    # libbz2-rs-sys, pulled by Deno 2.9.5's npm tarball stack; permissive BSD-style terms.
+    "bzip2-1.0.6",
 ]

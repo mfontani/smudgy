@@ -66,7 +66,7 @@ static NODE_TYPES: Dir =
 
 /// Bumped whenever the vendored Deno lib / `@types/node` change, so the runtime typings are
 /// (re)written only on first run or after a re-vendor — not on every session start.
-const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.0+node-26.0.1+1";
+const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.5+node-26.0.1+1";
 
 const MANAGED_README: &str = "\
 This folder is generated and managed by smudgy. It gives VS Code (and any\n\
@@ -2152,6 +2152,44 @@ export function make() { return createEvent('dynamic'); }
         assert!(
             base.contains("./node-types/@types"),
             "typeRoots missing:\n{base}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_runtime_typings_are_replaced_without_touching_user_tsconfig() {
+        let dir = temp_server_dir("runtime-types-upgrade");
+        let managed = dir.join(".smudgy");
+        let deno_types = managed.join("types/deno");
+        fs::create_dir_all(&deno_types).unwrap();
+        fs::write(
+            managed.join(".runtime-types-version"),
+            "deno-v2.9.0+node-26.0.1+1",
+        )
+        .unwrap();
+        fs::write(deno_types.join("lib.deno.ns.d.ts"), "stale declaration").unwrap();
+
+        let authored = "{ \"compilerOptions\": { \"strict\": false } }";
+        fs::write(dir.join("tsconfig.json"), authored).unwrap();
+
+        ensure_script_tsconfig_in(&dir, &[]).expect("upgrade managed runtime typings");
+
+        assert_eq!(
+            fs::read_to_string(managed.join(".runtime-types-version"))
+                .unwrap()
+                .trim(),
+            RUNTIME_TYPES_VERSION
+        );
+        assert_ne!(
+            fs::read_to_string(deno_types.join("lib.deno.ns.d.ts")).unwrap(),
+            "stale declaration",
+            "the stale managed declaration tree must be replaced"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("tsconfig.json")).unwrap(),
+            authored,
+            "the user's own project configuration must remain untouched"
         );
 
         fs::remove_dir_all(&dir).ok();
