@@ -24,7 +24,8 @@ use smudgy_cloud::{Mapper, PackageApiClient};
 use smudgy_script::{
     ImportPolicy, InspectorConfig, LoadReport, LoadedModuleKind, ModulePolicy, ModuleSet,
     PackagePermissions, PackageProvider, Permissions, PermissionsContainer, PermissionsOptions,
-    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, parse_canonical,
+    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, is_local_transport_net_entry,
+    is_windows_pipe_namespace_entry, native_ipc_grants, parse_canonical,
     permission_descriptor_parser,
 };
 
@@ -3149,20 +3150,63 @@ fn local_manifest_permissions(server_name: &str, name: &str) -> PackagePermissio
 /// private, update-surviving data dir ([`sandbox_fs_data_dir`]), so a `$DATA` grant reaches only
 /// that package's files, never the shared server root or another package.
 ///
+/// Local IPC arrives through the structured `ipc` axis: each consented row's realization native
+/// to this platform (`windowsPipe` → `\\.\pipe\<name>` on Windows, `unix` → the declared socket
+/// path on the Unix family) compiles into an exact `unix:` net descriptor **plus** the read+write
+/// grant the socket ops additionally require on that same path; the non-native realization
+/// contributes nothing. `net` itself stays hosts-only.
+///
 /// # Errors
 /// Returns an error if `deno_permissions` rejects a descriptor (e.g. a malformed `net`
-/// `host:port`, an unknown `sys` kind, or an empty `run` program name); the caller skips the
-/// package rather than run it ungated. The pinned `deno_permissions` patch accepts `*` as a
-/// host-only any-host descriptor, retaining an optional `*:port` restriction across every Deno
-/// network op without granting Unix-domain or VSock transports.
+/// `host:port`, an unknown `sys` kind, or an empty `run` program name), if a `net` entry names a
+/// local transport (`unix:`/`vsock:` — a manifest-validation error), if an `ipc` row is
+/// malformed, or if a `read`/`write`/`ffi` entry names the Windows pipe namespace (pipe
+/// fs-grants may only originate from consented `ipc` rows); the caller skips the package rather
+/// than run it ungated. The pinned
+/// `deno_permissions` patch accepts `*` as a host-only any-host descriptor, retaining an
+/// optional `*:port` restriction across every Deno network op without granting Unix-domain or
+/// `VSock` transports.
 fn build_restricted_container(
     union: &PackagePermissions,
     data_dir: &std::path::Path,
 ) -> Result<PermissionsContainer> {
+    // `net` is hosts-only; a hand-edited manifest must not smuggle a local-transport grant
+    // through the host list (the editor rejects these before they ever reach disk).
+    if let Some(entry) = union.net.iter().find(|e| is_local_transport_net_entry(e)) {
+        bail!(
+            "net entry {entry:?} names a local transport; local IPC is declared on the `ipc` axis"
+        );
+    }
+    // An invalid `ipc` row (no realization, relative unix path, separator in a pipe name) is
+    // refused outright, never silently narrowed.
+    if let Some(row) = union.ipc.iter().find(|row| row.issue().is_some()) {
+        bail!("invalid `ipc` permission row {row:?}");
+    }
+    // The path axes must never name the Windows pipe namespace: fs-opening a pipe IS
+    // connecting to it, and the pinned `deno_permissions` patch exempts pipe-namespace query
+    // paths from the unscoped-"all" special-file demand on the strength of this rejection —
+    // a pipe fs-grant may only originate from a consented `ipc` row below.
+    if let Some(entry) = [&union.read, &union.write, &union.ffi]
+        .into_iter()
+        .flatten()
+        .find(|e| is_windows_pipe_namespace_entry(e))
+    {
+        bail!(
+            "path entry {entry:?} names the Windows pipe namespace; local IPC is declared on \
+             the `ipc` axis"
+        );
+    }
+    let ipc = native_ipc_grants(&union.ipc);
+    let mut net = union.net.clone();
+    net.extend(ipc.net);
+    let mut read = expand_data_paths(&union.read, data_dir);
+    read.extend(ipc.paths.iter().cloned());
+    let mut write = expand_data_paths(&union.write, data_dir);
+    write.extend(ipc.paths);
     let opts = PermissionsOptions {
-        allow_net: to_allow_list(union.net.clone()),
-        allow_read: to_allow_list(expand_data_paths(&union.read, data_dir)),
-        allow_write: to_allow_list(expand_data_paths(&union.write, data_dir)),
+        allow_net: to_allow_list(net),
+        allow_read: to_allow_list(read),
+        allow_write: to_allow_list(write),
         allow_env: to_allow_list(union.env.clone()),
         // `run`/`ffi` are sandbox escapes (a subprocess / native library runs outside the
         // permission model entirely) and are only ever granted through explicit consent — the

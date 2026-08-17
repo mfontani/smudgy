@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use super::persistence::write_atomic;
 
 pub use smudgy_script::{
-    ImportPolicy, NetEntryKind, PackageManifest, PackageParameter, PackagePermissions, ParamKind,
-    ParamOption, SmudgyCapabilities, is_any_host_net_entry, net_entry_kind,
+    ImportPolicy, IpcEntry, IpcEntryIssue, PackageManifest, PackageParameter, PackagePermissions,
+    ParamKind, ParamOption, SmudgyCapabilities, is_any_host_net_entry,
+    is_local_transport_net_entry, is_windows_pipe_namespace_entry,
 };
 
 use crate::get_smudgy_home;
@@ -1254,10 +1255,15 @@ mod tests {
         assert!(!entry.trusted, "a fresh install is untrusted");
 
         // Recording consent stores the granted union verbatim and reloads equal — including the
-        // full-access-weight axes (`run`/`ffi`) and `sys`, which must survive the lockfile so the
-        // enforcement container and the manage-pane banner keep seeing what was actually granted.
+        // full-access-weight axes (`run`/`ffi`/`ipc`) and `sys`, which must survive the lockfile
+        // so the enforcement container and the manage-pane banner keep seeing what was actually
+        // granted.
         let granted = PackagePermissions {
             net: vec!["comms.coreclan.org:6379".into()],
+            ipc: vec![IpcEntry {
+                unix: Some("/var/run/docker.sock".into()),
+                windows_pipe: Some("docker_engine".into()),
+            }],
             read: vec!["$DATA/maps".into()],
             write: Vec::new(),
             env: vec!["MYPKG_TOKEN".into()],

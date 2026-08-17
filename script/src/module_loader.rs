@@ -213,12 +213,15 @@ impl ScriptModuleLoader {
         rest: &str,
         referrer: &str,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        let (url, package) = crate::package_resolver::kind_scheme_url(kind, rest)
-            .map_err(generic_loader_error)?;
+        let (url, package) =
+            crate::package_resolver::kind_scheme_url(kind, rest).map_err(generic_loader_error)?;
         if let Some(key) = package {
             let spec = crate::package_resolver::SmudgySpecifier::parse(&key.to_user_specifier())
                 .map_err(|err| {
-                    generic_loader_error(format!("invalid producer {}: {err}", key.to_user_specifier()))
+                    generic_loader_error(format!(
+                        "invalid producer {}: {err}",
+                        key.to_user_specifier()
+                    ))
                 })?;
             self.enforce_declared_smudgy_dep(&spec, referrer, DepGate::InteropConsume)?;
         }
@@ -234,12 +237,13 @@ impl ScriptModuleLoader {
     ///
     /// Checked in [`Self::resolve`], the single point every import passes before any fetch, so a
     /// denied `jsr:`/`npm:` import never even reaches the registry for metadata.
-    fn enforce_import_allowed(
-        &self,
-        resolved: &ModuleSpecifier,
-    ) -> Result<(), ModuleLoaderError> {
+    fn enforce_import_allowed(&self, resolved: &ModuleSpecifier) -> Result<(), ModuleLoaderError> {
         let scheme = resolved.scheme();
-        if self.policy.import_policy.allows_import(scheme, resolved.host_str().unwrap_or_default()) {
+        if self
+            .policy
+            .import_policy
+            .allows_import(scheme, resolved.host_str().unwrap_or_default())
+        {
             return Ok(());
         }
         // Name what was blocked in the package's own terms (the source, not the rewritten host).
@@ -344,7 +348,9 @@ impl ModuleLoader for ScriptModuleLoader {
                 .ok()
                 .and_then(|url| crate::package_resolver::parse_canonical(&url))
                 .map(|coords| coords.key);
-            return Ok(crate::package_resolver::params_module_url(importer.as_ref()));
+            return Ok(crate::package_resolver::params_module_url(
+                importer.as_ref(),
+            ));
         }
 
         // `smudgy:core`: a per-importer virtual module whose creation functions
@@ -397,7 +403,10 @@ impl ModuleLoader for ScriptModuleLoader {
         }
         // Kind-scheme misspellings fail loudly with the intended spelling (interop.md §4) instead of
         // falling through to the package-marker loader's mystifying "package not found".
-        if specifier == "smudgy:state" || specifier == "smudgy:events" || specifier == "smudgy:procedures" {
+        if specifier == "smudgy:state"
+            || specifier == "smudgy:events"
+            || specifier == "smudgy:procedures"
+        {
             return Err(generic_loader_error(format!(
                 "{specifier} needs a producer: import from {specifier}/<owner>/<package>"
             )));
@@ -433,9 +442,10 @@ impl ModuleLoader for ScriptModuleLoader {
         // canonical pinned URL. Relative imports from inside a package use the
         // canonical `smudgy-pkg:` scheme and fall through to the normal path below.
         if specifier.starts_with("smudgy://") {
-            let spec = crate::package_resolver::SmudgySpecifier::parse(specifier).map_err(|err| {
-                generic_loader_error(format!("invalid smudgy specifier {specifier}: {err}"))
-            })?;
+            let spec =
+                crate::package_resolver::SmudgySpecifier::parse(specifier).map_err(|err| {
+                    generic_loader_error(format!("invalid smudgy specifier {specifier}: {err}"))
+                })?;
             // Dep-gating: a PACKAGE's module may only import `smudgy://` packages it
             // declared in its manifest `dependencies`. User modules (`<server>/modules/`,
             // `file://`) are unrestricted, and only `smudgy://` is gated (jsr:/npm:/url
@@ -1030,7 +1040,10 @@ mod dep_gating_tests {
         });
         ScriptModuleLoader {
             cwd: std::env::temp_dir(),
-            policy: ModulePolicy { allow_https: true, ..Default::default() },
+            policy: ModulePolicy {
+                allow_https: true,
+                ..Default::default()
+            },
             source_maps: Default::default(),
             import_provider: RefCell::new(Box::new(NoopImportProvider)),
             npm: None,
@@ -1049,16 +1062,18 @@ mod dep_gating_tests {
         let loader = loader_with_app(
             r#"{ "name": "app", "version": "1.0.0", "dependencies": ["smudgy://wbk/util"] }"#,
         );
-        let resolved =
-            loader.resolve("smudgy://wbk/util", APP_REFERRER, ResolutionKind::Import);
-        assert!(resolved.is_ok(), "a declared smudgy:// dep is allowed: {resolved:?}");
+        let resolved = loader.resolve("smudgy://wbk/util", APP_REFERRER, ResolutionKind::Import);
+        assert!(
+            resolved.is_ok(),
+            "a declared smudgy:// dep is allowed: {resolved:?}"
+        );
     }
 
     #[test]
     fn package_may_not_import_an_undeclared_smudgy_dep() {
-        let loader = loader_with_app(r#"{ "name": "app", "version": "1.0.0", "dependencies": [] }"#);
-        let resolved =
-            loader.resolve("smudgy://other/evil", APP_REFERRER, ResolutionKind::Import);
+        let loader =
+            loader_with_app(r#"{ "name": "app", "version": "1.0.0", "dependencies": [] }"#);
+        let resolved = loader.resolve("smudgy://other/evil", APP_REFERRER, ResolutionKind::Import);
         assert!(resolved.is_err(), "an undeclared smudgy:// dep is denied");
     }
 
@@ -1075,7 +1090,8 @@ mod dep_gating_tests {
 
     #[test]
     fn user_module_may_import_any_smudgy_package() {
-        let loader = loader_with_app(r#"{ "name": "app", "version": "1.0.0", "dependencies": [] }"#);
+        let loader =
+            loader_with_app(r#"{ "name": "app", "version": "1.0.0", "dependencies": [] }"#);
         // A non-canonical (user-module) referrer is unrestricted.
         let resolved = loader.resolve(
             "smudgy://anyone#1/anything",
@@ -1092,8 +1108,15 @@ mod dep_gating_tests {
         let loader = loader_with_app(
             r#"{ "name": "app", "version": "1.0.0", "requires": ["smudgy://wbk/prod"] }"#,
         );
-        let resolved = loader.resolve("smudgy:events/wbk/prod", APP_REFERRER, ResolutionKind::Import);
-        assert!(resolved.is_ok(), "a `requires` root authorizes consuming its events: {resolved:?}");
+        let resolved = loader.resolve(
+            "smudgy:events/wbk/prod",
+            APP_REFERRER,
+            ResolutionKind::Import,
+        );
+        assert!(
+            resolved.is_ok(),
+            "a `requires` root authorizes consuming its events: {resolved:?}"
+        );
     }
 
     #[test]
@@ -1103,18 +1126,32 @@ mod dep_gating_tests {
         let loader = loader_with_app(
             r#"{ "name": "app", "version": "1.0.0", "dependencies": ["smudgy://wbk/prod"] }"#,
         );
-        let resolved = loader.resolve("smudgy:events/wbk/prod", APP_REFERRER, ResolutionKind::Import);
-        assert!(resolved.is_ok(), "a `dependencies` entry authorizes consuming its events: {resolved:?}");
+        let resolved = loader.resolve(
+            "smudgy:events/wbk/prod",
+            APP_REFERRER,
+            ResolutionKind::Import,
+        );
+        assert!(
+            resolved.is_ok(),
+            "a `dependencies` entry authorizes consuming its events: {resolved:?}"
+        );
     }
 
     #[test]
     fn package_may_not_consume_events_of_an_undeclared_producer() {
         let loader = loader_with_app(r#"{ "name": "app", "version": "1.0.0" }"#);
         let err = loader
-            .resolve("smudgy:events/wbk/prod", APP_REFERRER, ResolutionKind::Import)
+            .resolve(
+                "smudgy:events/wbk/prod",
+                APP_REFERRER,
+                ResolutionKind::Import,
+            )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("requires"), "the interop-gate diagnostic points at `requires`: {err}");
+        assert!(
+            err.contains("requires"),
+            "the interop-gate diagnostic points at `requires`: {err}"
+        );
     }
 
     #[test]
@@ -1125,17 +1162,21 @@ mod dep_gating_tests {
             r#"{ "name": "app", "version": "1.0.0", "requires": ["smudgy://wbk/prod"] }"#,
         );
         let resolved = loader.resolve("smudgy://wbk/prod", APP_REFERRER, ResolutionKind::Import);
-        assert!(resolved.is_err(), "a `requires` root is not importable as a code dependency");
+        assert!(
+            resolved.is_err(),
+            "a `requires` root is not importable as a code dependency"
+        );
     }
 
     /// A provider holding one library `gandalf/lib@1.0.0` with the given `importable` flag.
     fn provider_with_lib(importable: bool) -> Rc<InMemoryPackageProvider> {
         let mut provider = InMemoryPackageProvider::new();
-        let manifest_json = format!(
-            r#"{{ "version": "1.0.0", "importable": {importable} }}"#
-        );
+        let manifest_json = format!(r#"{{ "version": "1.0.0", "importable": {importable} }}"#);
         provider.insert(ResolvedPackage {
-            key: PackageKey { owner: "gandalf".into(), name: "lib".into() },
+            key: PackageKey {
+                owner: "gandalf".into(),
+                name: "lib".into(),
+            },
             resolved_version: "1.0.0".into(),
             manifest: PackageManifest::parse(&manifest_json).unwrap(),
             integrity: "sha256-test".into(),
@@ -1154,10 +1195,14 @@ mod dep_gating_tests {
         referrer: Option<(&str, &str, &str)>,
     ) -> Result<ModuleSource, ModuleLoaderError> {
         let provider = provider_with_lib(importable);
-        let mut spec = crate::package_resolver::SmudgySpecifier::parse("smudgy://gandalf/lib").unwrap();
+        let mut spec =
+            crate::package_resolver::SmudgySpecifier::parse("smudgy://gandalf/lib").unwrap();
         if let Some((owner, name, version)) = referrer {
             spec = spec.with_referrer(
-                PackageKey { owner: owner.into(), name: name.into() },
+                PackageKey {
+                    owner: owner.into(),
+                    name: name.into(),
+                },
                 version,
             );
         }
@@ -1166,32 +1211,46 @@ mod dep_gating_tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(crate::package_resolver::load_marker_module(provider, &marker))
+        rt.block_on(crate::package_resolver::load_marker_module(
+            provider, &marker,
+        ))
     }
 
     #[test]
     fn non_importable_denies_cross_owner_package_import() {
         let result = load_lib(false, Some(("frodo", "app", "1.0.0")));
-        assert!(result.is_err(), "a cross-owner import of importable:false is denied");
+        assert!(
+            result.is_err(),
+            "a cross-owner import of importable:false is denied"
+        );
     }
 
     #[test]
     fn non_importable_allows_same_owner_package_import() {
         let result = load_lib(false, Some(("gandalf", "other", "1.0.0")));
-        assert!(result.is_ok(), "a same-owner sibling may import it: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a same-owner sibling may import it: {result:?}"
+        );
     }
 
     #[test]
     fn non_importable_allows_user_top_level_import() {
         // No referrer = a user/top-level import; the user may import their own installed packages.
         let result = load_lib(false, None);
-        assert!(result.is_ok(), "a user/top-level import is exempt: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a user/top-level import is exempt: {result:?}"
+        );
     }
 
     #[test]
     fn importable_allows_cross_owner_package_import() {
         let result = load_lib(true, Some(("frodo", "app", "1.0.0")));
-        assert!(result.is_ok(), "an importable package is freely importable: {result:?}");
+        assert!(
+            result.is_ok(),
+            "an importable package is freely importable: {result:?}"
+        );
     }
 }
 
@@ -1210,7 +1269,10 @@ mod import_gate_tests {
     fn loader(import_policy: ImportPolicy) -> ScriptModuleLoader {
         ScriptModuleLoader {
             cwd: std::env::temp_dir(),
-            policy: ModulePolicy { allow_https: true, import_policy },
+            policy: ModulePolicy {
+                allow_https: true,
+                import_policy,
+            },
             source_maps: Default::default(),
             import_provider: RefCell::new(Box::new(NoopImportProvider)),
             npm: None,
@@ -1220,7 +1282,10 @@ mod import_gate_tests {
         }
     }
 
-    fn resolve(loader: &ScriptModuleLoader, specifier: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
+    fn resolve(
+        loader: &ScriptModuleLoader,
+        specifier: &str,
+    ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         loader.resolve(specifier, REFERRER, ResolutionKind::Import)
     }
 
@@ -1228,12 +1293,23 @@ mod import_gate_tests {
     fn none_blocks_every_external_scheme() {
         let off = loader(ImportPolicy::None);
         let npm = resolve(&off, "npm:left-pad").unwrap_err().to_string();
-        assert!(npm.contains("blocked") && npm.contains("npm"), "npm blocked at None: {npm}");
+        assert!(
+            npm.contains("blocked") && npm.contains("npm"),
+            "npm blocked at None: {npm}"
+        );
         // `jsr:` is rejected at the gate before async metadata loading (so, offline).
         let jsr = resolve(&off, "jsr:@std/assert").unwrap_err().to_string();
-        assert!(jsr.contains("blocked") && jsr.contains("jsr"), "jsr blocked at None: {jsr}");
-        let web = resolve(&off, "https://cdn.example.com/x.js").unwrap_err().to_string();
-        assert!(web.contains("blocked") && web.contains("the web"), "arbitrary https blocked at None: {web}");
+        assert!(
+            jsr.contains("blocked") && jsr.contains("jsr"),
+            "jsr blocked at None: {jsr}"
+        );
+        let web = resolve(&off, "https://cdn.example.com/x.js")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            web.contains("blocked") && web.contains("the web"),
+            "arbitrary https blocked at None: {web}"
+        );
     }
 
     #[test]
@@ -1251,7 +1327,9 @@ mod import_gate_tests {
             "the jsr.io CDN is allowed at Registries"
         );
         // Any OTHER web host is blocked.
-        let web = resolve(&reg, "https://cdn.example.com/x.js").unwrap_err().to_string();
+        let web = resolve(&reg, "https://cdn.example.com/x.js")
+            .unwrap_err()
+            .to_string();
         assert!(
             web.contains("blocked") && web.contains("the web"),
             "arbitrary https blocked at Registries: {web}"
@@ -1262,8 +1340,14 @@ mod import_gate_tests {
     fn any_allows_arbitrary_web() {
         let any = loader(ImportPolicy::Any);
         assert!(resolve(&any, "npm:left-pad").is_ok(), "npm allowed at Any");
-        assert!(resolve(&any, "https://cdn.example.com/x.js").is_ok(), "arbitrary https allowed at Any");
-        assert!(resolve(&any, "http://192.0.2.1:8080/x.js").is_ok(), "arbitrary http allowed at Any");
+        assert!(
+            resolve(&any, "https://cdn.example.com/x.js").is_ok(),
+            "arbitrary https allowed at Any"
+        );
+        assert!(
+            resolve(&any, "http://192.0.2.1:8080/x.js").is_ok(),
+            "arbitrary http allowed at Any"
+        );
     }
 
     #[test]
@@ -1273,10 +1357,19 @@ mod import_gate_tests {
         // branches before the gate (and `smudgy://` is dep-gated, not import-gated). Guards against
         // a refactor moving the gate ahead of those early-returns.
         let off = loader(ImportPolicy::None);
-        assert!(resolve(&off, "smudgy:core").is_ok(), "smudgy:core is not import-gated");
-        assert!(resolve(&off, "smudgy:widgets").is_ok(), "smudgy:widgets is not import-gated");
+        assert!(
+            resolve(&off, "smudgy:core").is_ok(),
+            "smudgy:core is not import-gated"
+        );
+        assert!(
+            resolve(&off, "smudgy:widgets").is_ok(),
+            "smudgy:widgets is not import-gated"
+        );
         // A `smudgy://` import from a user/file referrer (unrestricted by dep-gating) returns its
         // marker URL — the point is it is NOT rejected with the import-block error.
-        assert!(resolve(&off, "smudgy://wbk/util").is_ok(), "smudgy:// is not import-gated");
+        assert!(
+            resolve(&off, "smudgy://wbk/util").is_ok(),
+            "smudgy:// is not import-gated"
+        );
     }
 }

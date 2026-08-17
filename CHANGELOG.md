@@ -11,9 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The embedded JavaScript/TypeScript runtime now follows Deno 2.9.5 (V8 150.4), including its
   updated npm/CommonJS compatibility and matching editor declarations.
-- Package network permissions can declare exact Unix-domain (`unix:/path`) and VSock
-  (`vsock:CID:PORT`) targets. They are displayed separately from internet hosts and receive the
-  effectively-full-access consent warning; `*` and `*:port` remain internet-host-only grants.
+- Package manifests gain an `ipc` permission axis for local IPC endpoints. Each row declares a
+  Unix socket path and/or a Windows named-pipe name; the entry matching the user's platform is
+  granted as an exact target (together with the read/write access those socket operations
+  require), while the other entry is shown as not applying to that computer. The axis carries
+  the effectively-full-access consent warning, and `net` remains internet hosts only —
+  `unix:`/`vsock:` strings there are now manifest validation errors.
+- Sandboxed packages can no longer terminate the application through Deno's unstable-feature
+  gate (for example `Deno.connect({ transport: "vsock" })`); such calls now fail with an
+  ordinary catchable error.
 
 ## [0.5.3] - 2026-08-14
 

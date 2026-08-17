@@ -92,8 +92,10 @@ pub fn generate_declarations(
     }
     let root_names: Vec<String> = all_sources.keys().cloned().collect();
 
-    let libs: BTreeMap<String, &'static str> =
-        LIBS.iter().map(|(name, body)| ((*name).to_string(), *body)).collect();
+    let libs: BTreeMap<String, &'static str> = LIBS
+        .iter()
+        .map(|(name, body)| ((*name).to_string(), *body))
+        .collect();
 
     let input = GeneratorInput {
         libs: &libs,
@@ -116,7 +118,10 @@ pub fn generate_declarations(
         extensions: Vec::new(),
         data_dir,
         webstorage_dir: None,
-        module_policy: ModulePolicy { allow_https: false, ..Default::default() },
+        module_policy: ModulePolicy {
+            allow_https: false,
+            ..Default::default()
+        },
         inspector: None,
         tokio,
         package_provider: None,
@@ -128,8 +133,11 @@ pub fn generate_declarations(
     let deno = rt.deno_runtime();
     deno.execute_script("[smudgy:dts:shim]", FastString::from(SHIM_JS.to_string()))
         .context("dts shim")?;
-    deno.execute_script("[smudgy:dts:typescript]", FastString::from(TYPESCRIPT_JS.to_string()))
-        .context("load typescript.js")?;
+    deno.execute_script(
+        "[smudgy:dts:typescript]",
+        FastString::from(TYPESCRIPT_JS.to_string()),
+    )
+    .context("load typescript.js")?;
     deno.execute_script("[smudgy:dts:bind]", FastString::from(BIND_JS.to_string()))
         .context("bind ts")?;
     deno.execute_script(
@@ -138,7 +146,10 @@ pub fn generate_declarations(
     )
     .context("set dts input")?;
     let value = deno
-        .execute_script("[smudgy:dts:driver]", FastString::from(DRIVER_JS.to_string()))
+        .execute_script(
+            "[smudgy:dts:driver]",
+            FastString::from(DRIVER_JS.to_string()),
+        )
         .context("run dts driver")?;
 
     let json: String = {
@@ -194,18 +205,31 @@ mod tests {
         );
 
         let out = generate_declarations(&sources, &smudgy_core_ambient()).expect("generate");
-        assert!(out.diagnostics.is_empty(), "diagnostics: {:?}", out.diagnostics);
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
 
         let index = out.files.get("index.d.ts").expect("index.d.ts emitted");
         assert!(
             index.contains("PROMPT_EVENT: SmudgyEvent<PromptData>"),
             "branded token type missing:\n{index}"
         );
-        assert!(index.contains("describe(hp: number)"), "describe missing:\n{index}");
-        assert!(index.contains("level: string"), "inferred return missing:\n{index}");
+        assert!(
+            index.contains("describe(hp: number)"),
+            "describe missing:\n{index}"
+        );
+        assert!(
+            index.contains("level: string"),
+            "inferred return missing:\n{index}"
+        );
 
         let prompt = out.files.get("prompt.d.ts").expect("prompt.d.ts emitted");
-        assert!(prompt.contains("\"high\" | \"low\""), "inferred union missing:\n{prompt}");
+        assert!(
+            prompt.contains("\"high\" | \"low\""),
+            "inferred union missing:\n{prompt}"
+        );
 
         // The ambient smudgy-core.d.ts is resolve-only — not emitted as a package file.
         assert!(!out.files.contains_key("smudgy-core.d.ts"));
@@ -231,7 +255,11 @@ mod tests {
         );
 
         let out = generate_declarations(&sources, &smudgy_core_ambient()).expect("generate");
-        assert!(out.diagnostics.is_empty(), "diagnostics: {:?}", out.diagnostics);
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
 
         let index = out.files.get("index.d.ts").expect("index.d.ts emitted");
         assert!(
@@ -267,7 +295,11 @@ mod tests {
         );
 
         let out = generate_declarations(&sources, &smudgy_core_ambient()).expect("generate");
-        assert!(out.diagnostics.is_empty(), "diagnostics: {:?}", out.diagnostics);
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
 
         let index = out.files.get("index.d.ts").expect("index.d.ts emitted");
         assert!(

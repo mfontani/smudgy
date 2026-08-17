@@ -26,11 +26,12 @@ use deno_permissions::RuntimePermissionDescriptorParser;
 // &opts)` + `PermissionsContainer::new`, with the parser from
 // [`permission_descriptor_parser`].
 pub use deno_permissions::{
-    PermissionDescriptorParser, Permissions, PermissionsContainer, PermissionsOptions,
+    OpenAccessKind, PermissionDescriptorParser, Permissions, PermissionsContainer,
+    PermissionsOptions,
 };
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::deno_inspector_server::{
-    InspectPublishUid, InspectorServer, create_inspector_server,
+    create_inspector_server, InspectPublishUid, InspectorServer,
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
 pub use deno_web::InMemoryBroadcastChannel;
@@ -39,13 +40,14 @@ use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
 pub use package_resolver::{
-    CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy, InMemoryPackageProvider,
-    MARKER_SCHEME, NetEntryKind, PARAMS_SCHEME, PackageDependency, PackageError, PackageKey,
-    PackageManifest, PackageModuleSource, PackageParameter, PackagePermissions, PackageProvider,
-    ParamKind, ParamOption, ReferrerRef, ResolvedPackage, STATE_SCHEME, SmudgyCapabilities,
-    SmudgySpecifier, SmudgySpecifierError, canonical_url, is_any_host_net_entry, net_entry_kind,
-    params_module_url, parse_canonical, parse_params_url, platform_event_catalog,
-    platform_state_producer,
+    canonical_url, is_any_host_net_entry, is_local_transport_net_entry,
+    is_windows_pipe_namespace_entry, native_ipc_grants, native_ipc_path, params_module_url,
+    parse_canonical, parse_params_url, platform_event_catalog, platform_state_producer,
+    CanonicalCoords, ImportPolicy, InMemoryPackageProvider, IpcEntry, IpcEntryIssue, IpcGrants,
+    PackageDependency, PackageError, PackageKey, PackageManifest, PackageModuleSource,
+    PackageParameter, PackagePermissions, PackageProvider, ParamKind, ParamOption, ReferrerRef,
+    ResolvedPackage, SmudgyCapabilities, SmudgySpecifier, SmudgySpecifierError, CANONICAL_SCHEME,
+    EVENTS_SCHEME, MARKER_SCHEME, PARAMS_SCHEME, STATE_SCHEME,
 };
 
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
@@ -275,12 +277,30 @@ impl ScriptRuntime {
             )))
         });
 
+        // deno's default `FeatureChecker` callback is `std::process::exit(70)`, and
+        // unstable-gated ops consult the checker BEFORE any permission check — the vsock net
+        // ops (compiled on Linux/Android/macOS) reach it straight from
+        // `Deno.connect({ transport: "vsock" })`. Sandboxed script code must never be able to
+        // terminate the host process via a feature gate, so this checker enables no unstable
+        // features and swaps the exit callback for a log: the op falls through to the
+        // deny-by-default permission check (or its own unsupported-platform error) and
+        // surfaces as a catchable JS error instead of killing the app.
+        let feature_checker = {
+            let mut checker = deno_runtime::FeatureChecker::default();
+            checker.set_exit_cb(Box::new(|feature, api_name| {
+                log::warn!(
+                    "smudgy: denied unstable Deno feature '{feature}' requested by '{api_name}'"
+                );
+            }));
+            Arc::new(checker)
+        };
+
         let services =
             WorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
                 blob_store: Arc::new(deno_web::BlobStore::default()),
                 broadcast_channel: options.broadcast_channel.unwrap_or_default(),
                 deno_rt_native_addon_loader: None,
-                feature_checker: Default::default(),
+                feature_checker,
                 fs,
                 module_loader: loader,
                 node_services: Some(node_services),

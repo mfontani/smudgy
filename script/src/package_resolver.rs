@@ -662,25 +662,32 @@ impl ImportPolicy {
 }
 
 /// Requested permissions, enforced per sandboxed package isolate. The deno-native fields
-/// (`net`/`read`/`write`/`env`/`run`/`ffi`/`sys`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`) are
-/// each a deny-by-default allowlist: an absent/empty field denies that kind entirely. Value
-/// formats: `net` host entries are `host:port` (only that port), bare `host` (any port), `*`
-/// (any internet host/port), or `*:port` (any internet host on only that port). Local transports
-/// are separate exact-target entries: `unix:/absolute/path.sock` and `vsock:CID:PORT`. Host
-/// wildcards never cover either local transport;
+/// (`net`/`ipc`/`read`/`write`/`env`/`run`/`ffi`/`sys`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`)
+/// are each a deny-by-default allowlist: an absent/empty field denies that kind entirely. Value
+/// formats: `net` entries are **internet hosts only** — `host:port` (only that port), bare `host`
+/// (any port), `*` (any internet host/port), or `*:port` (any internet host on only that port);
+/// a `unix:`/`vsock:` prefix in `net` is a manifest-validation error (local IPC is the `ipc`
+/// axis, and vsock has no manifest surface at all);
 /// `read`/`write` are paths whose directory grants cover the whole subtree (and may use the
 /// `$DATA` placeholder, host-expanded before enforcement); `env` are exact var names; `run` are
 /// program names (PATH-resolved at container build) or absolute paths; `ffi` are dynamic-library
 /// paths with the same subtree + `$DATA` semantics as `read`/`write`; `sys` are deno system-info
 /// kind tokens (`hostname`, `osRelease`, …), exact-matched.
 ///
-/// **`run` and `ffi` are sandbox escapes**: a subprocess or a native library runs *outside* the
-/// permission model with the user's full privileges, and a `write` entry that reaches outside
-/// `$DATA` is equivalent (it can rewrite config, scripts, or other packages). They are declarable
-/// so a package that genuinely needs them can ask honestly — but every surface that shows a
-/// permission set (the consent window, the package panes) must present them as what they are:
-/// effectively full access, not a scoped grant (see `permission_can_lines` / `PermissionRisk` in
-/// the automations window).
+/// `ipc` rows ([`IpcEntry`]) name local IPC endpoints with per-platform realizations: an
+/// absolute POSIX socket path (`unix`) and/or a Windows pipe name (`windowsPipe`), at least one
+/// per row. The container build compiles the realization native to the running platform into an
+/// exact `unix:` net descriptor plus the paired read+write grant the socket ops require on that
+/// same path ([`native_ipc_grants`]); the non-native realization contributes nothing there.
+///
+/// **`run`, `ffi`, and `ipc` are sandbox escapes**: a subprocess or a native library runs
+/// *outside* the permission model with the user's full privileges, a local socket can front a
+/// privileged daemon (`unix:/var/run/docker.sock` is arbitrary code execution), and a `write`
+/// entry that reaches outside `$DATA` is equivalent (it can rewrite config, scripts, or other
+/// packages). They are declarable so a package that genuinely needs them can ask honestly — but
+/// every surface that shows a permission set (the consent window, the package panes) must
+/// present them as what they are: effectively full access, not a scoped grant (see
+/// `permission_can_lines` / `PermissionRisk` in the automations window).
 ///
 /// `import` is a tri-state [`ImportPolicy`] (not a host list) and a separate axis from `net`: `net`
 /// governs runtime network *connections* (opening sockets / `fetch`, where the package could send
@@ -694,6 +701,12 @@ impl ImportPolicy {
 pub struct PackagePermissions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub net: Vec<String>,
+    /// Local IPC endpoints ([`IpcEntry`] rows), each carrying per-platform realizations. The
+    /// highest ("unbox") risk tier: an exact target, but the target can be a privileged local
+    /// service. Absent/empty denies local IPC entirely; clients that predate the axis ignore it
+    /// and keep local IPC denied (fail-closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ipc: Vec<IpcEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -733,6 +746,7 @@ impl PackagePermissions {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.net.is_empty()
+            && self.ipc.is_empty()
             && self.read.is_empty()
             && self.write.is_empty()
             && self.env.is_empty()
@@ -752,6 +766,7 @@ impl PackagePermissions {
     /// no-op.
     pub fn merge(&mut self, other: &Self) {
         merge_dedup(&mut self.net, &other.net);
+        merge_dedup_ipc(&mut self.ipc, &other.ipc);
         merge_dedup(&mut self.read, &other.read);
         merge_dedup(&mut self.write, &other.write);
         merge_dedup(&mut self.env, &other.env);
@@ -782,6 +797,7 @@ impl PackagePermissions {
     pub fn added_since(&self, baseline: &Self) -> Self {
         Self {
             net: added_entries(&self.net, &baseline.net, PermField::Net),
+            ipc: added_ipc_entries(&self.ipc, &baseline.ipc),
             read: added_entries(&self.read, &baseline.read, PermField::Path),
             write: added_entries(&self.write, &baseline.write, PermField::Path),
             env: added_entries(&self.env, &baseline.env, PermField::Exact),
@@ -814,6 +830,7 @@ impl PackagePermissions {
     #[must_use]
     pub fn is_within(&self, ceiling: &Self) -> bool {
         self.net.iter().all(|e| covered_by(PermField::Net, &ceiling.net, e))
+            && self.ipc.iter().all(|row| ipc_covered(&ceiling.ipc, row))
             && self.read.iter().all(|e| covered_by(PermField::Path, &ceiling.read, e))
             && self.write.iter().all(|e| covered_by(PermField::Path, &ceiling.write, e))
             && self.env.iter().all(|e| covered_by(PermField::Exact, &ceiling.env, e))
@@ -823,6 +840,155 @@ impl PackagePermissions {
             // `import` fits iff it asks for no higher level than the ceiling grants.
             && self.import <= ceiling.import
             && self.smudgy.is_within(&ceiling.smudgy)
+    }
+}
+
+/// One row of the `ipc` permission axis: a local IPC endpoint named by its per-platform
+/// realizations. `unix` is an absolute POSIX Unix-domain socket path; `windowsPipe` is a bare
+/// Windows named-pipe name (no separators — the engine prepends `\\.\pipe\`). At least one
+/// realization must be declared per row ([`IpcEntry::issue`]). A row is one *endpoint*, not two
+/// grants: declaring both realizations keeps a single manifest honest across platforms, and the
+/// container build materializes only the realization native to the running platform
+/// ([`native_ipc_grants`]) — the other is inert there and is annotated as such in consent UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEntry {
+    /// The Unix-family realization: an absolute POSIX socket path (`/var/run/example.sock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix: Option<String>,
+    /// The Windows realization: a pipe name with no separators; the engine grants
+    /// `\\.\pipe\<name>`. Pipe names are case-insensitive on Windows, and consent coverage
+    /// compares them accordingly.
+    #[serde(
+        default,
+        rename = "windowsPipe",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub windows_pipe: Option<String>,
+}
+
+/// Why one [`IpcEntry`] fails manifest validation. Surfaced with a localized message by the
+/// manifest editor; the engine's container build refuses an invalid row outright (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcEntryIssue {
+    /// Neither realization is declared — the row grants nothing anywhere and is a mistake.
+    NoRealization,
+    /// `unix` is not a non-empty absolute POSIX path (must start with `/`, no NUL).
+    InvalidUnixPath,
+    /// `windowsPipe` is empty or contains a separator (`/`, `\`, `:`) — the engine prepends
+    /// `\\.\pipe\`, so a separator would let a name escape the pipe namespace.
+    InvalidPipeName,
+}
+
+impl IpcEntry {
+    /// The row's validation failure, if any. `None` means the row is well-formed.
+    #[must_use]
+    pub fn issue(&self) -> Option<IpcEntryIssue> {
+        if self.unix.is_none() && self.windows_pipe.is_none() {
+            return Some(IpcEntryIssue::NoRealization);
+        }
+        if self
+            .unix
+            .as_deref()
+            .is_some_and(|path| !path.starts_with('/') || path.contains('\0'))
+        {
+            return Some(IpcEntryIssue::InvalidUnixPath);
+        }
+        if self
+            .windows_pipe
+            .as_deref()
+            .is_some_and(|name| name.is_empty() || name.contains(['/', '\\', ':', '\0']))
+        {
+            return Some(IpcEntryIssue::InvalidPipeName);
+        }
+        None
+    }
+}
+
+/// Whether a manifest `net` entry names a local transport (`unix:`/`vsock:` prefix). Such
+/// entries are manifest-validation errors — `net` is internet hosts only, local IPC is the
+/// structured `ipc` axis, and vsock has no manifest surface — and the container build refuses
+/// them fail-closed so a hand-edited manifest cannot smuggle a local grant through the host
+/// list.
+#[must_use]
+pub fn is_local_transport_net_entry(entry: &str) -> bool {
+    let entry = entry.trim();
+    entry.starts_with("unix:") || entry.starts_with("vsock:")
+}
+
+/// Whether a manifest path-axis entry (`read`/`write`/`ffi`) names the Windows named-pipe
+/// namespace: two separators (either style), `.` or `?`, a separator, `pipe`
+/// (case-insensitive), then a separator or the end of the entry — the same shape the pinned
+/// `deno_permissions` patch's special-file carve-out admits, plus the bare namespace root
+/// (which would grant every pipe as a subtree). Such entries are manifest-validation errors.
+///
+/// This is the pairing invariant that keeps the carve-out safe: on Windows, fs-opening a pipe
+/// IS connecting to it, so with pipe-namespace query paths exempted from the unscoped-"all"
+/// demand, a plain `read`/`write` grant on a pipe path would reach local IPC without the
+/// Critical-tier `ipc` consent. Rejecting pipe paths in every path axis means a scoped grant
+/// that admits a pipe path can only originate from a consented `ipc` row — whose exact-pipe
+/// `unix:` net descriptor still gates the connection at the socket layer.
+#[must_use]
+pub fn is_windows_pipe_namespace_entry(entry: &str) -> bool {
+    fn is_sep(b: u8) -> bool {
+        b == b'\\' || b == b'/'
+    }
+    let s = entry.trim().as_bytes();
+    s.len() >= 8
+        && is_sep(s[0])
+        && is_sep(s[1])
+        && (s[2] == b'.' || s[2] == b'?')
+        && is_sep(s[3])
+        && s[4..8].eq_ignore_ascii_case(b"pipe")
+        && (s.len() == 8 || is_sep(s[8]))
+}
+
+/// The deno-native grants realized from consented `ipc` rows on the running platform: the
+/// `unix:<path>` strings for the net allowlist, and the same paths for the read **and** write
+/// allowlists — every Unix-socket/named-pipe op checks open access (read+write, no-follow) on
+/// the exact path *in addition to* the `unix:` net descriptor, so a net-only grant would
+/// silently never pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpcGrants {
+    /// `unix:<path>` entries for `allow_net`.
+    pub net: Vec<String>,
+    /// The bare paths for `allow_read` and `allow_write`.
+    pub paths: Vec<String>,
+}
+
+/// Compile consented `ipc` rows into the running platform's deno-native grants. Rows without a
+/// native realization contribute nothing (inert, not an error): a unix-only row on Windows and a
+/// pipe-only row on unix simply grant nothing there.
+#[must_use]
+pub fn native_ipc_grants(rows: &[IpcEntry]) -> IpcGrants {
+    let mut grants = IpcGrants::default();
+    for path in rows.iter().filter_map(native_ipc_path) {
+        grants.net.push(format!("unix:{path}"));
+        grants.paths.push(path);
+    }
+    grants
+}
+
+/// The running platform's realization of one `ipc` row: `\\.\pipe\<name>` from `windowsPipe` on
+/// Windows, the declared socket path from `unix` on the Unix family, `None` when the row has no
+/// realization here. Both forms parse as `unix:` net-descriptor rules on their own platform
+/// (Windows named pipes travel through the same `UnixSocket` descriptor and ops).
+#[must_use]
+pub fn native_ipc_path(entry: &IpcEntry) -> Option<String> {
+    #[cfg(windows)]
+    {
+        entry
+            .windows_pipe
+            .as_ref()
+            .map(|name| format!(r"\\.\pipe\{name}"))
+    }
+    #[cfg(unix)]
+    {
+        entry.unix.clone()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = entry;
+        None
     }
 }
 
@@ -1195,7 +1361,6 @@ fn path_entry_dropped(entry: &str) -> bool {
 /// `net` is host-case-insensitive, paths/env are case-sensitive (trimmed).
 fn dedup_key(field: PermField, entry: &str) -> String {
     match field {
-        PermField::Net if net_entry_kind(entry) != NetEntryKind::Host => normalize_plain(entry),
         PermField::Net => normalize_host(entry),
         PermField::Path | PermField::Exact => normalize_plain(entry),
     }
@@ -1204,18 +1369,11 @@ fn dedup_key(field: PermField, entry: &str) -> String {
 /// Whether the consented `net` grant `ceiling` covers the `requested` host entry, mirroring deno's
 /// `NetDescriptor` (`PACKAGE-ISOLATES-ENFORCEMENT.md`): hosts compare case-insensitively, and a
 /// bare-host grant (no port) covers every port while a `host:port` grant covers only that exact
-/// port. The special host `*` covers every requested internet host, with its optional port
-/// restriction applied normally. Unix-domain and VSock entries are different transports and
-/// cover only the same literal target; a host wildcard never covers them. (A colon suffix that
-/// isn't a `u16` port is taken as part of the host.)
+/// port. The special host `*` covers every requested host, with its optional port restriction
+/// applied normally. (A colon suffix that isn't a `u16` port is taken as part of the host.)
+/// `net` entries are internet hosts only — local IPC is the `ipc` axis ([`ipc_covered`]), so no
+/// host grant, wildcard included, ever meets a local-transport query here.
 fn host_covers(ceiling: &str, requested: &str) -> bool {
-    let ceiling_kind = net_entry_kind(ceiling);
-    let requested_kind = net_entry_kind(requested);
-    if ceiling_kind != NetEntryKind::Host || requested_kind != NetEntryKind::Host {
-        return ceiling_kind == requested_kind
-            && ceiling_kind != NetEntryKind::Host
-            && normalize_plain(ceiling) == normalize_plain(requested);
-    }
     let (ceiling_host, ceiling_port) = split_host_port(ceiling);
     let (requested_host, requested_port) = split_host_port(requested);
     (ceiling_host == "*" || ceiling_host == requested_host)
@@ -1227,32 +1385,70 @@ fn host_covers(ceiling: &str, requested: &str) -> bool {
 /// deno permission descriptor parser.
 #[must_use]
 pub fn is_any_host_net_entry(entry: &str) -> bool {
-    net_entry_kind(entry) == NetEntryKind::Host && split_host_port(entry).0 == "*"
+    split_host_port(entry).0 == "*"
 }
 
-/// The transport family named by one manifest `permissions.net` entry. This syntactic
-/// classification intentionally does not make malformed entries valid; `deno_permissions`
-/// remains the authoritative parser and rejects them when the restricted container is built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetEntryKind {
-    /// A DNS name, IP address/subnet, subdomain wildcard, or Smudgy's host-only `*` wildcard.
-    Host,
-    /// An exact Unix-domain socket path (`unix:/absolute/path.sock`).
-    UnixSocket,
-    /// An exact VM socket endpoint (`vsock:CID:PORT`).
-    Vsock,
+/// The `ipc` rows of `new` not covered by any row of `old`, preserving `new`'s order and
+/// spelling, de-duped within `new` — the `ipc` twin of [`added_entries`].
+fn added_ipc_entries(new: &[IpcEntry], old: &[IpcEntry]) -> Vec<IpcEntry> {
+    let mut seen: std::collections::HashSet<IpcKey> = std::collections::HashSet::new();
+    new.iter()
+        .filter(|row| !ipc_covered(old, row) && seen.insert(ipc_key(row)))
+        .cloned()
+        .collect()
 }
 
-/// Classify a manifest network entry for containment and honest consent rendering.
-#[must_use]
-pub fn net_entry_kind(entry: &str) -> NetEntryKind {
-    let entry = entry.trim();
-    if entry.starts_with("unix:") {
-        NetEntryKind::UnixSocket
-    } else if entry.starts_with("vsock:") {
-        NetEntryKind::Vsock
-    } else {
-        NetEntryKind::Host
+/// Whether any consented `ipc` row covers `requested`: coverage is **whole-row equality** under
+/// [`ipc_key`] — both realizations must match, including each one's absence. A row naming only a
+/// pipe is a different (narrower on one platform, absent on the other) ask than a row naming the
+/// pipe and a socket path, so it never rides the other's consent.
+fn ipc_covered(ceiling: &[IpcEntry], requested: &IpcEntry) -> bool {
+    let key = ipc_key(requested);
+    ceiling.iter().any(|grant| ipc_key(grant) == key)
+}
+
+/// The comparison key of one `ipc` row.
+type IpcKey = (Option<String>, Option<String>);
+
+/// Comparison key for an `ipc` row, normalized the way the engine's grants compare: the `unix`
+/// path lexically normalized exactly as `deno_permissions` normalizes `unix:` rules
+/// ([`normalize_unix_socket_path`]), the pipe name lowercased (Windows pipe names are
+/// case-insensitive).
+fn ipc_key(entry: &IpcEntry) -> IpcKey {
+    (
+        entry.unix.as_deref().map(normalize_unix_socket_path),
+        entry.windows_pipe.as_deref().map(str::to_lowercase),
+    )
+}
+
+/// Lexically normalize an absolute POSIX socket path the way `deno_permissions` normalizes a
+/// `unix:` allow-rule (its `normalize_path`, applied at rule-parse time): empty and `.`
+/// components drop, `..` pops the previous component (clamped at the root), and symlinks are
+/// deliberately not resolved — the rule scopes the socket *location*. Keeping this comparison in
+/// lockstep is what makes consent coverage agree with what the container actually grants:
+/// without it, `/var/run/../run/x.sock` would look like a new ask over a consented
+/// `/var/run/x.sock` even though both compile to the same descriptor.
+fn normalize_unix_socket_path(path: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    format!("/{}", stack.join("/"))
+}
+
+/// Append each `ipc` row of `src` not already present in `dst` (by [`ipc_key`]) — the `ipc` twin
+/// of [`merge_dedup`], preserving first-seen order across the dependency-closure union.
+fn merge_dedup_ipc(dst: &mut Vec<IpcEntry>, src: &[IpcEntry]) {
+    for row in src {
+        if !dst.iter().any(|existing| ipc_key(existing) == ipc_key(row)) {
+            dst.push(row.clone());
+        }
     }
 }
 
@@ -2309,16 +2505,14 @@ pub(crate) async fn load_kind_scheme_module(
                     ))
                 })?;
                 let entry_url = canonical_url(key, &fetched.resolved_version, &entry.subpath);
-                let extraction = crate::interop_extract::extract_interop_handles(
-                    &entry_url,
-                    &entry.text,
-                )
-                .map_err(|err| {
-                    crate::generic_loader_error(format!(
+                let extraction =
+                    crate::interop_extract::extract_interop_handles(&entry_url, &entry.text)
+                        .map_err(|err| {
+                            crate::generic_loader_error(format!(
                         "cannot consume {display}/{}/{}: its entry module failed to parse: {err}",
                         key.owner, key.name
                     ))
-                })?;
+                        })?;
                 if !extraction.duplicates.is_empty() {
                     log::warn!(
                         "smudgy: package {}/{} declares duplicate interop handle name(s): {} (first declaration wins)",
@@ -2679,11 +2873,9 @@ mod tests {
         assert_eq!(widgets_jsx_runtime_url().path(), "/jsx-runtime");
         assert_eq!(widgets_module_url("repl").scheme(), WIDGETS_SCHEME);
         assert_eq!(widgets_module_url("repl").path(), "/user");
-        assert!(
-            widgets_module_url("file:///srv/modules/hud.tsx")
-                .path()
-                .starts_with("/mod")
-        );
+        assert!(widgets_module_url("file:///srv/modules/hud.tsx")
+            .path()
+            .starts_with("/mod"));
     }
 
     #[test]
@@ -3371,11 +3563,9 @@ mod tests {
         assert!(json.contains(r#""description":"A handy mapper""#));
         // …but an empty one is omitted (skip_serializing_if).
         let empty = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
-        assert!(
-            !serde_json::to_string(&empty)
-                .unwrap()
-                .contains("description")
-        );
+        assert!(!serde_json::to_string(&empty)
+            .unwrap()
+            .contains("description"));
     }
 
     #[test]
@@ -3784,40 +3974,202 @@ mod tests {
         assert!(!is_any_host_net_entry("*:not-a-port"));
     }
 
+    /// A row helper for the `ipc` axis tests.
+    fn ipc_row(unix: Option<&str>, pipe: Option<&str>) -> IpcEntry {
+        IpcEntry {
+            unix: unix.map(str::to_string),
+            windows_pipe: pipe.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn local_network_transports_are_exact_and_never_covered_by_host_wildcards() {
+    fn ipc_rows_are_exact_whole_row_grants() {
+        let consented = PackagePermissions {
+            ipc: vec![ipc_row(Some("/var/run/docker.sock"), Some("Docker_Engine"))],
+            ..Default::default()
+        };
+        // The same endpoint spelled through a lexical detour + a re-cased pipe name is covered:
+        // the unix path compares after deno's rule normalization, the pipe case-insensitively.
+        let respelled = PackagePermissions {
+            ipc: vec![ipc_row(
+                Some("/var/run/../run/./docker.sock"),
+                Some("docker_engine"),
+            )],
+            ..Default::default()
+        };
+        assert!(respelled.is_within(&consented));
+        assert!(respelled.added_since(&consented).ipc.is_empty());
+
+        // A different target is a new ask.
+        let other = PackagePermissions {
+            ipc: vec![ipc_row(Some("/var/run/other.sock"), Some("Docker_Engine"))],
+            ..Default::default()
+        };
+        assert!(!other.is_within(&consented));
+        assert_eq!(other.added_since(&consented).ipc, other.ipc);
+
+        // Coverage is whole-row: a pipe-only row does not ride a consented two-realization row
+        // (and vice versa) — each fields-set is its own ask.
+        let pipe_only = PackagePermissions {
+            ipc: vec![ipc_row(None, Some("docker_engine"))],
+            ..Default::default()
+        };
+        assert!(!pipe_only.is_within(&consented));
+        assert!(!consented.is_within(&pipe_only));
+
+        // `net` and `ipc` are different axes entirely: no host grant covers an ipc row.
         let any_host = PackagePermissions {
             net: vec!["*".into()],
             ..Default::default()
         };
-        let unix = PackagePermissions {
-            net: vec!["unix:/var/run/docker.sock".into()],
-            ..Default::default()
-        };
-        let other_unix = PackagePermissions {
-            net: vec!["unix:/var/run/other.sock".into()],
-            ..Default::default()
-        };
-        let vsock = PackagePermissions {
-            net: vec!["vsock:2:1234".into()],
-            ..Default::default()
-        };
-        let other_vsock = PackagePermissions {
-            net: vec!["vsock:3:1234".into()],
-            ..Default::default()
-        };
+        assert!(!consented.is_within(&any_host));
+        assert_eq!(consented.added_since(&any_host).ipc, consented.ipc);
+    }
 
-        assert!(!unix.is_within(&any_host));
-        assert!(!vsock.is_within(&any_host));
-        assert!(unix.is_within(&unix));
-        assert!(vsock.is_within(&vsock));
-        assert!(!unix.is_within(&other_unix));
-        assert!(!vsock.is_within(&other_vsock));
-        assert_eq!(unix.added_since(&any_host).net, unix.net);
-        assert_eq!(vsock.added_since(&any_host).net, vsock.net);
-        assert_eq!(net_entry_kind("unix:/tmp/a.sock"), NetEntryKind::UnixSocket);
-        assert_eq!(net_entry_kind("vsock:2:1234"), NetEntryKind::Vsock);
-        assert_eq!(net_entry_kind("example.com:443"), NetEntryKind::Host);
+    #[test]
+    fn ipc_axis_merges_dedups_and_round_trips_serde() {
+        let manifest = PackageManifest::parse(
+            r#"{ "version": "1.0.0", "permissions": { "ipc": [
+                { "unix": "/var/run/docker.sock", "windowsPipe": "docker_engine" },
+                { "windowsPipe": "solo-pipe" }
+            ] } }"#,
+        )
+        .expect("ipc rows parse");
+        assert_eq!(
+            manifest.permissions.ipc,
+            vec![
+                ipc_row(Some("/var/run/docker.sock"), Some("docker_engine")),
+                ipc_row(None, Some("solo-pipe")),
+            ]
+        );
+        // The wire form uses the camelCase key and omits an absent realization.
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains(r#""windowsPipe":"docker_engine""#), "{json}");
+        assert!(
+            !json.contains(r#""unix":null"#),
+            "an absent realization is omitted: {json}"
+        );
+        // An ipc-less manifest round-trips with no `ipc` key at all.
+        let plain = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
+        assert!(plain.permissions.ipc.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("ipc"));
+
+        // The closure union dedups equal rows (normalized-key equality) and keeps distinct ones.
+        let mut union = manifest.permissions.clone();
+        union.merge(&PackagePermissions {
+            ipc: vec![
+                ipc_row(Some("/var/run//docker.sock"), Some("DOCKER_ENGINE")),
+                ipc_row(Some("/tmp/other.sock"), None),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(union.ipc.len(), 3, "one duplicate folded, one new row kept");
+        assert_eq!(union.ipc[2], ipc_row(Some("/tmp/other.sock"), None));
+    }
+
+    #[test]
+    fn ipc_rows_validate_and_net_local_transport_entries_are_flagged() {
+        assert_eq!(ipc_row(Some("/var/run/x.sock"), None).issue(), None);
+        assert_eq!(ipc_row(None, Some("pipe-name")).issue(), None);
+        assert_eq!(
+            ipc_row(None, None).issue(),
+            Some(IpcEntryIssue::NoRealization)
+        );
+        assert_eq!(
+            ipc_row(Some("relative.sock"), None).issue(),
+            Some(IpcEntryIssue::InvalidUnixPath)
+        );
+        assert_eq!(
+            ipc_row(Some(""), None).issue(),
+            Some(IpcEntryIssue::InvalidUnixPath)
+        );
+        for bad in ["", "a/b", r"a\b", "a:b"] {
+            assert_eq!(
+                ipc_row(None, Some(bad)).issue(),
+                Some(IpcEntryIssue::InvalidPipeName),
+                "pipe name {bad:?} must be rejected"
+            );
+        }
+        // `net` is hosts-only; the legacy string forms are flagged for validation errors.
+        assert!(is_local_transport_net_entry("unix:/var/run/docker.sock"));
+        assert!(is_local_transport_net_entry(" vsock:2:1234"));
+        assert!(!is_local_transport_net_entry("example.com:443"));
+        assert!(!is_local_transport_net_entry("*"));
+    }
+
+    #[test]
+    fn windows_pipe_namespace_entries_are_flagged_in_every_spelling() {
+        // The read/write/ffi axes must reject the pipe namespace (fs-opening a pipe IS
+        // connecting to it): both separator styles, the `\\?\` verbatim prefix, re-cased
+        // `pipe`, mixed separators, and the bare namespace root.
+        for entry in [
+            r"\\.\pipe\docker_engine",
+            "//./pipe/docker_engine",
+            r"\\?\pipe\docker_engine",
+            "//?/pipe/docker_engine",
+            r"\\.\PIPE\docker_engine",
+            r"//.\Pipe/docker_engine",
+            r"\\.\pipe\",
+            "//./pipe/",
+            r"\\.\pipe",
+            " //./pipe/spaced ",
+        ] {
+            assert!(
+                is_windows_pipe_namespace_entry(entry),
+                "{entry:?} names the pipe namespace"
+            );
+        }
+        // Ordinary paths — drive paths, UNC shares, POSIX paths, `$DATA`, and other
+        // device-namespace objects (still all-permission-gated) — are not flagged.
+        for entry in [
+            r"C:\Users\me\file.txt",
+            r"C:\pipe\file.txt",
+            r"\\server\pipe\share.txt",
+            "/var/run/pipe/x.sock",
+            "$DATA/maps",
+            r"\\.\PhysicalDrive0",
+            r"\\.\pipeline\x",
+        ] {
+            assert!(
+                !is_windows_pipe_namespace_entry(entry),
+                "{entry:?} is not the pipe namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn native_ipc_grants_realize_only_the_running_platform() {
+        let rows = [
+            ipc_row(Some("/var/run/both.sock"), Some("both-pipe")),
+            ipc_row(Some("/var/run/unix-only.sock"), None),
+            ipc_row(None, Some("pipe-only")),
+        ];
+        let grants = native_ipc_grants(&rows);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                grants.net,
+                vec![r"unix:\\.\pipe\both-pipe", r"unix:\\.\pipe\pipe-only"]
+            );
+            assert_eq!(
+                grants.paths,
+                vec![r"\\.\pipe\both-pipe", r"\\.\pipe\pipe-only"]
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                grants.net,
+                vec!["unix:/var/run/both.sock", "unix:/var/run/unix-only.sock"]
+            );
+            assert_eq!(
+                grants.paths,
+                vec!["/var/run/both.sock", "/var/run/unix-only.sock"]
+            );
+        }
+        // An empty axis realizes nothing — deny-by-default is preserved downstream (the engine
+        // maps an empty list to deno's `None`, never `Some(vec![])`).
+        assert_eq!(native_ipc_grants(&[]), IpcGrants::default());
     }
 
     #[test]

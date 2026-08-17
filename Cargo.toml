@@ -99,8 +99,11 @@ deno_core = { version = "0.410", features = [
 ] }
 pathfinding = "4.14.0"
 deno_error = "=0.7.1"
-# Windows UI process-memory accounting and workspace restore APIs.
-winapi = { version = "0.3.9", features = ["sysinfoapi"] }
+# Windows UI platform calls: the Restart Manager window-proc subclass
+# (ui/src/win_rm.rs — commctrl/winuser, WM_ENDSESSION handling) and
+# virtual-screen metrics for workspace restore (ui/src/workspace/restore.rs).
+# The ui crate declares the feature set it needs at its own dependency entry.
+winapi = "0.3.9"
 build-time = "0.1.3"
 fluent-bundle = "0.16.0"
 sys-locale = "0.3.2"
@@ -128,7 +131,11 @@ unic-langid = "0.9.6"
 # - `deno_permissions` (patches/deno_permissions+0.116.0.patch): adds a host-only
 #   any-host network descriptor so package manifests can express `*` (any internet
 #   host/port) and `*:port` (any internet host on one port) consistently without
-#   granting Unix-domain or VSock transports.
+#   granting Unix-domain or VSock transports. Also exempts Windows pipe-namespace
+#   query paths (`\\.\pipe\<name>`) from the special-file all-permissions demand so
+#   scoped read+write grants can reach them; paired invariant: smudgy rejects
+#   pipe-namespace paths in manifest path axes, so a pipe fs-grant only ever
+#   originates from a consented Critical-tier `ipc` row.
 [workspace.metadata.patch]
 crates = ["iced_graphics", "cosmic-text", "vtparse", "deno_permissions"]
 

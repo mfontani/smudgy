@@ -21,9 +21,8 @@ use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::local_packages::{self, LocalModule, LocalPackage};
 use smudgy_core::models::naming;
 use smudgy_core::models::shared_packages::{
-    self, ImportPolicy, LockedPackage, NetEntryKind, PackageManifest, PackageParameter,
+    self, ImportPolicy, IpcEntry, LockedPackage, PackageManifest, PackageParameter,
     PackagePermissions, ParamKind, SmudgyCapabilities, UpdateMode, is_any_host_net_entry,
-    net_entry_kind,
 };
 
 use crate::assets::fonts;
@@ -1031,35 +1030,36 @@ fn import_can_line(policy: ImportPolicy) -> Option<&'static str> {
 /// banner ([`union_risk`]) agree on what's scoped and what's effectively unlimited.
 fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
     let mut lines = Vec::new();
-    // Internet hosts dedup case-insensitively (DNS is case-insensitive); local transport targets
-    // retain exact spelling because Unix paths are case-sensitive and both kinds are exact grants.
+    // Hosts dedup case-insensitively (DNS is case-insensitive) so the list shows no near-dupes,
+    // keeping each host's first-seen spelling.
     let mut seen_hosts: HashSet<String> = HashSet::new();
     for host in &perms.net {
-        let kind = net_entry_kind(host);
-        let dedup = if kind == NetEntryKind::Host {
-            host.trim().to_lowercase()
-        } else {
-            host.trim().to_string()
-        };
-        if seen_hosts.insert(dedup) {
+        if seen_hosts.insert(host.trim().to_lowercase()) {
             lines.push(PermissionLine {
-                head: match kind {
-                    NetEntryKind::Host => crate::i18n::t!("permission-connect-to"),
-                    NetEntryKind::UnixSocket => {
-                        crate::i18n::t!("permission-connect-to-unix")
-                    }
-                    NetEntryKind::Vsock => crate::i18n::t!("permission-connect-to-vsock"),
-                },
+                head: crate::i18n::t!("permission-connect-to"),
                 detail: Some(host.clone()),
-                risk: match kind {
-                    // A local socket can expose a privileged daemon (for example Docker) and
-                    // therefore crosses the same full-access consent cliff as run/ffi.
-                    NetEntryKind::UnixSocket | NetEntryKind::Vsock => PermissionRisk::Critical,
-                    // `*` / `*:port` lets the package choose the peer rather than constraining it
-                    // to a named host. Frame that like arbitrary web-code imports.
-                    NetEntryKind::Host if is_any_host_net_entry(host) => PermissionRisk::Caution,
-                    NetEntryKind::Host => PermissionRisk::Normal,
+                // `*` / `*:port` lets the package choose the peer rather than constraining it to
+                // a named host. Frame that at the same caution tier as arbitrary web-code imports.
+                risk: if is_any_host_net_entry(host) {
+                    PermissionRisk::Caution
+                } else {
+                    PermissionRisk::Normal
                 },
+            });
+        }
+    }
+    // Local IPC rows: one line per endpoint showing BOTH realizations distinctly, the one that
+    // does not apply to this computer annotated (it is inert on this install). A local socket
+    // can front a privileged daemon (for example Docker), so every row sits at the same
+    // full-access cliff as run/ffi.
+    let mut seen_ipc: HashSet<String> = HashSet::new();
+    for row in &perms.ipc {
+        let detail = ipc_line_detail(row);
+        if seen_ipc.insert(detail.clone()) {
+            lines.push(PermissionLine {
+                head: crate::i18n::t!("permission-connect-local-ipc"),
+                detail: Some(detail),
+                risk: PermissionRisk::Critical,
             });
         }
     }
@@ -1152,6 +1152,32 @@ fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
     lines
 }
 
+/// The consent-line detail for one `ipc` row: both realizations, each labeled by kind (Unix
+/// socket path vs Windows pipe name), with the realization that does not match the running
+/// platform annotated — it contributes nothing to the grant on this install, and honest consent
+/// says so.
+fn ipc_line_detail(row: &IpcEntry) -> String {
+    let foreign = crate::i18n::t!("permission-ipc-foreign-platform");
+    let mut parts = Vec::new();
+    if let Some(path) = &row.unix {
+        let part = crate::i18n::t!("permission-ipc-unix-socket", "path" => path.as_str());
+        parts.push(if cfg!(windows) {
+            format!("{part} ({foreign})")
+        } else {
+            part
+        });
+    }
+    if let Some(name) = &row.windows_pipe {
+        let part = crate::i18n::t!("permission-ipc-windows-pipe", "name" => name.as_str());
+        parts.push(if cfg!(windows) {
+            part
+        } else {
+            format!("{part} ({foreign})")
+        });
+    }
+    parts.join(" \u{00B7} ")
+}
+
 /// A smudgy op-capability "can do" line with no target list (the head text is the whole label).
 fn cap_line(head: &str) -> PermissionLine {
     PermissionLine {
@@ -1188,13 +1214,8 @@ fn union_risk(perms: &PackagePermissions) -> PermissionRisk {
 /// {a}, {b}"). Empty iff the union has no [`PermissionRisk::Critical`] line.
 fn escape_reasons(perms: &PackagePermissions) -> Vec<&'static str> {
     let mut reasons = Vec::new();
-    if perms.net.iter().any(|entry| {
-        matches!(
-            net_entry_kind(entry),
-            NetEntryKind::UnixSocket | NetEntryKind::Vsock
-        )
-    }) {
-        reasons.push("connect to local system transports");
+    if !perms.ipc.is_empty() {
+        reasons.push("connect to local IPC services");
     }
     if !perms.run.is_empty() {
         reasons.push("run other programs");
@@ -7312,29 +7333,62 @@ mod tests {
     }
 
     #[test]
-    fn local_transport_grants_are_distinct_and_critical() {
+    fn ipc_rows_render_one_critical_line_with_both_realizations() {
         let local = PackagePermissions {
-            net: vec!["unix:/var/run/docker.sock".into(), "vsock:2:1234".into()],
+            ipc: vec![IpcEntry {
+                unix: Some("/var/run/docker.sock".into()),
+                windows_pipe: Some("docker_engine".into()),
+            }],
             ..Default::default()
         };
         let lines = permission_can_lines(&local);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].head, crate::i18n::t!("permission-connect-to-unix"));
+        assert_eq!(lines.len(), 1, "one row is one consent line");
         assert_eq!(
-            lines[0].detail.as_deref(),
-            Some("unix:/var/run/docker.sock")
+            lines[0].head,
+            crate::i18n::t!("permission-connect-local-ipc")
         );
         assert_eq!(lines[0].risk, PermissionRisk::Critical);
-        assert_eq!(
-            lines[1].head,
-            crate::i18n::t!("permission-connect-to-vsock")
+        let detail = lines[0].detail.as_deref().expect("ipc line lists targets");
+        assert!(
+            detail.contains("/var/run/docker.sock") && detail.contains("docker_engine"),
+            "both realizations are shown distinctly: {detail}"
         );
-        assert_eq!(lines[1].detail.as_deref(), Some("vsock:2:1234"));
-        assert_eq!(lines[1].risk, PermissionRisk::Critical);
-        assert_eq!(union_risk(&local), PermissionRisk::Critical);
+        // Exactly one realization is foreign to the running platform, and it is annotated.
+        let foreign = crate::i18n::t!("permission-ipc-foreign-platform");
         assert_eq!(
-            escape_reasons(&local),
-            ["connect to local system transports"]
+            detail.matches(foreign.as_str()).count(),
+            1,
+            "the non-native realization carries the platform annotation: {detail}"
+        );
+        assert_eq!(union_risk(&local), PermissionRisk::Critical);
+        assert_eq!(escape_reasons(&local), ["connect to local IPC services"]);
+
+        // A row with only the foreign realization still surfaces (Critical, annotated): the
+        // user is consenting to what the package gets on its other platform installs too.
+        let one_sided = PackagePermissions {
+            ipc: vec![IpcEntry {
+                unix: if cfg!(windows) {
+                    Some("/var/run/docker.sock".into())
+                } else {
+                    None
+                },
+                windows_pipe: if cfg!(windows) {
+                    None
+                } else {
+                    Some("docker_engine".into())
+                },
+            }],
+            ..Default::default()
+        };
+        let lines = permission_can_lines(&one_sided);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].risk, PermissionRisk::Critical);
+        assert!(
+            lines[0]
+                .detail
+                .as_deref()
+                .expect("detail")
+                .contains(foreign.as_str())
         );
     }
 }

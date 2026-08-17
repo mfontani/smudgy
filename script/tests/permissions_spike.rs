@@ -23,11 +23,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use deno_core::{FastString, PollEventLoopOptions, serde_v8};
+use deno_core::{serde_v8, FastString, PollEventLoopOptions};
 use serde_json::Value;
 use smudgy_script::{
-    ModulePolicy, Permissions, PermissionsContainer, PermissionsOptions, ScriptRuntime,
-    ScriptRuntimeOptions, permission_descriptor_parser,
+    native_ipc_grants, permission_descriptor_parser, IpcEntry, ModulePolicy, OpenAccessKind,
+    Permissions, PermissionsContainer, PermissionsOptions, ScriptRuntime, ScriptRuntimeOptions,
 };
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
@@ -478,11 +478,9 @@ fn any_host_wildcard_does_not_cover_local_transports() -> Result<()> {
         ..Default::default()
     };
     let mut permissions = permissions_container(&opts)?;
-    assert!(
-        permissions
-            .check_net(&("example.com", Some(443)), "wildcard-test")
-            .is_ok()
-    );
+    assert!(permissions
+        .check_net(&("example.com", Some(443)), "wildcard-test")
+        .is_ok());
     assert!(
         permissions
             .check_net_vsock(2, 1234, "wildcard-test")
@@ -498,30 +496,162 @@ fn any_host_wildcard_does_not_cover_local_transports() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-#[test]
-fn literal_local_transport_grants_match_only_the_exact_target() -> Result<()> {
-    let opts = PermissionsOptions {
-        allow_net: Some(vec![
-            "unix:/var/run/example.sock".to_string(),
-            "vsock:2:1234".to_string(),
-        ]),
+/// Assemble the restricted options for an `ipc` grant exactly the way the engine's container
+/// build does (`core::…::script_engine::build_restricted_container`): [`native_ipc_grants`]
+/// realizes each row on the running platform, its `unix:` strings join `allow_net`, and the same
+/// paths join `allow_read` AND `allow_write` — the socket ops check open access on the exact
+/// path in addition to the net descriptor. An empty result maps to `None` (deny), never
+/// `Some(vec![])` (deno's allow-all sentinel).
+fn ipc_options(rows: &[IpcEntry]) -> PermissionsOptions {
+    let grants = native_ipc_grants(rows);
+    PermissionsOptions {
+        allow_net: (!grants.net.is_empty()).then(|| grants.net.clone()),
+        allow_read: (!grants.paths.is_empty()).then(|| grants.paths.clone()),
+        allow_write: (!grants.paths.is_empty()).then_some(grants.paths),
         prompt: false,
         ..Default::default()
-    };
-    let mut permissions = permissions_container(&opts)?;
+    }
+}
+
+fn ipc_row(unix: Option<&str>, pipe: Option<&str>) -> IpcEntry {
+    IpcEntry {
+        unix: unix.map(str::to_string),
+        windows_pipe: pipe.map(str::to_string),
+    }
+}
+
+/// The `ipc` axis on Windows: a row's pipe realization grants exactly `\\.\pipe\<name>` — as the
+/// unix-socket net descriptor plus the paired read+write open access the socket ops require — a
+/// different pipe name stays denied, a unix-only row contributes nothing, and an empty axis
+/// yields deny-by-default.
+#[cfg(windows)]
+#[test]
+fn ipc_axis_realizes_the_windows_pipe_exactly() -> Result<()> {
+    let rows = [
+        ipc_row(Some("/var/run/granted.sock"), Some("smudgy-spike-granted")),
+        ipc_row(Some("/var/run/unix-only.sock"), None),
+    ];
+    let mut permissions = permissions_container(&ipc_options(&rows))?;
+    let granted = Path::new(r"\\.\pipe\smudgy-spike-granted");
     assert!(
         permissions
-            .check_net_unix_socket(Path::new("/var/run/example.sock"), Some("local-test"))
-            .is_ok()
+            .check_net_unix_socket(granted, Some("ipc-test"))
+            .is_ok(),
+        "the pipe realization must be granted as an exact unix-socket descriptor"
+    );
+    // The paired read+write open access on the same pipe, in the canonical spelling: the
+    // patched `deno_permissions` exempts pipe-namespace query paths from the special-file
+    // all-permissions demand, so the scoped grant alone must admit it.
+    assert!(
+        permissions
+            .check_open(
+                std::borrow::Cow::Borrowed(granted),
+                OpenAccessKind::ReadWriteNoFollow,
+                Some("ipc-test"),
+            )
+            .is_ok(),
+        "the ipc grant must carry the paired read+write on the exact path"
+    );
+    // The forward-slash spelling of the same object is the same grant (Windows path
+    // components compare separator-insensitively) — and a different pipe stays denied in
+    // both spellings.
+    assert!(
+        permissions
+            .check_open(
+                std::borrow::Cow::Borrowed(Path::new("//./pipe/smudgy-spike-granted")),
+                OpenAccessKind::ReadWriteNoFollow,
+                Some("ipc-test"),
+            )
+            .is_ok(),
+        "the forward-slash spelling of the granted pipe is the same object"
+    );
+    for other in [
+        r"\\.\pipe\smudgy-spike-other",
+        "//./pipe/smudgy-spike-other",
+    ] {
+        assert!(
+            permissions
+                .check_open(
+                    std::borrow::Cow::Borrowed(Path::new(other)),
+                    OpenAccessKind::ReadWriteNoFollow,
+                    Some("ipc-test"),
+                )
+                .is_err(),
+            "the paired read+write is exact — {other:?} stays denied"
+        );
+    }
+    assert!(
+        permissions
+            .check_net_unix_socket(Path::new(r"\\.\pipe\smudgy-spike-other"), Some("ipc-test"))
+            .is_err(),
+        "a different pipe name must stay denied"
     );
     assert!(
         permissions
-            .check_net_unix_socket(Path::new("/var/run/other.sock"), Some("local-test"))
-            .is_err()
+            .check_net_unix_socket(Path::new("/var/run/unix-only.sock"), Some("ipc-test"))
+            .is_err(),
+        "a unix-only row must contribute nothing on Windows"
     );
-    assert!(permissions.check_net_vsock(2, 1234, "local-test").is_ok());
-    assert!(permissions.check_net_vsock(3, 1234, "local-test").is_err());
+
+    // Deny-by-default: an empty axis produces no grant at all.
+    let mut denied = permissions_container(&ipc_options(&[]))?;
+    assert!(
+        denied
+            .check_net_unix_socket(granted, Some("ipc-test"))
+            .is_err(),
+        "an empty ipc axis must deny every local endpoint"
+    );
+    Ok(())
+}
+
+/// The unix mirror of `ipc_axis_realizes_the_windows_pipe_exactly`: the unix realization is an
+/// exact-path grant, a different path stays denied, and a pipe-only row is inert.
+#[cfg(unix)]
+#[test]
+fn ipc_axis_realizes_the_unix_socket_exactly() -> Result<()> {
+    let rows = [
+        ipc_row(Some("/var/run/granted.sock"), Some("smudgy-spike-granted")),
+        ipc_row(None, Some("windows-only")),
+    ];
+    let mut permissions = permissions_container(&ipc_options(&rows))?;
+    let granted = Path::new("/var/run/granted.sock");
+    assert!(
+        permissions
+            .check_net_unix_socket(granted, Some("ipc-test"))
+            .is_ok(),
+        "the unix realization must be granted as an exact unix-socket descriptor"
+    );
+    assert!(
+        permissions
+            .check_open(
+                std::borrow::Cow::Borrowed(granted),
+                OpenAccessKind::ReadWriteNoFollow,
+                Some("ipc-test"),
+            )
+            .is_ok(),
+        "the ipc grant must carry the paired read+write on the exact path"
+    );
+    assert!(
+        permissions
+            .check_net_unix_socket(Path::new("/var/run/other.sock"), Some("ipc-test"))
+            .is_err(),
+        "a different socket path must stay denied"
+    );
+    assert!(
+        permissions
+            .check_net_unix_socket(Path::new(r"\\.\pipe\windows-only"), Some("ipc-test"))
+            .is_err(),
+        "a pipe-only row must contribute nothing on unix"
+    );
+
+    // Deny-by-default: an empty axis produces no grant at all.
+    let mut denied = permissions_container(&ipc_options(&[]))?;
+    assert!(
+        denied
+            .check_net_unix_socket(granted, Some("ipc-test"))
+            .is_err(),
+        "an empty ipc axis must deny every local endpoint"
+    );
     Ok(())
 }
 

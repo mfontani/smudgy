@@ -12,8 +12,8 @@ use deno_core::{FastString, ModuleSource, ModuleSourceCode, ModuleSpecifier};
 use deno_error::JsErrorBox;
 use deno_maybe_sync::new_rc;
 use deno_node::{NodeExtInitServices, NodeRequireLoader};
-use deno_npm::NpmSystemInfo;
 use deno_npm::resolution::{AddPkgReqsOptions, NpmResolutionSnapshot, NpmVersionResolver};
+use deno_npm::NpmSystemInfo;
 use deno_npm_cache::{
     DownloadError, NpmCache, NpmCacheHttpClient, NpmCacheHttpClientBytesResponse,
     NpmCacheHttpClientResponse, NpmCacheSetting, NpmPackumentFormat, RegistryInfoProvider,
@@ -496,8 +496,8 @@ impl ModuleForExportAnalysis for AnalyzedModule {
     }
 
     fn analyze_member_export_props(&self) -> BTreeMap<String, Vec<String>> {
-        use deno_ast::ProgramRef;
         use deno_ast::swc::ast::ModuleItem;
+        use deno_ast::ProgramRef;
 
         // One top-level walk composes `exports.MEMBER = IDENT` aliases with static
         // `IDENT.X = ...` assignments, then advertises only X for the selected MEMBER.
@@ -540,8 +540,8 @@ impl ModuleForExportAnalysis for AnalyzedModule {
 }
 
 fn find_module_exports_require_member(parsed: &deno_ast::ParsedSource) -> Option<(String, String)> {
-    use deno_ast::ProgramRef;
     use deno_ast::swc::ast::ModuleItem;
+    use deno_ast::ProgramRef;
 
     match parsed.program_ref() {
         ProgramRef::Module(module) => module.body.iter().find_map(|item| match item {
@@ -791,12 +791,10 @@ mod tests {
             inner.analyze_member_export_props().get("unrelated"),
             Some(&vec!["secret".to_string()])
         );
-        assert!(
-            inner
-                .analyze_es_runtime_exports()
-                .member_reexports
-                .is_empty()
-        );
+        assert!(inner
+            .analyze_es_runtime_exports()
+            .member_reexports
+            .is_empty());
     }
 
     #[test]
@@ -810,18 +808,98 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn composed_member_wrapper_narrows_final_export_set() {
+        // Full-stack narrowing lock, driven through the real loader path
+        // (`load_npm_module` -> `NpmModuleLoader::load` -> upstream
+        // `CjsModuleExportAnalyzer::analyze_all_exports`): the wrapper's FINAL
+        // translated export set contains only the names statically attached to
+        // the selected member, and never the inner module's unrelated members
+        // or their properties. The adapter-level tests above prove detection
+        // and the props map; this one fails if the resolve/merge of
+        // member_reexports ever regresses to a wholesale re-export.
+        let temp = tempfile::tempdir().unwrap();
+        let (services, _node_services) = SmudgyNpmServices::new(temp.path().to_path_buf()).unwrap();
+        // Under the npm cache root, so both files classify as npm-package CJS
+        // and recursive analysis may read them directly.
+        let pkg_dir = temp.path().join("npm").join("wrapper-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"wrapper-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("index.js"),
+            "module.exports = require('./inner.js').narrowedMember;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("inner.js"),
+            concat!(
+                "exports.narrowedMember = alpha;\n",
+                "alpha.narrowedAlpha = function () {};\n",
+                "alpha.narrowedBeta = function () {};\n",
+                "exports.unrelatedMember = omega;\n",
+                "omega.unrelatedSecret = function () {};\n",
+            ),
+        )
+        .unwrap();
+
+        let entry = deno_core::url::Url::from_file_path(pkg_dir.join("index.js")).unwrap();
+        let (module_type, source) = services.load_npm_module(&entry, None).await.unwrap();
+        assert!(matches!(module_type, deno_core::ModuleType::JavaScript));
+        assert!(
+            source.contains("narrowedAlpha") && source.contains("narrowedBeta"),
+            "selected member's props must be advertised: {source}"
+        );
+        assert!(
+            !source.contains("unrelatedMember") && !source.contains("unrelatedSecret"),
+            "unrelated inner members and their props must not leak into the wrapper: {source}"
+        );
+    }
+
     #[test]
     fn node_require_loader_uses_require_specific_cjs_classification() {
+        // The two classification paths diverge on exactly one shape: an
+        // extensionless file inside a `"type": "module"` package. Require-side
+        // classification (`CjsTracker::is_maybe_cjs_from_require` ->
+        // `check_for_require`) honors the module type only for files WITH an
+        // extension, so the extensionless file stays Require (true); import-side
+        // classification (`is_maybe_cjs` -> `check_based_on_pkg_json`) has no
+        // extension clause outside npm roots, so the same file is Import
+        // (false). Asserting both directions on the same specifier fails if
+        // either method ever delegates to the other.
         let temp = tempfile::tempdir().unwrap();
-        let (_services, node_services) = SmudgyNpmServices::new(temp.path().to_path_buf()).unwrap();
-        let specifier = deno_core::url::Url::parse("file:///outside-package.js").unwrap();
+        let (_services, node_services) = SmudgyNpmServices::new(temp.path().join("data")).unwrap();
+        let pkg_dir = temp.path().join("esm-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"esm-pkg","version":"1.0.0","type":"module"}"#,
+        )
+        .unwrap();
+        let extensionless = pkg_dir.join("extensionless-entry");
+        std::fs::write(&extensionless, "module.exports = 1;\n").unwrap();
+        let with_extension = pkg_dir.join("entry.js");
+        std::fs::write(&with_extension, "export default 1;\n").unwrap();
+
+        let extensionless = deno_core::url::Url::from_file_path(&extensionless).unwrap();
+        let with_extension = deno_core::url::Url::from_file_path(&with_extension).unwrap();
+        let loader = &node_services.node_require_loader;
+
         assert!(
-            node_services
-                .node_require_loader
-                .is_maybe_cjs_from_require(&specifier)
-                .unwrap(),
-            "a .js loaded through require() must be compiled as CJS before ESM fallback"
+            loader.is_maybe_cjs_from_require(&extensionless).unwrap(),
+            "require() of an extensionless file in a type-module package must compile as CJS"
         );
+        assert!(
+            !loader.is_maybe_cjs(&extensionless).unwrap(),
+            "import-side classification of the same file must stay ESM"
+        );
+        // A .js sibling is ESM on both sides: the require-specific extension
+        // clause applies only to extensionless files.
+        assert!(!loader.is_maybe_cjs_from_require(&with_extension).unwrap());
+        assert!(!loader.is_maybe_cjs(&with_extension).unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -882,5 +960,54 @@ mod tests {
             }
             CjsAnalysis::Esm(_, _) => panic!("missing loader source must degrade to empty CJS"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loader_path_none_fallback_ignores_out_of_root_reexports() {
+        // Locks the `None` fallback source provider at `load_npm_module`'s call
+        // into `NpmModuleLoader::load`. With no fallback, a CJS re-export edge
+        // that escapes the npm root degrades softly: the load still succeeds,
+        // but the out-of-root file contributes no named exports because the
+        // loader-side provider refuses to read it and there is nothing to fall
+        // back to. Replacing that `None` with a disk-reading provider makes the
+        // outside file's export appear and this test fail. The analyzer-level
+        // test above covers the same policy one layer down; this one drives the
+        // real `SmudgyNpmServices` call site end to end.
+        let temp = tempfile::tempdir().unwrap();
+        let (services, _node_services) = SmudgyNpmServices::new(temp.path().to_path_buf()).unwrap();
+        let pkg_dir = temp.path().join("npm").join("escapist-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"escapist-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        // Two levels up from the package escapes the npm cache root into the
+        // data dir, where a syntactically valid CJS file really exists.
+        std::fs::write(
+            pkg_dir.join("index.js"),
+            "module.exports = require('../../outside.js');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("outside.js"),
+            "exports.leakedOutside = function () {};\n",
+        )
+        .unwrap();
+
+        let entry = deno_core::url::Url::from_file_path(pkg_dir.join("index.js")).unwrap();
+        let (module_type, source) = services
+            .load_npm_module(&entry, None)
+            .await
+            .expect("an out-of-root re-export edge must degrade softly, not fail the load");
+        assert!(matches!(module_type, deno_core::ModuleType::JavaScript));
+        assert!(
+            source.contains("export default"),
+            "the CJS entry must still be translated to an ESM wrapper: {source}"
+        );
+        assert!(
+            !source.contains("leakedOutside"),
+            "an out-of-root file must contribute no named exports: {source}"
+        );
     }
 }

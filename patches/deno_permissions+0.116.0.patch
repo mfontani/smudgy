@@ -1,7 +1,8 @@
 diff --git a/lib.rs b/lib.rs
+index 79bbab0..40ab0b9 100644
 --- a/lib.rs
 +++ b/lib.rs
-@@ -1797,6 +1797,7 @@ pub enum SubdomainWildcards {
+@@ -1797,6 +1797,7 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
  
  #[derive(Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
  pub enum Host {
@@ -9,7 +10,7 @@ diff --git a/lib.rs b/lib.rs
    Fqdn(FQDN),
    FqdnWithSubdomainWildcard(FQDN),
    Ip(IpAddr),
-@@ -1847,6 +1848,10 @@ impl Host {
+@@ -1846,6 +1847,10 @@ impl Host {
      s: &str,
      subdomain_wildcards: SubdomainWildcards,
    ) -> Result<Self, HostParseError> {
@@ -34,7 +35,7 @@ diff --git a/lib.rs b/lib.rs
        (Host::Fqdn(a), Host::Fqdn(b)) => a == b,
        (Host::FqdnWithSubdomainWildcard(a), Host::Fqdn(b)) => {
          b.is_subdomain_of(a)
-@@ -2202,6 +2214,7 @@ impl fmt::Display for NetDescriptor {
+@@ -2202,6 +2214,7 @@ impl NetDescriptor {
  impl fmt::Display for NetDescriptor {
    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
      match &self.0 {
@@ -42,7 +43,64 @@ diff --git a/lib.rs b/lib.rs
        Host::Fqdn(fqdn) => write!(f, "{fqdn}"),
        Host::FqdnWithSubdomainWildcard(fqdn) => write!(f, "*.{fqdn}"),
        Host::IpSubnet(ip_subnet) => write!(f, "{ip_subnet}"),
-@@ -8003,6 +8017,7 @@ mod tests {
+@@ -3989,6 +4002,32 @@ impl PermissionCheckError {
+   }
+ }
+ 
++/// Whether a path names an object inside the Windows named-pipe namespace.
++///
++/// Matches every spelling that can reach `check_special_file`: the `\\.\pipe\`
++/// device form (device paths pass through path parsing and canonicalization
++/// unmodified), the `//./pipe/` forward-slash spelling (not recognized as a
++/// device path, so it arrives with either separator preserved), and the
++/// `\\?\pipe\` verbatim form (verbatim-prefix stripping only rewrites drive
++/// paths, so it survives intact). The `pipe` segment is compared
++/// case-insensitively to match the NT object namespace. Only the pipe
++/// namespace qualifies: every other device-namespace object (`\\.\CON`,
++/// `\\.\PhysicalDrive0`, `\\.\C:`, ...) is a device-level capability and must
++/// keep requiring all permissions.
++fn is_windows_pipe_namespace_path(path: &Path) -> bool {
++  fn is_sep(b: u8) -> bool {
++    b == b'\\' || b == b'/'
++  }
++  let s = path.as_os_str().as_encoded_bytes();
++  s.len() >= 9
++    && is_sep(s[0])
++    && is_sep(s[1])
++    && (s[2] == b'.' || s[2] == b'?')
++    && is_sep(s[3])
++    && s[4..8].eq_ignore_ascii_case(b"pipe")
++    && is_sep(s[8])
++}
++
+ /// Wrapper struct for `Permissions` that can be shared across threads.
+ ///
+ /// We need a way to have internal mutability for permissions as they might get
+@@ -4593,8 +4632,21 @@ impl PermissionsContainer {
+         }
+       }
+ 
+-      // If this is a normalized drive path, accept it
+-      if !is_normalized_windows_drive_path(&path) {
++      // If this is a normalized drive path, accept it. Named-pipe paths are
++      // carved out of the all-permissions wall: a pipe is meaningfully scoped
++      // by its own path, so pipe-namespace queries rely on the ordinary
++      // scoped read/write checks that `check_open` has already performed.
++      // Without the carve-out the wall is spelling-dependent rather than a
++      // real boundary -- the `//./pipe/` spelling of the same object never
++      // starts with `\\` and is accepted as a normalized path above. Pairing
++      // invariant (smudgy): manifest validation rejects pipe-namespace paths
++      // in the read/write axes, so a scoped grant that admits a pipe path
++      // here can only originate from a consented ipc permission row, and
++      // connecting to the pipe stays gated by that row's exact-pipe `unix:`
++      // net descriptor at the socket layer.
++      if !is_normalized_windows_drive_path(&path)
++        && !is_windows_pipe_namespace_path(&path)
++      {
+         self.check_has_all_permissions(&path)?;
+       }
+     } else {
+@@ -7953,6 +8005,7 @@ mod tests {
    #[test]
    fn test_host_parse_for_list() {
      let hosts = &[
@@ -50,7 +108,7 @@ diff --git a/lib.rs b/lib.rs
        ("deno.land", Some(Host::Fqdn(fqdn!("deno.land")))),
        (
          "*.deno.land",
-@@ -8111,6 +8126,8 @@ mod tests {
+@@ -8110,6 +8163,8 @@ mod tests {
    #[test]
    fn test_net_descriptor_parse_for_list() {
      let cases = &[
@@ -59,7 +117,7 @@ diff --git a/lib.rs b/lib.rs
        (
          "deno.land",
          Some(NetDescriptor(Host::Fqdn(fqdn!("deno.land")), None)),
-@@ -8195,6 +8212,11 @@ mod tests {
+@@ -8207,6 +8262,11 @@ mod tests {
            None,
          )),
        ),
@@ -71,7 +129,7 @@ diff --git a/lib.rs b/lib.rs
        ("unix:", None),
        ("unix:relative.sock", None),
      ];
-@@ -8207,6 +8231,56 @@ mod tests {
+@@ -8220,6 +8280,200 @@ mod tests {
      }
    }
  
@@ -123,6 +181,150 @@ diff --git a/lib.rs b/lib.rs
 +    assert_eq!(any_443.to_string(), "*:443");
 +    assert_eq!(vsock.to_string(), "vsock:2:1234");
 +    assert_eq!(unix.to_string(), "unix:/var/run/example.sock");
++  }
++
++  #[test]
++  fn test_wildcard_never_parses_to_any_host_for_query() {
++    // `Host::Any` may only ever be produced by allow-list parsing
++    // (`SubdomainWildcards::Enabled`). Query-side parsing runs with wildcards
++    // disabled, so a literal "*" hostname arriving from a remote peer (e.g. a
++    // redirect or a hostile URL) is an ordinary invalid host name. If query
++    // parsing ever produced `Host::Any`, that single request would match every
++    // allow-list entry.
++    assert_eq!(Host::parse_for_query("*").ok(), None);
++    assert_eq!(NetDescriptor::parse_for_query("*").ok(), None);
++    assert_eq!(NetDescriptor::parse_for_query("*:443").ok(), None);
++    for input in ["*", "*:443", "*.deno.land", "*.deno.land:443"] {
++      let parsed = NetDescriptor::parse_for_query(input);
++      assert!(
++        !matches!(parsed, Ok(NetDescriptor(Host::Any, _))),
++        "query-parse of {input:?} must never yield Host::Any: {parsed:?}"
++      );
++    }
++  }
++
++  #[test]
++  fn test_windows_pipe_namespace_predicate() {
++    // Byte-level predicate, so the pipe-namespace shapes hold on every host
++    // platform. Every accepted spelling combines either separator with the
++    // `.` or `?` namespace marker and a case-insensitive `pipe` segment that
++    // is followed by a separator.
++    for path in [
++      r"\\.\pipe\x",
++      r"\\.\PIPE\deno-ipc",
++      r"\\?\pipe\x",
++      "//./pipe/x",
++      r"\\./pipe/x",
++      r"//?/pipe\x",
++    ] {
++      assert!(is_windows_pipe_namespace_path(Path::new(path)), "{path}");
++    }
++    // Everything else in (or out of) the device namespace stays unmatched:
++    // other devices, drive paths, the bare pipe root without a separator,
++    // and names that merely begin with "pipe".
++    for path in [
++      r"\\.\CON",
++      r"\\.\PhysicalDrive0",
++      r"\\.\C:",
++      r"\\.\pipe",
++      r"\\.\pipefitting\x",
++      r"\\.\pip\x",
++      r"C:\pipe\x",
++      r"\pipe\x",
++      "/dev/pipe/x",
++      "pipe/x",
++    ] {
++      assert!(!is_windows_pipe_namespace_path(Path::new(path)), "{path}");
++    }
++  }
++
++  #[cfg(windows)]
++  #[test]
++  fn test_scoped_grants_admit_pipe_namespace_paths_without_all() {
++    set_prompter(Box::new(TestPrompter));
++    let parser = TestPermissionDescriptorParser;
++    let perms = Permissions::from_options(
++      &parser,
++      &PermissionsOptions {
++        allow_read: Some(svec![r"\\.\pipe\x", "//./pipe/x"]),
++        allow_write: Some(svec![r"\\.\pipe\x", "//./pipe/x"]),
++        prompt: false,
++        ..Default::default()
++      },
++    )
++    .unwrap();
++    let perms = PermissionsContainer::new(Arc::new(parser), perms);
++
++    // Exact scoped read+write grants -- with no unscoped "all" permission --
++    // admit the canonical backslash spelling of the granted pipe.
++    assert!(
++      perms
++        .check_open(
++          Cow::Borrowed(Path::new(r"\\.\pipe\x")),
++          OpenAccessKind::ReadWrite,
++          None,
++        )
++        .is_ok()
++    );
++    // The forward-slash spelling of the same object is equally admitted; the
++    // boundary is the pipe itself, not its spelling.
++    assert!(
++      perms
++        .check_open(
++          Cow::Borrowed(Path::new("//./pipe/x")),
++          OpenAccessKind::ReadWrite,
++          None,
++        )
++        .is_ok()
++    );
++    // A different pipe name stays denied by the ordinary scoped path checks:
++    // the carve-out removes the all-permissions wall, it grants nothing.
++    let err = perms
++      .check_open(
++        Cow::Borrowed(Path::new(r"\\.\pipe\other")),
++        OpenAccessKind::ReadWrite,
++        None,
++      )
++      .unwrap_err();
++    assert!(
++      err.to_string().contains("read access"),
++      "an ungranted pipe must fail the scoped read check: {err}"
++    );
++  }
++
++  #[cfg(windows)]
++  #[test]
++  fn test_non_pipe_device_paths_still_require_all_permissions() {
++    set_prompter(Box::new(TestPrompter));
++    let parser = TestPermissionDescriptorParser;
++    let perms = Permissions::from_options(
++      &parser,
++      &PermissionsOptions {
++        allow_read: Some(svec![r"\\.\CON", r"\\.\PhysicalDrive0"]),
++        allow_write: Some(svec![r"\\.\CON", r"\\.\PhysicalDrive0"]),
++        prompt: false,
++        ..Default::default()
++      },
++    )
++    .unwrap();
++    let perms = PermissionsContainer::new(Arc::new(parser), perms);
++
++    // Scoped grants are not enough for device-namespace objects outside the
++    // pipe namespace: those are device-level capabilities and keep demanding
++    // the unscoped "all" permission.
++    for path in [r"\\.\CON", r"\\.\PhysicalDrive0"] {
++      let err = perms
++        .check_open(
++          Cow::Borrowed(Path::new(path)),
++          OpenAccessKind::ReadWrite,
++          None,
++        )
++        .unwrap_err();
++      assert!(
++        err.to_string().contains("all access"),
++        "{path} must keep requiring all permissions: {err}"
++      );
++    }
 +  }
 +
    #[test]

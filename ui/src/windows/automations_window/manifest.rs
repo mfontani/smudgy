@@ -24,8 +24,9 @@ use iced::{Length, Padding};
 
 use smudgy_core::models::local_packages;
 use smudgy_core::models::shared_packages::{
-    ImportPolicy, NetEntryKind, PackageManifest, PackageParameter, PackagePermissions, ParamKind,
-    ParamOption, SmudgyCapabilities, net_entry_kind, running_smudgy_release,
+    ImportPolicy, IpcEntry, IpcEntryIssue, PackageManifest, PackageParameter, PackagePermissions,
+    ParamKind, ParamOption, SmudgyCapabilities, is_local_transport_net_entry,
+    is_windows_pipe_namespace_entry, running_smudgy_release,
 };
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -55,6 +56,10 @@ pub struct ManifestDraft {
     pub requires: Vec<String>,
     pub params: Vec<ParamDraft>,
     pub net: Vec<String>,
+    /// Local IPC endpoints (`permissions.ipc`), one row per endpoint with both per-platform
+    /// realization buffers. A local socket can front a privileged daemon, so any row carries the
+    /// same full-access weight as [`run`](Self::run)/[`ffi`](Self::ffi).
+    pub ipc: Vec<IpcRowDraft>,
     pub read: Vec<String>,
     pub write: Vec<String>,
     pub env: Vec<String>,
@@ -92,6 +97,7 @@ impl Default for ManifestDraft {
             requires: Vec::new(),
             params: Vec::new(),
             net: Vec::new(),
+            ipc: Vec::new(),
             read: Vec::new(),
             write: Vec::new(),
             env: Vec::new(),
@@ -132,6 +138,26 @@ pub struct ParamDraft {
 pub struct OptionDraft {
     pub value: String,
     pub label: String,
+}
+
+/// One Local IPC endpoint (`permissions.ipc`), in editable form: both per-platform realizations
+/// held as text buffers. A row with both fields blank is dropped on Save (like a blank list
+/// row); a row with either filled is validated on projection ([`IpcEntry::issue`]).
+#[derive(Debug, Clone, Default)]
+pub struct IpcRowDraft {
+    /// The Unix-family realization: an absolute POSIX socket path.
+    pub unix: String,
+    /// The Windows realization: a pipe name with no separators (the engine prepends `\\.\pipe\`).
+    pub windows_pipe: String,
+}
+
+impl IpcRowDraft {
+    fn from_entry(entry: &IpcEntry) -> Self {
+        Self {
+            unix: entry.unix.clone().unwrap_or_default(),
+            windows_pipe: entry.windows_pipe.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// A scalar sub-parameter, in editable form: a `List`'s element or one `Table` column. Containers
@@ -217,6 +243,13 @@ pub enum ManifestEdit {
     /// Set `permissions.import` — how far outside the smudgy ecosystem this package may download
     /// code (none / public registries / anywhere).
     ImportPolicy(ImportPolicy),
+    /// Append a blank Local IPC row (`permissions.ipc`).
+    AddIpcRow,
+    RemoveIpcRow(usize),
+    /// Set row `i`'s Unix socket path realization.
+    IpcUnix(usize, String),
+    /// Set row `i`'s Windows pipe name realization.
+    IpcWindowsPipe(usize, String),
     AddItem(ListField),
     /// Append a specific value to a list (vs [`AddItem`](Self::AddItem)'s blank row) — the
     /// dependency picker uses this to insert a correctly-owned `smudgy://owner/name` specifier.
@@ -355,6 +388,12 @@ impl ManifestDraft {
             requires: manifest.requires.clone(),
             params: manifest.params.iter().map(ParamDraft::from_param).collect(),
             net: manifest.permissions.net.clone(),
+            ipc: manifest
+                .permissions
+                .ipc
+                .iter()
+                .map(IpcRowDraft::from_entry)
+                .collect(),
             read: manifest.permissions.read.clone(),
             write: manifest.permissions.write.clone(),
             env: manifest.permissions.env.clone(),
@@ -422,6 +461,65 @@ impl ManifestDraft {
             params.push(projected);
         }
 
+        // `net` is hosts-only; the Local IPC section is the one home for local endpoints. The
+        // legacy `unix:`/`vsock:` string forms must never reach a manifest — the engine refuses
+        // them fail-closed, which would brick the package for installers.
+        let net = clean_list(&self.net);
+        if let Some(entry) = net.iter().find(|e| is_local_transport_net_entry(e)) {
+            return Err(crate::i18n::t!(
+                "manifest-net-local-transport-error",
+                "entry" => entry.as_str()
+            ));
+        }
+
+        // The path axes must never name the Windows pipe namespace: fs-opening a pipe IS
+        // connecting to it, so a pipe fs-grant may only originate from a Critical-tier Local
+        // IPC row (the engine refuses such a manifest fail-closed).
+        let read = clean_list(&self.read);
+        let write = clean_list(&self.write);
+        let ffi = clean_list(&self.ffi);
+        if let Some(entry) = [&read, &write, &ffi]
+            .into_iter()
+            .flatten()
+            .find(|e| is_windows_pipe_namespace_entry(e))
+        {
+            return Err(crate::i18n::t!(
+                "manifest-pipe-namespace-path-error",
+                "entry" => entry.as_str()
+            ));
+        }
+
+        // Local IPC rows: an untouched blank row is dropped like a blank list entry; a row with
+        // either realization filled must project to a valid `IpcEntry`.
+        let mut ipc = Vec::new();
+        for (i, row) in self.ipc.iter().enumerate() {
+            let unix = row.unix.trim();
+            let pipe = row.windows_pipe.trim();
+            if unix.is_empty() && pipe.is_empty() {
+                continue;
+            }
+            let entry = IpcEntry {
+                unix: (!unix.is_empty()).then(|| unix.to_string()),
+                windows_pipe: (!pipe.is_empty()).then(|| pipe.to_string()),
+            };
+            match entry.issue() {
+                Some(IpcEntryIssue::InvalidUnixPath) => {
+                    return Err(crate::i18n::t!(
+                        "manifest-ipc-unix-invalid",
+                        "number" => i + 1
+                    ));
+                }
+                Some(IpcEntryIssue::InvalidPipeName) => {
+                    return Err(crate::i18n::t!(
+                        "manifest-ipc-pipe-invalid",
+                        "number" => i + 1
+                    ));
+                }
+                // A both-blank row was skipped above, so no-realization cannot occur here.
+                Some(IpcEntryIssue::NoRealization) | None => ipc.push(entry),
+            }
+        }
+
         // `mapper: ["write"]` implies `read` (the manifest normalizes this at parse); keep the
         // projected manifest consistent so a write-only draft round-trips as read+write.
         let mut caps = self.caps;
@@ -439,12 +537,13 @@ impl ManifestDraft {
             hosts: clean_list(&self.hosts),
             params,
             permissions: PackagePermissions {
-                net: clean_list(&self.net),
-                read: clean_list(&self.read),
-                write: clean_list(&self.write),
+                net,
+                ipc,
+                read,
+                write,
                 env: clean_list(&self.env),
                 run: clean_list(&self.run),
-                ffi: clean_list(&self.ffi),
+                ffi,
                 sys: clean_list(&self.sys),
                 import: self.import,
                 smudgy: caps,
@@ -790,6 +889,22 @@ impl AutomationsWindow {
             ManifestEdit::MinSmudgyVersion(value) => draft.min_smudgy_version = value,
             ManifestEdit::Importable(value) => draft.importable = value,
             ManifestEdit::ImportPolicy(value) => draft.import = value,
+            ManifestEdit::AddIpcRow => draft.ipc.push(IpcRowDraft::default()),
+            ManifestEdit::RemoveIpcRow(i) => {
+                if i < draft.ipc.len() {
+                    draft.ipc.remove(i);
+                }
+            }
+            ManifestEdit::IpcUnix(i, value) => {
+                if let Some(row) = draft.ipc.get_mut(i) {
+                    row.unix = value;
+                }
+            }
+            ManifestEdit::IpcWindowsPipe(i, value) => {
+                if let Some(row) = draft.ipc.get_mut(i) {
+                    row.windows_pipe = value;
+                }
+            }
             ManifestEdit::AddItem(field) => list_mut(draft, field).push(String::new()),
             ManifestEdit::AddItemValue(field, value) => {
                 let list = list_mut(draft, field);
@@ -2149,8 +2264,10 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
     .into()
 }
 
-/// Network tab: the `permissions.net` connection allowlist + the public-registry import toggle
-/// (`permissions.import`). Connecting to a host and downloading code from one are separate grants.
+/// Network tab: the `permissions.net` host allowlist, the public-registry import toggle
+/// (`permissions.import`), and the Local IPC section (`permissions.ipc`). Connecting to a host
+/// and downloading code from one are separate grants; local IPC is a separate axis again — an
+/// exact local endpoint per row, never part of the host list.
 fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
     let mut col = column![
         perm_note(),
@@ -2163,19 +2280,93 @@ fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
             crate::i18n::ts!("manifest-host"),
         ),
         import_policy_picker(draft.import),
+        local_ipc_editor(&draft.ipc),
     ]
     .spacing(16.0);
-    if draft.net.iter().any(|entry| {
-        matches!(
-            net_entry_kind(entry),
-            NetEntryKind::UnixSocket | NetEntryKind::Vsock
-        )
-    }) {
+    if draft
+        .ipc
+        .iter()
+        .any(|row| !row.unix.trim().is_empty() || !row.windows_pipe.trim().is_empty())
+    {
         col = col.push(full_access_author_note(crate::i18n::ts!(
-            "manifest-local-transport-warning"
+            "manifest-ipc-warning"
         )));
     }
     col.into()
+}
+
+/// The Local IPC editor (`permissions.ipc`): one card per endpoint, each with both per-platform
+/// realization fields — a Unix socket path and/or a Windows pipe name. Only the realization
+/// matching the installer's platform is granted; declaring both keeps one manifest honest across
+/// platforms.
+fn local_ipc_editor(rows: &[IpcRowDraft]) -> Elem<'_> {
+    let mut col = Column::new()
+        .spacing(6.0)
+        .push(common::section_label(crate::i18n::ts!(
+            "manifest-local-ipc"
+        )))
+        .push(
+            text(crate::i18n::t!("manifest-local-ipc-help"))
+                .size(11.0)
+                .style(common::muted),
+        );
+    if rows.is_empty() {
+        col = col.push(
+            text(crate::i18n::t!("manifest-none-period"))
+                .size(12.0)
+                .style(common::faint),
+        );
+    }
+    for (i, row_draft) in rows.iter().enumerate() {
+        col = col.push(
+            row![
+                column![
+                    field_row(
+                        crate::i18n::ts!("manifest-ipc-unix-label"),
+                        text_input(
+                            crate::i18n::ts!("manifest-ipc-unix-placeholder"),
+                            &row_draft.unix
+                        )
+                        .on_input(move |v| Message::EditManifest(ManifestEdit::IpcUnix(i, v)))
+                        .size(14.0)
+                        .into(),
+                    ),
+                    field_row(
+                        crate::i18n::ts!("manifest-ipc-pipe-label"),
+                        text_input(
+                            crate::i18n::ts!("manifest-ipc-pipe-placeholder"),
+                            &row_draft.windows_pipe
+                        )
+                        .on_input(move |v| {
+                            Message::EditManifest(ManifestEdit::IpcWindowsPipe(i, v))
+                        })
+                        .size(14.0)
+                        .into(),
+                    ),
+                ]
+                .spacing(4.0)
+                .width(Length::Fill),
+                button(
+                    text(bootstrap_icons::TRASH_3)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(14.0)
+                )
+                .style(button_style::secondary)
+                .on_press(Message::EditManifest(ManifestEdit::RemoveIpcRow(i)))
+                .padding(8),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+        );
+    }
+    col.push(add_button(
+        &crate::i18n::t!(
+            "manifest-add-item",
+            "item" => crate::i18n::ts!("manifest-ipc-endpoint")
+        ),
+        Message::EditManifest(ManifestEdit::AddIpcRow),
+    ))
+    .into()
 }
 
 /// The tri-state `permissions.import` chooser: how far outside the smudgy ecosystem the package may
@@ -2849,6 +3040,10 @@ mod tests {
             ],
             permissions: PackagePermissions {
                 net: vec!["comms.example.org:6667".to_string()],
+                ipc: vec![IpcEntry {
+                    unix: Some("/var/run/example.sock".to_string()),
+                    windows_pipe: Some("example-service".to_string()),
+                }],
                 read: vec!["$DATA/maps".to_string()],
                 write: vec!["$DATA".to_string()],
                 env: vec!["MYPKG_TOKEN".to_string()],
@@ -2982,21 +3177,121 @@ mod tests {
     }
 
     #[test]
-    fn local_network_transport_entries_round_trip_through_the_editor() {
+    fn ipc_rows_round_trip_through_the_editor_and_blank_rows_drop() {
         let draft = ManifestDraft {
             version: "1.0.0".to_string(),
-            net: vec![
-                "unix:/var/run/docker.sock".to_string(),
-                "vsock:2:1234".to_string(),
+            ipc: vec![
+                IpcRowDraft {
+                    unix: " /var/run/docker.sock ".to_string(),
+                    windows_pipe: " docker_engine ".to_string(),
+                },
+                IpcRowDraft {
+                    unix: String::new(),
+                    windows_pipe: "solo-pipe".to_string(),
+                },
+                // An untouched blank row projects to nothing, like a blank list entry.
+                IpcRowDraft::default(),
             ],
             ..ManifestDraft::default()
         };
-        let manifest = draft
-            .to_manifest()
-            .expect("local transports are valid manifest entries");
-        assert_eq!(manifest.permissions.net, draft.net);
+        let manifest = draft.to_manifest().expect("valid ipc rows project");
+        assert_eq!(
+            manifest.permissions.ipc,
+            vec![
+                IpcEntry {
+                    unix: Some("/var/run/docker.sock".to_string()),
+                    windows_pipe: Some("docker_engine".to_string()),
+                },
+                IpcEntry {
+                    unix: None,
+                    windows_pipe: Some("solo-pipe".to_string()),
+                },
+            ]
+        );
         let round_trip = ManifestDraft::from_manifest(&manifest);
-        assert_eq!(round_trip.net, draft.net);
+        assert_eq!(round_trip.ipc.len(), 2);
+        assert_eq!(round_trip.ipc[0].unix, "/var/run/docker.sock");
+        assert_eq!(round_trip.ipc[0].windows_pipe, "docker_engine");
+        assert_eq!(round_trip.ipc[1].unix, "");
+        assert_eq!(round_trip.ipc[1].windows_pipe, "solo-pipe");
+    }
+
+    #[test]
+    fn invalid_ipc_rows_refuse_to_save() {
+        // A relative unix socket path is rejected (must be absolute POSIX).
+        let relative = ManifestDraft {
+            version: "1.0.0".to_string(),
+            ipc: vec![IpcRowDraft {
+                unix: "relative.sock".to_string(),
+                windows_pipe: String::new(),
+            }],
+            ..ManifestDraft::default()
+        };
+        assert!(relative.to_manifest().is_err());
+        // A pipe name with a separator is rejected (the engine prepends \\.\pipe\).
+        let separator = ManifestDraft {
+            version: "1.0.0".to_string(),
+            ipc: vec![IpcRowDraft {
+                unix: String::new(),
+                windows_pipe: r"bad\name".to_string(),
+            }],
+            ..ManifestDraft::default()
+        };
+        assert!(separator.to_manifest().is_err());
+    }
+
+    #[test]
+    fn pipe_namespace_paths_refuse_to_save_in_every_path_axis() {
+        // Both separator spellings, the verbatim prefix, a case variant, and the bare
+        // namespace root — in read, write, and ffi. Pipe fs-grants may only originate from a
+        // Local IPC row (fs-opening a pipe IS connecting to it).
+        let entries = [
+            r"\\.\pipe\docker_engine",
+            "//./pipe/docker_engine",
+            r"\\?\pipe\docker_engine",
+            r"\\.\PIPE\docker_engine",
+            r"\\.\pipe\",
+        ];
+        for entry in entries {
+            for axis in 0..3 {
+                let mut draft = ManifestDraft {
+                    version: "1.0.0".to_string(),
+                    ..ManifestDraft::default()
+                };
+                match axis {
+                    0 => draft.read = vec![entry.to_string()],
+                    1 => draft.write = vec![entry.to_string()],
+                    _ => draft.ffi = vec![entry.to_string()],
+                }
+                assert!(
+                    draft.to_manifest().is_err(),
+                    "path entry {entry:?} must be rejected in axis {axis}"
+                );
+            }
+        }
+        // Ordinary Windows drive paths (and $DATA paths) still validate.
+        let plain = ManifestDraft {
+            version: "1.0.0".to_string(),
+            read: vec![r"C:\Users\me\logs".to_string(), "$DATA/maps".to_string()],
+            write: vec![r"C:\pipe\not-the-namespace".to_string()],
+            ..ManifestDraft::default()
+        };
+        assert!(plain.to_manifest().is_ok());
+    }
+
+    #[test]
+    fn net_local_transport_strings_refuse_to_save() {
+        for entry in ["unix:/var/run/docker.sock", "vsock:2:1234"] {
+            let draft = ManifestDraft {
+                version: "1.0.0".to_string(),
+                net: vec![entry.to_string()],
+                ..ManifestDraft::default()
+            };
+            assert!(
+                draft.to_manifest().is_err(),
+                "net entry {entry:?} must be a validation error — net is hosts-only"
+            );
+        }
     }
 
     /// A draft with one parameter of a given kind, plus the supplied edits applied.

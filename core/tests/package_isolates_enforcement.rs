@@ -1346,3 +1346,147 @@ async fn worker_threads_broadcast_channel_cannot_bypass_interop_capability() {
         "a denied sandbox reached the server-scoped BroadcastChannel backend; transcript:\n{lines:#?}"
     );
 }
+
+/// The `ipc` axis materializes its platform-native realization as a real grant. Hermetic:
+/// nothing listens on either endpoint. The consented row's native target (a `\\.\pipe\` name on
+/// Windows, a socket path on unix) must fail **at the socket** (ENOENT/refused — the permission
+/// gate opened, no live server needed), while a different local endpoint must fail **at the
+/// gate** (`NotCapable`), proving deny-by-default holds around the exact grant.
+#[tokio::test]
+async fn sandboxed_package_ipc_grant_materializes_the_native_realization() {
+    prepare_server("pi_enf_ipc");
+
+    // The Windows probes use the canonical `\\.\pipe\` spelling (the patched
+    // `deno_permissions` exempts pipe-namespace query paths from the special-file
+    // all-permissions demand, so the scoped ipc grant alone admits them) plus the
+    // forward-slash spelling of the same granted pipe — Win32 path normalization treats
+    // `//./pipe/x` and `\\.\pipe\x` as one object, and the permission layer compares path
+    // components separator-insensitively, so both must ride the same grant. On unix the
+    // "alternate" probe repeats the canonical path (there is only one spelling).
+    let (granted, alt_granted, denied) = if cfg!(windows) {
+        (
+            r"\\.\pipe\smudgy-enf-ipc-granted",
+            "//./pipe/smudgy-enf-ipc-granted",
+            r"\\.\pipe\smudgy-enf-ipc-denied",
+        )
+    } else {
+        (
+            "/tmp/smudgy-enf-ipc-granted.sock",
+            "/tmp/smudgy-enf-ipc-granted.sock",
+            "/tmp/smudgy-enf-ipc-denied.sock",
+        )
+    };
+
+    let src = r#"
+        import { echo } from "smudgy:core";
+        import net from "node:net";
+        const attempt = (path) =>
+          new Promise((resolve) => {
+            try {
+              const sock = net.connect(path);
+              sock.on("error", (e) =>
+                resolve((e?.name ?? "Error") + ":" + (e?.code ?? "") + ":" + (e?.message ?? "")));
+              sock.on("connect", () => { sock.destroy(); resolve("CONNECTED"); });
+            } catch (e) {
+              resolve((e?.name ?? "Error") + ":" + (e?.code ?? "") + ":" + (e?.message ?? ""));
+            }
+          });
+        echo("IPC_DENIED:" + await attempt("__DENIED__"));
+        echo("IPC_GRANTED:" + await attempt("__GRANTED__"));
+        echo("IPC_GRANTED_ALT:" + await attempt("__ALT__"));
+        echo("DONE");
+    "#
+    .replace("__DENIED__", &js_path(Path::new(denied)))
+    .replace("__GRANTED__", &js_path(Path::new(granted)))
+    .replace("__ALT__", &js_path(Path::new(alt_granted)));
+
+    let pkg = make_package(
+        "wbk",
+        "ipc-probe",
+        "1.0.0",
+        r#", "permissions": { "ipc": [{ "unix": "/tmp/smudgy-enf-ipc-granted.sock", "windowsPipe": "smudgy-enf-ipc-granted" }] }"#,
+        &src,
+    );
+    let lines = collect_session_lines(
+        9440,
+        "pi_enf_ipc",
+        &["smudgy://wbk/ipc-probe"],
+        factory_for(vec![pkg]),
+    )
+    .await;
+
+    assert!(
+        has_line(&lines, "DONE"),
+        "both attempts settle (denials and socket errors are caught); transcript:\n{lines:#?}"
+    );
+    let denied_line = lines
+        .iter()
+        .find(|l| l.contains("IPC_DENIED:"))
+        .expect("the denied attempt reports");
+    assert!(
+        denied_line.contains("NotCapable"),
+        "the un-granted endpoint must be refused at the permission gate, not attempted; \
+         transcript:\n{lines:#?}"
+    );
+    for marker in ["IPC_GRANTED:", "IPC_GRANTED_ALT:"] {
+        let granted_line = lines
+            .iter()
+            .find(|l| l.contains(marker))
+            .expect("the granted attempt reports");
+        assert!(
+            !granted_line.contains("NotCapable") && !granted_line.contains("CONNECTED"),
+            "the granted endpoint ({marker}) must pass the gate (no permission error) and fail \
+             only at the socket; transcript:\n{lines:#?}"
+        );
+        assert!(
+            granted_line.contains("ENOENT") || granted_line.contains("ECONNREFUSED"),
+            "with no server listening, the granted endpoint ({marker}) surfaces a \
+             connection-level failure — proof the grant materialized; transcript:\n{lines:#?}"
+        );
+    }
+}
+
+/// Regression: an untrusted isolate touching the unstable-gated vsock transport gets a
+/// **catchable** JS error and the session keeps running — the process must not exit. The runtime
+/// installs a `FeatureChecker` with a non-exiting callback (deno's default is
+/// `std::process::exit(70)`, consulted BEFORE any permission check by the vsock ops compiled on
+/// Linux/Android/macOS); on Windows the op itself errors as unsupported. Either way the attempt
+/// must surface in-script, and the harness reaching `DONE` is the process-survival proof.
+#[tokio::test]
+async fn sandboxed_package_vsock_connect_is_a_catchable_error_not_process_death() {
+    prepare_server("pi_enf_vsock");
+
+    let src = r#"
+        import { echo } from "smudgy:core";
+        try {
+          const conn = await Deno.connect({ transport: "vsock", cid: 2, port: 1234 });
+          conn.close();
+          echo("VSOCK:NO_ERROR");
+        } catch (e) {
+          echo("VSOCK_ERR:" + (e?.name ?? String(e)));
+        }
+        echo("DONE");
+    "#;
+
+    let pkg = make_package("wbk", "vsock-probe", "1.0.0", "", src);
+    let lines = collect_session_lines(
+        9441,
+        "pi_enf_vsock",
+        &["smudgy://wbk/vsock-probe"],
+        factory_for(vec![pkg]),
+    )
+    .await;
+
+    assert!(
+        has_line(&lines, "DONE"),
+        "the session must survive the vsock attempt; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "VSOCK:NO_ERROR"),
+        "an untrusted isolate must never open a vsock connection; transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "VSOCK_ERR:"),
+        "the vsock attempt must surface as a catchable error; transcript:\n{lines:#?}"
+    );
+}

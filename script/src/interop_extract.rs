@@ -18,11 +18,11 @@
 
 use std::collections::HashMap;
 
-use deno_ast::SourceRangedForSpanned;
 use deno_ast::swc::ast::{
     CallExpr, Callee, Decl, ExportSpecifier, Expr, ImportSpecifier, Lit, Module, ModuleDecl,
     ModuleExportName, ModuleItem, Pat, Stmt, TsEntityName, TsType, TsTypeQueryExpr, VarDecl,
 };
+use deno_ast::SourceRangedForSpanned;
 use deno_ast::{MediaType, ParseParams};
 use deno_core::ModuleSpecifier;
 
@@ -132,7 +132,9 @@ pub const HANDLE_CONSTRUCTORS: &[(&str, InteropKind)] = &[
 /// mentions `smudgy:core` and at least one handle constructor.
 fn mentions_handle_constructors(source: &str) -> bool {
     source.contains("smudgy:core")
-        && HANDLE_CONSTRUCTORS.iter().any(|(ctor, _)| source.contains(ctor))
+        && HANDLE_CONSTRUCTORS
+            .iter()
+            .any(|(ctor, _)| source.contains(ctor))
 }
 
 /// Parse `source` as the media type implied by `specifier` (unknown extensions parse as TS:
@@ -180,7 +182,9 @@ fn constructor_bindings(module: &Module) -> HashMap<String, InteropKind> {
                 Some(ModuleExportName::Str(s)) => s.value.as_str().unwrap_or_default(),
                 None => named.local.sym.as_str(),
             };
-            let Some((_, kind)) = HANDLE_CONSTRUCTORS.iter().find(|(ctor, _)| *ctor == imported)
+            let Some((_, kind)) = HANDLE_CONSTRUCTORS
+                .iter()
+                .find(|(ctor, _)| *ctor == imported)
             else {
                 continue;
             };
@@ -229,51 +233,49 @@ pub fn extract_interop_handles(
     let text_info = parsed.text_info_lazy();
     let comments = parsed.comments();
     let mut extraction = InteropExtraction::default();
-    let collect_var = |var: &VarDecl,
-                       exported: bool,
-                       doc: Option<&str>,
-                       out: &mut InteropExtraction| {
-        for decl in &var.decls {
-            let Pat::Ident(binding) = &decl.name else {
-                continue;
-            };
-            let Some(init) = &decl.init else { continue };
-            let Expr::Call(call) = init.as_ref() else {
-                continue;
-            };
-            let Callee::Expr(callee) = &call.callee else {
-                continue;
-            };
-            let Expr::Ident(callee_ident) = callee.as_ref() else {
-                continue;
-            };
-            let Some(kind) = constructors.get(callee_ident.sym.as_str()).copied() else {
-                continue;
-            };
-            // A string-literal first argument names the handle explicitly; otherwise the
-            // declaration names itself after its binding (the same rule the transpile-time
-            // name injection applies, so static discovery and runtime always agree).
-            let name = explicit_name_arg(call).unwrap_or_else(|| binding.id.sym.to_string());
-            // The constructor's type argument, as source text: a named reference
-            // (`createState<PromptData>(…)`) is resolved to its declaration in pass 4; an
-            // inline type is its own display shape. JS packages simply have none.
-            let declared_shape = call
-                .type_args
-                .as_ref()
-                .and_then(|args| args.params.first())
-                .map(|ty| ty.text_fast(text_info).to_string());
-            out.handles.push(InteropHandle {
-                kind,
-                name: name.clone(),
-                const_name: binding.id.sym.to_string(),
-                exported,
-                type_alias: None,
-                declared_shape,
-                payload_type_export: None,
-                doc: doc.map(str::to_string),
-            });
-        }
-    };
+    let collect_var =
+        |var: &VarDecl, exported: bool, doc: Option<&str>, out: &mut InteropExtraction| {
+            for decl in &var.decls {
+                let Pat::Ident(binding) = &decl.name else {
+                    continue;
+                };
+                let Some(init) = &decl.init else { continue };
+                let Expr::Call(call) = init.as_ref() else {
+                    continue;
+                };
+                let Callee::Expr(callee) = &call.callee else {
+                    continue;
+                };
+                let Expr::Ident(callee_ident) = callee.as_ref() else {
+                    continue;
+                };
+                let Some(kind) = constructors.get(callee_ident.sym.as_str()).copied() else {
+                    continue;
+                };
+                // A string-literal first argument names the handle explicitly; otherwise the
+                // declaration names itself after its binding (the same rule the transpile-time
+                // name injection applies, so static discovery and runtime always agree).
+                let name = explicit_name_arg(call).unwrap_or_else(|| binding.id.sym.to_string());
+                // The constructor's type argument, as source text: a named reference
+                // (`createState<PromptData>(…)`) is resolved to its declaration in pass 4; an
+                // inline type is its own display shape. JS packages simply have none.
+                let declared_shape = call
+                    .type_args
+                    .as_ref()
+                    .and_then(|args| args.params.first())
+                    .map(|ty| ty.text_fast(text_info).to_string());
+                out.handles.push(InteropHandle {
+                    kind,
+                    name: name.clone(),
+                    const_name: binding.id.sym.to_string(),
+                    exported,
+                    type_alias: None,
+                    declared_shape,
+                    payload_type_export: None,
+                    doc: doc.map(str::to_string),
+                });
+            }
+        };
     // The declaration's JSDoc block, when one directly precedes it.
     let doc_for = |pos: deno_ast::SourcePos| -> Option<String> {
         let leading = comments.get_leading(pos)?;
@@ -379,7 +381,9 @@ pub fn extract_interop_handles(
             match item {
                 ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(named)) if named.src.is_none() => {
                     for spec in &named.specifiers {
-                        let ExportSpecifier::Named(n) = spec else { continue };
+                        let ExportSpecifier::Named(n) = spec else {
+                            continue;
+                        };
                         if export_name_text(&n.orig) == handle.const_name {
                             spellings.push(
                                 n.exported
@@ -429,7 +433,9 @@ pub fn extract_interop_handles(
         let ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) = item else {
             continue;
         };
-        let Decl::Var(var) = &export.decl else { continue };
+        let Decl::Var(var) = &export.decl else {
+            continue;
+        };
         if var.decls.len() < 2 {
             continue;
         }
@@ -460,7 +466,8 @@ pub fn extract_interop_handles(
 
     // Duplicate names within a kind: first declaration wins; later ones are dropped and the
     // folded name is reported once (the caller surfaces the diagnostic).
-    let mut seen: std::collections::HashSet<(InteropKind, String)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(InteropKind, String)> =
+        std::collections::HashSet::new();
     let mut duplicated: Vec<String> = Vec::new();
     extraction.handles.retain(|h| {
         let key = (h.kind, fold_interop_name(&h.name));
@@ -592,7 +599,9 @@ fn handle_bindings(
     };
     for item in &module.body {
         match item {
-            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => collect_var(var.as_ref(), &mut bindings),
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => {
+                collect_var(var.as_ref(), &mut bindings)
+            }
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
                 if let Decl::Var(var) = &export.decl {
                     collect_var(var.as_ref(), &mut bindings);
@@ -667,7 +676,9 @@ pub fn scrub_handle_exports(
             // declaration still evaluates. A mixed declaration list loses export-ness for
             // its other declarators too (a discouraged style; the diagnostic names why).
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
-                let Decl::Var(var) = &export.decl else { continue };
+                let Decl::Var(var) = &export.decl else {
+                    continue;
+                };
                 let names: Vec<String> = var
                     .decls
                     .iter()
@@ -677,9 +688,8 @@ pub fn scrub_handle_exports(
                     })
                     .collect();
                 if names.iter().any(|n| bindings.contains(n)) {
-                    let keyword =
-                        export.range().start.as_byte_index(program_start)
-                            ..var.range().start.as_byte_index(program_start);
+                    let keyword = export.range().start.as_byte_index(program_start)
+                        ..var.range().start.as_byte_index(program_start);
                     edits.push((keyword.clone(), blanked(&keyword)));
                     removed.extend(names);
                 }
@@ -800,13 +810,20 @@ mod tests {
         assert_eq!(out.handles.len(), 2);
         let vitals = &out.handles[0];
         assert!(vitals.exported);
-        assert_eq!(vitals.doc.as_deref(), Some("/** The current vitals reading. */"));
+        assert_eq!(
+            vitals.doc.as_deref(),
+            Some("/** The current vitals reading. */")
+        );
         assert_eq!(
             vitals.payload_type_export, None,
             "an unexported payload type is not re-exportable"
         );
         assert!(
-            vitals.declared_shape.as_deref().unwrap_or_default().contains("interface Hidden"),
+            vitals
+                .declared_shape
+                .as_deref()
+                .unwrap_or_default()
+                .contains("interface Hidden"),
             "the catalogue display shape still resolves"
         );
         let internal = &out.handles[1];
@@ -891,7 +908,10 @@ mod tests {
             }
             "#,
         );
-        assert!(out.handles.is_empty(), "only top-level declarations are static");
+        assert!(
+            out.handles.is_empty(),
+            "only top-level declarations are static"
+        );
     }
 
     #[test]
@@ -907,15 +927,27 @@ const refresh = createProcedure((args, caller) => {});
 const explicit = createState<{ x: number }>('pinned');
 "#;
         let out = inject_inferred_handle_names(&spec, source).expect("injects");
-        assert!(out.contains(r#"createState<{ hp: number }>("vitals")"#), "{out}");
+        assert!(
+            out.contains(r#"createState<{ hp: number }>("vitals")"#),
+            "{out}"
+        );
         assert!(out.contains(r#"createEvent(  "prompt")"#), "{out}");
-        assert!(out.contains(r#"createState("roster", { persist: true })"#), "{out}");
-        assert!(out.contains(r#"createDerived("hpPct", vitals, (v) => v.hp)"#), "{out}");
+        assert!(
+            out.contains(r#"createState("roster", { persist: true })"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"createDerived("hpPct", vitals, (v) => v.hp)"#),
+            "{out}"
+        );
         assert!(
             out.contains(r#"createProcedure("refresh", (args, caller) => {})"#),
             "{out}"
         );
-        assert!(out.contains("createState<{ x: number }>('pinned')"), "explicit name untouched: {out}");
+        assert!(
+            out.contains("createState<{ x: number }>('pinned')"),
+            "explicit name untouched: {out}"
+        );
         assert_eq!(
             source.lines().count(),
             out.lines().count(),
@@ -927,37 +959,31 @@ const explicit = createState<{ x: number }>('pinned');
     fn injection_is_none_when_nothing_applies() {
         let spec = ModuleSpecifier::parse("file:///index.ts").expect("valid url");
         // Explicit names only.
-        assert!(
-            inject_inferred_handle_names(
-                &spec,
-                r#"import { createState } from "smudgy:core"; const v = createState("v");"#,
-            )
-            .is_none()
-        );
+        assert!(inject_inferred_handle_names(
+            &spec,
+            r#"import { createState } from "smudgy:core"; const v = createState("v");"#,
+        )
+        .is_none());
         // No smudgy:core import at all.
         assert!(
             inject_inferred_handle_names(&spec, "const createState = () => 1; createState();")
                 .is_none()
         );
         // Nested scopes are dynamic creation: the runtime demands an explicit name there.
-        assert!(
-            inject_inferred_handle_names(
-                &spec,
-                r#"
+        assert!(inject_inferred_handle_names(
+            &spec,
+            r#"
                 import { createState } from "smudgy:core";
                 function make() { return createState(); }
                 "#,
-            )
-            .is_none()
-        );
+        )
+        .is_none());
         // A parse error is not the injector's problem to report.
-        assert!(
-            inject_inferred_handle_names(
-                &spec,
-                r#"import { createState } from "smudgy:core"; const = createState();"#,
-            )
-            .is_none()
-        );
+        assert!(inject_inferred_handle_names(
+            &spec,
+            r#"import { createState } from "smudgy:core"; const = createState();"#,
+        )
+        .is_none());
     }
 
     #[test]
@@ -975,8 +1001,17 @@ const explicit = createState<{ x: number }>('pinned');
             export default clean;
             "#,
         );
-        assert_eq!(out.export_diagnostics.len(), 3, "{:#?}", out.export_diagnostics);
-        assert!(out.export_diagnostics[0].contains("\"vitals\""), "{:#?}", out.export_diagnostics);
+        assert_eq!(
+            out.export_diagnostics.len(),
+            3,
+            "{:#?}",
+            out.export_diagnostics
+        );
+        assert!(
+            out.export_diagnostics[0].contains("\"vitals\""),
+            "{:#?}",
+            out.export_diagnostics
+        );
         assert!(
             out.export_diagnostics[0].contains("more than one name"),
             "{:#?}",
@@ -1007,7 +1042,11 @@ const explicit = createState<{ x: number }>('pinned');
             void hidden;
             "#,
         );
-        assert!(out.export_diagnostics.is_empty(), "{:#?}", out.export_diagnostics);
+        assert!(
+            out.export_diagnostics.is_empty(),
+            "{:#?}",
+            out.export_diagnostics
+        );
     }
 
     #[test]
@@ -1024,7 +1063,10 @@ export interface VitalData { hp: number }
 "#;
         let (out, removed) = scrub_handle_exports(&spec, source).expect("scrubs");
         // The declaration still evaluates; only export-ness is gone.
-        assert!(out.contains(r#" const vitals = createState<{ hp: number }>("vitals");"#), "{out}");
+        assert!(
+            out.contains(r#" const vitals = createState<{ hp: number }>("vitals");"#),
+            "{out}"
+        );
         assert!(!out.contains("export const vitals"), "{out}");
         // Non-handle exports survive, including through a rewritten named-export list.
         assert!(out.contains("export const helper = 42;"), "{out}");
@@ -1033,25 +1075,34 @@ export interface VitalData { hp: number }
         assert!(!out.contains("export default vitals"), "{out}");
         // Type exports are untouched.
         assert!(out.contains("export interface VitalData"), "{out}");
-        assert_eq!(source.lines().count(), out.lines().count(), "line counts preserved");
-        assert_eq!(removed, vec!["vitals".to_string(), "prompt".to_string(), "default".to_string()]);
+        assert_eq!(
+            source.lines().count(),
+            out.lines().count(),
+            "line counts preserved"
+        );
+        assert_eq!(
+            removed,
+            vec![
+                "vitals".to_string(),
+                "prompt".to_string(),
+                "default".to_string()
+            ]
+        );
     }
 
     #[test]
     fn scrub_is_none_without_handle_exports() {
         let spec = ModuleSpecifier::parse("file:///index.ts").expect("valid url");
         // Handles exist but none are exported: nothing to scrub.
-        assert!(
-            scrub_handle_exports(
-                &spec,
-                r#"
+        assert!(scrub_handle_exports(
+            &spec,
+            r#"
                 import { createState } from "smudgy:core";
                 const vitals = createState("vitals");
                 export function read() { return vitals.value; }
                 "#,
-            )
-            .is_none()
-        );
+        )
+        .is_none());
         // No handles at all.
         assert!(scrub_handle_exports(&spec, "export const x = 1;").is_none());
     }

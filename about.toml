@@ -37,6 +37,8 @@ accepted = [
     "Unlicense",
     "OpenSSL",
     "CDLA-Permissive-2.0",
-    # libbz2-rs-sys, pulled by Deno 2.9.5's npm tarball stack; permissive BSD-style terms.
+    # libbz2-rs-sys, via deno_runtime -> qbsdiff (bsdiff streams are
+    # bzip2-compressed) for the desktop auto-update patch op; permissive
+    # BSD-style terms.
     "bzip2-1.0.6",
 ]

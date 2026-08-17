@@ -57,10 +57,12 @@ pub fn transpile(
             // shim. `import_source` is a GLOBAL default applied to EVERY transpiled .jsx/.tsx;
             // a third-party file that wants a different host sets `/** @jsxImportSource X */`.
             &deno_ast::TranspileOptions {
-                jsx: Some(deno_ast::JsxRuntime::Automatic(deno_ast::JsxAutomaticOptions {
-                    import_source: Some("smudgy:widgets".to_string()),
-                    development: false,
-                })),
+                jsx: Some(deno_ast::JsxRuntime::Automatic(
+                    deno_ast::JsxAutomaticOptions {
+                        import_source: Some("smudgy:widgets".to_string()),
+                        development: false,
+                    },
+                )),
                 ..Default::default()
             },
             &deno_ast::TranspileModuleOptions::default(),
@@ -113,13 +115,19 @@ mod tests {
             "hud.tsx",
             "const x = <Column><Text>a</Text><Text>b</Text></Column>;",
         );
-        assert!(out.contains("jsxs"), "2+ children => jsxs import, got:\n{out}");
+        assert!(
+            out.contains("jsxs"),
+            "2+ children => jsxs import, got:\n{out}"
+        );
     }
 
     #[test]
     fn plain_typescript_is_unaffected_by_the_jsx_option() {
         let out = emit("mod.ts", "export const n: number = 1;");
-        assert!(out.contains("export const n = 1"), "type stripped, got:\n{out}");
+        assert!(
+            out.contains("export const n = 1"),
+            "type stripped, got:\n{out}"
+        );
         assert!(
             !out.contains("jsx-runtime"),
             "no JSX => no runtime import, got:\n{out}"

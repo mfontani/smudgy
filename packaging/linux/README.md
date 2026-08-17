@@ -26,8 +26,10 @@ Prerequisites: `flatpak` + **network access at build time** (see strategy below)
 The build tool (`org.flatpak.Builder`), the freedesktop `25.08` runtimes, and the
 `rust-stable` + `llvm20` extensions are installed automatically from Flathub on
 first run. Deno 2.9.5's Rust crate family requires Rust 1.95.0 or newer; the
-`rust-stable` SDK extension is used deliberately and the manifest prints its
-version before building so an unexpectedly stale SDK fails visibly.
+`rust-stable` SDK extension is used deliberately and the manifest prints
+`rustc --version` before building so the toolchain is auditable in the build
+log — a pre-1.95 SDK fails later during compilation, and the printed version
+is how to diagnose it.
 
 ### Architectures
 
