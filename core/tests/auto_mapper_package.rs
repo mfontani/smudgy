@@ -10,11 +10,13 @@
 //! unexplored exits), revisit the first (follow, no duplicate), and verify the map is
 //! available to a fresh mapper on the next run.
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use smudgy_cloud::{
     CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapDestination,
     MapStorage, Mapper, MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
@@ -22,10 +24,12 @@ use smudgy_cloud::{
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
 use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
-use std::collections::HashSet;
+use smudgy_core::session::{
+    BufferUpdate, SessionEvent, SessionId, SessionParams, TaggedSessionEvent, spawn,
+};
 
-const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const COMPLETION_TIMEOUT: Duration = Duration::from_mins(1);
+const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SERVER: &str = "AutoMapperTest";
 
 fn copy_package(server: &str, name: &str) {
@@ -73,6 +77,101 @@ fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
             lines.push(line.text.clone());
         }
     }
+}
+
+async fn wait_until<S, F>(events: &mut S, lines: &mut Vec<String>, description: &str, ready: F)
+where
+    S: Stream<Item = TaggedSessionEvent> + Unpin,
+    F: FnMut(&[String]) -> bool,
+{
+    wait_until_observing(events, lines, description, ready, |_| {}).await;
+}
+
+/// Wait for the operation's observable postcondition while continuing to collect session output.
+/// Durable mapper work can legitimately produce no events for seconds, so event-stream silence is
+/// never treated as completion.
+async fn wait_until_observing<S, F, O>(
+    events: &mut S,
+    lines: &mut Vec<String>,
+    description: &str,
+    mut ready: F,
+    mut observe: O,
+) where
+    S: Stream<Item = TaggedSessionEvent> + Unpin,
+    F: FnMut(&[String]) -> bool,
+    O: FnMut(&SessionEvent),
+{
+    let completed = tokio::time::timeout(COMPLETION_TIMEOUT, async {
+        loop {
+            if ready(lines) {
+                return true;
+            }
+            tokio::select! {
+                event = events.next() => {
+                    let Some(event) = event else {
+                        return false;
+                    };
+                    observe(&event.event);
+                    if let SessionEvent::UpdateBuffer(updates) = &event.event {
+                        collect(updates, lines);
+                    }
+                }
+                () = tokio::time::sleep(COMPLETION_POLL_INTERVAL) => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        matches!(completed, Ok(true)),
+        "timed out waiting for {description}.\n{}",
+        lines.join("\n")
+    );
+}
+
+fn room_exists(mapper: &Mapper, external_id: &str) -> bool {
+    mapper
+        .get_current_atlas()
+        .find_room_by_external_id(external_id)
+        .is_some()
+}
+
+fn room_title_is(mapper: &Mapper, external_id: &str, title: &str) -> bool {
+    mapper
+        .get_current_atlas()
+        .find_room_by_external_id(external_id)
+        .is_some_and(|(_, room)| room.get_title() == title)
+}
+
+fn room_is_materialized(mapper: &Mapper, external_id: &str) -> bool {
+    mapper
+        .get_current_atlas()
+        .find_room_by_external_id(external_id)
+        .is_some_and(|(_, room)| room.get_property("unvisited") != Some("true"))
+}
+
+fn rooms_linked(mapper: &Mapper, from_id: &str, to_id: &str) -> bool {
+    let atlas = mapper.get_current_atlas();
+    let Some((_, from)) = atlas.find_room_by_external_id(from_id) else {
+        return false;
+    };
+    let Some((to, _)) = atlas.find_room_by_external_id(to_id) else {
+        return false;
+    };
+    from.get_exits().iter().any(|exit| {
+        exit.to_area_id == Some(to.area_id) && exit.to_room_number == Some(to.room_number)
+    })
+}
+
+fn rooms_reciprocally_linked(mapper: &Mapper, a: &str, b: &str) -> bool {
+    rooms_linked(mapper, a, b) && rooms_linked(mapper, b, a)
+}
+
+fn room_has_exit_count(mapper: &Mapper, external_id: &str, count: usize) -> bool {
+    mapper
+        .get_current_atlas()
+        .find_room_by_external_id(external_id)
+        .is_some_and(|(_, room)| room.get_exits().len() == count)
 }
 
 #[tokio::test]
@@ -203,18 +302,25 @@ async fn auto_mapper_maps_follows_and_persists() {
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 100, "vnum": "wrong-vnum-100", "id": "wrong-id-100",
-             "name": "Temple Square", "zone": "midgaard", "terrain": "city",
+             "name": "Temple Square Revisited", "zone": "midgaard", "terrain": "city",
              "exits": { "e": 101, "n": 102 },
              "coord": { "id": 0, "x": 30, "y": 20, "cont": 0 } }"#,
     ))
     .unwrap();
 
-    // Drain until quiet so every async creation lands before asserting.
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    // Wait until every queued creation and revisit has completed before asserting.
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the initial walk and revisit",
+        |_| {
+            room_title_is(&mapper, "100", "Temple Square Revisited")
+                && rooms_reciprocally_linked(&mapper, "100", "101")
+                && rooms_reciprocally_linked(&mapper, "101", "103")
+                && rooms_linked(&mapper, "100", "102")
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
 
     // ---- The durable map: one local zone area, bound ids, linked exits. ----
@@ -250,7 +356,7 @@ async fn auto_mapper_maps_follows_and_persists() {
         5,
         "three visited rooms + the 102 placeholder + the seeded blocker"
     );
-    assert_eq!(room100.get_title(), "Temple Square");
+    assert_eq!(room100.get_title(), "Temple Square Revisited");
     assert_eq!(room101.get_title(), "Market Street");
     assert_eq!(room103.get_title(), "East Gate");
     assert!(
@@ -356,11 +462,15 @@ async fn auto_mapper_maps_follows_and_persists() {
              "exits": { "s": 100 } }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "room 102 to materialize and link back to room 100",
+        |_| {
+            room_is_materialized(&mapper, "102") && rooms_reciprocally_linked(&mapper, "100", "102")
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     let (key102, _) = atlas
@@ -456,11 +566,13 @@ async fn auto_mapper_maps_follows_and_persists() {
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the saved area to be adopted and room 105 to link to room 102",
+        |_| rooms_reciprocally_linked(&mapper, "102", "105"),
+    )
+    .await;
     let transcript = lines.join("\n");
 
     let atlas = mapper.get_current_atlas();
@@ -599,11 +711,17 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         tx.send(gmcp("Room.Info", payload)).unwrap();
     }
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the zone-crossing walk to link rooms 200, 201, 300, and 202",
+        |_| {
+            rooms_reciprocally_linked(&mapper, "200", "201")
+                && rooms_reciprocally_linked(&mapper, "201", "300")
+                && rooms_reciprocally_linked(&mapper, "200", "202")
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
 
     let atlas = mapper.get_current_atlas();
@@ -707,11 +825,21 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
              "exits": { "n": -1 } }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    // A following known-room update is an ordered marker proving the preceding unmappable
+    // report was consumed without drawing anything.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 200, "name": "West Plaza After Maze", "zone": "old-town",
+             "terrain": "city", "exits": { "e": 201, "n": 202 } }"#,
+    ))
+    .unwrap();
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the post-maze known-room marker",
+        |_| room_title_is(&mapper, "200", "West Plaza After Maze"),
+    )
+    .await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     assert!(
@@ -804,11 +932,13 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the IRE room and its placeholder exit",
+        |_| rooms_linked(&mapper, "4711", "4712"),
+    )
+    .await;
     let transcript = lines.join("\n");
 
     let atlas = mapper.get_current_atlas();
@@ -856,11 +986,16 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
              "coords": "77,5,8,2", "exits": { "s": 4711 } }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "IRE room 4712 to materialize and link back to 4711",
+        |_| {
+            room_is_materialized(&mapper, "4712")
+                && rooms_reciprocally_linked(&mapper, "4711", "4712")
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     let (key4712b, room4712b) = atlas
@@ -1013,11 +1148,13 @@ async fn auto_mapper_maps_msdp_composite_room() {
     })
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the MSDP room and its placeholder exit",
+        |_| rooms_linked(&mapper, "14100", "14101"),
+    )
+    .await;
     let transcript = lines.join("\n");
 
     let atlas = mapper.get_current_atlas();
@@ -1114,28 +1251,21 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     };
 
     tx.send(RuntimeAction::GmcpEnabled).unwrap();
-    // Let the session settle first (package load, sys:send subscription registration,
-    // the maps-loaded barrier) — a real login spends seconds here before anyone moves.
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
-    // Login room: exits advertised without destination ids. Each step drains until
-    // quiet before the next command goes out: commands and room reports interleave at
-    // human/network timescales, and a same-instant blast would deliver the observed
-    // command before the PRIOR fix's watch even flushed — an ordering no real walk
-    // produces.
+    // RuntimeReady guarantees the package's subscriptions are registered; the first room's
+    // observable postcondition also waits through the maps-loaded barrier. Each subsequent step
+    // completes before the next command goes out, matching human/network interleaving.
     tx.send(gmcp(
         "Room.Info",
         r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": { "e": "" } }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "room 900 and its destination-less east stub",
+        |_| room_has_exit_count(&mapper, "900", 1),
+    )
+    .await;
     // Walk east — the sent command is observed via sys:send and attributed to the next fix.
     tx.send(RuntimeAction::Send(Arc::new("e".to_string())))
         .unwrap();
@@ -1144,25 +1274,30 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         r#"{ "num": 901, "name": "Open Trail", "zone": "trailfields", "exits": { "w": "", "e": "" } }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "movement evidence to link rooms 900 and 901",
+        |_| rooms_reciprocally_linked(&mapper, "900", "901"),
+    )
+    .await;
     // Walk back west into known terrain: follow only, nothing new minted.
     tx.send(RuntimeAction::Send(Arc::new("w".to_string())))
         .unwrap();
     tx.send(gmcp(
         "Room.Info",
-        r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": { "e": "" } }"#,
+        r#"{ "num": 900, "name": "Trail Head Revisited", "zone": "trailfields",
+             "exits": { "e": "" } }"#,
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the return to known room 900",
+        |_| room_title_is(&mapper, "900", "Trail Head Revisited"),
+    )
+    .await;
     let transcript = lines.join("\n");
 
     let atlas = mapper.get_current_atlas();
@@ -1227,11 +1362,13 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         r#"{ "num": 903, "name": "Ambiguous Trail", "zone": "trailfields", "exits": {} }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "ambiguous-arrival room 903",
+        |_| room_exists(&mapper, "903"),
+    )
+    .await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     let (key903, _) = atlas
@@ -1261,11 +1398,13 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         r#"{ "num": 902, "name": "Far Field", "zone": "trailfields", "coords": "1,999999999,5", "exits": {} }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "bounded-coordinate room 902",
+        |_| room_exists(&mapper, "902"),
+    )
+    .await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     assert!(
@@ -1290,11 +1429,13 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         r#"{ "num": 900, "name": "Trail Head", "zone": "trailfields", "exits": {} }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "mapprune to remove room 900's stale exit",
+        |_| room_has_exit_count(&mapper, "900", 0),
+    )
+    .await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     let (_, room900_pruned) = atlas.find_room_by_external_id("900").expect("room 900");
@@ -1403,19 +1544,34 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
              "coord": { "id": 0, "x": 501, "y": 300, "cont": 1 } }"#,
     ))
     .unwrap();
+    // Follow the known room again as an ordered marker after the unknown-room report.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 35200, "name": "On a dusty road", "zone": "mesolar", "terrain": "field",
+             "exits": { "e": 35201 },
+             "coord": { "id": 0, "x": 500, "y": 300, "cont": 1 } }"#,
+    ))
+    .unwrap();
 
-    let mut located = None;
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        match event.event {
-            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
-            SessionEvent::SetCurrentLocation(area, room) => located = Some((area, room)),
-            _ => {}
-        }
-    }
+    let located = Cell::new(None);
+    let known_location_events = Cell::new(0_usize);
+    wait_until_observing(
+        &mut events,
+        &mut lines,
+        "both known-room follows around the unknown continent room",
+        |_| known_location_events.get() == 2,
+        |event| {
+            if let SessionEvent::SetCurrentLocation(area, room) = event {
+                located.set(Some((*area, *room)));
+                known_location_events.set(known_location_events.get() + 1);
+            }
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
 
     assert_eq!(
-        located,
+        located.get(),
         Some((mesolar, Some(1))),
         "a known continent room is FOLLOWED (follow-only, not follow-never).\n{transcript}"
     );
@@ -1539,19 +1695,23 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     ))
     .unwrap();
 
-    // Drain until quiet, watching for the rescue offer.
-    let mut rescue_offered = false;
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        match event.event {
-            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
-            SessionEvent::OfferMapRescue { .. } => rescue_offered = true,
-            _ => {}
-        }
-    }
+    let rescue_offered = Cell::new(false);
+    wait_until_observing(
+        &mut events,
+        &mut lines,
+        "the cross-entry rescue offer",
+        |_| rescue_offered.get(),
+        |event| {
+            if matches!(event, SessionEvent::OfferMapRescue { .. }) {
+                rescue_offered.set(true);
+            }
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
 
     assert!(
-        rescue_offered,
+        rescue_offered.get(),
         "a room mapped on another entry raises the cross-entry rescue offer.\n{transcript}"
     );
     // No duplicate was minted: no new durable zone area appeared, and "9500"
@@ -1663,11 +1823,10 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
     // Let initial map loading finish while the document is still readable, then make this
     // one area read-only to the backend without disabling new local map creation. A
     // future-format document is deliberately refused on every platform.
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    mapper
+        .import_areas_if_absent(Vec::new())
+        .await
+        .expect("wait for the initial local map load");
     let bound_path = map_root
         .join("local")
         .join("areas-v2")
@@ -1694,11 +1853,15 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the unwritable-map retry to create room 701 in a fallback area",
+        |lines| {
+            lines.iter().any(|line| line.contains("not writable")) && room_exists(&mapper, "701")
+        },
+    )
+    .await;
     let transcript = lines.join("\n");
 
     assert!(
