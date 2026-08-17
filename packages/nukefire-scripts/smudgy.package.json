@@ -86,6 +86,12 @@
       "default": 12
     },
     {
+      "key": "separateChatMessages",
+      "label": "Separate chat messages with empty lines",
+      "type": "bool",
+      "default": true
+    },
+    {
       "key": "widgetFontSize",
       "label": "Widget font size (px)",
       "type": "number",
