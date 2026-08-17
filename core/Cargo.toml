@@ -53,7 +53,6 @@ vtparse = { workspace = true }
 deno_core = { workspace = true }
 deno_error = { workspace = true }
 build-time = { workspace = true }
-winapi = { workspace = true }
 chrono = { workspace = true }
 simplelog = "0.12.2"
 thiserror = "2.0.10"

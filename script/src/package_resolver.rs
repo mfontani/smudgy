@@ -326,10 +326,7 @@ pub struct CanonicalCoords {
 #[must_use]
 pub fn canonical_url(key: &PackageKey, version: &str, module_subpath: &str) -> ModuleSpecifier {
     let module_subpath = module_subpath.trim_start_matches('/');
-    let path = format!(
-        "/{}/{}/{}/{}",
-        key.owner, key.name, version, module_subpath
-    );
+    let path = format!("/{}/{}/{}/{}", key.owner, key.name, version, module_subpath);
     ModuleSpecifier::parse(&format!("{CANONICAL_SCHEME}://{path}"))
         .expect("canonical URL is well-formed for validated components")
 }
@@ -345,11 +342,7 @@ pub fn parse_canonical(url: &ModuleSpecifier) -> Option<CanonicalCoords> {
     let name = segments.next()?.to_string();
     let version = segments.next()?.to_string();
     let module_subpath = segments.collect::<Vec<_>>().join("/");
-    if owner.is_empty()
-        || name.is_empty()
-        || version.is_empty()
-        || module_subpath.is_empty()
-    {
+    if owner.is_empty() || name.is_empty() || version.is_empty() || module_subpath.is_empty() {
         return None;
     }
     Some(CanonicalCoords {
@@ -573,7 +566,10 @@ impl ParamOption {
     /// The user-facing label, falling back to the raw value when none was given.
     #[must_use]
     pub fn display_label(&self) -> &str {
-        self.label.as_deref().filter(|l| !l.is_empty()).unwrap_or(&self.value)
+        self.label
+            .as_deref()
+            .filter(|l| !l.is_empty())
+            .unwrap_or(&self.value)
     }
 }
 
@@ -666,23 +662,32 @@ impl ImportPolicy {
 }
 
 /// Requested permissions, enforced per sandboxed package isolate. The deno-native fields
-/// (`net`/`read`/`write`/`env`/`run`/`ffi`/`sys`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`) are
-/// each a deny-by-default allowlist: an absent/empty field denies that kind entirely. Value
-/// formats: `net` entries are `host:port` (only that port), bare `host` (any port), `*` (any
-/// host/port), or `*:port` (any host on only that port);
+/// (`net`/`ipc`/`read`/`write`/`env`/`run`/`ffi`/`sys`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`)
+/// are each a deny-by-default allowlist: an absent/empty field denies that kind entirely. Value
+/// formats: `net` entries are **internet hosts only** — `host:port` (only that port), bare `host`
+/// (any port), `*` (any internet host/port), or `*:port` (any internet host on only that port);
+/// a `unix:`/`vsock:` prefix in `net` is a manifest-validation error (local IPC is the `ipc`
+/// axis, and vsock has no manifest surface at all);
 /// `read`/`write` are paths whose directory grants cover the whole subtree (and may use the
 /// `$DATA` placeholder, host-expanded before enforcement); `env` are exact var names; `run` are
 /// program names (PATH-resolved at container build) or absolute paths; `ffi` are dynamic-library
 /// paths with the same subtree + `$DATA` semantics as `read`/`write`; `sys` are deno system-info
 /// kind tokens (`hostname`, `osRelease`, …), exact-matched.
 ///
-/// **`run` and `ffi` are sandbox escapes**: a subprocess or a native library runs *outside* the
-/// permission model with the user's full privileges, and a `write` entry that reaches outside
-/// `$DATA` is equivalent (it can rewrite config, scripts, or other packages). They are declarable
-/// so a package that genuinely needs them can ask honestly — but every surface that shows a
-/// permission set (the consent window, the package panes) must present them as what they are:
-/// effectively full access, not a scoped grant (see `permission_can_lines` / `PermissionRisk` in
-/// the automations window).
+/// `ipc` rows ([`IpcEntry`]) name local IPC endpoints with per-platform realizations: an
+/// absolute POSIX socket path (`unix`) and/or a Windows pipe name (`windowsPipe`), at least one
+/// per row. The container build compiles the realization native to the running platform into an
+/// exact `unix:` net descriptor plus the paired read+write grant the socket ops require on that
+/// same path ([`native_ipc_grants`]); the non-native realization contributes nothing there.
+///
+/// **`run`, `ffi`, and `ipc` are sandbox escapes**: a subprocess or a native library runs
+/// *outside* the permission model with the user's full privileges, a local socket can front a
+/// privileged daemon (`unix:/var/run/docker.sock` is arbitrary code execution), and a `write`
+/// entry that reaches outside `$DATA` is equivalent (it can rewrite config, scripts, or other
+/// packages). They are declarable so a package that genuinely needs them can ask honestly — but
+/// every surface that shows a permission set (the consent window, the package panes) must
+/// present them as what they are: effectively full access, not a scoped grant (see
+/// `permission_can_lines` / `PermissionRisk` in the automations window).
 ///
 /// `import` is a tri-state [`ImportPolicy`] (not a host list) and a separate axis from `net`: `net`
 /// governs runtime network *connections* (opening sockets / `fetch`, where the package could send
@@ -696,6 +701,12 @@ impl ImportPolicy {
 pub struct PackagePermissions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub net: Vec<String>,
+    /// Local IPC endpoints ([`IpcEntry`] rows), each carrying per-platform realizations. The
+    /// highest ("unbox") risk tier: an exact target, but the target can be a privileged local
+    /// service. Absent/empty denies local IPC entirely; clients that predate the axis ignore it
+    /// and keep local IPC denied (fail-closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ipc: Vec<IpcEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -735,6 +746,7 @@ impl PackagePermissions {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.net.is_empty()
+            && self.ipc.is_empty()
             && self.read.is_empty()
             && self.write.is_empty()
             && self.env.is_empty()
@@ -754,6 +766,7 @@ impl PackagePermissions {
     /// no-op.
     pub fn merge(&mut self, other: &Self) {
         merge_dedup(&mut self.net, &other.net);
+        merge_dedup_ipc(&mut self.ipc, &other.ipc);
         merge_dedup(&mut self.read, &other.read);
         merge_dedup(&mut self.write, &other.write);
         merge_dedup(&mut self.env, &other.env);
@@ -784,6 +797,7 @@ impl PackagePermissions {
     pub fn added_since(&self, baseline: &Self) -> Self {
         Self {
             net: added_entries(&self.net, &baseline.net, PermField::Net),
+            ipc: added_ipc_entries(&self.ipc, &baseline.ipc),
             read: added_entries(&self.read, &baseline.read, PermField::Path),
             write: added_entries(&self.write, &baseline.write, PermField::Path),
             env: added_entries(&self.env, &baseline.env, PermField::Exact),
@@ -792,7 +806,11 @@ impl PackagePermissions {
             sys: added_entries(&self.sys, &baseline.sys, PermField::Exact),
             // The "additionally wants" for `import` is the new level only when it escalates past the
             // consented one (a higher level is a superset); otherwise nothing new.
-            import: if self.import > baseline.import { self.import } else { ImportPolicy::None },
+            import: if self.import > baseline.import {
+                self.import
+            } else {
+                ImportPolicy::None
+            },
             smudgy: self.smudgy.added_since(&baseline.smudgy),
         }
     }
@@ -812,6 +830,7 @@ impl PackagePermissions {
     #[must_use]
     pub fn is_within(&self, ceiling: &Self) -> bool {
         self.net.iter().all(|e| covered_by(PermField::Net, &ceiling.net, e))
+            && self.ipc.iter().all(|row| ipc_covered(&ceiling.ipc, row))
             && self.read.iter().all(|e| covered_by(PermField::Path, &ceiling.read, e))
             && self.write.iter().all(|e| covered_by(PermField::Path, &ceiling.write, e))
             && self.env.iter().all(|e| covered_by(PermField::Exact, &ceiling.env, e))
@@ -821,6 +840,155 @@ impl PackagePermissions {
             // `import` fits iff it asks for no higher level than the ceiling grants.
             && self.import <= ceiling.import
             && self.smudgy.is_within(&ceiling.smudgy)
+    }
+}
+
+/// One row of the `ipc` permission axis: a local IPC endpoint named by its per-platform
+/// realizations. `unix` is an absolute POSIX Unix-domain socket path; `windowsPipe` is a bare
+/// Windows named-pipe name (no separators — the engine prepends `\\.\pipe\`). At least one
+/// realization must be declared per row ([`IpcEntry::issue`]). A row is one *endpoint*, not two
+/// grants: declaring both realizations keeps a single manifest honest across platforms, and the
+/// container build materializes only the realization native to the running platform
+/// ([`native_ipc_grants`]) — the other is inert there and is annotated as such in consent UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEntry {
+    /// The Unix-family realization: an absolute POSIX socket path (`/var/run/example.sock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix: Option<String>,
+    /// The Windows realization: a pipe name with no separators; the engine grants
+    /// `\\.\pipe\<name>`. Pipe names are case-insensitive on Windows, and consent coverage
+    /// compares them accordingly.
+    #[serde(
+        default,
+        rename = "windowsPipe",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub windows_pipe: Option<String>,
+}
+
+/// Why one [`IpcEntry`] fails manifest validation. Surfaced with a localized message by the
+/// manifest editor; the engine's container build refuses an invalid row outright (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcEntryIssue {
+    /// Neither realization is declared — the row grants nothing anywhere and is a mistake.
+    NoRealization,
+    /// `unix` is not a non-empty absolute POSIX path (must start with `/`, no NUL).
+    InvalidUnixPath,
+    /// `windowsPipe` is empty or contains a separator (`/`, `\`, `:`) — the engine prepends
+    /// `\\.\pipe\`, so a separator would let a name escape the pipe namespace.
+    InvalidPipeName,
+}
+
+impl IpcEntry {
+    /// The row's validation failure, if any. `None` means the row is well-formed.
+    #[must_use]
+    pub fn issue(&self) -> Option<IpcEntryIssue> {
+        if self.unix.is_none() && self.windows_pipe.is_none() {
+            return Some(IpcEntryIssue::NoRealization);
+        }
+        if self
+            .unix
+            .as_deref()
+            .is_some_and(|path| !path.starts_with('/') || path.contains('\0'))
+        {
+            return Some(IpcEntryIssue::InvalidUnixPath);
+        }
+        if self
+            .windows_pipe
+            .as_deref()
+            .is_some_and(|name| name.is_empty() || name.contains(['/', '\\', ':', '\0']))
+        {
+            return Some(IpcEntryIssue::InvalidPipeName);
+        }
+        None
+    }
+}
+
+/// Whether a manifest `net` entry names a local transport (`unix:`/`vsock:` prefix). Such
+/// entries are manifest-validation errors — `net` is internet hosts only, local IPC is the
+/// structured `ipc` axis, and vsock has no manifest surface — and the container build refuses
+/// them fail-closed so a hand-edited manifest cannot smuggle a local grant through the host
+/// list.
+#[must_use]
+pub fn is_local_transport_net_entry(entry: &str) -> bool {
+    let entry = entry.trim();
+    entry.starts_with("unix:") || entry.starts_with("vsock:")
+}
+
+/// Whether a manifest path-axis entry (`read`/`write`/`ffi`) names the Windows named-pipe
+/// namespace: two separators (either style), `.` or `?`, a separator, `pipe`
+/// (case-insensitive), then a separator or the end of the entry — the same shape the pinned
+/// `deno_permissions` patch's special-file carve-out admits, plus the bare namespace root
+/// (which would grant every pipe as a subtree). Such entries are manifest-validation errors.
+///
+/// This is the pairing invariant that keeps the carve-out safe: on Windows, fs-opening a pipe
+/// IS connecting to it, so with pipe-namespace query paths exempted from the unscoped-"all"
+/// demand, a plain `read`/`write` grant on a pipe path would reach local IPC without the
+/// Critical-tier `ipc` consent. Rejecting pipe paths in every path axis means a scoped grant
+/// that admits a pipe path can only originate from a consented `ipc` row — whose exact-pipe
+/// `unix:` net descriptor still gates the connection at the socket layer.
+#[must_use]
+pub fn is_windows_pipe_namespace_entry(entry: &str) -> bool {
+    fn is_sep(b: u8) -> bool {
+        b == b'\\' || b == b'/'
+    }
+    let s = entry.trim().as_bytes();
+    s.len() >= 8
+        && is_sep(s[0])
+        && is_sep(s[1])
+        && (s[2] == b'.' || s[2] == b'?')
+        && is_sep(s[3])
+        && s[4..8].eq_ignore_ascii_case(b"pipe")
+        && (s.len() == 8 || is_sep(s[8]))
+}
+
+/// The deno-native grants realized from consented `ipc` rows on the running platform: the
+/// `unix:<path>` strings for the net allowlist, and the same paths for the read **and** write
+/// allowlists — every Unix-socket/named-pipe op checks open access (read+write, no-follow) on
+/// the exact path *in addition to* the `unix:` net descriptor, so a net-only grant would
+/// silently never pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpcGrants {
+    /// `unix:<path>` entries for `allow_net`.
+    pub net: Vec<String>,
+    /// The bare paths for `allow_read` and `allow_write`.
+    pub paths: Vec<String>,
+}
+
+/// Compile consented `ipc` rows into the running platform's deno-native grants. Rows without a
+/// native realization contribute nothing (inert, not an error): a unix-only row on Windows and a
+/// pipe-only row on unix simply grant nothing there.
+#[must_use]
+pub fn native_ipc_grants(rows: &[IpcEntry]) -> IpcGrants {
+    let mut grants = IpcGrants::default();
+    for path in rows.iter().filter_map(native_ipc_path) {
+        grants.net.push(format!("unix:{path}"));
+        grants.paths.push(path);
+    }
+    grants
+}
+
+/// The running platform's realization of one `ipc` row: `\\.\pipe\<name>` from `windowsPipe` on
+/// Windows, the declared socket path from `unix` on the Unix family, `None` when the row has no
+/// realization here. Both forms parse as `unix:` net-descriptor rules on their own platform
+/// (Windows named pipes travel through the same `UnixSocket` descriptor and ops).
+#[must_use]
+pub fn native_ipc_path(entry: &IpcEntry) -> Option<String> {
+    #[cfg(windows)]
+    {
+        entry
+            .windows_pipe
+            .as_ref()
+            .map(|name| format!(r"\\.\pipe\{name}"))
+    }
+    #[cfg(unix)]
+    {
+        entry.unix.clone()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = entry;
+        None
     }
 }
 
@@ -1182,9 +1350,9 @@ fn path_entry_dropped(entry: &str) -> bool {
         return false;
     };
     let sub = match rest.chars().next() {
-        None => return false,                              // bare `$DATA`
+        None => return false, // bare `$DATA`
         Some('/' | '\\') => rest.trim_start_matches(['/', '\\']),
-        Some(_) => return false,                           // `$DATABASE` etc. — not the placeholder
+        Some(_) => return false, // `$DATABASE` etc. — not the placeholder
     };
     sub.split(['/', '\\']).any(|component| component == "..")
 }
@@ -1203,6 +1371,8 @@ fn dedup_key(field: PermField, entry: &str) -> String {
 /// bare-host grant (no port) covers every port while a `host:port` grant covers only that exact
 /// port. The special host `*` covers every requested host, with its optional port restriction
 /// applied normally. (A colon suffix that isn't a `u16` port is taken as part of the host.)
+/// `net` entries are internet hosts only — local IPC is the `ipc` axis ([`ipc_covered`]), so no
+/// host grant, wildcard included, ever meets a local-transport query here.
 fn host_covers(ceiling: &str, requested: &str) -> bool {
     let (ceiling_host, ceiling_port) = split_host_port(ceiling);
     let (requested_host, requested_port) = split_host_port(requested);
@@ -1216,6 +1386,70 @@ fn host_covers(ceiling: &str, requested: &str) -> bool {
 #[must_use]
 pub fn is_any_host_net_entry(entry: &str) -> bool {
     split_host_port(entry).0 == "*"
+}
+
+/// The `ipc` rows of `new` not covered by any row of `old`, preserving `new`'s order and
+/// spelling, de-duped within `new` — the `ipc` twin of [`added_entries`].
+fn added_ipc_entries(new: &[IpcEntry], old: &[IpcEntry]) -> Vec<IpcEntry> {
+    let mut seen: std::collections::HashSet<IpcKey> = std::collections::HashSet::new();
+    new.iter()
+        .filter(|row| !ipc_covered(old, row) && seen.insert(ipc_key(row)))
+        .cloned()
+        .collect()
+}
+
+/// Whether any consented `ipc` row covers `requested`: coverage is **whole-row equality** under
+/// [`ipc_key`] — both realizations must match, including each one's absence. A row naming only a
+/// pipe is a different (narrower on one platform, absent on the other) ask than a row naming the
+/// pipe and a socket path, so it never rides the other's consent.
+fn ipc_covered(ceiling: &[IpcEntry], requested: &IpcEntry) -> bool {
+    let key = ipc_key(requested);
+    ceiling.iter().any(|grant| ipc_key(grant) == key)
+}
+
+/// The comparison key of one `ipc` row.
+type IpcKey = (Option<String>, Option<String>);
+
+/// Comparison key for an `ipc` row, normalized the way the engine's grants compare: the `unix`
+/// path lexically normalized exactly as `deno_permissions` normalizes `unix:` rules
+/// ([`normalize_unix_socket_path`]), the pipe name lowercased (Windows pipe names are
+/// case-insensitive).
+fn ipc_key(entry: &IpcEntry) -> IpcKey {
+    (
+        entry.unix.as_deref().map(normalize_unix_socket_path),
+        entry.windows_pipe.as_deref().map(str::to_lowercase),
+    )
+}
+
+/// Lexically normalize an absolute POSIX socket path the way `deno_permissions` normalizes a
+/// `unix:` allow-rule (its `normalize_path`, applied at rule-parse time): empty and `.`
+/// components drop, `..` pops the previous component (clamped at the root), and symlinks are
+/// deliberately not resolved — the rule scopes the socket *location*. Keeping this comparison in
+/// lockstep is what makes consent coverage agree with what the container actually grants:
+/// without it, `/var/run/../run/x.sock` would look like a new ask over a consented
+/// `/var/run/x.sock` even though both compile to the same descriptor.
+fn normalize_unix_socket_path(path: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    format!("/{}", stack.join("/"))
+}
+
+/// Append each `ipc` row of `src` not already present in `dst` (by [`ipc_key`]) — the `ipc` twin
+/// of [`merge_dedup`], preserving first-seen order across the dependency-closure union.
+fn merge_dedup_ipc(dst: &mut Vec<IpcEntry>, src: &[IpcEntry]) {
+    for row in src {
+        if !dst.iter().any(|existing| ipc_key(existing) == ipc_key(row)) {
+            dst.push(row.clone());
+        }
+    }
 }
 
 /// Split a `net` entry into its lowercased host and optional `u16` port. A trailing `:<digits>`
@@ -1340,7 +1574,10 @@ impl ResolvedPackage {
     ///
     /// # Errors
     /// Returns [`PackageError::NotFound`] when no module matches.
-    pub fn resolve_module(&self, subpath: Option<&str>) -> Result<&PackageModuleSource, PackageError> {
+    pub fn resolve_module(
+        &self,
+        subpath: Option<&str>,
+    ) -> Result<&PackageModuleSource, PackageError> {
         let candidates = match subpath {
             None => entry_candidates(self.manifest.entry.as_deref()),
             Some(sub) => subpath_candidates(sub),
@@ -1547,8 +1784,9 @@ pub(crate) async fn load_marker_module(
         .resolve_module(None)
         .is_ok_and(|entry| entry.subpath == module.subpath);
     let text = serve_text(&provider, &key, &canonical, &module.text, is_entry);
-    let (code, _source_map) = crate::transpiler::transpile(&canonical, &text)
-        .map_err(|err| crate::generic_loader_error(format!("failed transpiling {canonical}: {err}")))?;
+    let (code, _source_map) = crate::transpiler::transpile(&canonical, &text).map_err(|err| {
+        crate::generic_loader_error(format!("failed transpiling {canonical}: {err}"))
+    })?;
     Ok(ModuleSource::new_with_redirect(
         module_type_for(&module.subpath),
         ModuleSourceCode::String(code.into()),
@@ -1569,8 +1807,9 @@ pub(crate) async fn load_canonical_module(
     provider: Rc<dyn PackageProvider>,
     url: &ModuleSpecifier,
 ) -> Result<ModuleSource, ModuleLoaderError> {
-    let coords = parse_canonical(url)
-        .ok_or_else(|| crate::generic_loader_error(format!("invalid canonical package url {url}")))?;
+    let coords = parse_canonical(url).ok_or_else(|| {
+        crate::generic_loader_error(format!("invalid canonical package url {url}"))
+    })?;
     let fetched = provider
         .get_cached(&coords.key, &coords.version)
         .ok_or_else(|| {
@@ -1579,12 +1818,14 @@ pub(crate) async fn load_canonical_module(
                 coords.key.name, coords.version
             ))
         })?;
-    let module = fetched.module_source(&coords.module_subpath).ok_or_else(|| {
-        crate::generic_loader_error(format!(
-            "package {} has no module {}",
-            coords.key.name, coords.module_subpath
-        ))
-    })?;
+    let module = fetched
+        .module_source(&coords.module_subpath)
+        .ok_or_else(|| {
+            crate::generic_loader_error(format!(
+                "package {} has no module {}",
+                coords.key.name, coords.module_subpath
+            ))
+        })?;
     let is_entry = fetched
         .resolve_module(None)
         .is_ok_and(|entry| entry.subpath == module.subpath);
@@ -1614,7 +1855,9 @@ pub(crate) fn load_params_module(url: &ModuleSpecifier) -> Result<ModuleSource, 
     let importer = parse_params_url(url)
         .ok_or_else(|| crate::generic_loader_error(format!("invalid smudgy:params url {url}")))?;
     // JSON-encode the specifier (or "") so it embeds as a safe JS string literal.
-    let spec = importer.map(|key| key.to_user_specifier()).unwrap_or_default();
+    let spec = importer
+        .map(|key| key.to_user_specifier())
+        .unwrap_or_default();
     let spec_literal = serde_json::to_string(&spec).expect("a string always serializes");
     let code = format!(
         "const __spec = {spec_literal};\n\
@@ -1645,7 +1888,10 @@ pub fn core_module_url(referrer: &str) -> ModuleSpecifier {
         .ok()
         .and_then(|url| parse_canonical(&url))
     {
-        let path = format!("/pkg/{}/{}/{}", coords.key.owner, coords.key.name, coords.version);
+        let path = format!(
+            "/pkg/{}/{}/{}",
+            coords.key.owner, coords.key.name, coords.version
+        );
         return ModuleSpecifier::parse(&format!("{CORE_SCHEME}://{path}"))
             .expect("core package URL is well-formed for validated components");
     }
@@ -1658,8 +1904,7 @@ pub fn core_module_url(referrer: &str) -> ModuleSpecifier {
         url.query_pairs_mut().append_pair("ref", referrer);
         return url;
     }
-    ModuleSpecifier::parse(&format!("{CORE_SCHEME}:///user"))
-        .expect("core user URL is well-formed")
+    ModuleSpecifier::parse(&format!("{CORE_SCHEME}:///user")).expect("core user URL is well-formed")
 }
 
 /// Recover the creator descriptor (as a JSON object literal) from a [`core_module_url`]
@@ -1806,10 +2051,14 @@ pub fn widgets_module_url(referrer: &str) -> ModuleSpecifier {
         .ok()
         .and_then(|url| parse_canonical(&url))
     {
-        let path = format!("/pkg/{}/{}/{}", coords.key.owner, coords.key.name, coords.version);
+        let path = format!(
+            "/pkg/{}/{}/{}",
+            coords.key.owner, coords.key.name, coords.version
+        );
         let mut url = ModuleSpecifier::parse(&format!("{WIDGETS_SCHEME}://{path}"))
             .expect("widgets package URL is well-formed for validated components");
-        url.query_pairs_mut().append_pair("mod", &coords.module_subpath);
+        url.query_pairs_mut()
+            .append_pair("mod", &coords.module_subpath);
         return url;
     }
     if referrer.starts_with("file://") {
@@ -1927,7 +2176,9 @@ pub(crate) struct KindSchemeRef {
 /// shares user handles by ordinary import). Reservation is unconditional, so a package owner
 /// who happens to take one of these nicknames stays unaddressable through the schemes rather
 /// than shadowing the platform.
-const PLATFORM_PRODUCERS: [&str; 8] = ["sys", "map", "gmcp", "msdp", "user", "input", "pane", "sessions"];
+const PLATFORM_PRODUCERS: [&str; 8] = [
+    "sys", "map", "gmcp", "msdp", "user", "input", "pane", "sessions",
+];
 
 /// The host event catalog of a platform producer: `(export name, event name)`, where the
 /// event name is the canonical kind's suffix (`("receive", "receive")` ⇒ `sys:receive`).
@@ -2030,7 +2281,7 @@ pub(crate) fn kind_scheme_url(
                     return Err(format!(
                         "{display}/{rest} has too many segments for the platform producer {}",
                         segments[0]
-                    ))
+                    ));
                 }
             }
         } else {
@@ -2038,7 +2289,7 @@ pub(crate) fn kind_scheme_url(
                 [_owner] => {
                     return Err(format!(
                         "{display}/{rest} is incomplete: import from {display}/<owner>/<package>"
-                    ))
+                    ));
                 }
                 [owner, name] | [owner, name, _] => {
                     // Reuse the package-specifier parser for owner/name charset validation.
@@ -2058,7 +2309,7 @@ pub(crate) fn kind_scheme_url(
                 _ => {
                     return Err(format!(
                         "{display}/{rest} has too many segments: {display}/<owner>/<package>[/<handle>]"
-                    ))
+                    ));
                 }
             }
         };
@@ -2137,9 +2388,7 @@ fn synthesize_consumer_code(
 ) -> String {
     let spec_literal = serde_json::to_string(producer_spec).expect("a string always serializes");
     let ctor = kind.as_str();
-    let mut code = format!(
-        "const __c = globalThis.__smudgy_interop_consumer({spec_literal});\n"
-    );
+    let mut code = format!("const __c = globalThis.__smudgy_interop_consumer({spec_literal});\n");
     for (index, (export, name)) in handles.iter().enumerate() {
         let folded = crate::interop_extract::fold_interop_name(export);
         if let Some(selected) = selected {
@@ -2183,118 +2432,120 @@ pub(crate) async fn load_kind_scheme_module(
     let display = kind_scheme_display(parsed.kind);
     let producer_spec = kind_scheme_producer_spec(&parsed.target);
 
-    let (handles, other_kind_names): (HandleExports, Vec<(InteropKind, Vec<String>)>) = match &parsed.target {
-        KindSchemeTarget::Platform(producer) => {
-            // A platform *state* producer serves one root-addressed consumer handle over
-            // its whole subtree — synthesized directly (the generic per-handle flow below
-            // maps export names onto named subtrees, and a root handle has no name).
-            if parsed.kind == InteropKind::State && platform_state_producer(producer) {
-                if parsed.handle.is_some() {
-                    return Err(crate::generic_loader_error(format!(
-                        "{display}/{producer} exports a single handle over the whole {producer} \
+    let (handles, other_kind_names): (HandleExports, Vec<(InteropKind, Vec<String>)>) =
+        match &parsed.target {
+            KindSchemeTarget::Platform(producer) => {
+                // A platform *state* producer serves one root-addressed consumer handle over
+                // its whole subtree — synthesized directly (the generic per-handle flow below
+                // maps export names onto named subtrees, and a root handle has no name).
+                if parsed.kind == InteropKind::State && platform_state_producer(producer) {
+                    if parsed.handle.is_some() {
+                        return Err(crate::generic_loader_error(format!(
+                            "{display}/{producer} exports a single handle over the whole {producer} \
                          tree; import it bare: import {producer} from \"{display}/{producer}\""
-                    )));
-                }
-                let code = format!(
-                    "const __c = globalThis.__smudgy_interop_consumer(\"{producer}\");\n\
+                        )));
+                    }
+                    let code = format!(
+                        "const __c = globalThis.__smudgy_interop_consumer(\"{producer}\");\n\
                      const __h0 = __c.state(\"\");\n\
                      export {{ __h0 as {producer} }};\n\
                      export default __h0;\n"
-                );
-                return Ok(ModuleSource::new(
-                    deno_core::ModuleType::JavaScript,
-                    ModuleSourceCode::String(code.into()),
-                    url,
-                    None,
-                ));
-            }
-            let catalog = platform_event_catalog(producer);
-            if catalog.is_empty() {
-                return Err(crate::generic_loader_error(format!(
-                    "{display}/{producer} is reserved for the platform but not published in this build"
-                )));
-            }
-            if parsed.kind != InteropKind::Event {
-                let hint = if platform_state_producer(producer) {
-                    format!(
-                        "{producer} publishes state and events; import from \
+                    );
+                    return Ok(ModuleSource::new(
+                        deno_core::ModuleType::JavaScript,
+                        ModuleSourceCode::String(code.into()),
+                        url,
+                        None,
+                    ));
+                }
+                let catalog = platform_event_catalog(producer);
+                if catalog.is_empty() {
+                    return Err(crate::generic_loader_error(format!(
+                        "{display}/{producer} is reserved for the platform but not published in this build"
+                    )));
+                }
+                if parsed.kind != InteropKind::Event {
+                    let hint = if platform_state_producer(producer) {
+                        format!(
+                            "{producer} publishes state and events; import from \
                          smudgy:state/{producer} or smudgy:events/{producer}"
-                    )
-                } else {
-                    format!("{producer} publishes events; import from smudgy:events/{producer}")
-                };
-                return Err(crate::generic_loader_error(format!(
-                    "{display}/{producer} does not exist — {hint}"
-                )));
+                        )
+                    } else {
+                        format!("{producer} publishes events; import from smudgy:events/{producer}")
+                    };
+                    return Err(crate::generic_loader_error(format!(
+                        "{display}/{producer} does not exist — {hint}"
+                    )));
+                }
+                (
+                    catalog
+                        .iter()
+                        .map(|(export, name)| ((*export).to_string(), (*name).to_string()))
+                        .collect(),
+                    Vec::new(),
+                )
             }
-            (
-                catalog
-                    .iter()
-                    .map(|(export, name)| ((*export).to_string(), (*name).to_string()))
-                    .collect(),
-                Vec::new(),
-            )
-        }
-        KindSchemeTarget::Package(key) => {
-            let provider = provider.ok_or_else(|| {
-                crate::generic_loader_error(format!(
-                    "consuming {display}/{}/{} requires a package provider",
-                    key.owner, key.name
-                ))
-            })?;
-            let fetched = provider.resolve_package_for_stub(key).await.map_err(|err| {
+            KindSchemeTarget::Package(key) => {
+                let provider = provider.ok_or_else(|| {
+                    crate::generic_loader_error(format!(
+                        "consuming {display}/{}/{} requires a package provider",
+                        key.owner, key.name
+                    ))
+                })?;
+                let fetched = provider.resolve_package_for_stub(key).await.map_err(|err| {
                 crate::generic_loader_error(format!(
                     "cannot consume {display}/{}/{}: the producer package could not be fetched ({err})",
                     key.owner, key.name
                 ))
             })?;
-            let entry = fetched.resolve_module(None).map_err(|err| {
-                crate::generic_loader_error(format!(
-                    "cannot consume {display}/{}/{}: {err}",
-                    key.owner, key.name
-                ))
-            })?;
-            let entry_url = canonical_url(key, &fetched.resolved_version, &entry.subpath);
-            let extraction =
-                crate::interop_extract::extract_interop_handles(&entry_url, &entry.text)
-                    .map_err(|err| {
-                        crate::generic_loader_error(format!(
-                            "cannot consume {display}/{}/{}: its entry module failed to parse: {err}",
-                            key.owner, key.name
-                        ))
-                    })?;
-            if !extraction.duplicates.is_empty() {
-                log::warn!(
-                    "smudgy: package {}/{} declares duplicate interop handle name(s): {} (first declaration wins)",
-                    key.owner,
-                    key.name,
-                    extraction.duplicates.join(", ")
-                );
-            }
-            for diagnostic in &extraction.export_diagnostics {
-                log::warn!("smudgy: package {}/{}: {diagnostic}", key.owner, key.name);
-            }
-            let of = |kind: InteropKind| -> Vec<String> {
-                extraction
-                    .of_kind(kind)
-                    .map(|h| h.name.clone())
-                    .collect()
-            };
-            let others = [InteropKind::State, InteropKind::Event, InteropKind::Procedure]
+                let entry = fetched.resolve_module(None).map_err(|err| {
+                    crate::generic_loader_error(format!(
+                        "cannot consume {display}/{}/{}: {err}",
+                        key.owner, key.name
+                    ))
+                })?;
+                let entry_url = canonical_url(key, &fetched.resolved_version, &entry.subpath);
+                let extraction =
+                    crate::interop_extract::extract_interop_handles(&entry_url, &entry.text)
+                        .map_err(|err| {
+                            crate::generic_loader_error(format!(
+                        "cannot consume {display}/{}/{}: its entry module failed to parse: {err}",
+                        key.owner, key.name
+                    ))
+                        })?;
+                if !extraction.duplicates.is_empty() {
+                    log::warn!(
+                        "smudgy: package {}/{} declares duplicate interop handle name(s): {} (first declaration wins)",
+                        key.owner,
+                        key.name,
+                        extraction.duplicates.join(", ")
+                    );
+                }
+                for diagnostic in &extraction.export_diagnostics {
+                    log::warn!("smudgy: package {}/{}: {diagnostic}", key.owner, key.name);
+                }
+                let of = |kind: InteropKind| -> Vec<String> {
+                    extraction.of_kind(kind).map(|h| h.name.clone()).collect()
+                };
+                let others = [
+                    InteropKind::State,
+                    InteropKind::Event,
+                    InteropKind::Procedure,
+                ]
                 .into_iter()
                 .filter(|kind| *kind != parsed.kind)
                 .map(|kind| (kind, of(kind)))
                 .collect();
-            // A package handle exports under its own name.
-            (
-                of(parsed.kind)
-                    .into_iter()
-                    .map(|name| (name.clone(), name))
-                    .collect(),
-                others,
-            )
-        }
-    };
+                // A package handle exports under its own name.
+                (
+                    of(parsed.kind)
+                        .into_iter()
+                        .map(|name| (name.clone(), name))
+                        .collect(),
+                    others,
+                )
+            }
+        };
 
     if let Some(handle) = &parsed.handle {
         let known = handles
@@ -2622,11 +2873,9 @@ mod tests {
         assert_eq!(widgets_jsx_runtime_url().path(), "/jsx-runtime");
         assert_eq!(widgets_module_url("repl").scheme(), WIDGETS_SCHEME);
         assert_eq!(widgets_module_url("repl").path(), "/user");
-        assert!(
-            widgets_module_url("file:///srv/modules/hud.tsx")
-                .path()
-                .starts_with("/mod")
-        );
+        assert!(widgets_module_url("file:///srv/modules/hud.tsx")
+            .path()
+            .starts_with("/mod"));
     }
 
     #[test]
@@ -2643,13 +2892,14 @@ mod tests {
         // NOT change (widget keying stays (creator, name) across importing modules).
         let url = widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/lib/panels/main.tsx");
         assert_eq!(url.path(), "/pkg/wbk/hud/1.2.0");
-        assert_eq!(module_subpath_from_url(&url).as_deref(), Some("lib/panels/main.tsx"));
+        assert_eq!(
+            module_subpath_from_url(&url).as_deref(),
+            Some("lib/panels/main.tsx")
+        );
         assert_eq!(
             creator_json_from_path(&url).unwrap(),
-            creator_json_from_path(
-                &widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/other.tsx")
-            )
-            .unwrap(),
+            creator_json_from_path(&widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/other.tsx"))
+                .unwrap(),
             "the ?mod= query never leaks into the creator descriptor"
         );
         // Two importing modules mint two distinct instances (deno dedups by URL string).
@@ -2703,7 +2953,10 @@ mod tests {
 
         // And the plain case round-trips verbatim end to end.
         let url = widgets_module_url("smudgy-pkg:///wbk/hud/1.2.0/lib/hud.tsx");
-        assert_eq!(module_subpath_from_url(&url).as_deref(), Some("lib/hud.tsx"));
+        assert_eq!(
+            module_subpath_from_url(&url).as_deref(),
+            Some("lib/hud.tsx")
+        );
     }
 
     #[test]
@@ -2727,8 +2980,14 @@ mod tests {
                     kind: ParamKind::Dropdown,
                     default: Some(serde_json::Value::String("fast".to_string())),
                     options: vec![
-                        ParamOption { value: "fast".to_string(), label: None },
-                        ParamOption { value: "slow".to_string(), label: Some("Careful".to_string()) },
+                        ParamOption {
+                            value: "fast".to_string(),
+                            label: None,
+                        },
+                        ParamOption {
+                            value: "slow".to_string(),
+                            label: Some("Careful".to_string()),
+                        },
                     ],
                     fields: Vec::new(),
                 },
@@ -2803,15 +3062,27 @@ mod tests {
     #[test]
     fn dropdown_option_label_falls_back_to_value() {
         assert_eq!(
-            ParamOption { value: "x".to_string(), label: None }.display_label(),
+            ParamOption {
+                value: "x".to_string(),
+                label: None
+            }
+            .display_label(),
             "x"
         );
         assert_eq!(
-            ParamOption { value: "x".to_string(), label: Some(String::new()) }.display_label(),
+            ParamOption {
+                value: "x".to_string(),
+                label: Some(String::new())
+            }
+            .display_label(),
             "x"
         );
         assert_eq!(
-            ParamOption { value: "x".to_string(), label: Some("Ex".to_string()) }.display_label(),
+            ParamOption {
+                value: "x".to_string(),
+                label: Some("Ex".to_string())
+            }
+            .display_label(),
             "Ex"
         );
     }
@@ -2880,9 +3151,11 @@ mod tests {
                 marker,
                 "marker {marker} must round-trip as a URL"
             );
-            let recovered =
-                SmudgySpecifier::from_marker_url(&marker).expect("marker decodes back");
-            assert_eq!(recovered, original, "marker for {raw} must decode losslessly");
+            let recovered = SmudgySpecifier::from_marker_url(&marker).expect("marker decodes back");
+            assert_eq!(
+                recovered, original,
+                "marker for {raw} must decode losslessly"
+            );
         }
     }
 
@@ -2909,10 +3182,16 @@ mod tests {
         let from_app = spec("smudgy://wbk/util").with_referrer(app.clone(), "1.0.0");
         let marker = from_app.to_marker_url();
         // The marker round-trips back to the same specifier incl. its referrer instance.
-        assert_eq!(SmudgySpecifier::from_marker_url(&marker), Some(from_app.clone()));
+        assert_eq!(
+            SmudgySpecifier::from_marker_url(&marker),
+            Some(from_app.clone())
+        );
         let recovered = SmudgySpecifier::from_marker_url(&marker).unwrap();
         assert_eq!(recovered.referrer().map(|r| &r.key), Some(&app));
-        assert_eq!(recovered.referrer().map(|r| r.version.as_str()), Some("1.0.0"));
+        assert_eq!(
+            recovered.referrer().map(|r| r.version.as_str()),
+            Some("1.0.0")
+        );
 
         // Same target + same referrer instance → identical marker (one deno instance).
         let from_app_again = spec("smudgy://wbk/util").with_referrer(app.clone(), "1.0.0");
@@ -2930,7 +3209,10 @@ mod tests {
         // A bare (referrer-less) import stays bare and decodes to no referrer.
         let bare = spec("smudgy://wbk/util").to_marker_url();
         assert!(bare.query().is_none());
-        assert_eq!(SmudgySpecifier::from_marker_url(&bare).unwrap().referrer(), None);
+        assert_eq!(
+            SmudgySpecifier::from_marker_url(&bare).unwrap().referrer(),
+            None
+        );
     }
 
     #[test]
@@ -2955,7 +3237,10 @@ mod tests {
         assert_eq!(parse_params_url(&app_url), Some(Some(app)));
         assert_eq!(parse_params_url(&params_module_url(None)), Some(None));
         // A non-params URL isn't recognized.
-        assert_eq!(parse_params_url(&ModuleSpecifier::parse("file:///x").unwrap()), None);
+        assert_eq!(
+            parse_params_url(&ModuleSpecifier::parse("file:///x").unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -2970,7 +3255,10 @@ mod tests {
         };
         let code = code.as_str();
         // The importer's specifier is baked in, and get bridges to the host hook.
-        assert!(code.contains("\"smudgy://wbk/app\""), "binds the caller's spec: {code}");
+        assert!(
+            code.contains("\"smudgy://wbk/app\""),
+            "binds the caller's spec: {code}"
+        );
         assert!(code.contains("globalThis.__smudgy_param_get"));
         assert!(code.contains("export function get(key)"));
 
@@ -2979,7 +3267,10 @@ mod tests {
         let ModuleSourceCode::String(code) = none.code else {
             panic!("expected string module source");
         };
-        assert!(code.as_str().contains("const __spec = \"\""), "no package -> empty spec");
+        assert!(
+            code.as_str().contains("const __spec = \"\""),
+            "no package -> empty spec"
+        );
     }
 
     #[test]
@@ -2987,7 +3278,10 @@ mod tests {
         // A package's modules coarsen to one creator instance per owner/name/version.
         let from_index = core_module_url("smudgy-pkg:///wbk/mapper/1.4.0/index.ts");
         let from_lib = core_module_url("smudgy-pkg:///wbk/mapper/1.4.0/lib/util.ts");
-        assert_eq!(from_index, from_lib, "a package's modules share one core instance");
+        assert_eq!(
+            from_index, from_lib,
+            "a package's modules share one core instance"
+        );
         // A different version is a different creator.
         let v2 = core_module_url("smudgy-pkg:///wbk/mapper/2.0.0/index.ts");
         assert_ne!(from_index.as_str(), v2.as_str());
@@ -2995,7 +3289,11 @@ mod tests {
         // Local modules are keyed per-file (distinct instances), and stable per file.
         let a = core_module_url("file:///srv/modules/combat/healer.ts");
         let b = core_module_url("file:///srv/modules/combat/damage.ts");
-        assert_ne!(a.as_str(), b.as_str(), "two local modules get distinct core instances");
+        assert_ne!(
+            a.as_str(),
+            b.as_str(),
+            "two local modules get distinct core instances"
+        );
         assert_eq!(
             a.as_str(),
             core_module_url("file:///srv/modules/combat/healer.ts").as_str()
@@ -3035,7 +3333,10 @@ mod tests {
             panic!("expected string module source");
         };
         let code = code.as_str();
-        assert!(code.contains(r#""kind":"package""#), "bakes the creator: {code}");
+        assert!(
+            code.contains(r#""kind":"package""#),
+            "bakes the creator: {code}"
+        );
         assert!(code.contains("globalThis.__smudgy_create_api"), "{code}");
         assert!(code.contains("export const createAlias"), "{code}");
         assert!(code.contains("export const createTrigger"), "{code}");
@@ -3043,12 +3344,30 @@ mod tests {
         // The creator-bound timer/hotkey factories + registries are named exports too.
         assert!(code.contains("export const createTimer"), "{code}");
         assert!(code.contains("export const createHotkey"), "{code}");
-        assert!(code.contains("export const timers = __api.timers;"), "{code}");
-        assert!(code.contains("export const hotkeys = __api.hotkeys;"), "{code}");
+        assert!(
+            code.contains("export const timers = __api.timers;"),
+            "{code}"
+        );
+        assert!(
+            code.contains("export const hotkeys = __api.hotkeys;"),
+            "{code}"
+        );
         // The convenience surface is delivered as named exports too.
         for name in [
-            "send", "sendRaw", "echo", "style", "link", "reload", "capture", "fallthrough",
-            "line", "buffer", "submission", "vars", "byId", "byName",
+            "send",
+            "sendRaw",
+            "echo",
+            "style",
+            "link",
+            "reload",
+            "capture",
+            "fallthrough",
+            "line",
+            "buffer",
+            "submission",
+            "vars",
+            "byId",
+            "byName",
         ] {
             assert!(
                 code.contains(&format!("export const {name} = __api.{name};")),
@@ -3124,7 +3443,10 @@ mod tests {
             &[own_name("PromptState"), own_name("roster")],
             None,
         );
-        assert!(code.contains(r#"globalThis.__smudgy_interop_consumer("smudgy://o/p")"#), "{code}");
+        assert!(
+            code.contains(r#"globalThis.__smudgy_interop_consumer("smudgy://o/p")"#),
+            "{code}"
+        );
         assert!(code.contains(r#"__c.state("PromptState")"#), "{code}");
         // Canonical casing + the folded lenient alias.
         assert!(code.contains(r#"as "PromptState""#), "{code}");
@@ -3232,15 +3554,18 @@ mod tests {
 
     #[test]
     fn manifest_round_trips_description() {
-        let manifest = PackageManifest::parse(r#"{ "version": "1.0.0", "description": "A handy mapper" }"#)
-            .expect("manifest with description parses");
+        let manifest =
+            PackageManifest::parse(r#"{ "version": "1.0.0", "description": "A handy mapper" }"#)
+                .expect("manifest with description parses");
         assert_eq!(manifest.description, "A handy mapper");
         // A set description serializes back out…
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(json.contains(r#""description":"A handy mapper""#));
         // …but an empty one is omitted (skip_serializing_if).
         let empty = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
-        assert!(!serde_json::to_string(&empty).unwrap().contains("description"));
+        assert!(!serde_json::to_string(&empty)
+            .unwrap()
+            .contains("description"));
     }
 
     #[test]
@@ -3367,7 +3692,9 @@ mod tests {
             "1.0.0",
             &[("index.ts", "x"), ("lib/util.ts", "export const u = 2;")],
         );
-        let module = pkg.resolve_module(Some("lib/util")).expect("subpath resolves");
+        let module = pkg
+            .resolve_module(Some("lib/util"))
+            .expect("subpath resolves");
         assert_eq!(module.subpath, "lib/util.ts");
     }
 
@@ -3389,7 +3716,10 @@ mod tests {
             owner: "wbk".into(),
             name: "mapper".into(),
         };
-        let resolved = provider.resolve_package(&key, None).await.expect("resolves");
+        let resolved = provider
+            .resolve_package(&key, None)
+            .await
+            .expect("resolves");
         assert_eq!(resolved.resolved_version, "1.1.0");
         assert!(provider.get_cached(&key, "1.0.0").is_some());
     }
@@ -3410,9 +3740,17 @@ mod tests {
             env: Vec::new(),
             ..Default::default()
         });
-        assert_eq!(base.net, vec!["a:1", "b"], "net unions and dedups (first-seen order)");
+        assert_eq!(
+            base.net,
+            vec!["a:1", "b"],
+            "net unions and dedups (first-seen order)"
+        );
         assert_eq!(base.read, vec!["$DATA/x", "$DATA/y"], "read unions");
-        assert_eq!(base.write, vec!["$DATA/w"], "write picks up the other's grant");
+        assert_eq!(
+            base.write,
+            vec!["$DATA/w"],
+            "write picks up the other's grant"
+        );
         assert_eq!(base.env, vec!["TOK"], "env keeps the original");
         // Merging an empty set is a no-op (the union is monotonic).
         let before = base.clone();
@@ -3454,9 +3792,21 @@ mod tests {
             ..Default::default()
         };
         let added = grown.added_since(&consented);
-        assert_eq!(added.net, vec!["api.example.com"], "only the genuinely-new host is added");
-        assert_eq!(added.read, vec!["$DATA/cache"], "only the new read path is added");
-        assert_eq!(added.write, vec!["$DATA/maps"], "a first write is wholly new");
+        assert_eq!(
+            added.net,
+            vec!["api.example.com"],
+            "only the genuinely-new host is added"
+        );
+        assert_eq!(
+            added.read,
+            vec!["$DATA/cache"],
+            "only the new read path is added"
+        );
+        assert_eq!(
+            added.write,
+            vec!["$DATA/maps"],
+            "a first write is wholly new"
+        );
         assert!(added.env.is_empty(), "the env ask was already consented");
 
         // Baseline ∅ (never consented) → the whole new union is added (deduped, original order).
@@ -3531,18 +3881,30 @@ mod tests {
             net: vec!["comms.coreclan.org:6379".into()],
             ..Default::default()
         };
-        assert!(ported.is_within(&bare), "a bare-host grant covers a specific port on it");
-        assert!(ported.added_since(&bare).net.is_empty(), "...so it adds nothing");
+        assert!(
+            ported.is_within(&bare),
+            "a bare-host grant covers a specific port on it"
+        );
+        assert!(
+            ported.added_since(&bare).net.is_empty(),
+            "...so it adds nothing"
+        );
         // Re-cased host still matches (case-insensitive).
         let recased = PackagePermissions {
             net: vec!["Comms.CoreClan.ORG:6379".into()],
             ..Default::default()
         };
-        assert!(recased.is_within(&bare), "host comparison is case-insensitive");
+        assert!(
+            recased.is_within(&bare),
+            "host comparison is case-insensitive"
+        );
 
         // An exact `host:port` grant covers ONLY that port: a bare (any-port) ask exceeds it, and so
         // does a different port — both are genuinely-new asks.
-        assert!(!bare.is_within(&ported), "a port-scoped grant does not cover any-port");
+        assert!(
+            !bare.is_within(&ported),
+            "a port-scoped grant does not cover any-port"
+        );
         assert_eq!(
             bare.added_since(&ported).net,
             vec!["comms.coreclan.org"],
@@ -3552,7 +3914,10 @@ mod tests {
             net: vec!["comms.coreclan.org:6380".into()],
             ..Default::default()
         };
-        assert!(!other_port.is_within(&ported), "a port-scoped grant covers only its own port");
+        assert!(
+            !other_port.is_within(&ported),
+            "a port-scoped grant covers only its own port"
+        );
         assert_eq!(
             other_port.added_since(&ported).net,
             vec!["comms.coreclan.org:6380"],
@@ -3581,10 +3946,22 @@ mod tests {
 
         assert!(example_443.is_within(&any), "* covers every host and port");
         assert!(example_80.is_within(&any));
-        assert!(any_443.is_within(&any), "a port-scoped wildcard is narrower than *");
-        assert!(example_443.is_within(&any_443), "*:443 covers every host on port 443");
-        assert!(!example_80.is_within(&any_443), "*:443 does not cover another port");
-        assert!(!any.is_within(&any_443), "*:443 does not cover the all-port wildcard");
+        assert!(
+            any_443.is_within(&any),
+            "a port-scoped wildcard is narrower than *"
+        );
+        assert!(
+            example_443.is_within(&any_443),
+            "*:443 covers every host on port 443"
+        );
+        assert!(
+            !example_80.is_within(&any_443),
+            "*:443 does not cover another port"
+        );
+        assert!(
+            !any.is_within(&any_443),
+            "*:443 does not cover the all-port wildcard"
+        );
         assert!(
             !any_443.is_within(&example_443),
             "one named host never covers an any-host request"
@@ -3595,6 +3972,204 @@ mod tests {
         assert!(is_any_host_net_entry(" *:443 "));
         assert!(!is_any_host_net_entry("*.example.com"));
         assert!(!is_any_host_net_entry("*:not-a-port"));
+    }
+
+    /// A row helper for the `ipc` axis tests.
+    fn ipc_row(unix: Option<&str>, pipe: Option<&str>) -> IpcEntry {
+        IpcEntry {
+            unix: unix.map(str::to_string),
+            windows_pipe: pipe.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn ipc_rows_are_exact_whole_row_grants() {
+        let consented = PackagePermissions {
+            ipc: vec![ipc_row(Some("/var/run/docker.sock"), Some("Docker_Engine"))],
+            ..Default::default()
+        };
+        // The same endpoint spelled through a lexical detour + a re-cased pipe name is covered:
+        // the unix path compares after deno's rule normalization, the pipe case-insensitively.
+        let respelled = PackagePermissions {
+            ipc: vec![ipc_row(
+                Some("/var/run/../run/./docker.sock"),
+                Some("docker_engine"),
+            )],
+            ..Default::default()
+        };
+        assert!(respelled.is_within(&consented));
+        assert!(respelled.added_since(&consented).ipc.is_empty());
+
+        // A different target is a new ask.
+        let other = PackagePermissions {
+            ipc: vec![ipc_row(Some("/var/run/other.sock"), Some("Docker_Engine"))],
+            ..Default::default()
+        };
+        assert!(!other.is_within(&consented));
+        assert_eq!(other.added_since(&consented).ipc, other.ipc);
+
+        // Coverage is whole-row: a pipe-only row does not ride a consented two-realization row
+        // (and vice versa) — each fields-set is its own ask.
+        let pipe_only = PackagePermissions {
+            ipc: vec![ipc_row(None, Some("docker_engine"))],
+            ..Default::default()
+        };
+        assert!(!pipe_only.is_within(&consented));
+        assert!(!consented.is_within(&pipe_only));
+
+        // `net` and `ipc` are different axes entirely: no host grant covers an ipc row.
+        let any_host = PackagePermissions {
+            net: vec!["*".into()],
+            ..Default::default()
+        };
+        assert!(!consented.is_within(&any_host));
+        assert_eq!(consented.added_since(&any_host).ipc, consented.ipc);
+    }
+
+    #[test]
+    fn ipc_axis_merges_dedups_and_round_trips_serde() {
+        let manifest = PackageManifest::parse(
+            r#"{ "version": "1.0.0", "permissions": { "ipc": [
+                { "unix": "/var/run/docker.sock", "windowsPipe": "docker_engine" },
+                { "windowsPipe": "solo-pipe" }
+            ] } }"#,
+        )
+        .expect("ipc rows parse");
+        assert_eq!(
+            manifest.permissions.ipc,
+            vec![
+                ipc_row(Some("/var/run/docker.sock"), Some("docker_engine")),
+                ipc_row(None, Some("solo-pipe")),
+            ]
+        );
+        // The wire form uses the camelCase key and omits an absent realization.
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains(r#""windowsPipe":"docker_engine""#), "{json}");
+        assert!(
+            !json.contains(r#""unix":null"#),
+            "an absent realization is omitted: {json}"
+        );
+        // An ipc-less manifest round-trips with no `ipc` key at all.
+        let plain = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
+        assert!(plain.permissions.ipc.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("ipc"));
+
+        // The closure union dedups equal rows (normalized-key equality) and keeps distinct ones.
+        let mut union = manifest.permissions.clone();
+        union.merge(&PackagePermissions {
+            ipc: vec![
+                ipc_row(Some("/var/run//docker.sock"), Some("DOCKER_ENGINE")),
+                ipc_row(Some("/tmp/other.sock"), None),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(union.ipc.len(), 3, "one duplicate folded, one new row kept");
+        assert_eq!(union.ipc[2], ipc_row(Some("/tmp/other.sock"), None));
+    }
+
+    #[test]
+    fn ipc_rows_validate_and_net_local_transport_entries_are_flagged() {
+        assert_eq!(ipc_row(Some("/var/run/x.sock"), None).issue(), None);
+        assert_eq!(ipc_row(None, Some("pipe-name")).issue(), None);
+        assert_eq!(
+            ipc_row(None, None).issue(),
+            Some(IpcEntryIssue::NoRealization)
+        );
+        assert_eq!(
+            ipc_row(Some("relative.sock"), None).issue(),
+            Some(IpcEntryIssue::InvalidUnixPath)
+        );
+        assert_eq!(
+            ipc_row(Some(""), None).issue(),
+            Some(IpcEntryIssue::InvalidUnixPath)
+        );
+        for bad in ["", "a/b", r"a\b", "a:b"] {
+            assert_eq!(
+                ipc_row(None, Some(bad)).issue(),
+                Some(IpcEntryIssue::InvalidPipeName),
+                "pipe name {bad:?} must be rejected"
+            );
+        }
+        // `net` is hosts-only; the legacy string forms are flagged for validation errors.
+        assert!(is_local_transport_net_entry("unix:/var/run/docker.sock"));
+        assert!(is_local_transport_net_entry(" vsock:2:1234"));
+        assert!(!is_local_transport_net_entry("example.com:443"));
+        assert!(!is_local_transport_net_entry("*"));
+    }
+
+    #[test]
+    fn windows_pipe_namespace_entries_are_flagged_in_every_spelling() {
+        // The read/write/ffi axes must reject the pipe namespace (fs-opening a pipe IS
+        // connecting to it): both separator styles, the `\\?\` verbatim prefix, re-cased
+        // `pipe`, mixed separators, and the bare namespace root.
+        for entry in [
+            r"\\.\pipe\docker_engine",
+            "//./pipe/docker_engine",
+            r"\\?\pipe\docker_engine",
+            "//?/pipe/docker_engine",
+            r"\\.\PIPE\docker_engine",
+            r"//.\Pipe/docker_engine",
+            r"\\.\pipe\",
+            "//./pipe/",
+            r"\\.\pipe",
+            " //./pipe/spaced ",
+        ] {
+            assert!(
+                is_windows_pipe_namespace_entry(entry),
+                "{entry:?} names the pipe namespace"
+            );
+        }
+        // Ordinary paths — drive paths, UNC shares, POSIX paths, `$DATA`, and other
+        // device-namespace objects (still all-permission-gated) — are not flagged.
+        for entry in [
+            r"C:\Users\me\file.txt",
+            r"C:\pipe\file.txt",
+            r"\\server\pipe\share.txt",
+            "/var/run/pipe/x.sock",
+            "$DATA/maps",
+            r"\\.\PhysicalDrive0",
+            r"\\.\pipeline\x",
+        ] {
+            assert!(
+                !is_windows_pipe_namespace_entry(entry),
+                "{entry:?} is not the pipe namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn native_ipc_grants_realize_only_the_running_platform() {
+        let rows = [
+            ipc_row(Some("/var/run/both.sock"), Some("both-pipe")),
+            ipc_row(Some("/var/run/unix-only.sock"), None),
+            ipc_row(None, Some("pipe-only")),
+        ];
+        let grants = native_ipc_grants(&rows);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                grants.net,
+                vec![r"unix:\\.\pipe\both-pipe", r"unix:\\.\pipe\pipe-only"]
+            );
+            assert_eq!(
+                grants.paths,
+                vec![r"\\.\pipe\both-pipe", r"\\.\pipe\pipe-only"]
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                grants.net,
+                vec!["unix:/var/run/both.sock", "unix:/var/run/unix-only.sock"]
+            );
+            assert_eq!(
+                grants.paths,
+                vec!["/var/run/both.sock", "/var/run/unix-only.sock"]
+            );
+        }
+        // An empty axis realizes nothing — deny-by-default is preserved downstream (the engine
+        // maps an empty list to deno's `None`, never `Some(vec![])`).
+        assert_eq!(native_ipc_grants(&[]), IpcGrants::default());
     }
 
     #[test]
@@ -3614,8 +4189,14 @@ mod tests {
             sys: vec!["hostname".into()],
             ..Default::default()
         };
-        assert!(within.is_within(&consented), "trimmed run + nested ffi + same sys all fit");
-        assert!(within.added_since(&consented).is_empty(), "...and add nothing");
+        assert!(
+            within.is_within(&consented),
+            "trimmed run + nested ffi + same sys all fit"
+        );
+        assert!(
+            within.added_since(&consented).is_empty(),
+            "...and add nothing"
+        );
 
         // `run` does NOT unify spellings: an absolute path to the same program is a new ask
         // (conservative — it re-prompts rather than riding the bare-name grant).
@@ -3623,7 +4204,10 @@ mod tests {
             run: vec!["C:/Program Files/Git/cmd/git.exe".into()],
             ..Default::default()
         };
-        assert!(!respelled.is_within(&consented), "a re-spelled run program is a new ask");
+        assert!(
+            !respelled.is_within(&consented),
+            "a re-spelled run program is a new ask"
+        );
 
         // A new program, a sibling ffi path, and a new sys kind each exceed the grant.
         let grown = PackagePermissions {
@@ -3654,7 +4238,10 @@ mod tests {
             ffi: vec!["$DATA/../outside".into()],
             ..Default::default()
         };
-        assert!(escape.is_within(&PackagePermissions::default()), "a dropped ffi escape asks nothing");
+        assert!(
+            escape.is_within(&PackagePermissions::default()),
+            "a dropped ffi escape asks nothing"
+        );
     }
 
     #[test]
@@ -3687,7 +4274,9 @@ mod tests {
         assert!(plain.permissions.sys.is_empty());
         let plain_json = serde_json::to_string(&plain).expect("serializes");
         assert!(
-            !plain_json.contains("\"run\"") && !plain_json.contains("\"ffi\"") && !plain_json.contains("\"sys\""),
+            !plain_json.contains("\"run\"")
+                && !plain_json.contains("\"ffi\"")
+                && !plain_json.contains("\"sys\""),
             "empty axes are omitted from the wire form: {plain_json}"
         );
     }
@@ -3697,29 +4286,65 @@ mod tests {
         use ImportPolicy::{Any, None as ImpNone, Registries};
         // Ordered None < Registries < Any; the closure union is the max (escalates monotonically).
         assert!(ImpNone < Registries && Registries < Any);
-        let mut p = PackagePermissions { import: ImpNone, ..Default::default() };
-        p.merge(&PackagePermissions { import: Registries, ..Default::default() });
+        let mut p = PackagePermissions {
+            import: ImpNone,
+            ..Default::default()
+        };
+        p.merge(&PackagePermissions {
+            import: Registries,
+            ..Default::default()
+        });
         assert_eq!(p.import, Registries, "merge raises to the higher level");
-        p.merge(&PackagePermissions { import: ImpNone, ..Default::default() });
+        p.merge(&PackagePermissions {
+            import: ImpNone,
+            ..Default::default()
+        });
         assert_eq!(p.import, Registries, "merging a lower level is a no-op");
 
         // is_within: a level fits iff it is no higher than the ceiling.
-        let any = PackagePermissions { import: Any, ..Default::default() };
-        let reg = PackagePermissions { import: Registries, ..Default::default() };
+        let any = PackagePermissions {
+            import: Any,
+            ..Default::default()
+        };
+        let reg = PackagePermissions {
+            import: Registries,
+            ..Default::default()
+        };
         assert!(reg.is_within(&any), "Registries fits under Any");
         assert!(!any.is_within(&reg), "Any exceeds a Registries grant");
-        assert!(PackagePermissions::default().is_within(&reg), "None fits any grant");
+        assert!(
+            PackagePermissions::default().is_within(&reg),
+            "None fits any grant"
+        );
 
         // added_since: the escalation only — the new level when it exceeds the consented baseline.
-        assert_eq!(any.added_since(&reg).import, Any, "raising to Any is newly requested");
-        assert_eq!(reg.added_since(&any).import, ImpNone, "narrowing adds nothing");
-        assert_eq!(reg.added_since(&reg).import, ImpNone, "the same level adds nothing");
+        assert_eq!(
+            any.added_since(&reg).import,
+            Any,
+            "raising to Any is newly requested"
+        );
+        assert_eq!(
+            reg.added_since(&any).import,
+            ImpNone,
+            "narrowing adds nothing"
+        );
+        assert_eq!(
+            reg.added_since(&reg).import,
+            ImpNone,
+            "the same level adds nothing"
+        );
 
         // `import` is independent of `net`: a pure-net grant leaves import at None and never covers
         // an import ask.
-        let net_only = PackagePermissions { net: vec!["jsr.io".into()], ..Default::default() };
+        let net_only = PackagePermissions {
+            net: vec!["jsr.io".into()],
+            ..Default::default()
+        };
         assert_eq!(net_only.import, ImpNone, "a net grant doesn't grant import");
-        assert!(!reg.is_within(&net_only), "a net grant does not cover an import ask");
+        assert!(
+            !reg.is_within(&net_only),
+            "a net grant does not cover an import ask"
+        );
     }
 
     #[test]
@@ -3728,29 +4353,56 @@ mod tests {
         // The exact gate the loader runs, per scheme × level (host matters only for http/https).
         // npm / jsr: off at None, on at Registries and Any.
         for scheme in ["npm", "jsr"] {
-            assert!(!ImpNone.allows_import(scheme, ""), "{scheme} denied at None");
-            assert!(Registries.allows_import(scheme, ""), "{scheme} allowed at Registries");
+            assert!(
+                !ImpNone.allows_import(scheme, ""),
+                "{scheme} denied at None"
+            );
+            assert!(
+                Registries.allows_import(scheme, ""),
+                "{scheme} allowed at Registries"
+            );
             assert!(Any.allows_import(scheme, ""), "{scheme} allowed at Any");
         }
         // Arbitrary https/http: off at None and Registries, on only at Any.
         for scheme in ["http", "https"] {
-            assert!(!ImpNone.allows_import(scheme, "cdn.example.com"), "{scheme} denied at None");
+            assert!(
+                !ImpNone.allows_import(scheme, "cdn.example.com"),
+                "{scheme} denied at None"
+            );
             assert!(
                 !Registries.allows_import(scheme, "cdn.example.com"),
                 "arbitrary {scheme} denied at Registries"
             );
-            assert!(Any.allows_import(scheme, "cdn.example.com"), "{scheme} allowed at Any");
+            assert!(
+                Any.allows_import(scheme, "cdn.example.com"),
+                "{scheme} allowed at Any"
+            );
         }
         // The jsr.io CDN is the one https host allowed at Registries (a jsr package's own
         // sub-modules), case-insensitively — but still denied at None.
-        assert!(Registries.allows_import("https", "jsr.io"), "jsr.io https allowed at Registries");
-        assert!(Registries.allows_import("https", "JSR.IO"), "jsr.io match is case-insensitive");
-        assert!(!ImpNone.allows_import("https", "jsr.io"), "jsr.io https denied at None");
+        assert!(
+            Registries.allows_import("https", "jsr.io"),
+            "jsr.io https allowed at Registries"
+        );
+        assert!(
+            Registries.allows_import("https", "JSR.IO"),
+            "jsr.io match is case-insensitive"
+        );
+        assert!(
+            !ImpNone.allows_import("https", "jsr.io"),
+            "jsr.io https denied at None"
+        );
 
         // Non-external schemes are never gated here (smudgy://, smudgy-pkg:, file:) at any level.
         for level in [ImpNone, Registries, Any] {
-            assert!(level.allows_import("smudgy", ""), "smudgy:// never import-gated");
-            assert!(level.allows_import("smudgy-pkg", ""), "smudgy-pkg: never import-gated");
+            assert!(
+                level.allows_import("smudgy", ""),
+                "smudgy:// never import-gated"
+            );
+            assert!(
+                level.allows_import("smudgy-pkg", ""),
+                "smudgy-pkg: never import-gated"
+            );
             assert!(level.allows_import("file", ""), "file: never import-gated");
         }
     }
@@ -3766,15 +4418,24 @@ mod tests {
             read: vec!["$DATA/maps/regions/eu.json".into()],
             ..Default::default()
         };
-        assert!(nested.is_within(&grant), "a path under the grant is covered");
-        assert!(nested.added_since(&grant).read.is_empty(), "...so it adds nothing");
+        assert!(
+            nested.is_within(&grant),
+            "a path under the grant is covered"
+        );
+        assert!(
+            nested.added_since(&grant).read.is_empty(),
+            "...so it adds nothing"
+        );
 
         // A sibling that merely shares a string prefix is NOT in the subtree (component boundary).
         let sibling = PackagePermissions {
             read: vec!["$DATA/maps-2".into()],
             ..Default::default()
         };
-        assert!(!sibling.is_within(&grant), "a prefix-sharing sibling is not in the subtree");
+        assert!(
+            !sibling.is_within(&grant),
+            "a prefix-sharing sibling is not in the subtree"
+        );
         assert_eq!(
             sibling.added_since(&grant).read,
             vec!["$DATA/maps-2"],
@@ -3785,7 +4446,10 @@ mod tests {
             read: vec!["$DATA".into()],
             ..Default::default()
         };
-        assert!(!parent.is_within(&grant), "a broader parent dir exceeds a child-scoped grant");
+        assert!(
+            !parent.is_within(&grant),
+            "a broader parent dir exceeds a child-scoped grant"
+        );
 
         // `write` uses the same subtree semantics, and a trailing slash / backslash is ignored.
         let w_grant = PackagePermissions {
@@ -3796,7 +4460,10 @@ mod tests {
             write: vec![r"$DATA\maps\cache".into()],
             ..Default::default()
         };
-        assert!(w_nested.is_within(&w_grant), "write subtree containment matches read");
+        assert!(
+            w_nested.is_within(&w_grant),
+            "write subtree containment matches read"
+        );
     }
 
     #[test]
@@ -3916,8 +4583,16 @@ mod tests {
         provider.insert(pkg_with("root", r#"{ "read": ["$DATA/maps"] }"#));
         provider.insert(pkg_with("dep", r#"{ "net": ["host:6379"] }"#));
         let union = provider.closure_permissions();
-        assert_eq!(union.net, vec!["host:6379"], "the dep's net joins the union");
-        assert_eq!(union.read, vec!["$DATA/maps"], "the root's read joins the union");
+        assert_eq!(
+            union.net,
+            vec!["host:6379"],
+            "the dep's net joins the union"
+        );
+        assert_eq!(
+            union.read,
+            vec!["$DATA/maps"],
+            "the root's read joins the union"
+        );
         assert!(union.write.is_empty() && union.env.is_empty());
     }
 
@@ -3949,23 +4624,36 @@ mod tests {
     #[test]
     fn smudgy_mapper_write_implies_read() {
         let write = perms_with_smudgy(r#"{ "mapper": ["write"] }"#).smudgy;
-        assert!(write.mapper_write && write.mapper_read, "write implies read");
+        assert!(
+            write.mapper_write && write.mapper_read,
+            "write implies read"
+        );
         let read = perms_with_smudgy(r#"{ "mapper": ["read"] }"#).smudgy;
-        assert!(read.mapper_read && !read.mapper_write, "read alone is not write");
+        assert!(
+            read.mapper_read && !read.mapper_write,
+            "read alone is not write"
+        );
     }
 
     #[test]
     fn smudgy_tokens_are_case_insensitive_and_drop_unknowns() {
-        let perms = perms_with_smudgy(r#"{ "session": ["SEND", " Reach-Others "], "widgets": ["bogus"] }"#);
+        let perms =
+            perms_with_smudgy(r#"{ "session": ["SEND", " Reach-Others "], "widgets": ["bogus"] }"#);
         assert!(perms.smudgy.send && perms.smudgy.reach_others);
-        assert!(!perms.smudgy.widgets, "an unknown widgets token is ignored, not granted");
+        assert!(
+            !perms.smudgy.widgets,
+            "an unknown widgets token is ignored, not granted"
+        );
     }
 
     #[test]
     fn smudgy_absent_block_denies_everything() {
-        let manifest =
-            PackageManifest::parse(r#"{ "name": "p", "version": "1.0.0" }"#).expect("valid manifest");
-        assert!(manifest.permissions.smudgy.is_empty(), "no smudgy block ⇒ all denied");
+        let manifest = PackageManifest::parse(r#"{ "name": "p", "version": "1.0.0" }"#)
+            .expect("valid manifest");
+        assert!(
+            manifest.permissions.smudgy.is_empty(),
+            "no smudgy block ⇒ all denied"
+        );
     }
 
     #[test]
@@ -4059,18 +4747,39 @@ mod tests {
             "an ask for an un-granted capability (send-direct) does NOT fit"
         );
         // mapper write covers a read ask (write implies read).
-        let writer = SmudgyCapabilities { mapper_write: true, mapper_read: true, ..Default::default() };
-        let reader = SmudgyCapabilities { mapper_read: true, ..Default::default() };
+        let writer = SmudgyCapabilities {
+            mapper_write: true,
+            mapper_read: true,
+            ..Default::default()
+        };
+        let reader = SmudgyCapabilities {
+            mapper_read: true,
+            ..Default::default()
+        };
         assert!(reader.is_within(&writer), "a write grant covers a read ask");
-        assert!(!writer.is_within(&reader), "a read grant does NOT cover a write ask");
+        assert!(
+            !writer.is_within(&reader),
+            "a read grant does NOT cover a write ask"
+        );
     }
 
     #[test]
     fn smudgy_added_since_is_the_capability_delta() {
-        let old = SmudgyCapabilities { send: true, ..Default::default() };
-        let new = SmudgyCapabilities { send: true, send_direct: true, change_display: true, ..Default::default() };
+        let old = SmudgyCapabilities {
+            send: true,
+            ..Default::default()
+        };
+        let new = SmudgyCapabilities {
+            send: true,
+            send_direct: true,
+            change_display: true,
+            ..Default::default()
+        };
         let added = new.added_since(&old);
-        assert!(added.send_direct && added.change_display, "the new asks are surfaced");
+        assert!(
+            added.send_direct && added.change_display,
+            "the new asks are surfaced"
+        );
         assert!(!added.send, "an already-granted capability is not 'added'");
         assert!(
             new.added_since(&new).is_empty(),
@@ -4106,6 +4815,9 @@ mod tests {
         let dep = perms_with_smudgy(r#"{ "display": ["change"], "session": ["echo"] }"#);
         root.merge(&dep);
         assert!(root.smudgy.send && root.smudgy.echo && root.smudgy.change_display);
-        assert!(!root.smudgy.send_direct, "un-requested capabilities stay denied after merge");
+        assert!(
+            !root.smudgy.send_direct,
+            "un-requested capabilities stay denied after merge"
+        );
     }
 }

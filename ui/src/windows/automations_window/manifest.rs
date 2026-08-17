@@ -24,8 +24,9 @@ use iced::{Length, Padding};
 
 use smudgy_core::models::local_packages;
 use smudgy_core::models::shared_packages::{
-    ImportPolicy, PackageManifest, PackageParameter, PackagePermissions, ParamKind, ParamOption,
-    SmudgyCapabilities, running_smudgy_release,
+    ImportPolicy, IpcEntry, IpcEntryIssue, PackageManifest, PackageParameter, PackagePermissions,
+    ParamKind, ParamOption, SmudgyCapabilities, is_local_transport_net_entry,
+    is_windows_pipe_namespace_entry, running_smudgy_release,
 };
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -55,6 +56,10 @@ pub struct ManifestDraft {
     pub requires: Vec<String>,
     pub params: Vec<ParamDraft>,
     pub net: Vec<String>,
+    /// Local IPC endpoints (`permissions.ipc`), one row per endpoint with both per-platform
+    /// realization buffers. A local socket can front a privileged daemon, so any row carries the
+    /// same full-access weight as [`run`](Self::run)/[`ffi`](Self::ffi).
+    pub ipc: Vec<IpcRowDraft>,
     pub read: Vec<String>,
     pub write: Vec<String>,
     pub env: Vec<String>,
@@ -92,6 +97,7 @@ impl Default for ManifestDraft {
             requires: Vec::new(),
             params: Vec::new(),
             net: Vec::new(),
+            ipc: Vec::new(),
             read: Vec::new(),
             write: Vec::new(),
             env: Vec::new(),
@@ -132,6 +138,26 @@ pub struct ParamDraft {
 pub struct OptionDraft {
     pub value: String,
     pub label: String,
+}
+
+/// One Local IPC endpoint (`permissions.ipc`), in editable form: both per-platform realizations
+/// held as text buffers. A row with both fields blank is dropped on Save (like a blank list
+/// row); a row with either filled is validated on projection ([`IpcEntry::issue`]).
+#[derive(Debug, Clone, Default)]
+pub struct IpcRowDraft {
+    /// The Unix-family realization: an absolute POSIX socket path.
+    pub unix: String,
+    /// The Windows realization: a pipe name with no separators (the engine prepends `\\.\pipe\`).
+    pub windows_pipe: String,
+}
+
+impl IpcRowDraft {
+    fn from_entry(entry: &IpcEntry) -> Self {
+        Self {
+            unix: entry.unix.clone().unwrap_or_default(),
+            windows_pipe: entry.windows_pipe.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// A scalar sub-parameter, in editable form: a `List`'s element or one `Table` column. Containers
@@ -217,6 +243,13 @@ pub enum ManifestEdit {
     /// Set `permissions.import` — how far outside the smudgy ecosystem this package may download
     /// code (none / public registries / anywhere).
     ImportPolicy(ImportPolicy),
+    /// Append a blank Local IPC row (`permissions.ipc`).
+    AddIpcRow,
+    RemoveIpcRow(usize),
+    /// Set row `i`'s Unix socket path realization.
+    IpcUnix(usize, String),
+    /// Set row `i`'s Windows pipe name realization.
+    IpcWindowsPipe(usize, String),
     AddItem(ListField),
     /// Append a specific value to a list (vs [`AddItem`](Self::AddItem)'s blank row) — the
     /// dependency picker uses this to insert a correctly-owned `smudgy://owner/name` specifier.
@@ -355,6 +388,12 @@ impl ManifestDraft {
             requires: manifest.requires.clone(),
             params: manifest.params.iter().map(ParamDraft::from_param).collect(),
             net: manifest.permissions.net.clone(),
+            ipc: manifest
+                .permissions
+                .ipc
+                .iter()
+                .map(IpcRowDraft::from_entry)
+                .collect(),
             read: manifest.permissions.read.clone(),
             write: manifest.permissions.write.clone(),
             env: manifest.permissions.env.clone(),
@@ -422,6 +461,65 @@ impl ManifestDraft {
             params.push(projected);
         }
 
+        // `net` is hosts-only; the Local IPC section is the one home for local endpoints. The
+        // legacy `unix:`/`vsock:` string forms must never reach a manifest — the engine refuses
+        // them fail-closed, which would brick the package for installers.
+        let net = clean_list(&self.net);
+        if let Some(entry) = net.iter().find(|e| is_local_transport_net_entry(e)) {
+            return Err(crate::i18n::t!(
+                "manifest-net-local-transport-error",
+                "entry" => entry.as_str()
+            ));
+        }
+
+        // The path axes must never name the Windows pipe namespace: fs-opening a pipe IS
+        // connecting to it, so a pipe fs-grant may only originate from a Critical-tier Local
+        // IPC row (the engine refuses such a manifest fail-closed).
+        let read = clean_list(&self.read);
+        let write = clean_list(&self.write);
+        let ffi = clean_list(&self.ffi);
+        if let Some(entry) = [&read, &write, &ffi]
+            .into_iter()
+            .flatten()
+            .find(|e| is_windows_pipe_namespace_entry(e))
+        {
+            return Err(crate::i18n::t!(
+                "manifest-pipe-namespace-path-error",
+                "entry" => entry.as_str()
+            ));
+        }
+
+        // Local IPC rows: an untouched blank row is dropped like a blank list entry; a row with
+        // either realization filled must project to a valid `IpcEntry`.
+        let mut ipc = Vec::new();
+        for (i, row) in self.ipc.iter().enumerate() {
+            let unix = row.unix.trim();
+            let pipe = row.windows_pipe.trim();
+            if unix.is_empty() && pipe.is_empty() {
+                continue;
+            }
+            let entry = IpcEntry {
+                unix: (!unix.is_empty()).then(|| unix.to_string()),
+                windows_pipe: (!pipe.is_empty()).then(|| pipe.to_string()),
+            };
+            match entry.issue() {
+                Some(IpcEntryIssue::InvalidUnixPath) => {
+                    return Err(crate::i18n::t!(
+                        "manifest-ipc-unix-invalid",
+                        "number" => i + 1
+                    ));
+                }
+                Some(IpcEntryIssue::InvalidPipeName) => {
+                    return Err(crate::i18n::t!(
+                        "manifest-ipc-pipe-invalid",
+                        "number" => i + 1
+                    ));
+                }
+                // A both-blank row was skipped above, so no-realization cannot occur here.
+                Some(IpcEntryIssue::NoRealization) | None => ipc.push(entry),
+            }
+        }
+
         // `mapper: ["write"]` implies `read` (the manifest normalizes this at parse); keep the
         // projected manifest consistent so a write-only draft round-trips as read+write.
         let mut caps = self.caps;
@@ -439,12 +537,13 @@ impl ManifestDraft {
             hosts: clean_list(&self.hosts),
             params,
             permissions: PackagePermissions {
-                net: clean_list(&self.net),
-                read: clean_list(&self.read),
-                write: clean_list(&self.write),
+                net,
+                ipc,
+                read,
+                write,
                 env: clean_list(&self.env),
                 run: clean_list(&self.run),
-                ffi: clean_list(&self.ffi),
+                ffi,
                 sys: clean_list(&self.sys),
                 import: self.import,
                 smudgy: caps,
@@ -790,6 +889,22 @@ impl AutomationsWindow {
             ManifestEdit::MinSmudgyVersion(value) => draft.min_smudgy_version = value,
             ManifestEdit::Importable(value) => draft.importable = value,
             ManifestEdit::ImportPolicy(value) => draft.import = value,
+            ManifestEdit::AddIpcRow => draft.ipc.push(IpcRowDraft::default()),
+            ManifestEdit::RemoveIpcRow(i) => {
+                if i < draft.ipc.len() {
+                    draft.ipc.remove(i);
+                }
+            }
+            ManifestEdit::IpcUnix(i, value) => {
+                if let Some(row) = draft.ipc.get_mut(i) {
+                    row.unix = value;
+                }
+            }
+            ManifestEdit::IpcWindowsPipe(i, value) => {
+                if let Some(row) = draft.ipc.get_mut(i) {
+                    row.windows_pipe = value;
+                }
+            }
             ManifestEdit::AddItem(field) => list_mut(draft, field).push(String::new()),
             ManifestEdit::AddItemValue(field, value) => {
                 let list = list_mut(draft, field);
@@ -985,7 +1100,8 @@ impl AutomationsWindow {
             local_packages::write_local_file(&self.server_name, &name, "smudgy.package.json", &json)
         {
             if let Some(draft) = self.manifest_draft.as_mut() {
-                draft.error = Some(crate::i18n::t!("manifest-save-failed", "error" => e.to_string()));
+                draft.error =
+                    Some(crate::i18n::t!("manifest-save-failed", "error" => e.to_string()));
             }
             return Update::none();
         }
@@ -1106,10 +1222,13 @@ impl AutomationsWindow {
         // Identity / entry (pinned above the tabs).
         body = body.push(field_row(
             crate::i18n::ts!("manifest-version"),
-            text_input(crate::i18n::ts!("manifest-version-placeholder"), &draft.version)
-                .on_input(|v| Message::EditManifest(ManifestEdit::Version(v)))
-                .size(14.0)
-                .into(),
+            text_input(
+                crate::i18n::ts!("manifest-version-placeholder"),
+                &draft.version,
+            )
+            .on_input(|v| Message::EditManifest(ManifestEdit::Version(v)))
+            .size(14.0)
+            .into(),
         ));
         if !draft.version.trim().is_empty() && semver::Version::parse(draft.version.trim()).is_err()
         {
@@ -1199,7 +1318,11 @@ impl AutomationsWindow {
         if self.manifest_dirty {
             bar = bar
                 .push(text("\u{25CF}").size(9.0).style(common::accent))
-                .push(text(crate::i18n::t!("manifest-unsaved")).size(13.0).style(common::muted));
+                .push(
+                    text(crate::i18n::t!("manifest-unsaved"))
+                        .size(13.0)
+                        .style(common::muted),
+                );
         }
         bar = bar.push(iced::widget::space::horizontal());
         bar = bar.push(
@@ -1383,7 +1506,10 @@ fn ro_value_list<'a>(items: &[String], empty: &str, mono: bool) -> Elem<'a> {
 /// and a non-secret default).
 fn ro_params<'a>(params: &[PackageParameter]) -> Elem<'a> {
     if params.is_empty() {
-        return text(crate::i18n::t!("manifest-none")).size(13.0).style(common::faint).into();
+        return text(crate::i18n::t!("manifest-none"))
+            .size(13.0)
+            .style(common::faint)
+            .into();
     }
     let mut col = Column::new().spacing(4.0);
     for param in params {
@@ -1438,7 +1564,9 @@ fn kind_summary(param: &PackageParameter) -> String {
             let element = param
                 .fields
                 .first()
-                .map_or(crate::i18n::ts!("manifest-kind-text"), |f| kind_word(f.kind));
+                .map_or(crate::i18n::ts!("manifest-kind-text"), |f| {
+                    kind_word(f.kind)
+                });
             crate::i18n::t!("manifest-kind-list-summary", "kind" => element)
         }
         ParamKind::Table => {
@@ -1522,7 +1650,10 @@ fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<String> {
         out.push(cap_summary("on / get / watch", "manifest-cap-interop-read"));
     }
     if caps.interop_broadcast {
-        out.push(cap_summary("BroadcastChannel", "manifest-cap-interop-broadcast"));
+        out.push(cap_summary(
+            "BroadcastChannel",
+            "manifest-cap-interop-broadcast",
+        ));
     }
     if caps.panes {
         out.push(cap_summary("pane", "manifest-cap-panes"));
@@ -1545,14 +1676,20 @@ fn cap_summary(api: &str, gloss_key: &str) -> String {
 fn manifest_params(draft: &ManifestDraft) -> Elem<'_> {
     let mut col = Column::new()
         .spacing(8.0)
-        .push(common::section_label(crate::i18n::ts!("manifest-parameters")))
+        .push(common::section_label(crate::i18n::ts!(
+            "manifest-parameters"
+        )))
         .push(
             text(crate::i18n::t!("manifest-params-help"))
                 .size(11.0)
                 .style(common::muted),
         );
     if draft.params.is_empty() {
-        col = col.push(text(crate::i18n::t!("manifest-no-parameters")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("manifest-no-parameters"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (i, param) in draft.params.iter().enumerate() {
         col = col.push(param_card(i, param));
@@ -1574,10 +1711,13 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
     .text_size(13.0);
 
     let top = row![
-        text_input(crate::i18n::ts!("manifest-param-key-placeholder"), &param.key)
-            .on_input(move |v| Message::EditManifest(ManifestEdit::ParamKey(i, v)))
-            .size(14.0)
-            .width(Length::Fill),
+        text_input(
+            crate::i18n::ts!("manifest-param-key-placeholder"),
+            &param.key
+        )
+        .on_input(move |v| Message::EditManifest(ManifestEdit::ParamKey(i, v)))
+        .size(14.0)
+        .width(Length::Fill),
         kind_picker,
         button(
             text(bootstrap_icons::TRASH_3)
@@ -1591,9 +1731,12 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
     .spacing(8.0)
     .align_y(Vertical::Center);
 
-    let label_row = text_input(crate::i18n::ts!("manifest-param-label-placeholder"), &param.label)
-        .on_input(move |v| Message::EditManifest(ManifestEdit::ParamLabel(i, v)))
-        .size(14.0);
+    let label_row = text_input(
+        crate::i18n::ts!("manifest-param-label-placeholder"),
+        &param.label,
+    )
+    .on_input(move |v| Message::EditManifest(ManifestEdit::ParamLabel(i, v)))
+    .size(14.0);
 
     let mut body = Column::new().spacing(8.0).push(top).push(label_row);
     body = body.push(param_kind_config(i, param));
@@ -1622,7 +1765,9 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
         ParamKind::List => {
             let mut col = Column::new()
                 .spacing(8.0)
-                .push(common::section_label(crate::i18n::ts!("manifest-each-entry-is")));
+                .push(common::section_label(crate::i18n::ts!(
+                    "manifest-each-entry-is"
+                )));
             if let Some(element) = param.fields.first() {
                 col = col.push(sub_param_editor(i, 0, element, false));
             }
@@ -1727,19 +1872,29 @@ impl OptionPath {
 fn options_editor(path: OptionPath, options: &[OptionDraft]) -> Elem<'_> {
     let mut col = Column::new().spacing(6.0);
     if options.is_empty() {
-        col = col.push(text(crate::i18n::t!("manifest-no-options")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("manifest-no-options"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (k, option) in options.iter().enumerate() {
         col = col.push(
             row![
-                text_input(crate::i18n::ts!("manifest-option-value-placeholder"), &option.value)
-                    .on_input(move |v| Message::EditManifest(path.value(k, v)))
-                    .size(14.0)
-                    .width(Length::Fill),
-                text_input(crate::i18n::ts!("manifest-option-label-placeholder"), &option.label)
-                    .on_input(move |v| Message::EditManifest(path.label(k, v)))
-                    .size(14.0)
-                    .width(Length::Fill),
+                text_input(
+                    crate::i18n::ts!("manifest-option-value-placeholder"),
+                    &option.value
+                )
+                .on_input(move |v| Message::EditManifest(path.value(k, v)))
+                .size(14.0)
+                .width(Length::Fill),
+                text_input(
+                    crate::i18n::ts!("manifest-option-label-placeholder"),
+                    &option.label
+                )
+                .on_input(move |v| Message::EditManifest(path.label(k, v)))
+                .size(14.0)
+                .width(Length::Fill),
                 button(
                     text(bootstrap_icons::TRASH_3)
                         .font(fonts::BOOTSTRAP_ICONS)
@@ -1783,7 +1938,12 @@ fn dropdown_default_picker(i: usize, param: &ParamDraft) -> Elem<'_> {
         .cloned()
         .or_else(|| choices.first().cloned());
     row![
-        container(text(crate::i18n::t!("manifest-default")).size(13.0).style(common::muted)).width(Length::Fixed(72.0)),
+        container(
+            text(crate::i18n::t!("manifest-default"))
+                .size(13.0)
+                .style(common::muted)
+        )
+        .width(Length::Fixed(72.0)),
         pick_list(choices, selected, move |choice: DefaultChoice| {
             Message::EditManifest(ManifestEdit::ParamDefault(i, choice.value))
         })
@@ -1831,17 +1991,20 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
     let mut header = row![].spacing(8.0).align_y(Vertical::Center);
     if is_column {
         header = header.push(
-            text_input(crate::i18n::ts!("manifest-column-key-placeholder"), &field.key)
-                .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldKey(i, j, v)))
-                .size(14.0)
-                .width(Length::Fill),
+            text_input(
+                crate::i18n::ts!("manifest-column-key-placeholder"),
+                &field.key,
+            )
+            .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldKey(i, j, v)))
+            .size(14.0)
+            .width(Length::Fill),
         );
     } else {
         header = header.push(
             container(
                 text(crate::i18n::t!("manifest-value-of-type"))
                     .size(13.0)
-                    .style(common::muted)
+                    .style(common::muted),
             )
             .width(Length::Fill),
         );
@@ -1860,9 +2023,12 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
         );
     }
 
-    let label_row = text_input(crate::i18n::ts!("manifest-option-label-placeholder"), &field.label)
-        .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldLabel(i, j, v)))
-        .size(14.0);
+    let label_row = text_input(
+        crate::i18n::ts!("manifest-option-label-placeholder"),
+        &field.label,
+    )
+    .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldLabel(i, j, v)))
+    .size(14.0);
 
     let mut col = Column::new().spacing(6.0).push(header).push(label_row);
     if field.kind == ParamKind::Dropdown {
@@ -1979,8 +2145,8 @@ fn perm_note<'a>() -> Elem<'a> {
 fn dependency_lock_note<'a>() -> Elem<'a> {
     container(
         text(crate::i18n::t!("manifest-dependency-lock-note"))
-        .size(11.0)
-        .style(common::muted),
+            .size(11.0)
+            .style(common::muted),
     )
     .width(Length::Fill)
     .padding(Padding {
@@ -2024,14 +2190,17 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
     let mut requires_smudgy = column![
         field_row(
             crate::i18n::ts!("manifest-requires-smudgy"),
-            text_input(crate::i18n::ts!("manifest-any-version-placeholder"), &draft.min_smudgy_version)
-                .on_input(|v| Message::EditManifest(ManifestEdit::MinSmudgyVersion(v)))
-                .size(14.0)
-                .into(),
+            text_input(
+                crate::i18n::ts!("manifest-any-version-placeholder"),
+                &draft.min_smudgy_version
+            )
+            .on_input(|v| Message::EditManifest(ManifestEdit::MinSmudgyVersion(v)))
+            .size(14.0)
+            .into(),
         ),
         text(crate::i18n::t!("manifest-min-version-help"))
-        .size(12.0)
-        .style(common::muted),
+            .size(12.0)
+            .style(common::muted),
     ]
     .spacing(4.0);
     let min = draft.min_smudgy_version.trim();
@@ -2085,8 +2254,8 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
                 .text_size(13)
                 .on_toggle(|v| Message::EditManifest(ManifestEdit::Importable(v))),
             text(crate::i18n::t!("manifest-allow-import-help"))
-            .size(12.0)
-            .style(common::muted),
+                .size(12.0)
+                .style(common::muted),
         ]
         .spacing(4.0),
         manifest_params(draft),
@@ -2095,10 +2264,12 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
     .into()
 }
 
-/// Network tab: the `permissions.net` connection allowlist + the public-registry import toggle
-/// (`permissions.import`). Connecting to a host and downloading code from one are separate grants.
+/// Network tab: the `permissions.net` host allowlist, the public-registry import toggle
+/// (`permissions.import`), and the Local IPC section (`permissions.ipc`). Connecting to a host
+/// and downloading code from one are separate grants; local IPC is a separate axis again — an
+/// exact local endpoint per row, never part of the host list.
 fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
-    column![
+    let mut col = column![
         perm_note(),
         list_editor(
             crate::i18n::ts!("manifest-allowed-hosts"),
@@ -2109,8 +2280,92 @@ fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
             crate::i18n::ts!("manifest-host"),
         ),
         import_policy_picker(draft.import),
+        local_ipc_editor(&draft.ipc),
     ]
-    .spacing(16.0)
+    .spacing(16.0);
+    if draft
+        .ipc
+        .iter()
+        .any(|row| !row.unix.trim().is_empty() || !row.windows_pipe.trim().is_empty())
+    {
+        col = col.push(full_access_author_note(crate::i18n::ts!(
+            "manifest-ipc-warning"
+        )));
+    }
+    col.into()
+}
+
+/// The Local IPC editor (`permissions.ipc`): one card per endpoint, each with both per-platform
+/// realization fields — a Unix socket path and/or a Windows pipe name. Only the realization
+/// matching the installer's platform is granted; declaring both keeps one manifest honest across
+/// platforms.
+fn local_ipc_editor(rows: &[IpcRowDraft]) -> Elem<'_> {
+    let mut col = Column::new()
+        .spacing(6.0)
+        .push(common::section_label(crate::i18n::ts!(
+            "manifest-local-ipc"
+        )))
+        .push(
+            text(crate::i18n::t!("manifest-local-ipc-help"))
+                .size(11.0)
+                .style(common::muted),
+        );
+    if rows.is_empty() {
+        col = col.push(
+            text(crate::i18n::t!("manifest-none-period"))
+                .size(12.0)
+                .style(common::faint),
+        );
+    }
+    for (i, row_draft) in rows.iter().enumerate() {
+        col = col.push(
+            row![
+                column![
+                    field_row(
+                        crate::i18n::ts!("manifest-ipc-unix-label"),
+                        text_input(
+                            crate::i18n::ts!("manifest-ipc-unix-placeholder"),
+                            &row_draft.unix
+                        )
+                        .on_input(move |v| Message::EditManifest(ManifestEdit::IpcUnix(i, v)))
+                        .size(14.0)
+                        .into(),
+                    ),
+                    field_row(
+                        crate::i18n::ts!("manifest-ipc-pipe-label"),
+                        text_input(
+                            crate::i18n::ts!("manifest-ipc-pipe-placeholder"),
+                            &row_draft.windows_pipe
+                        )
+                        .on_input(move |v| {
+                            Message::EditManifest(ManifestEdit::IpcWindowsPipe(i, v))
+                        })
+                        .size(14.0)
+                        .into(),
+                    ),
+                ]
+                .spacing(4.0)
+                .width(Length::Fill),
+                button(
+                    text(bootstrap_icons::TRASH_3)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(14.0)
+                )
+                .style(button_style::secondary)
+                .on_press(Message::EditManifest(ManifestEdit::RemoveIpcRow(i)))
+                .padding(8),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+        );
+    }
+    col.push(add_button(
+        &crate::i18n::t!(
+            "manifest-add-item",
+            "item" => crate::i18n::ts!("manifest-ipc-endpoint")
+        ),
+        Message::EditManifest(ManifestEdit::AddIpcRow),
+    ))
     .into()
 }
 
@@ -2173,8 +2428,8 @@ fn manifest_tab_files(draft: &ManifestDraft) -> Elem<'_> {
     if escapes_data(&draft.read) {
         col = col.push(
             text(crate::i18n::t!("manifest-readable-path-warning"))
-            .size(11.0)
-            .style(common::warning),
+                .size(11.0)
+                .style(common::warning),
         );
     }
     col = col.push(list_editor(
@@ -2319,38 +2574,124 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
         text(crate::i18n::t!("manifest-capabilities-help"))
             .size(11.0)
             .style(common::muted),
-        cap_group(crate::i18n::ts!("manifest-cap-group-automations"), vec![
-            cap_check("createAlias", crate::i18n::ts!("manifest-cap-create-aliases"), caps.create_aliases, Cap::CreateAliases),
-            cap_check("createTrigger / createTriggers", crate::i18n::ts!("manifest-cap-create-triggers"), caps.create_triggers, Cap::CreateTriggers),
-        ]),
-        cap_group("Session", vec![
-            cap_check("send", "send commands as if typed (runs through your aliases)", caps.send, Cap::Send),
-            cap_check("sendRaw", "send straight to the game (bypasses your aliases)", caps.send_direct, Cap::SendDirect),
-            cap_check("echo", "print text to your screen", caps.echo, Cap::Echo),
-            cap_check("input", "access, change, and focus input change; manage autocomplete list", caps.input, Cap::Input),
-            cap_check("sessions / byName", "reach your other connected sessions", caps.reach_others, Cap::ReachOthers),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-display"), vec![
-            cap_check("line / buffer", crate::i18n::ts!("manifest-cap-display"), caps.change_display, Cap::ChangeDisplay),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-mapper"), vec![
-            mapper_read,
-            cap_check("mapper", crate::i18n::ts!("manifest-cap-mapper-write"), caps.mapper_write, Cap::MapperWrite),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-widgets"), vec![
-            cap_check("createWidget", crate::i18n::ts!("manifest-cap-widgets"), caps.widgets, Cap::Widgets),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-interop"), vec![
-            cap_check("emit / set", crate::i18n::ts!("manifest-cap-interop-write"), caps.interop_write, Cap::InteropWrite),
-            cap_check("on / get / watch", crate::i18n::ts!("manifest-cap-interop-read"), caps.interop_read, Cap::InteropRead),
-            cap_check("BroadcastChannel", crate::i18n::ts!("manifest-cap-interop-broadcast"), caps.interop_broadcast, Cap::InteropBroadcast),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-panes"), vec![
-            cap_check("pane",  crate::i18n::ts!("manifest-cap-panes"), caps.panes, Cap::Panes),
-        ]),
-        cap_group(crate::i18n::ts!("manifest-cap-group-gmcp"), vec![
-            cap_check("gmcp.send", crate::i18n::ts!("manifest-cap-gmcp"), caps.gmcp_send, Cap::GmcpSend),
-        ]),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-automations"),
+            vec![
+                cap_check(
+                    "createAlias",
+                    crate::i18n::ts!("manifest-cap-create-aliases"),
+                    caps.create_aliases,
+                    Cap::CreateAliases
+                ),
+                cap_check(
+                    "createTrigger / createTriggers",
+                    crate::i18n::ts!("manifest-cap-create-triggers"),
+                    caps.create_triggers,
+                    Cap::CreateTriggers
+                ),
+            ]
+        ),
+        cap_group(
+            "Session",
+            vec![
+                cap_check(
+                    "send",
+                    "send commands as if typed (runs through your aliases)",
+                    caps.send,
+                    Cap::Send
+                ),
+                cap_check(
+                    "sendRaw",
+                    "send straight to the game (bypasses your aliases)",
+                    caps.send_direct,
+                    Cap::SendDirect
+                ),
+                cap_check("echo", "print text to your screen", caps.echo, Cap::Echo),
+                cap_check(
+                    "input",
+                    "access, change, and focus input change; manage autocomplete list",
+                    caps.input,
+                    Cap::Input
+                ),
+                cap_check(
+                    "sessions / byName",
+                    "reach your other connected sessions",
+                    caps.reach_others,
+                    Cap::ReachOthers
+                ),
+            ]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-display"),
+            vec![cap_check(
+                "line / buffer",
+                crate::i18n::ts!("manifest-cap-display"),
+                caps.change_display,
+                Cap::ChangeDisplay
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-mapper"),
+            vec![
+                mapper_read,
+                cap_check(
+                    "mapper",
+                    crate::i18n::ts!("manifest-cap-mapper-write"),
+                    caps.mapper_write,
+                    Cap::MapperWrite
+                ),
+            ]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-widgets"),
+            vec![cap_check(
+                "createWidget",
+                crate::i18n::ts!("manifest-cap-widgets"),
+                caps.widgets,
+                Cap::Widgets
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-interop"),
+            vec![
+                cap_check(
+                    "emit / set",
+                    crate::i18n::ts!("manifest-cap-interop-write"),
+                    caps.interop_write,
+                    Cap::InteropWrite
+                ),
+                cap_check(
+                    "on / get / watch",
+                    crate::i18n::ts!("manifest-cap-interop-read"),
+                    caps.interop_read,
+                    Cap::InteropRead
+                ),
+                cap_check(
+                    "BroadcastChannel",
+                    crate::i18n::ts!("manifest-cap-interop-broadcast"),
+                    caps.interop_broadcast,
+                    Cap::InteropBroadcast
+                ),
+            ]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-panes"),
+            vec![cap_check(
+                "pane",
+                crate::i18n::ts!("manifest-cap-panes"),
+                caps.panes,
+                Cap::Panes
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-gmcp"),
+            vec![cap_check(
+                "gmcp.send",
+                crate::i18n::ts!("manifest-cap-gmcp"),
+                caps.gmcp_send,
+                Cap::GmcpSend
+            ),]
+        ),
     ]
     .spacing(16.0)
     .into()
@@ -2459,7 +2800,11 @@ fn list_editor<'a>(
         col = col.push(text(hint.to_string()).size(11.0).style(common::muted));
     }
     if items.is_empty() {
-        col = col.push(text(crate::i18n::t!("manifest-none-period")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("manifest-none-period"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (i, item) in items.iter().enumerate() {
         col = col.push(
@@ -2695,6 +3040,10 @@ mod tests {
             ],
             permissions: PackagePermissions {
                 net: vec!["comms.example.org:6667".to_string()],
+                ipc: vec![IpcEntry {
+                    unix: Some("/var/run/example.sock".to_string()),
+                    windows_pipe: Some("example-service".to_string()),
+                }],
                 read: vec!["$DATA/maps".to_string()],
                 write: vec!["$DATA".to_string()],
                 env: vec!["MYPKG_TOKEN".to_string()],
@@ -2825,6 +3174,124 @@ mod tests {
         };
         let manifest = draft.to_manifest().expect("projects");
         assert_eq!(manifest.permissions.net, vec!["host:1".to_string()]);
+    }
+
+    #[test]
+    fn ipc_rows_round_trip_through_the_editor_and_blank_rows_drop() {
+        let draft = ManifestDraft {
+            version: "1.0.0".to_string(),
+            ipc: vec![
+                IpcRowDraft {
+                    unix: " /var/run/docker.sock ".to_string(),
+                    windows_pipe: " docker_engine ".to_string(),
+                },
+                IpcRowDraft {
+                    unix: String::new(),
+                    windows_pipe: "solo-pipe".to_string(),
+                },
+                // An untouched blank row projects to nothing, like a blank list entry.
+                IpcRowDraft::default(),
+            ],
+            ..ManifestDraft::default()
+        };
+        let manifest = draft.to_manifest().expect("valid ipc rows project");
+        assert_eq!(
+            manifest.permissions.ipc,
+            vec![
+                IpcEntry {
+                    unix: Some("/var/run/docker.sock".to_string()),
+                    windows_pipe: Some("docker_engine".to_string()),
+                },
+                IpcEntry {
+                    unix: None,
+                    windows_pipe: Some("solo-pipe".to_string()),
+                },
+            ]
+        );
+        let round_trip = ManifestDraft::from_manifest(&manifest);
+        assert_eq!(round_trip.ipc.len(), 2);
+        assert_eq!(round_trip.ipc[0].unix, "/var/run/docker.sock");
+        assert_eq!(round_trip.ipc[0].windows_pipe, "docker_engine");
+        assert_eq!(round_trip.ipc[1].unix, "");
+        assert_eq!(round_trip.ipc[1].windows_pipe, "solo-pipe");
+    }
+
+    #[test]
+    fn invalid_ipc_rows_refuse_to_save() {
+        // A relative unix socket path is rejected (must be absolute POSIX).
+        let relative = ManifestDraft {
+            version: "1.0.0".to_string(),
+            ipc: vec![IpcRowDraft {
+                unix: "relative.sock".to_string(),
+                windows_pipe: String::new(),
+            }],
+            ..ManifestDraft::default()
+        };
+        assert!(relative.to_manifest().is_err());
+        // A pipe name with a separator is rejected (the engine prepends \\.\pipe\).
+        let separator = ManifestDraft {
+            version: "1.0.0".to_string(),
+            ipc: vec![IpcRowDraft {
+                unix: String::new(),
+                windows_pipe: r"bad\name".to_string(),
+            }],
+            ..ManifestDraft::default()
+        };
+        assert!(separator.to_manifest().is_err());
+    }
+
+    #[test]
+    fn pipe_namespace_paths_refuse_to_save_in_every_path_axis() {
+        // Both separator spellings, the verbatim prefix, a case variant, and the bare
+        // namespace root — in read, write, and ffi. Pipe fs-grants may only originate from a
+        // Local IPC row (fs-opening a pipe IS connecting to it).
+        let entries = [
+            r"\\.\pipe\docker_engine",
+            "//./pipe/docker_engine",
+            r"\\?\pipe\docker_engine",
+            r"\\.\PIPE\docker_engine",
+            r"\\.\pipe\",
+        ];
+        for entry in entries {
+            for axis in 0..3 {
+                let mut draft = ManifestDraft {
+                    version: "1.0.0".to_string(),
+                    ..ManifestDraft::default()
+                };
+                match axis {
+                    0 => draft.read = vec![entry.to_string()],
+                    1 => draft.write = vec![entry.to_string()],
+                    _ => draft.ffi = vec![entry.to_string()],
+                }
+                assert!(
+                    draft.to_manifest().is_err(),
+                    "path entry {entry:?} must be rejected in axis {axis}"
+                );
+            }
+        }
+        // Ordinary Windows drive paths (and $DATA paths) still validate.
+        let plain = ManifestDraft {
+            version: "1.0.0".to_string(),
+            read: vec![r"C:\Users\me\logs".to_string(), "$DATA/maps".to_string()],
+            write: vec![r"C:\pipe\not-the-namespace".to_string()],
+            ..ManifestDraft::default()
+        };
+        assert!(plain.to_manifest().is_ok());
+    }
+
+    #[test]
+    fn net_local_transport_strings_refuse_to_save() {
+        for entry in ["unix:/var/run/docker.sock", "vsock:2:1234"] {
+            let draft = ManifestDraft {
+                version: "1.0.0".to_string(),
+                net: vec![entry.to_string()],
+                ..ManifestDraft::default()
+            };
+            assert!(
+                draft.to_manifest().is_err(),
+                "net entry {entry:?} must be a validation error — net is hosts-only"
+            );
+        }
     }
 
     /// A draft with one parameter of a given kind, plus the supplied edits applied.

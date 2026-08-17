@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use super::persistence::write_atomic;
 
 pub use smudgy_script::{
-    ImportPolicy, ParamKind, ParamOption, PackageManifest, PackageParameter, PackagePermissions,
-    SmudgyCapabilities, is_any_host_net_entry,
+    ImportPolicy, IpcEntry, IpcEntryIssue, PackageManifest, PackageParameter, PackagePermissions,
+    ParamKind, ParamOption, SmudgyCapabilities, is_any_host_net_entry,
+    is_local_transport_net_entry, is_windows_pipe_namespace_entry,
 };
 
 use crate::get_smudgy_home;
@@ -422,10 +423,7 @@ pub fn uninstall_package(server_name: &str, specifier: &str) -> Result<()> {
 /// # Errors
 /// Returns an error if the lockfile can't be loaded or saved, or the packages directory can't
 /// be determined.
-pub fn reconcile_local_installs(
-    server_name: &str,
-    nickname: Option<&str>,
-) -> Result<Vec<String>> {
+pub fn reconcile_local_installs(server_name: &str, nickname: Option<&str>) -> Result<Vec<String>> {
     let mut lock = load_lock(server_name)?;
     let packages_dir = crate::models::local_packages::packages_dir(server_name)?;
     let prefix = format!("smudgy://{}/", crate::models::local_packages::LOCAL_OWNER);
@@ -720,7 +718,11 @@ impl SmudgyVersionFloor {
         }
         match semver::Version::parse(raw) {
             Ok(version) => {
-                if self.highest.as_ref().is_none_or(|(highest, _)| version > *highest) {
+                if self
+                    .highest
+                    .as_ref()
+                    .is_none_or(|(highest, _)| version > *highest)
+                {
                     self.highest = Some((version, declared_by.to_string()));
                 }
             }
@@ -758,11 +760,7 @@ impl SmudgyVersionFloor {
 
 /// Reads a single non-secret option value for a package, if set.
 #[must_use]
-pub fn get_param_value(
-    server_name: &str,
-    specifier: &str,
-    key: &str,
-) -> Option<serde_json::Value> {
+pub fn get_param_value(server_name: &str, specifier: &str, key: &str) -> Option<serde_json::Value> {
     let dir = server_dir(server_name).ok()?;
     let values = load_param_values_in(&dir).ok()?;
     values.get(specifier)?.get(key).cloned()
@@ -808,17 +806,14 @@ fn secret_keyring_entry(slot: &str) -> keyring::Result<keyring::Entry> {
 ///
 /// # Errors
 /// Returns an error if both the keyring write and the fallback-file write fail.
-pub fn save_secret_param(
-    server_name: &str,
-    specifier: &str,
-    key: &str,
-    value: &str,
-) -> Result<()> {
+pub fn save_secret_param(server_name: &str, specifier: &str, key: &str, value: &str) -> Result<()> {
     let slot = secret_slot(server_name, specifier, key);
     match secret_keyring_entry(&slot).and_then(|entry| entry.set_password(value)) {
         Ok(()) => Ok(()),
         Err(e) => {
-            warn!("OS keyring unavailable for package secret, falling back to obfuscated file: {e}");
+            warn!(
+                "OS keyring unavailable for package secret, falling back to obfuscated file: {e}"
+            );
             let dir = server_dir(server_name)?;
             save_secret_to_file(&dir, &slot, value)
         }
@@ -828,7 +823,8 @@ pub fn save_secret_param(
 /// Whether a keyring-read failure has already been warned about this process. Secret reads
 /// happen on the per-line hot path (a script may `get()` a secret in a trigger), so on a
 /// keyring-unavailable host the warning would otherwise flood the log; warn once.
-static KEYRING_READ_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEYRING_READ_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Reads a secret option value, if stored. Tries the OS keyring, then the fallback
 /// file. Never logs secret material.
@@ -843,7 +839,9 @@ pub fn load_secret_param(server_name: &str, specifier: &str, key: &str) -> Optio
             if !matches!(e, keyring::Error::NoEntry)
                 && !KEYRING_READ_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
-                warn!("Failed to read a package secret from the OS keyring (further occurrences suppressed); using the obfuscated-file fallback: {e}");
+                warn!(
+                    "Failed to read a package secret from the OS keyring (further occurrences suppressed); using the obfuscated-file fallback: {e}"
+                );
             }
             let dir = server_dir(server_name).ok()?;
             load_secret_from_file(&dir, &slot)
@@ -863,8 +861,7 @@ pub fn clear_secret_param(server_name: &str, specifier: &str, key: &str) -> Resu
             "Failed to delete package secret from the OS keyring: {e}"
         )),
     };
-    let file_result =
-        server_dir(server_name).and_then(|dir| remove_secret_from_file(&dir, &slot));
+    let file_result = server_dir(server_name).and_then(|dir| remove_secret_from_file(&dir, &slot));
     keyring_result?;
     file_result
 }
@@ -908,7 +905,8 @@ fn remove_secret_from_file(dir: &Path, slot: &str) -> Result<()> {
     }
     let mut secrets = load_secrets_file(dir);
     if secrets.remove(slot).is_some() {
-        let json = serde_json::to_string(&secrets).context("Failed to serialize package secrets")?;
+        let json =
+            serde_json::to_string(&secrets).context("Failed to serialize package secrets")?;
         write_atomic(&path, json.as_bytes())
             .with_context(|| format!("Failed to write {}", path.display()))?;
     }
@@ -929,10 +927,8 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "smudgy-pkg-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("smudgy-pkg-test-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
@@ -985,7 +981,10 @@ mod tests {
         assert_eq!(floor.refusal(&running), None, "an equal floor is satisfied");
         floor.fold("mapper", Some("0.4.0"));
         let reason = floor.refusal(&running).expect("a higher floor refuses");
-        assert!(reason.contains("mapper requires smudgy 0.4.0 or newer"), "{reason}");
+        assert!(
+            reason.contains("mapper requires smudgy 0.4.0 or newer"),
+            "{reason}"
+        );
         assert!(reason.contains("this smudgy is 0.3.3"), "{reason}");
     }
 
@@ -1037,7 +1036,10 @@ mod tests {
         entries
             .iter()
             .map(|(s, reqs)| {
-                ((*s).to_string(), reqs.iter().map(|r| (*r).to_string()).collect())
+                (
+                    (*s).to_string(),
+                    reqs.iter().map(|r| (*r).to_string()).collect(),
+                )
             })
             .collect()
     }
@@ -1092,7 +1094,10 @@ mod tests {
         orphans.sort();
         assert_eq!(
             orphans,
-            vec!["smudgy://k/group".to_string(), "smudgy://k/prompt".to_string()]
+            vec![
+                "smudgy://k/group".to_string(),
+                "smudgy://k/prompt".to_string()
+            ]
         );
     }
 
@@ -1144,16 +1149,25 @@ mod tests {
         breaks.sort();
         assert_eq!(
             breaks,
-            vec!["smudgy://k/autoloot".to_string(), "smudgy://k/group".to_string()]
+            vec![
+                "smudgy://k/autoloot".to_string(),
+                "smudgy://k/group".to_string()
+            ]
         );
     }
 
     #[test]
     fn requirers_sweep_ignores_packages_that_do_not_require_it() {
         // unrelated(user) requires nothing of prompt → not a requirer.
-        let lock = lock_of(&[("smudgy://k/unrelated", false), ("smudgy://k/prompt", false)]);
+        let lock = lock_of(&[
+            ("smudgy://k/unrelated", false),
+            ("smudgy://k/prompt", false),
+        ]);
         let reqs = requires_map(&[]);
-        assert!(lock.requirers_of_removal("smudgy://k/prompt", &reqs).is_empty());
+        assert!(
+            lock.requirers_of_removal("smudgy://k/prompt", &reqs)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1202,7 +1216,10 @@ mod tests {
             version: "1.0.0".into(),
         })
         .unwrap();
-        assert_eq!(pinned, serde_json::json!({ "mode": "pinned", "version": "1.0.0" }));
+        assert_eq!(
+            pinned,
+            serde_json::json!({ "mode": "pinned", "version": "1.0.0" })
+        );
     }
 
     #[test]
@@ -1231,14 +1248,22 @@ mod tests {
         install_package(&server, spec, UpdateMode::Auto, true).unwrap();
         let lock = load_lock(&server).unwrap();
         let entry = lock.find(spec).expect("installed");
-        assert_eq!(entry.consented_permissions, None, "a fresh install is un-consented");
+        assert_eq!(
+            entry.consented_permissions, None,
+            "a fresh install is un-consented"
+        );
         assert!(!entry.trusted, "a fresh install is untrusted");
 
         // Recording consent stores the granted union verbatim and reloads equal — including the
-        // full-access-weight axes (`run`/`ffi`) and `sys`, which must survive the lockfile so the
-        // enforcement container and the manage-pane banner keep seeing what was actually granted.
+        // full-access-weight axes (`run`/`ffi`/`ipc`) and `sys`, which must survive the lockfile
+        // so the enforcement container and the manage-pane banner keep seeing what was actually
+        // granted.
         let granted = PackagePermissions {
             net: vec!["comms.coreclan.org:6379".into()],
+            ipc: vec![IpcEntry {
+                unix: Some("/var/run/docker.sock".into()),
+                windows_pipe: Some("docker_engine".into()),
+            }],
             read: vec!["$DATA/maps".into()],
             write: Vec::new(),
             env: vec!["MYPKG_TOKEN".into()],
@@ -1255,7 +1280,9 @@ mod tests {
         record_consent(&server, spec, &granted).unwrap();
         let reloaded = load_lock(&server).unwrap();
         assert_eq!(
-            reloaded.find(spec).and_then(|p| p.consented_permissions.clone()),
+            reloaded
+                .find(spec)
+                .and_then(|p| p.consented_permissions.clone()),
             Some(granted.clone()),
             "the consented union round-trips through the lockfile"
         );
@@ -1287,7 +1314,10 @@ mod tests {
         // (true), so existing installs keep loading after the upgrade.
         let json = r#"{ "packages": [ { "specifier": "smudgy://wbk/mapper" } ] }"#;
         let lock: SharedPackageLock = serde_json::from_str(json).unwrap();
-        assert!(lock.packages[0].enabled, "a pre-field entry defaults to enabled");
+        assert!(
+            lock.packages[0].enabled,
+            "a pre-field entry defaults to enabled"
+        );
         // A freshly-installed package is enabled by default too.
         assert!(LockedPackage::new("smudgy://wbk/x", UpdateMode::Auto).enabled);
     }
@@ -1370,7 +1400,9 @@ mod tests {
         let lock = load_lock(&server).unwrap();
         assert!(lock.find(live).is_none());
         assert!(
-            lock.find("smudgy://wbk/keeper").expect("nickname entry").enabled,
+            lock.find("smudgy://wbk/keeper")
+                .expect("nickname entry")
+                .enabled,
             "the installed nickname entry wins over the placeholder duplicate"
         );
 
@@ -1412,9 +1444,9 @@ mod tests {
         let server = format!("ParamGateTest-{}", std::process::id());
         let spec = "smudgy://wbk/needsconfig";
         let declared = [
-            param("name", true, false),     // required, non-secret
+            param("name", true, false),      // required, non-secret
             param("autosave", false, false), // optional -> never gates
-            param("pg.url", true, true),    // required, secret
+            param("pg.url", true, true),     // required, secret
         ];
 
         // Nothing set: both required params are missing (declaration order), optional excluded.
@@ -1453,7 +1485,10 @@ mod tests {
         // Clearing one key leaves the others.
         clear_param_value(&server, spec, "name").unwrap();
         assert_eq!(get_param_value(&server, spec, "name"), None);
-        assert_eq!(get_param_value(&server, spec, "autosave"), Some(serde_json::json!("on")));
+        assert_eq!(
+            get_param_value(&server, spec, "autosave"),
+            Some(serde_json::json!("on"))
+        );
 
         // Clearing a missing key is a no-op (idempotent).
         clear_param_value(&server, spec, "name").unwrap();

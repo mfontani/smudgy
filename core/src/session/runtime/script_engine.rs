@@ -24,7 +24,8 @@ use smudgy_cloud::{Mapper, PackageApiClient};
 use smudgy_script::{
     ImportPolicy, InspectorConfig, LoadReport, LoadedModuleKind, ModulePolicy, ModuleSet,
     PackagePermissions, PackageProvider, Permissions, PermissionsContainer, PermissionsOptions,
-    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, parse_canonical,
+    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, is_local_transport_net_entry,
+    is_windows_pipe_namespace_entry, native_ipc_grants, parse_canonical,
     permission_descriptor_parser,
 };
 
@@ -345,7 +346,7 @@ impl Drop for ScriptEngine<'_> {
         // Each isolate is left "exited" between operations (Model B), but rusty_v8's
         // `OwnedIsolate::Drop` still does real v8 teardown + an `exit()` that require the isolate
         // to be the thread's *current* one. So enter each isolate immediately before dropping it;
-        // order is then irrelevant (validated for deno_core 0.395 / v8 147). A plain drop of the
+        // order is then irrelevant (validated for deno_core 0.410 / v8 150.4). A plain drop of the
         // map would tear an isolate down while another was current → the misleading "Cannot
         // create a handle without a HandleScope" abort. Do NOT `exit` here — `OwnedIsolate::Drop`
         // performs the single matching exit.
@@ -2945,7 +2946,7 @@ fn build_script_runtime(
     // out of order, so leave the enter-stack empty between operations: exit the just-built
     // isolate now. Every later v8 op re-enters it via [`EnteredIsolate`], and teardown enters it
     // once more right before dropping (see `Drop for ScriptEngine`). This is the "Model B"
-    // lifecycle validated for deno_core 0.395 / v8 147 — teardown is order-independent.
+    // lifecycle validated for deno_core 0.410 / v8 150.4 — teardown is order-independent.
     // SAFETY: balances the construct-time enter; the new isolate is the current one here.
     unsafe {
         runtime.deno_runtime().v8_isolate().exit();
@@ -3149,19 +3150,63 @@ fn local_manifest_permissions(server_name: &str, name: &str) -> PackagePermissio
 /// private, update-surviving data dir ([`sandbox_fs_data_dir`]), so a `$DATA` grant reaches only
 /// that package's files, never the shared server root or another package.
 ///
+/// Local IPC arrives through the structured `ipc` axis: each consented row's realization native
+/// to this platform (`windowsPipe` → `\\.\pipe\<name>` on Windows, `unix` → the declared socket
+/// path on the Unix family) compiles into an exact `unix:` net descriptor **plus** the read+write
+/// grant the socket ops additionally require on that same path; the non-native realization
+/// contributes nothing. `net` itself stays hosts-only.
+///
 /// # Errors
 /// Returns an error if `deno_permissions` rejects a descriptor (e.g. a malformed `net`
-/// `host:port`, an unknown `sys` kind, or an empty `run` program name); the caller skips the
-/// package rather than run it ungated. The pinned `deno_permissions` patch accepts `*` as an
-/// any-host descriptor, retaining an optional `*:port` restriction across every deno network op.
+/// `host:port`, an unknown `sys` kind, or an empty `run` program name), if a `net` entry names a
+/// local transport (`unix:`/`vsock:` — a manifest-validation error), if an `ipc` row is
+/// malformed, or if a `read`/`write`/`ffi` entry names the Windows pipe namespace (pipe
+/// fs-grants may only originate from consented `ipc` rows); the caller skips the package rather
+/// than run it ungated. The pinned
+/// `deno_permissions` patch accepts `*` as a host-only any-host descriptor, retaining an
+/// optional `*:port` restriction across every Deno network op without granting Unix-domain or
+/// `VSock` transports.
 fn build_restricted_container(
     union: &PackagePermissions,
     data_dir: &std::path::Path,
 ) -> Result<PermissionsContainer> {
+    // `net` is hosts-only; a hand-edited manifest must not smuggle a local-transport grant
+    // through the host list (the editor rejects these before they ever reach disk).
+    if let Some(entry) = union.net.iter().find(|e| is_local_transport_net_entry(e)) {
+        bail!(
+            "net entry {entry:?} names a local transport; local IPC is declared on the `ipc` axis"
+        );
+    }
+    // An invalid `ipc` row (no realization, relative unix path, separator in a pipe name) is
+    // refused outright, never silently narrowed.
+    if let Some(row) = union.ipc.iter().find(|row| row.issue().is_some()) {
+        bail!("invalid `ipc` permission row {row:?}");
+    }
+    // The path axes must never name the Windows pipe namespace: fs-opening a pipe IS
+    // connecting to it, and the pinned `deno_permissions` patch exempts pipe-namespace query
+    // paths from the unscoped-"all" special-file demand on the strength of this rejection —
+    // a pipe fs-grant may only originate from a consented `ipc` row below.
+    if let Some(entry) = [&union.read, &union.write, &union.ffi]
+        .into_iter()
+        .flatten()
+        .find(|e| is_windows_pipe_namespace_entry(e))
+    {
+        bail!(
+            "path entry {entry:?} names the Windows pipe namespace; local IPC is declared on \
+             the `ipc` axis"
+        );
+    }
+    let ipc = native_ipc_grants(&union.ipc);
+    let mut net = union.net.clone();
+    net.extend(ipc.net);
+    let mut read = expand_data_paths(&union.read, data_dir);
+    read.extend(ipc.paths.iter().cloned());
+    let mut write = expand_data_paths(&union.write, data_dir);
+    write.extend(ipc.paths);
     let opts = PermissionsOptions {
-        allow_net: to_allow_list(union.net.clone()),
-        allow_read: to_allow_list(expand_data_paths(&union.read, data_dir)),
-        allow_write: to_allow_list(expand_data_paths(&union.write, data_dir)),
+        allow_net: to_allow_list(net),
+        allow_read: to_allow_list(read),
+        allow_write: to_allow_list(write),
         allow_env: to_allow_list(union.env.clone()),
         // `run`/`ffi` are sandbox escapes (a subprocess / native library runs outside the
         // permission model entirely) and are only ever granted through explicit consent — the
@@ -3188,12 +3233,26 @@ fn build_restricted_container(
 }
 
 /// Map an allowlist into `deno_permissions`' `Option<Vec<String>>`. **An empty list becomes
-/// `None`, not `Some(vec![])`** — in `deno_permissions` 0.101 `Some(vec![])` sets
+/// `None`, not `Some(vec![])`** — in `deno_permissions` 0.116 `Some(vec![])` sets
 /// `granted_global = true` (the bare `--allow-net` semantic = **allow all**), the opposite of
 /// the deny-by-default this enforces. `None` (no global grant, no descriptors, `prompt:false`)
 /// denies the kind entirely; a non-empty list scopes the grant to exactly those entries.
 fn to_allow_list(entries: Vec<String>) -> Option<Vec<String>> {
     (!entries.is_empty()).then_some(entries)
+}
+
+#[cfg(test)]
+mod permission_option_tests {
+    use super::to_allow_list;
+
+    #[test]
+    fn empty_manifest_axis_maps_to_none_not_deno_allow_all_sentinel() {
+        assert_eq!(to_allow_list(Vec::new()), None);
+        assert_eq!(
+            to_allow_list(vec!["example.com:443".to_string()]),
+            Some(vec!["example.com:443".to_string()])
+        );
+    }
 }
 
 /// Expand the `$DATA` placeholder in `read`/`write`/`ffi` path entries to the package's absolute
@@ -3570,6 +3629,7 @@ mod error_format_tests {
             name: Some(name.to_string()),
             message: Some(message.to_string()),
             stack: None,
+            stack_is_custom: false,
             cause: None,
             exception_message: exception_message.to_string(),
             frames,

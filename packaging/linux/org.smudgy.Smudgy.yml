@@ -2,8 +2,9 @@
 # packaging/linux/README.md and bin/release-linux.sh for the build/bundle flow.
 #
 # Strategy: NETWORK-ENABLED build. The build module is granted --share=network so
-# cargo fetches crates and the `v8` crate downloads its prebuilt librusty_v8
-# archive normally. This is the simplest correct path for a private, non-Flathub
+# cargo fetches crates and the Deno 2.9.5 engine chain (`deno_core 0.410` ->
+# `deno_v8 0.2` -> `v8 150.4.0`) downloads its simdutf-enabled prebuilt
+# librusty_v8 archive normally. This is the simplest correct path for a private, non-Flathub
 # bundle; it is not bit-reproducible. To go fully offline/Flathub later, vendor
 # the cargo sources + librusty_v8 and drop the build-time network share (notes in
 # README.md).
@@ -55,6 +56,9 @@ modules:
       build-args:
         - --share=network
     build-commands:
+      # Deno 2.9.5 requires Rust >=1.95.0. The SDK's rust-stable extension is on
+      # PATH above; print the selected compiler so packaging logs prove the floor.
+      - rustc --version
       # Materialize the patch-crate-managed dependency patches (patches/*.patch
       # -> target/patch/): the dir source skips target/, so the patched crates
       # must be recreated inside the sandbox before any cargo invocation.

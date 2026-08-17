@@ -90,19 +90,20 @@ pretty_env_logger = "0.5.0"
 # `log_enabled!(Debug)`) from every build, dev and release alike — info and above only.
 log = { version = "0.4.27", features = ["max_level_info"] }
 vtparse = "0.7.0"
-# Greenfield runtime bump (branch feat/greenfield-script-runtime): newer Deno than
-# the rustyscript fork's 0.347. deno_core is workspace-wide because core + smudgy_widgets
-# ops also use it directly (v8's `links` forbids two versions). Anchored to the
-# deno_runtime 0.250 set (deno_core 0.395 / deno_error 0.7.1 / deno_ast 0.53.1 / v8 147).
-deno_core = { version = "0.395", features = [
+# Embedded Deno v2.9.5 crate family, frozen from the official latest-stable endpoint on
+# 2026-08-16. deno_core is workspace-wide because core + smudgy_widgets also use it directly
+# (`links = "v8"` forbids two versions). The engine path is deno_core 0.410 -> deno_v8 0.2 ->
+# rusty_v8 150.4; keep the V8 backend and do not enable deno_v8's experimental `quickjs` feature.
+deno_core = { version = "0.410", features = [
     "unsafe_use_unprotected_platform",
 ] }
 pathfinding = "4.14.0"
 deno_error = "=0.7.1"
-# `std` is required by deno_io 0.152 on Windows: it assumes winapi's `ctypes::c_void`
-# aliases `std::os::raw::c_void` (only true with the `std` feature), else `GetStdHandle`
-# / `from_raw_handle` types mismatch. Feature-unified across the workspace.
-winapi = { version = "0.3.9", features = ["sysinfoapi", "std"] }
+# Windows UI platform calls: the Restart Manager window-proc subclass
+# (ui/src/win_rm.rs — commctrl/winuser, WM_ENDSESSION handling) and
+# virtual-screen metrics for workspace restore (ui/src/workspace/restore.rs).
+# The ui crate declares the feature set it needs at its own dependency entry.
+winapi = "0.3.9"
 build-time = "0.1.3"
 fluent-bundle = "0.16.0"
 sys-locale = "0.3.2"
@@ -127,10 +128,14 @@ unic-langid = "0.9.6"
 #   proportional script/common lists.
 # - `vtparse` (patches/vtparse+0.7.0.patch): bounds the std/alloc OSC and APC
 #   string buffers so hostile peers cannot grow them without limit.
-# - `deno_permissions` (patches/deno_permissions+0.101.0.patch): adds an
-#   any-host network descriptor so package manifests can express `*` (any
-#   host/port) and `*:port` (any host on one port) consistently across fetch,
-#   sockets, listeners, TLS, WebSockets, and the other deno network ops.
+# - `deno_permissions` (patches/deno_permissions+0.116.0.patch): adds a host-only
+#   any-host network descriptor so package manifests can express `*` (any internet
+#   host/port) and `*:port` (any internet host on one port) consistently without
+#   granting Unix-domain or VSock transports. Also exempts Windows pipe-namespace
+#   query paths (`\\.\pipe\<name>`) from the special-file all-permissions demand so
+#   scoped read+write grants can reach them; paired invariant: smudgy rejects
+#   pipe-namespace paths in manifest path axes, so a pipe fs-grant only ever
+#   originates from a consented Critical-tier `ipc` row.
 [workspace.metadata.patch]
 crates = ["iced_graphics", "cosmic-text", "vtparse", "deno_permissions"]
 
@@ -138,7 +143,7 @@ crates = ["iced_graphics", "cosmic-text", "vtparse", "deno_permissions"]
 iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
 cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
 vtparse = { path = "./target/patch/vtparse-0.7.0" }
-deno_permissions = { path = "./target/patch/deno_permissions-0.101.0" }
+deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }
 
 # Define workspace-wide lints
 [workspace.lints.clippy]
