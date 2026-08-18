@@ -1220,6 +1220,7 @@ impl ManagedSession {
                 session,
                 isolate_token,
                 id,
+                token,
             } => {
                 let (isolate, instance) = IsolateId::from_widget_token(&isolate_token);
                 RuntimeAction::InvokeLinkCallback {
@@ -1227,6 +1228,7 @@ impl ManagedSession {
                     isolate,
                     instance,
                     id,
+                    token,
                     shift: event.shift,
                     ctrl: event.ctrl,
                     alt: event.alt,
@@ -1306,6 +1308,7 @@ impl ManagedSession {
                 isolate,
                 instance,
                 id: request.id,
+                token: request.token,
                 state: request.state,
             })
             .ok();

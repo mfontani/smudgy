@@ -523,6 +523,7 @@ async fn styled_splice_edits_incoming_lines() {
         isolate,
         instance,
         id: request.id,
+        token: request.token,
         state: request.state,
     })
     .unwrap();
@@ -710,6 +711,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
         session,
         ref isolate_token,
         id,
+        ..
     } = clickable.links[0].action
     else {
         panic!(
@@ -786,6 +788,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
                 session: menu_session,
                 isolate_token: menu_isolate,
                 id: menu_id,
+                ..
             },
         ..
     } = &menu.items[2]
@@ -796,12 +799,15 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
     let (menu_isolate_id, menu_instance) = IsolateId::from_widget_token(menu_isolate);
 
     // Click it, exactly as the UI would: the handler runs in its isolate and sees
-    // the modifiers.
+    // the modifiers. (The UI forwards the clicked line's token; a fresh one is
+    // equivalent here — the line held by this test pins the registry entry.)
+    let test_token = || Arc::new(smudgy_core::session::styled_line::LinkToken::default());
     tx.send(RuntimeAction::InvokeLinkCallback {
         session,
         isolate: isolate.clone(),
         instance,
         id,
+        token: test_token(),
         shift: true,
         ctrl: false,
         alt: false,
@@ -826,6 +832,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
         isolate: menu_isolate_id,
         instance: menu_instance,
         id: *menu_id,
+        token: test_token(),
         shift: false,
         ctrl: false,
         alt: false,
@@ -852,6 +859,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
         isolate: isolate.clone(),
         instance: instance + 1,
         id,
+        token: test_token(),
         shift: false,
         ctrl: false,
         alt: false,
@@ -862,6 +870,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
         isolate,
         instance,
         id: id + 1000,
+        token: test_token(),
         shift: false,
         ctrl: false,
         alt: false,

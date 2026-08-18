@@ -14,7 +14,7 @@ use crate::session::runtime::{
     SingletonRegistry,
 };
 use crate::session::styled_line::{
-    Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkTooltip,
+    Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkToken, LinkTooltip,
     LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyleUpdate, StyledLine,
     StyledLink, TextAttributes, TextAttributesUpdate, Underline, sanitize_display_text,
 };
@@ -24,7 +24,7 @@ use crate::session::{
 };
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -2777,40 +2777,180 @@ fn op_smudgy_session_echo(
 
 /// Per-isolate registry of link-callback functions: the `v8::Global` handles stay
 /// HERE, inside their isolate's `OpState` (dropped with the isolate, on the session
-/// thread), and echoed lines carry only a `(token, id)` address — a scrollback line
-/// must never own a v8 handle, or its eventual drop on the UI thread aborts the
-/// process. Ids are monotonic; a capped ring evicts the oldest, so a trigger echoing
-/// callback links on every line cannot grow the registry unboundedly. A click on an
-/// evicted (or reload-stale) id is a defined no-op.
-#[derive(Default)]
-pub struct LinkCallbacks {
-    /// The id of `items[0]`; slot `i` holds id `base + i`. Ids are monotonic and
-    /// `u64` — they cannot wrap within any real session, so a stale id can only
-    /// miss, never alias a newer callback.
-    base: u64,
-    items: std::collections::VecDeque<v8::Global<v8::Function>>,
+/// thread), and echoed lines carry only a `(token, id)` address plus a plain-data
+/// [`LinkToken`] — a scrollback line must never own a v8 handle, or its eventual
+/// drop on the UI thread aborts the process.
+///
+/// Entry lifetime is tied to line reachability: every line carrying a callback
+/// holds an `Arc<LinkToken>` and the registry holds the `Weak`, so entries whose
+/// lines have left every buffer are swept opportunistically (amortized, on
+/// insert past a high-water mark, and at most once per [`Self::SWEEP_FLOOR`]
+/// inserts when the backstop cap keeps the size pinned). Re-registering the
+/// SAME function (by v8 identity) reuses its entry instead of minting a new
+/// one, so a per-line trigger with one handler occupies one entry total. Ids
+/// are monotonic `u64`s and can never alias a DIFFERENT callback: a swept id
+/// misses, and the only reuse is re-arming an id for the same function. A
+/// click on a swept (or reload-stale) id is a defined no-op. A capped
+/// oldest-first eviction remains as a backstop for pathologically many
+/// simultaneously-reachable callbacks.
+///
+/// Generic over the handle type so the bookkeeping (dedup, sweep, backstop) is
+/// unit-testable without a live isolate.
+pub struct LinkCallbacks<F = v8::Global<v8::Function>> {
+    entries: BTreeMap<u64, LinkCallbackEntry<F>>,
+    /// v8 identity hash -> candidate ids (hash collisions are possible; a
+    /// candidate is confirmed by handle equality before reuse).
+    by_identity: HashMap<i32, Vec<u64>>,
+    next_id: u64,
+    /// Sweep when `entries` reaches this size (amortized-O(1) growth trigger).
+    sweep_at: usize,
+    /// Inserts since the last sweep: rations sweeps once the registry sits at
+    /// the cap, where `sweep_at` alone would degrade to a full walk per insert.
+    inserts_since_sweep: usize,
 }
 
-impl LinkCallbacks {
-    /// Generous for real use; tiny next to the heap a script could grow anyway.
-    const CAP: usize = 8192;
+struct LinkCallbackEntry<F> {
+    function: F,
+    token: std::sync::Weak<LinkToken>,
+    identity: i32,
+}
 
-    fn insert(&mut self, function: v8::Global<v8::Function>) -> u64 {
-        if self.items.len() == Self::CAP {
-            self.items.pop_front();
-            self.base += 1;
+impl<F> Default for LinkCallbacks<F> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            by_identity: HashMap::new(),
+            next_id: 0,
+            sweep_at: Self::SWEEP_FLOOR,
+            inserts_since_sweep: 0,
         }
-        self.items.push_back(function);
-        self.base + (self.items.len() as u64 - 1)
+    }
+}
+
+impl<F> LinkCallbacks<F> {
+    /// Backstop only: sweeping bounds the live population by what retained
+    /// lines actually reference, and this sits far above any realistic
+    /// reachable count (a full 10k-line scrollback of per-line closures is
+    /// ~10k). Only a pathological line set (thousands of distinct callbacks
+    /// per line) can hit it, at which point the oldest evict first.
+    const CAP: usize = 65_536;
+    /// Never sweep below this size — small registries aren't worth the walk —
+    /// and, at the cap, sweep at most once per this many inserts.
+    const SWEEP_FLOOR: usize = 64;
+
+    /// Register `function` under `identity`, deduplicating against existing
+    /// entries via `is_same` (v8 handle equality in real use). A hit returns
+    /// the existing id — re-arming its liveness token if every prior line
+    /// already dropped (safe: a dead token means no line can click the id, and
+    /// the function is the same one regardless).
+    fn insert_raw(
+        &mut self,
+        identity: i32,
+        function: F,
+        mut is_same: impl FnMut(&F) -> bool,
+    ) -> (u64, Arc<LinkToken>) {
+        let found = self.by_identity.get(&identity).and_then(|candidates| {
+            candidates.iter().copied().find(|id| {
+                self.entries
+                    .get(id)
+                    .is_some_and(|entry| is_same(&entry.function))
+            })
+        });
+        if let Some(id) = found {
+            let entry = self.entries.get_mut(&id).expect("candidate ids are live");
+            if let Some(token) = entry.token.upgrade() {
+                return (id, token);
+            }
+            // Re-arming a dead entry is safe: the id addresses the SAME
+            // function, so the only possible holder of the old id — a click
+            // already in flight from a just-dropped line — invokes exactly
+            // what that click always meant.
+            let token = Arc::new(LinkToken::default());
+            entry.token = Arc::downgrade(&token);
+            return (id, token);
+        }
+
+        // Sweep on growth past the high-water mark and — once the backstop
+        // cap pins the size — at most once per SWEEP_FLOOR inserts, so a
+        // saturated registry pays an amortized fraction of a walk per insert
+        // instead of a full futile walk on every one.
+        self.inserts_since_sweep += 1;
+        if self.entries.len() >= self.sweep_at
+            || (self.entries.len() >= Self::CAP && self.inserts_since_sweep >= Self::SWEEP_FLOOR)
+        {
+            self.sweep();
+        }
+        if self.entries.len() >= Self::CAP {
+            let oldest = self.entries.keys().next().copied();
+            if let Some(oldest) = oldest {
+                self.remove(oldest);
+            }
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let token = Arc::new(LinkToken::default());
+        self.entries.insert(
+            id,
+            LinkCallbackEntry {
+                function,
+                token: Arc::downgrade(&token),
+                identity,
+            },
+        );
+        self.by_identity.entry(identity).or_default().push(id);
+        (id, token)
+    }
+
+    /// Drop every entry whose token has no strong holders left — no line in
+    /// any buffer references it, so no click can ever arrive for its id.
+    fn sweep(&mut self) {
+        self.entries
+            .retain(|_, entry| entry.token.strong_count() > 0);
+        self.by_identity.clear();
+        for (id, entry) in &self.entries {
+            self.by_identity
+                .entry(entry.identity)
+                .or_default()
+                .push(*id);
+        }
+        // Deliberately uncapped: at the backstop cap the size cannot grow to
+        // meet a doubled mark, so the once-per-SWEEP_FLOOR-inserts trigger in
+        // `insert_raw` takes over instead of a per-insert futile walk.
+        self.sweep_at = (self.entries.len() * 2).max(Self::SWEEP_FLOOR);
+        self.inserts_since_sweep = 0;
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some(entry) = self.entries.remove(&id)
+            && let Some(candidates) = self.by_identity.get_mut(&entry.identity)
+        {
+            candidates.retain(|candidate| *candidate != id);
+            if candidates.is_empty() {
+                self.by_identity.remove(&entry.identity);
+            }
+        }
     }
 
     #[must_use]
-    pub fn get(&self, id: u64) -> Option<&v8::Global<v8::Function>> {
-        // An evicted id (`id < base`) wraps to a huge offset and misses.
-        let offset = id.wrapping_sub(self.base);
-        usize::try_from(offset)
-            .ok()
-            .and_then(|offset| self.items.get(offset))
+    pub fn get(&self, id: u64) -> Option<&F> {
+        self.entries.get(&id).map(|entry| &entry.function)
+    }
+}
+
+impl LinkCallbacks {
+    /// Register a link-callback function, deduplicated by v8 identity: the
+    /// identity hash narrows to candidates, strict equality confirms.
+    fn insert(
+        &mut self,
+        scope: &mut v8::PinScope,
+        function: v8::Local<v8::Function>,
+    ) -> (u64, Arc<LinkToken>) {
+        let identity = function.get_identity_hash().get();
+        let global = v8::Global::new(scope, function);
+        self.insert_raw(identity, global, |existing| {
+            v8::Local::new(scope, existing).strict_equals(function.into())
+        })
     }
 }
 
@@ -2898,13 +3038,22 @@ enum TooltipWire {
 /// refcount instead of copying the string.
 pub struct LinkIsolateToken(pub Arc<str>);
 
-/// Everything needed to turn wire links into [`LinkAction`]s: the callback ids the
+/// One registered callback as payload consumers index it: the registry slot
+/// plus the liveness anchor every line carrying it must hold. Pairing them in
+/// one value makes an id/token mismatch unrepresentable.
+#[derive(Clone)]
+struct CallbackRef {
+    id: u64,
+    token: Arc<LinkToken>,
+}
+
+/// Everything needed to turn wire links into [`LinkAction`]s: the callbacks the
 /// op registered from the payload's function array, plus the address a click routes
 /// back to (this session + this isolate instantiation).
 struct LinkContext {
     session: SessionId,
     isolate_token: Arc<str>,
-    callback_ids: Vec<u64>,
+    callbacks: Vec<CallbackRef>,
     tooltip_states: Vec<Arc<LinkTooltipState>>,
 }
 
@@ -2922,28 +3071,35 @@ fn link_context(
     callbacks: v8::Local<v8::Array>,
 ) -> Result<LinkContext, StyledTextOpError> {
     let len = callbacks.length();
-    let mut callback_ids = Vec::with_capacity(len as usize);
-    if len > 0 {
+    // Validate the whole array BEFORE registering anything, so a rejected
+    // payload consumes no registry entries.
+    let mut functions = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let function: v8::Local<v8::Function> = callbacks
+            .get_index(scope, i)
+            .and_then(|value| value.try_into().ok())
+            .ok_or_else(|| {
+                StyledTextOpError::Invalid("link callback must be a function".to_string())
+            })?;
+        functions.push(function);
+    }
+    let mut refs = Vec::with_capacity(functions.len());
+    if !functions.is_empty() {
         let registry = state.borrow::<SharedLinkCallbacks>().clone();
         let mut registry = registry.borrow_mut();
-        for i in 0..len {
-            let function: v8::Local<v8::Function> = callbacks
-                .get_index(scope, i)
-                .and_then(|value| value.try_into().ok())
-                .ok_or_else(|| {
-                    StyledTextOpError::Invalid("link callback must be a function".to_string())
-                })?;
-            callback_ids.push(registry.insert(v8::Global::new(scope, function)));
+        for function in functions {
+            let (id, token) = registry.insert(scope, function);
+            refs.push(CallbackRef { id, token });
         }
     }
     Ok(LinkContext {
         session: *state.borrow::<SessionId>(),
         isolate_token: state.borrow::<LinkIsolateToken>().0.clone(),
-        tooltip_states: callback_ids
+        tooltip_states: refs
             .iter()
             .map(|_| Arc::new(LinkTooltipState::default()))
             .collect(),
-        callback_ids,
+        callbacks: refs,
     })
 }
 
@@ -2975,7 +3131,7 @@ impl LinkContext {
             Some(ResolvedTooltip::Text(text)) => Ok(Some(LinkTooltip::styled_text(text, target))),
             Some(ResolvedTooltip::Callback(index)) => {
                 let index = index as usize;
-                let id = self.callback_ids.get(index).copied().ok_or_else(|| {
+                let callback = self.callbacks.get(index).cloned().ok_or_else(|| {
                     StyledTextOpError::Invalid(
                         "link tooltip callback index out of range".to_string(),
                     )
@@ -2989,7 +3145,8 @@ impl LinkContext {
                     LinkTooltipCallback {
                         session: self.session,
                         isolate_token: self.isolate_token.clone(),
-                        id,
+                        id: callback.id,
+                        token: callback.token,
                         state,
                     },
                     target,
@@ -3544,15 +3701,16 @@ fn packed_echo_lines(
                     )?))
                 }
                 PackedLink::Callback(index) => {
-                    let id = link_context
-                        .callback_ids
+                    let callback = link_context
+                        .callbacks
                         .get(index)
-                        .copied()
+                        .cloned()
                         .ok_or_else(|| packed_invalid("link callback index out of range"))?;
                     Some(LinkAction::Callback {
                         session: link_context.session,
                         isolate_token: link_context.isolate_token.clone(),
-                        id,
+                        id: callback.id,
+                        token: callback.token,
                     })
                 }
             };
@@ -3734,17 +3892,14 @@ fn resolve_script_link_action(
     match action {
         ScriptLinkActionWire::Send { send } => Ok(LinkAction::Send(Arc::from(send.as_str()))),
         ScriptLinkActionWire::Callback { cb } => {
-            let id = links
-                .callback_ids
-                .get(*cb as usize)
-                .copied()
-                .ok_or_else(|| {
-                    StyledTextOpError::Invalid("link callback index out of range".to_string())
-                })?;
+            let callback = links.callbacks.get(*cb as usize).cloned().ok_or_else(|| {
+                StyledTextOpError::Invalid("link callback index out of range".to_string())
+            })?;
             Ok(LinkAction::Callback {
                 session: links.session,
                 isolate_token: links.isolate_token.clone(),
-                id,
+                id: callback.id,
+                token: callback.token,
             })
         }
     }
@@ -7469,7 +7624,7 @@ mod tests {
     };
     use crate::session::runtime::store::ProducerKey;
     use crate::session::styled_line::{
-        Blink, LinkAction, TextAttributes, TextAttributesUpdate, Underline,
+        Blink, LinkAction, LinkToken, TextAttributes, TextAttributesUpdate, Underline,
     };
     use std::sync::Arc;
 
@@ -7492,8 +7647,79 @@ mod tests {
                 .iter()
                 .map(|_| Arc::new(super::LinkTooltipState::default()))
                 .collect(),
-            callback_ids,
+            callbacks: callback_ids
+                .into_iter()
+                .map(|id| super::CallbackRef {
+                    id,
+                    token: Arc::new(LinkToken::default()),
+                })
+                .collect(),
         }
+    }
+
+    // ---- Link-callback registry --------------------------------------------
+
+    #[test]
+    fn link_callbacks_dedupe_by_identity_and_sweep_dead_entries() {
+        // `u32` stands in for the v8 global; the i32 plays the identity hash.
+        let mut registry = super::LinkCallbacks::<u32>::default();
+        let (id_a, token_a) = registry.insert_raw(1, 100, |f| *f == 100);
+        let (id_b, token_b) = registry.insert_raw(1, 100, |f| *f == 100);
+        assert_eq!(id_a, id_b, "the same function reuses its entry");
+        assert!(Arc::ptr_eq(&token_a, &token_b), "and its liveness token");
+
+        // An identity-hash collision with a DIFFERENT function is confirmed
+        // away by handle equality and gets its own entry.
+        let (id_c, token_c) = registry.insert_raw(1, 200, |f| *f == 200);
+        assert_ne!(id_a, id_c);
+        assert_eq!(registry.get(id_a), Some(&100));
+        assert_eq!(registry.get(id_c), Some(&200));
+
+        // Dropping every line's token makes the entry sweepable; a reachable
+        // entry survives the sweep.
+        drop(token_a);
+        drop(token_b);
+        registry.sweep();
+        assert_eq!(registry.get(id_a), None, "unreachable entry swept");
+        assert_eq!(registry.get(id_c), Some(&200), "reachable entry kept");
+
+        // Ids are monotonic: a swept id misses forever, never aliases.
+        drop(token_c);
+        let (id_d, _token_d) = registry.insert_raw(1, 100, |f| *f == 100);
+        assert!(id_d > id_c);
+        assert_eq!(registry.get(id_a), None);
+    }
+
+    #[test]
+    fn link_callbacks_rearm_a_dead_entry_for_the_same_function() {
+        let mut registry = super::LinkCallbacks::<u32>::default();
+        let (id_a, token_a) = registry.insert_raw(7, 100, |f| *f == 100);
+        drop(token_a);
+        // No sweep ran, so the dead entry is still present. Re-registering the
+        // same function revives it under the SAME id — safe, because a dead
+        // token means no line still holds the old id to click.
+        let (id_b, token_b) = registry.insert_raw(7, 100, |f| *f == 100);
+        assert_eq!(id_a, id_b);
+        assert_eq!(registry.get(id_b), Some(&100));
+        drop(token_b);
+    }
+
+    #[test]
+    fn link_callbacks_cap_evicts_oldest_reachable_entry_as_backstop() {
+        let mut registry = super::LinkCallbacks::<u32>::default();
+        let cap = u32::try_from(super::LinkCallbacks::<u32>::CAP).expect("cap fits");
+        // Fill to the cap with distinct, still-reachable callbacks.
+        let tokens: Vec<_> = (0..cap)
+            .map(|i| {
+                registry
+                    .insert_raw(i32::try_from(i).expect("hash"), i, |f| *f == i)
+                    .1
+            })
+            .collect();
+        let (id_new, _token_new) = registry.insert_raw(-1, 999_999, |f| *f == 999_999);
+        assert_eq!(registry.get(0), None, "the oldest entry evicts at the cap");
+        assert_eq!(registry.get(id_new), Some(&999_999));
+        drop(tokens);
     }
 
     #[test]

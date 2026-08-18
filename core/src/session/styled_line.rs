@@ -355,6 +355,18 @@ pub struct LinkProtocol {
     pub spoiler: bool,
 }
 
+/// Liveness anchor for a callback link. Every line referencing the callback
+/// holds a clone of the `Arc`; the registry holds only a `Weak`, so a
+/// callback's registry entry (and its `v8::Global`) can be reclaimed exactly
+/// when the last line referencing it leaves every buffer — main scrollback,
+/// panes, the recent-lines ring, cross-session copies. Deliberately plain
+/// data: a scrollback line must never own a v8 handle, or its eventual drop
+/// on the UI thread would abort the process. All tokens compare equal (the
+/// derived unit equality) — link identity lives in the `(session, isolate,
+/// id)` address beside it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LinkToken(());
+
 /// What a click on a linked range of a line does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkAction {
@@ -405,6 +417,9 @@ pub enum LinkAction {
         /// The slot in that instantiation's link-callback registry (`u64` so the
         /// monotonic ids can never wrap into aliasing another callback).
         id: u64,
+        /// Keeps the registry entry alive while any line carries this action
+        /// (see [`LinkToken`]).
+        token: Arc<LinkToken>,
     },
 }
 
@@ -655,6 +670,9 @@ pub struct LinkTooltipCallback {
     pub session: super::SessionId,
     pub isolate_token: Arc<str>,
     pub id: u64,
+    /// Keeps the registry entry alive while any line carries this tooltip
+    /// (see [`LinkToken`]).
+    pub token: Arc<LinkToken>,
     pub state: Arc<LinkTooltipState>,
 }
 
@@ -808,7 +826,9 @@ pub struct StyledLine {
 /// methods run every script-supplied byte offset through this: a mid-code-point
 /// span or link boundary would panic the first `&text[a..b]` slice it meets
 /// (here or in the renderer), and scripts address lines by raw byte offsets.
-fn floor_char_boundary(text: &str, pos: usize) -> usize {
+/// Public so out-of-crate byte-offset consumers (the bench corpus slicer)
+/// share one definition.
+pub fn floor_char_boundary(text: &str, pos: usize) -> usize {
     let mut pos = pos.min(text.len());
     while pos > 0 && !text.is_char_boundary(pos) {
         pos -= 1;
@@ -1110,14 +1130,20 @@ impl StyledLine {
         // A zero length delta makes the splice remap a pure trim.
         let mut links = self.remap_links(begin, end, end - begin);
         if let Some(link) = link {
-            links.push(LinkSpan {
-                begin_pos: begin,
-                end_pos: end,
-                action: link.action,
-                tooltip: link.tooltip,
-                style: link.style,
-            });
-            links.sort_by_key(|link| link.begin_pos);
+            // The trimmed vec is already sorted; place the one new span.
+            // Deliberately no merging with equal-action neighbors: unlike a
+            // splice's runs, an adjacent link here is a distinct registration.
+            let at = links.partition_point(|existing| existing.begin_pos < begin);
+            links.insert(
+                at,
+                LinkSpan {
+                    begin_pos: begin,
+                    end_pos: end,
+                    action: link.action,
+                    tooltip: link.tooltip,
+                    style: link.style,
+                },
+            );
         }
         self.links = links;
     }

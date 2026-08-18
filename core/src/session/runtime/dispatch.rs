@@ -775,16 +775,22 @@ impl Inner<'_> {
                 isolate,
                 instance,
                 id,
+                token,
                 shift,
                 ctrl,
                 alt,
             } => {
                 // The UI addressed the session owning the clicked pane; a fragment
                 // echoed cross-session names its creating session here, so forward
-                // the click home — the callback lives in that engine.
+                // the click home — the callback lives in that engine. `token`
+                // rides along untouched: its presence in the queue is what pins
+                // the registry entry until the invoke actually runs.
                 if session == self.session_id {
-                    self.script_engine
-                        .invoke_link_callback(&isolate, instance, id, shift, ctrl, alt)
+                    let result = self
+                        .script_engine
+                        .invoke_link_callback(&isolate, instance, id, shift, ctrl, alt);
+                    drop(token);
+                    result
                 } else {
                     if let Some(runtime) = crate::session::registry::get_runtime(session) {
                         runtime
@@ -794,6 +800,7 @@ impl Inner<'_> {
                                 isolate,
                                 instance,
                                 id,
+                                token,
                                 shift,
                                 ctrl,
                                 alt,
@@ -810,13 +817,18 @@ impl Inner<'_> {
                 isolate,
                 instance,
                 id,
+                token,
                 state,
             } => {
                 // Like click callbacks, tooltip callbacks execute in the isolate
                 // that created the fragment, even when another session displays it.
+                // `token` pins the registry entry while the request is queued.
                 if session == self.session_id {
-                    self.script_engine
-                        .resolve_link_tooltip(&isolate, instance, id, state)
+                    let result = self
+                        .script_engine
+                        .resolve_link_tooltip(&isolate, instance, id, state);
+                    drop(token);
+                    result
                 } else {
                     if let Some(runtime) = crate::session::registry::get_runtime(session) {
                         if !send_link_tooltip(
@@ -826,6 +838,7 @@ impl Inner<'_> {
                                 isolate,
                                 instance,
                                 id,
+                                token,
                                 state,
                             },
                         ) {
@@ -2176,6 +2189,7 @@ mod tests {
                 isolate: IsolateId::Main,
                 instance: 1,
                 id: 2,
+                token: Arc::new(crate::session::styled_line::LinkToken::default()),
                 state: Arc::clone(&state),
             },
         ));

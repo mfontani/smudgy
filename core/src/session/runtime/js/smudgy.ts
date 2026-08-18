@@ -669,6 +669,12 @@ function __line_options(
             throw new TypeError("options.link must be a link(...) tag or null");
         }
     }
+    if (
+        options.foregroundPaletteBright !== undefined
+        && typeof options.foregroundPaletteBright !== "boolean"
+    ) {
+        throw new TypeError("options.foregroundPaletteBright must be a boolean");
+    }
     // Canonicalize colors and attributes here so the plain op path throws on
     // the same mistakes the styled path does (unknown color names, unknown
     // attribute keys, wrong types) instead of shipping them to a silently-
@@ -3373,6 +3379,13 @@ class Line {
             this._highlightLinked(Uint32Array.of(begin, end), resolved);
             return;
         }
+        this._highlightAtResolved(begin, end, resolved);
+    }
+
+    /** The link-free restyle dispatch over NORMALIZED (see `__line_options`)
+     *  options, so `highlight`'s per-occurrence loop validates once, not once
+     *  per range. */
+    _highlightAtResolved(begin: number, end: number, resolved: HighlightOptions): void {
         if (this._isCurrent) {
             op_smudgy_highlight(
                 begin,
@@ -3433,7 +3446,7 @@ class Line {
             return true;
         }
         for (const range of ranges) {
-            this.highlightAt(range.begin, range.end, resolved);
+            this._highlightAtResolved(range.begin, range.end, resolved);
         }
         return true;
     }

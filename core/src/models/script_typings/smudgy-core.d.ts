@@ -1638,10 +1638,11 @@ declare module "smudgy:core" {
    * })`room actions`}`;
    * ```
    *
-   * A command link works forever, even on old lines. A function link lives with the
-   * script that made it: after a script reload the text remains but clicking it does
-   * nothing, and only the most recent function links are kept, so a very old one can
-   * expire early. Prefer command links for anything long-lived.
+   * A command link works forever, even on old lines. A function link works for as
+   * long as its line is still anywhere on screen or in scrollback (any pane, any
+   * session) and the script that made it is loaded: after a script reload the text
+   * remains but clicking it does nothing. Prefer command links for text that
+   * should outlive the script.
    *
    * The tag also works directly as a highlight's options —
    * `line.highlight("goblin", link("kill goblin"))` makes every match

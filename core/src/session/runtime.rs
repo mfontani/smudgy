@@ -250,6 +250,7 @@ mod runtime_helper_tests {
             isolate: IsolateId::Main,
             instance: 1,
             id: 2,
+            token: Arc::new(crate::session::styled_line::LinkToken::default()),
             state: Arc::clone(&state),
         })
         .expect("open runtime queue");

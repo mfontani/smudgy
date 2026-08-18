@@ -209,6 +209,10 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         instance: u64,
         id: u64,
+        /// The clicked line's liveness anchor, carried so the registry entry
+        /// cannot be swept between the click and its dispatch (the line could
+        /// leave every buffer in that window).
+        token: Arc<crate::session::styled_line::LinkToken>,
         shift: bool,
         ctrl: bool,
         alt: bool,
@@ -222,6 +226,8 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         instance: u64,
         id: u64,
+        /// Pins the registry entry through dispatch, like the click's token.
+        token: Arc<crate::session::styled_line::LinkToken>,
         state: Arc<crate::session::styled_line::LinkTooltipState>,
     },
     CallJavascriptFunction {
