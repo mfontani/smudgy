@@ -293,6 +293,10 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
         },
     )
     .await;
+    // Drain before the snapshot so the log index below is a CAUSAL boundary:
+    // every envelope recorded past it was caused by Room.Map alone.
+    drain_mutation_queue(&mapper).await;
+    let mutations_before_room_map = local.mutation_log().len();
 
     tx.send(gmcp(
         "Room.Map",
@@ -322,10 +326,18 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     drain_mutation_queue(&mapper).await;
 
     // The engine commits a Room.Map snapshot through separate mutateArea gestures with
-    // host round-trips between them, so counting envelopes inside a time window is
-    // unsound. The boundary invariant is asserted by content instead: the rooms Room.Map
-    // alone knows about identify its envelopes wherever they fall in the log.
+    // host round-trips between them, so counting envelopes inside a TIME window is
+    // unsound — but the drains above and below are causal boundaries, so the log
+    // DELTA is exactly Room.Map's commits. Content identifies which envelope is
+    // which; the window length restores the "and nothing else" half a content
+    // filter cannot see (a spurious extra envelope, or topology split in two).
     let log = local.mutation_log();
+    let window = &log[mutations_before_room_map..];
+    assert_eq!(
+        window.len(),
+        2,
+        "Room.Map commits exactly one rooms envelope + one topology envelope:\n{window:#?}"
+    );
     let creates_reported_room = |envelope: &MutationEnvelope| {
         envelope.payload.iter().any(|op| {
             matches!(
@@ -335,7 +347,7 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
             )
         })
     };
-    let room_envelope_indices: Vec<usize> = log
+    let room_envelope_indices: Vec<usize> = window
         .iter()
         .enumerate()
         .filter(|(_, envelope)| creates_reported_room(envelope))
@@ -346,7 +358,7 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
         1,
         "Room.Map provisions its new rooms in one room/property envelope"
     );
-    let rooms_envelope = &log[room_envelope_indices[0]];
+    let rooms_envelope = &window[room_envelope_indices[0]];
     let created_numbers: Vec<RoomNumber> = rooms_envelope
         .payload
         .iter()
@@ -376,7 +388,7 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     let (key5542, _) = atlas_after_map
         .find_room_by_external_id("5542")
         .expect("provisioned room mapped");
-    let exit_envelope_indices: Vec<usize> = log
+    let exit_envelope_indices: Vec<usize> = window
         .iter()
         .enumerate()
         .filter(|(_, envelope)| {
