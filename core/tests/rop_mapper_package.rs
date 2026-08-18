@@ -3,33 +3,36 @@
 //! code-imported into that sandbox, proving the side-effect-free engine/subpath design.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use smudgy_cloud::{
     Area, AreaId, AreaUpdates, AreaWithDetails, CloudResult, CompositeBackend, CreateAreaRequest,
     Credential, CredentialSource, ExitDirection, LocalBackend, MapStorage, Mapper, MapperBackend,
-    PackageApiClient,
-    mutation::{MutationEnvelope, MutationResult},
+    PackageApiClient, RoomNumber,
+    mutation::{AreaMutation, MutationEnvelope, MutationResult},
 };
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
 use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
+use smudgy_core::session::{
+    BufferUpdate, SessionEvent, SessionId, SessionParams, TaggedSessionEvent, spawn,
+};
 
-const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const COMPLETION_TIMEOUT: Duration = Duration::from_mins(1);
+const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SERVER: &str = "RopMapperTest";
 
 /// A deterministic tier stand-in: CompositeBackend determines the public storage tier
 /// from routing membership, while this backend persists acknowledged bytes in a temporary
-/// LocalBackend and counts envelopes so the package test can exercise relocation without HTTP.
+/// LocalBackend and records envelopes so the package test can assert envelope boundaries
+/// and exercise relocation without HTTP.
 struct TestTierBackend {
     inner: LocalBackend,
     storage: MapStorage,
-    mutations: AtomicUsize,
+    mutations: Mutex<Vec<MutationEnvelope>>,
 }
 
 impl TestTierBackend {
@@ -37,12 +40,12 @@ impl TestTierBackend {
         Self {
             inner: LocalBackend::new(path),
             storage,
-            mutations: AtomicUsize::new(0),
+            mutations: Mutex::new(Vec::new()),
         }
     }
 
-    fn mutation_count(&self) -> usize {
-        self.mutations.load(Ordering::Relaxed)
+    fn mutation_log(&self) -> Vec<MutationEnvelope> {
+        self.mutations.lock().unwrap().clone()
     }
 }
 
@@ -82,7 +85,7 @@ impl MapperBackend for TestTierBackend {
         area_id: &AreaId,
         envelope: &MutationEnvelope,
     ) -> CloudResult<MutationResult> {
-        self.mutations.fetch_add(1, Ordering::Relaxed);
+        self.mutations.lock().unwrap().push(envelope.clone());
         self.inner.execute_mutation(area_id, envelope).await
     }
 }
@@ -146,6 +149,65 @@ fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
             lines.push(line.text.clone());
         }
     }
+}
+
+/// Wait for the operation's observable postcondition while continuing to collect session output.
+/// Durable mapper work can legitimately produce no events for seconds, so event-stream silence is
+/// never treated as completion.
+async fn wait_until<S, F>(events: &mut S, lines: &mut Vec<String>, description: &str, mut ready: F)
+where
+    S: Stream<Item = TaggedSessionEvent> + Unpin,
+    F: FnMut(&[String]) -> bool,
+{
+    let completed = tokio::time::timeout(COMPLETION_TIMEOUT, async {
+        loop {
+            if ready(lines) {
+                return true;
+            }
+            tokio::select! {
+                event = events.next() => {
+                    let Some(event) = event else {
+                        return false;
+                    };
+                    if let SessionEvent::UpdateBuffer(updates) = &event.event {
+                        collect(updates, lines);
+                    }
+                }
+                () = tokio::time::sleep(COMPLETION_POLL_INTERVAL) => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        matches!(completed, Ok(true)),
+        "timed out waiting for {description}.\n{}",
+        lines.join("\n")
+    );
+}
+
+/// Envelope commits ride the mapper's own queue, which keeps working after the session's
+/// event stream goes quiet; backend mutation counts are only comparable once it drains.
+async fn drain_mutation_queue(mapper: &Mapper) {
+    match mapper.wait_for_sync_completion(60).await {
+        Ok(true) => {}
+        Ok(false) => panic!("mutation queue still pending after 60 seconds"),
+        Err(()) => panic!("mutation queue reported failed operations"),
+    }
+}
+
+fn room_exists(mapper: &Mapper, external_id: &str) -> bool {
+    mapper
+        .get_current_atlas()
+        .find_room_by_external_id(external_id)
+        .is_some()
+}
+
+fn room_title_is(mapper: &Mapper, external_id: &str, title: &str) -> bool {
+    mapper
+        .get_current_atlas()
+        .find_room_by_external_id(external_id)
+        .is_some_and(|(_, room)| room.get_title() == title)
 }
 
 #[tokio::test]
@@ -220,12 +282,17 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
-    let mutations_before_room_map = local.mutation_count();
+    wait_until(
+        &mut events,
+        &mut lines,
+        "Room.Info to provision the center room and both exit neighbors",
+        |_| {
+            room_exists(&mapper, "5539")
+                && room_exists(&mapper, "5540")
+                && room_exists(&mapper, "5541")
+        },
+    )
+    .await;
 
     tx.send(gmcp(
         "Room.Map",
@@ -239,15 +306,98 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "Room.Map to provision and link the authoritative neighborhood",
+        |_| {
+            room_exists(&mapper, "5550")
+                && mapper
+                    .get_current_atlas()
+                    .find_room_by_external_id("5542")
+                    .is_some_and(|(_, room)| !room.get_exits().is_empty())
+        },
+    )
+    .await;
+    drain_mutation_queue(&mapper).await;
+
+    // The engine commits a Room.Map snapshot through separate mutateArea gestures with
+    // host round-trips between them, so counting envelopes inside a time window is
+    // unsound. The boundary invariant is asserted by content instead: the rooms Room.Map
+    // alone knows about identify its envelopes wherever they fall in the log.
+    let log = local.mutation_log();
+    let creates_reported_room = |envelope: &MutationEnvelope| {
+        envelope.payload.iter().any(|op| {
+            matches!(
+                op,
+                AreaMutation::CreateRoom { body, .. }
+                    if matches!(&body.external_id, Some(Some(id)) if id == "5542" || id == "5550")
+            )
+        })
+    };
+    let room_envelope_indices: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, envelope)| creates_reported_room(envelope))
+        .map(|(index, _)| index)
+        .collect();
     assert_eq!(
-        local.mutation_count() - mutations_before_room_map,
-        2,
-        "Room.Map commits one room/property envelope and one same-area topology envelope"
+        room_envelope_indices.len(),
+        1,
+        "Room.Map provisions its new rooms in one room/property envelope"
+    );
+    let rooms_envelope = &log[room_envelope_indices[0]];
+    let created_numbers: Vec<RoomNumber> = rooms_envelope
+        .payload
+        .iter()
+        .filter_map(|op| match op {
+            AreaMutation::CreateRoom { room_number, .. } => Some(*room_number),
+            _ => None,
+        })
+        .collect();
+    for number in &created_numbers {
+        assert!(
+            rooms_envelope.payload.iter().any(|op| matches!(
+                op,
+                AreaMutation::UpsertRoomProperty { room_number, name, .. }
+                    if room_number == number && name == "unvisited"
+            )),
+            "provisioned rooms carry their properties in the same envelope"
+        );
+    }
+    assert!(
+        rooms_envelope
+            .payload
+            .iter()
+            .all(|op| !matches!(op, AreaMutation::CreateExit { .. })),
+        "the room/property envelope carries no topology"
+    );
+    let atlas_after_map = mapper.get_current_atlas();
+    let (key5542, _) = atlas_after_map
+        .find_room_by_external_id("5542")
+        .expect("provisioned room mapped");
+    let exit_envelope_indices: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, envelope)| {
+            envelope.payload.iter().any(|op| {
+                matches!(
+                    op,
+                    AreaMutation::CreateExit { room_number, .. }
+                        if *room_number == key5542.room_number
+                )
+            })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        exit_envelope_indices.len(),
+        1,
+        "Room.Map links its same-area topology in one envelope"
+    );
+    assert!(
+        room_envelope_indices[0] < exit_envelope_indices[0],
+        "rooms and properties commit before the topology that links them"
     );
 
     // The north command is refused without a Room.Info acknowledgement. The following
@@ -264,11 +414,13 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     ))
     .unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the east move's Room.Info to retitle the east room",
+        |_| room_title_is(&mapper, "5541", "The Training Grounds"),
+    )
+    .await;
 
     let local_atlas = mapper.get_current_atlas();
     let (local_key, _) = local_atlas
@@ -282,11 +434,18 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
 
     tx.send(RuntimeAction::Send(Arc::new("ropmap upgrade".to_string())))
         .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "ropmap upgrade to relocate the map into cloud storage",
+        |_| {
+            mapper
+                .get_current_atlas()
+                .find_room_by_external_id("5539")
+                .is_some_and(|(key, _)| mapper.area_storage(&key.area_id) == MapStorage::Cloud)
+        },
+    )
+    .await;
 
     // A post-upgrade revisit must write through the rebound cloud area, proving the
     // mapper did not retain its deleted local-area handle after relocation.
@@ -300,11 +459,13 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
              } }"#,
     ))
     .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the post-upgrade revisit to retitle the center room",
+        |_| room_title_is(&mapper, "5539", "The Bishop's Private Room (cloud)"),
+    )
+    .await;
     let transcript = lines.join("\n");
     assert_eq!(
         lines
