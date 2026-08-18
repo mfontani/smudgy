@@ -204,7 +204,10 @@ async fn run_scenario(
     }
     tx.send(RuntimeAction::Shutdown).ok();
 
-    assert!(sent, "gate sentinel {gate:?} (x{gate_count}) was never observed; transcript:\n{lines:#?}");
+    assert!(
+        sent,
+        "gate sentinel {gate:?} (x{gate_count}) was never observed; transcript:\n{lines:#?}"
+    );
     lines
 }
 
@@ -456,7 +459,9 @@ async fn failing_sandboxed_package_is_skipped_without_aborting() {
         "the session must survive a failing sandboxed package and keep firing main aliases; transcript:\n{lines:#?}"
     );
     assert!(
-        lines.iter().any(|l| l.starts_with("[package] broken failed to load")),
+        lines
+            .iter()
+            .any(|l| l.starts_with("[package] broken failed to load")),
         "the failing package must be reported (skipped, not silently ignored); transcript:\n{lines:#?}"
     );
 }

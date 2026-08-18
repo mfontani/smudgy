@@ -270,7 +270,9 @@ fn sync(
         Presence::Idle => "idle (no session connected)".to_string(),
         Presence::Playing { server_label, .. } => format!("on {server_label}"),
     };
-    let Some(active) = client.as_mut() else { return };
+    let Some(active) = client.as_mut() else {
+        return;
+    };
     // The crate's `set_activity` is send-only; read Discord's response frame
     // ourselves — it carries the verdict ("evt":"ERROR" plus a message when
     // the payload is rejected), and leaving it unread would let replies pile
@@ -293,7 +295,10 @@ mod tests {
 
     #[test]
     fn label_prefers_the_hostname() {
-        assert_eq!(server_label("mud.arctic.org", "ArcticMUD"), "mud.arctic.org");
+        assert_eq!(
+            server_label("mud.arctic.org", "ArcticMUD"),
+            "mud.arctic.org"
+        );
         assert_eq!(
             server_label(" tdome.nukefire.org ", "Thunderdome"),
             "tdome.nukefire.org"
@@ -312,7 +317,11 @@ mod tests {
             "[::1]",
             "2001:db8::7334",
         ] {
-            assert_eq!(server_label(host, "ArcticMUD"), "ArcticMUD", "host {host:?}");
+            assert_eq!(
+                server_label(host, "ArcticMUD"),
+                "ArcticMUD",
+                "host {host:?}"
+            );
         }
     }
 }

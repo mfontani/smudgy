@@ -140,11 +140,21 @@ async fn line_text_search_edits_apply_to_every_occurrence() {
     let highlighted = lines
         .iter()
         .find(|l| l.text == hl_incoming)
-        .unwrap_or_else(|| panic!("the HL line must still be delivered.\nTranscript:\n{transcript}"));
+        .unwrap_or_else(|| {
+            panic!("the HL line must still be delivered.\nTranscript:\n{transcript}")
+        });
     let red_texts: Vec<&str> = highlighted
         .spans
         .iter()
-        .filter(|span| matches!(span.style.fg, Color::Ansi { color: AnsiColor::Red, .. }))
+        .filter(|span| {
+            matches!(
+                span.style.fg,
+                Color::Ansi {
+                    color: AnsiColor::Red,
+                    ..
+                }
+            )
+        })
         .map(|span| &highlighted.text[span.begin_pos..span.end_pos])
         .collect();
     assert_eq!(

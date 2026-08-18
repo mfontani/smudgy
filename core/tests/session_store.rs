@@ -484,7 +484,9 @@ echo("ATCAP:" + store.get("user", "vitals.hp"));
 "#;
 
 async fn run_module(session_id: u32, server: &str, source: &str) -> Vec<String> {
-    run_module_counting_wakes(session_id, server, source).await.0
+    run_module_counting_wakes(session_id, server, source)
+        .await
+        .0
 }
 
 /// Like [`run_module`], but also counts the `StoreBindingsChanged` repaint wakes observed on
@@ -689,10 +691,19 @@ async fn store_round_trip_watch_coalescing_and_flush_before_dispatch() {
     let transcript = lines.join("\n");
 
     // Read-your-writes, with case-folded path lookups (write `Char.Vitals`, read `char.vitals.HP`).
-    assert!(lines.iter().any(|l| l == "RW:10"), "read-your-writes within the turn.\n{transcript}");
+    assert!(
+        lines.iter().any(|l| l == "RW:10"),
+        "read-your-writes within the turn.\n{transcript}"
+    );
     // Absent path vs stored null are distinguishable.
-    assert!(lines.iter().any(|l| l == "ABSENT:undefined"), "absent reads as undefined.\n{transcript}");
-    assert!(lines.iter().any(|l| l == "NIL:null"), "a stored null reads as null.\n{transcript}");
+    assert!(
+        lines.iter().any(|l| l == "ABSENT:undefined"),
+        "absent reads as undefined.\n{transcript}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "NIL:null"),
+        "a stored null reads as null.\n{transcript}"
+    );
 
     // Turn-coalesced watch: the module turn's three writes produce ONE delivery with the final
     // state, and it arrives after the turn's synchronous echoes.
@@ -728,7 +739,10 @@ async fn unwatch_stops_deliveries_and_enumeration_keeps_first_published_casing()
     let lines = run_module(7302, "StoreUnwatch", UNWATCH_TS).await;
     let transcript = lines.join("\n");
 
-    assert!(lines.iter().any(|l| l == "W:1"), "the live watch delivers.\n{transcript}");
+    assert!(
+        lines.iter().any(|l| l == "W:1"),
+        "the live watch delivers.\n{transcript}"
+    );
     assert!(
         !lines.iter().any(|l| l == "W:2"),
         "no delivery after unwatch.\n{transcript}"
@@ -738,7 +752,10 @@ async fn unwatch_stops_deliveries_and_enumeration_keeps_first_published_casing()
         lines.iter().any(|l| l == r#"FINAL:{"Foo":1,"Bar":2}"#),
         "first-published casing is preserved; later-cased writes land on the folded keys.\n{transcript}"
     );
-    assert!(lines.iter().any(|l| l == "X:2"), "the post-unwatch write still lands.\n{transcript}");
+    assert!(
+        lines.iter().any(|l| l == "X:2"),
+        "the post-unwatch write still lands.\n{transcript}"
+    );
 }
 
 #[tokio::test]
@@ -771,10 +788,22 @@ async fn value_proxy_publishes_set_at_path_per_assignment() {
     let lines = run_module(7305, "StoreValueProxy", VALUE_PROXY_TS).await;
     let transcript = lines.join("\n");
 
-    assert!(lines.iter().any(|l| l == "VAL:11"), "proxy reads see the turn's writes.\n{transcript}");
-    assert!(lines.iter().any(|l| l == "NEST:6"), "nested assignment lands at its path.\n{transcript}");
-    assert!(lines.iter().any(|l| l == "DEL:undefined"), "delete removes the key.\n{transcript}");
-    assert!(lines.iter().any(|l| l == r#"KEYS:["hp"]"#), "enumeration reads live state.\n{transcript}");
+    assert!(
+        lines.iter().any(|l| l == "VAL:11"),
+        "proxy reads see the turn's writes.\n{transcript}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "NEST:6"),
+        "nested assignment lands at its path.\n{transcript}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "DEL:undefined"),
+        "delete removes the key.\n{transcript}"
+    );
+    assert!(
+        lines.iter().any(|l| l == r#"KEYS:["hp"]"#),
+        "enumeration reads live state.\n{transcript}"
+    );
     assert!(
         lines.iter().any(|l| l == r#"WHOLE:{"fresh":1}"#),
         "assigning .value replaces the whole published value.\n{transcript}"
@@ -782,7 +811,9 @@ async fn value_proxy_publishes_set_at_path_per_assignment() {
     // The proxy's writes each published at exactly the assigned path (interop.md §4a): the bulk
     // set, two leaf assignments, the delete's parent rewrite, and the whole-value assign.
     assert!(
-        lines.iter().any(|l| l == r#"PATHS:["vitals","vitals.hp","vitals.stats.str","vitals","vitals"]"#),
+        lines
+            .iter()
+            .any(|l| l == r#"PATHS:["vitals","vitals.hp","vitals.stats.str","vitals","vitals"]"#),
         "every assignment is one set-at-path at the assigned path.\n{transcript}"
     );
 }
@@ -910,7 +941,9 @@ async fn previous_value_anchors_to_the_newest_write_batch() {
         "after the first commit the state before the first batch is still absence.\n{transcript}"
     );
     assert!(
-        lines.iter().any(|l| l == r#"P3:{"hp":1,"stats":{"str":5}}:2"#),
+        lines
+            .iter()
+            .any(|l| l == r#"P3:{"hp":1,"stats":{"str":5}}:2"#),
         "mid-batch, previousValue is the batch's committed base (materializable whole).\n{transcript}"
     );
     assert!(
@@ -1006,7 +1039,10 @@ async fn bindings_mint_deduped_tokens_and_wake_per_writing_turn() {
         lines.iter().any(|l| l == "DISTINCT:true"),
         "a different path gets its own binding id.\n{transcript}"
     );
-    assert!(lines.iter().any(|l| l == "DONE"), "the module ran to completion.\n{transcript}");
+    assert!(
+        lines.iter().any(|l| l == "DONE"),
+        "the module ran to completion.\n{transcript}"
+    );
     // Turn 1 (subtree write) and turn 2 (bound-path write) each wake the UI once; turn 3
     // (a write with no binding at, above, or below it) wakes nothing.
     assert_eq!(

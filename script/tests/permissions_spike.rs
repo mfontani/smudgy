@@ -23,11 +23,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use deno_core::{serde_v8, FastString, PollEventLoopOptions};
+use deno_core::{FastString, PollEventLoopOptions, serde_v8};
 use serde_json::Value;
 use smudgy_script::{
-    native_ipc_grants, permission_descriptor_parser, IpcEntry, ModulePolicy, OpenAccessKind,
-    Permissions, PermissionsContainer, PermissionsOptions, ScriptRuntime, ScriptRuntimeOptions,
+    IpcEntry, ModulePolicy, OpenAccessKind, Permissions, PermissionsContainer, PermissionsOptions,
+    ScriptRuntime, ScriptRuntimeOptions, native_ipc_grants, permission_descriptor_parser,
 };
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
@@ -478,9 +478,11 @@ fn any_host_wildcard_does_not_cover_local_transports() -> Result<()> {
         ..Default::default()
     };
     let mut permissions = permissions_container(&opts)?;
-    assert!(permissions
-        .check_net(&("example.com", Some(443)), "wildcard-test")
-        .is_ok());
+    assert!(
+        permissions
+            .check_net(&("example.com", Some(443)), "wildcard-test")
+            .is_ok()
+    );
     assert!(
         permissions
             .check_net_vsock(2, 1234, "wildcard-test")

@@ -15,9 +15,9 @@ use smudgy_cloud::AreaId;
 use uuid::Uuid;
 
 use super::state::{
-    API_KEY_PREFIX, ApiKeyRecord, AreaPropRecord, AreaRecord, AtlasRecord, BlockRecord,
-    ExitRecord, FriendStatus, FriendshipRecord, GrantRecord, LabelRecord, MockState,
-    RoomPropRecord, RoomRecord, SESSION_PREFIX, SessionRecord, ShapeRecord, UserRecord, gen_token,
+    API_KEY_PREFIX, ApiKeyRecord, AreaPropRecord, AreaRecord, AtlasRecord, BlockRecord, ExitRecord,
+    FriendStatus, FriendshipRecord, GrantRecord, LabelRecord, MockState, RoomPropRecord,
+    RoomRecord, SESSION_PREFIX, SessionRecord, ShapeRecord, UserRecord, gen_token,
 };
 use super::{areas, clone, identity, mutations, shares, social, transfers};
 
@@ -200,12 +200,27 @@ fn router(state: Shared) -> Router {
         // atlas copy
         .route("/atlases/:atlas_id/copy", post(clone::copy_atlas))
         // ownership transfer
-        .route("/areas/:area_id/transfer", post(transfers::create_area_transfer))
-        .route("/atlases/:atlas_id/transfer", post(transfers::create_atlas_transfer))
+        .route(
+            "/areas/:area_id/transfer",
+            post(transfers::create_area_transfer),
+        )
+        .route(
+            "/atlases/:atlas_id/transfer",
+            post(transfers::create_atlas_transfer),
+        )
         .route("/transfers", get(transfers::list_transfers))
-        .route("/transfers/:transfer_id/accept", post(transfers::accept_transfer))
-        .route("/transfers/:transfer_id/decline", post(transfers::decline_transfer))
-        .route("/transfers/:transfer_id", delete(transfers::cancel_transfer))
+        .route(
+            "/transfers/:transfer_id/accept",
+            post(transfers::accept_transfer),
+        )
+        .route(
+            "/transfers/:transfer_id/decline",
+            post(transfers::decline_transfer),
+        )
+        .route(
+            "/transfers/:transfer_id",
+            delete(transfers::cancel_transfer),
+        )
         // Mirror the server's pre-routing version gate (see `function_handler`):
         // every request passes through it before any handler runs.
         .layer(middleware::from_fn_with_state(state.clone(), version_gate))
@@ -230,11 +245,12 @@ async fn version_gate(State(state): State<Shared>, request: Request, next: Next)
     let mut response = next.run(request).await;
     // Soft upgrade hint for an in-range client, mirroring the server.
     if let Some(newest) = upgrade
-        && let Ok(value) = HeaderValue::from_str(&newest) {
-            response
-                .headers_mut()
-                .insert("x-smudgy-upgrade-available", value);
-        }
+        && let Ok(value) = HeaderValue::from_str(&newest)
+    {
+        response
+            .headers_mut()
+            .insert("x-smudgy-upgrade-available", value);
+    }
     response
 }
 

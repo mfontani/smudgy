@@ -19,8 +19,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Rust
+        run: rustup toolchain install --no-self-update
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   test:
     name: Test (${{ matrix.os }})
+    needs: fmt
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,10 +46,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Select stable Rust
-        run: |
-          rustup update stable --no-self-update
-          rustup default stable
+      - name: Install pinned Rust
+        run: rustup toolchain install --no-self-update
 
       - name: Install Linux webview dependencies
         if: runner.os == 'Linux'
@@ -51,7 +64,7 @@ jobs:
             ~/.cargo/git/db/
             ~/.cargo/bin/cargo-patch-crate*
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 

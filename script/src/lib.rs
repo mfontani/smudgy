@@ -31,7 +31,7 @@ pub use deno_permissions::{
 };
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use deno_runtime::deno_inspector_server::{
-    create_inspector_server, InspectPublishUid, InspectorServer,
+    InspectPublishUid, InspectorServer, create_inspector_server,
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
 pub use deno_web::InMemoryBroadcastChannel;
@@ -40,14 +40,14 @@ use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
 pub use package_resolver::{
-    canonical_url, is_any_host_net_entry, is_local_transport_net_entry,
-    is_windows_pipe_namespace_entry, native_ipc_grants, native_ipc_path, params_module_url,
-    parse_canonical, parse_params_url, platform_event_catalog, platform_state_producer,
-    CanonicalCoords, ImportPolicy, InMemoryPackageProvider, IpcEntry, IpcEntryIssue, IpcGrants,
-    PackageDependency, PackageError, PackageKey, PackageManifest, PackageModuleSource,
-    PackageParameter, PackagePermissions, PackageProvider, ParamKind, ParamOption, ReferrerRef,
-    ResolvedPackage, SmudgyCapabilities, SmudgySpecifier, SmudgySpecifierError, CANONICAL_SCHEME,
-    EVENTS_SCHEME, MARKER_SCHEME, PARAMS_SCHEME, STATE_SCHEME,
+    CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy, InMemoryPackageProvider,
+    IpcEntry, IpcEntryIssue, IpcGrants, MARKER_SCHEME, PARAMS_SCHEME, PackageDependency,
+    PackageError, PackageKey, PackageManifest, PackageModuleSource, PackageParameter,
+    PackagePermissions, PackageProvider, ParamKind, ParamOption, ReferrerRef, ResolvedPackage,
+    STATE_SCHEME, SmudgyCapabilities, SmudgySpecifier, SmudgySpecifierError, canonical_url,
+    is_any_host_net_entry, is_local_transport_net_entry, is_windows_pipe_namespace_entry,
+    native_ipc_grants, native_ipc_path, params_module_url, parse_canonical, parse_params_url,
+    platform_event_catalog, platform_state_producer,
 };
 
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.

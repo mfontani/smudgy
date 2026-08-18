@@ -2,6 +2,7 @@
 
 use iced::font::Weight;
 
+use crate::i18n::{t, ts};
 use iced::widget::{
     Column, Row, TextInput, button, column, container, scrollable,
     space::{horizontal as horizontal_space, vertical as vertical_space},
@@ -10,7 +11,6 @@ use iced::widget::{
 use iced::{Alignment, Font, Length, Padding, Pixels, Task};
 use log::warn;
 use validator::Validate;
-use crate::i18n::{t, ts};
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::Element;
@@ -91,7 +91,8 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
                 send_on_connect: state.profile_form_send_on_connect_content.text(),
             };
             if let Err(e) = config.validate() {
-                state.profile_crud_error = Some(t!("profile-error-config", "error" => e.to_string()));
+                state.profile_crud_error =
+                    Some(t!("profile-error-config", "error" => e.to_string()));
                 return Task::none();
             }
             let profile_name = state.profile_form_data.name.trim().to_string();
@@ -114,7 +115,8 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
                 send_on_connect: state.profile_form_send_on_connect_content.text(),
             };
             if let Err(e) = config.validate() {
-                state.profile_crud_error = Some(t!("profile-error-config", "error" => e.to_string()));
+                state.profile_crud_error =
+                    Some(t!("profile-error-config", "error" => e.to_string()));
                 return Task::none();
             }
             Task::perform(
@@ -146,10 +148,13 @@ pub(super) fn view_profile_form<'a>(
         ProfileCrudAction::Create => {
             let name_field = column![
                 field_label(t!("profile-name")),
-                TextInput::new(ts!("profile-name-placeholder"), &state.profile_form_data.name)
-                    .id(profile_name_input_id())
-                    .on_input(|val| Message::UpdateProfileFormField(ProfileFormField::Name, val))
-                    .on_submit(Message::SubmitProfileForm),
+                TextInput::new(
+                    ts!("profile-name-placeholder"),
+                    &state.profile_form_data.name
+                )
+                .id(profile_name_input_id())
+                .on_input(|val| Message::UpdateProfileFormField(ProfileFormField::Name, val))
+                .on_submit(Message::SubmitProfileForm),
             ]
             .spacing(4);
 
@@ -257,10 +262,13 @@ fn form_title<'a>(verb: String, state: &'a State) -> Element<'a, Message> {
 fn description_field(state: &State) -> Element<'_, Message> {
     column![
         field_label(t!("profile-description")),
-        TextInput::new(ts!("profile-description-placeholder"), &state.profile_form_data.description)
-            .id(profile_description_input_id())
-            .on_input(|val| Message::UpdateProfileFormField(ProfileFormField::Description, val))
-            .on_submit(Message::SubmitProfileForm),
+        TextInput::new(
+            ts!("profile-description-placeholder"),
+            &state.profile_form_data.description
+        )
+        .id(profile_description_input_id())
+        .on_input(|val| Message::UpdateProfileFormField(ProfileFormField::Description, val))
+        .on_submit(Message::SubmitProfileForm),
     ]
     .spacing(4)
     .into()
@@ -321,7 +329,11 @@ fn on_connect_field(state: &State) -> Element<'_, Message> {
 fn password_control(state: &State) -> Element<'_, Message> {
     if state.profile_form_password_stored && !state.profile_form_password_editing {
         Row::new()
-            .push(text(t!("profile-password-saved")).size(12).style(builtins::text::muted))
+            .push(
+                text(t!("profile-password-saved"))
+                    .size(12)
+                    .style(builtins::text::muted),
+            )
             .push(horizontal_space())
             .push(
                 button(text(t!("profile-password-change")).size(12))
@@ -341,11 +353,14 @@ fn password_control(state: &State) -> Element<'_, Message> {
     } else {
         column![
             field_label(t!("profile-password-label")),
-            TextInput::new(ts!("profile-password-placeholder"), &state.profile_form_password)
-                .secure(true)
-                .id(profile_password_input_id())
-                .on_input(Message::UpdateProfileFormPassword)
-                .on_submit(Message::SubmitProfileForm),
+            TextInput::new(
+                ts!("profile-password-placeholder"),
+                &state.profile_form_password
+            )
+            .secure(true)
+            .id(profile_password_input_id())
+            .on_input(Message::UpdateProfileFormPassword)
+            .on_submit(Message::SubmitProfileForm),
         ]
         .spacing(4)
         .into()
@@ -420,10 +435,7 @@ pub(super) fn view_server_details_and_profiles<'a>(
             })
             .into(),
         (None, false) => {
-            column![
-                text(t!("profiles-load-error")).style(builtins::text::danger)
-            ]
-            .into()
+            column![text(t!("profiles-load-error")).style(builtins::text::danger)].into()
         }
     };
 

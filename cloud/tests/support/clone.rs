@@ -293,7 +293,9 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
     }
     let mut target_visible: HashMap<Uuid, bool> = HashMap::new();
     for (src, _) in area_map {
-        let Some(area) = st.areas.get(src) else { continue };
+        let Some(area) = st.areas.get(src) else {
+            continue;
+        };
         for exit in &area.exits {
             if let Some(target) = exit.to_area_id {
                 target_visible.entry(target).or_insert_with(|| {
@@ -315,9 +317,7 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
             let clone = st.areas.get_mut(new_area).expect("clone header exists");
             for room in source.rooms.values().filter(|r| see || !r.is_secret) {
                 let mut copied = room.clone();
-                copied
-                    .properties
-                    .retain(|_, p| see || !p.is_secret);
+                copied.properties.retain(|_, p| see || !p.is_secret);
                 for prop in copied.properties.values() {
                     if prop.is_secret {
                         bump_count_secret += 1;
@@ -354,7 +354,11 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
                 }
                 clone.shapes.push(copied);
             }
-            for (name, prop) in source.properties.iter().filter(|(_, p)| see || !p.is_secret) {
+            for (name, prop) in source
+                .properties
+                .iter()
+                .filter(|(_, p)| see || !p.is_secret)
+            {
                 if prop.is_secret {
                     bump_count_secret += 1;
                 } else {
@@ -420,7 +424,11 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
                 None => (None, None, None),
                 Some(target) => {
                     if let Some(mapped) = remap.get(&target) {
-                        (Some(*mapped), exit.to_room_number, exit.to_direction.clone())
+                        (
+                            Some(*mapped),
+                            exit.to_room_number,
+                            exit.to_direction.clone(),
+                        )
                     } else if target_visible.get(&target).copied().unwrap_or(false) {
                         (Some(target), exit.to_room_number, exit.to_direction.clone())
                     } else {
@@ -625,9 +633,7 @@ pub async fn copy_atlas(
         }
     }
 
-    let new_name = req
-        .name
-        .unwrap_or_else(|| format!("{atlas_name} (copy)"));
+    let new_name = req.name.unwrap_or_else(|| format!("{atlas_name} (copy)"));
     let new_atlas_id = Uuid::new_v4();
     st.atlases.insert(
         new_atlas_id,
@@ -639,8 +645,7 @@ pub async fn copy_atlas(
         },
     );
 
-    let area_map: Vec<(Uuid, Uuid)> =
-        copyable.iter().map(|src| (*src, Uuid::new_v4())).collect();
+    let area_map: Vec<(Uuid, Uuid)> = copyable.iter().map(|src| (*src, Uuid::new_v4())).collect();
     let mut copied: Vec<Uuid> = Vec::new();
     for (src, new_area) in &area_map {
         let (src_rev, src_name) = {

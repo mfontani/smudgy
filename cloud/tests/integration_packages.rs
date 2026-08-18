@@ -18,13 +18,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use smudgy_cloud::{
-    highest_satisfying_version, Credential, CredentialSource, CloudError, PackageApiClient,
-    PublishDependency, PublishModule,
+    CloudError, Credential, CredentialSource, PackageApiClient, PublishDependency, PublishModule,
+    highest_satisfying_version,
 };
 
 // --- mock state ------------------------------------------------------------
@@ -168,7 +168,11 @@ fn mock_validate(modules: &[Value], manifest: &Value) -> Option<Response> {
 
 /// `…/versions/begin` — validate (mirroring the server) and return a presigned PUT per body
 /// not already stored (content-addressed dedup). Writes nothing.
-async fn begin_version(State(state): State<Shared>, Path(id): Path<Uuid>, body: String) -> Response {
+async fn begin_version(
+    State(state): State<Shared>,
+    Path(id): Path<Uuid>,
+    body: String,
+) -> Response {
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return mock_bad_request("invalid JSON body");
     };
@@ -190,7 +194,10 @@ async fn begin_version(State(state): State<Shared>, Path(id): Path<Uuid>, body: 
     }
     // Fast duplicate/retired pre-check (the authoritative re-check is in finalize). A number
     // is permanently reserved once published: reject a live duplicate OR a retired number.
-    let taken = st.packages[pkg].versions.iter().any(|v| v.version == version)
+    let taken = st.packages[pkg]
+        .versions
+        .iter()
+        .any(|v| v.version == version)
         || st.packages[pkg].retired.contains(&version);
     if taken {
         return mock_version_unavailable(&version);
@@ -263,7 +270,10 @@ async fn finalize_version(
     if version.contains('+') {
         return mock_bad_request("build metadata not allowed");
     }
-    let taken = st.packages[pkg].versions.iter().any(|v| v.version == version)
+    let taken = st.packages[pkg]
+        .versions
+        .iter()
+        .any(|v| v.version == version)
         || st.packages[pkg].retired.contains(&version);
     if taken {
         return mock_version_unavailable(&version);
@@ -302,11 +312,14 @@ async fn finalize_version(
         dependencies,
         yanked: false,
     });
-    envelope(201, json!({
-        "id": version_id, "package_id": id, "version": version,
-        "manifest": manifest, "modules": module_meta,
-        "published_at": "2026-06-20T00:00:00Z",
-    }))
+    envelope(
+        201,
+        json!({
+            "id": version_id, "package_id": id, "version": version,
+            "manifest": manifest, "modules": module_meta,
+            "published_at": "2026-06-20T00:00:00Z",
+        }),
+    )
 }
 
 /// Live (newest-first) + retired entries, mirroring the real `list_versions`: yanked
@@ -321,13 +334,12 @@ fn version_list_json(pkg: &MockPackage) -> Vec<Value> {
         .map(|v| (v.version.clone(), v.yanked, false))
         .chain(pkg.retired.iter().map(|v| (v.clone(), false, true)))
         .collect();
-    combined.sort_by(|a, b| match (
-        semver::Version::parse(&a.0),
-        semver::Version::parse(&b.0),
-    ) {
-        (Ok(va), Ok(vb)) => vb.cmp(&va),
-        _ => b.0.cmp(&a.0),
-    });
+    combined.sort_by(
+        |a, b| match (semver::Version::parse(&a.0), semver::Version::parse(&b.0)) {
+            (Ok(va), Ok(vb)) => vb.cmp(&va),
+            _ => b.0.cmp(&a.0),
+        },
+    );
     combined
         .into_iter()
         .map(|(version, yanked, deleted)| {
@@ -376,16 +388,26 @@ async fn delete_version(
     };
     // Heavy, two-step: a version must be yanked before it can be deleted.
     if !pkg.versions[idx].yanked {
-        return (StatusCode::CONFLICT, Json(json!({ "success": false, "data": null, "error": "version_not_yanked" }))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "success": false, "data": null, "error": "version_not_yanked" })),
+        )
+            .into_response();
     }
     pkg.versions.remove(idx);
     pkg.retired.push(version); // number stays permanently reserved
     StatusCode::OK.into_response()
 }
 
-async fn resolve(State(state): State<Shared>, Query(params): Query<HashMap<String, String>>) -> Response {
+async fn resolve(
+    State(state): State<Shared>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     let name = params.get("name").cloned().unwrap_or_default();
-    let range = params.get("version").cloned().unwrap_or_else(|| "latest".to_string());
+    let range = params
+        .get("version")
+        .cloned()
+        .unwrap_or_else(|| "latest".to_string());
     let st = state.lock().unwrap();
     let Some(pkg) = st.packages.iter().find(|p| p.name == name) else {
         return envelope(404, Value::Null);
@@ -401,11 +423,13 @@ async fn resolve(State(state): State<Shared>, Query(params): Query<HashMap<Strin
     let modules: Vec<Value> = version
         .modules
         .iter()
-        .map(|m| json!({
-            "subpath": m.subpath, "content_hash": m.content_hash, "media_type": m.media_type,
-            "byte_size": m.byte_size, "is_entry": m.is_entry,
-            "content_url": format!("{}/packages/blob/{}", st.base_url, m.content_hash),
-        }))
+        .map(|m| {
+            json!({
+                "subpath": m.subpath, "content_hash": m.content_hash, "media_type": m.media_type,
+                "byte_size": m.byte_size, "is_entry": m.is_entry,
+                "content_url": format!("{}/packages/blob/{}", st.base_url, m.content_hash),
+            })
+        })
         .collect();
     // Mirror the server: surface the locked deps in resolve-shape (drop the publish range).
     let dependencies: Vec<Value> = version
@@ -413,20 +437,25 @@ async fn resolve(State(state): State<Shared>, Query(params): Query<HashMap<Strin
         .as_array()
         .map(|deps| {
             deps.iter()
-                .map(|d| json!({
-                    "owner_nickname": d["owner_nickname"],
-                    "name": d["name"],
-                    "range": d["range"],
-                    "resolved_version": d["resolved_version"],
-                }))
+                .map(|d| {
+                    json!({
+                        "owner_nickname": d["owner_nickname"],
+                        "name": d["name"],
+                        "range": d["range"],
+                        "resolved_version": d["resolved_version"],
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
-    envelope(200, json!({
-        "package_id": pkg.id, "owner_nickname": st.owner_nickname, "name": pkg.name,
-        "version": version.version, "manifest": version.manifest, "is_public": pkg.is_public,
-        "aligned_hosts": [], "modules": modules, "dependencies": dependencies,
-    }))
+    envelope(
+        200,
+        json!({
+            "package_id": pkg.id, "owner_nickname": st.owner_nickname, "name": pkg.name,
+            "version": version.version, "manifest": version.manifest, "is_public": pkg.is_public,
+            "aligned_hosts": [], "modules": modules, "dependencies": dependencies,
+        }),
+    )
 }
 
 async fn get_blob(State(state): State<Shared>, Path(hash): Path<String>) -> Response {
@@ -488,7 +517,10 @@ async fn create_publish_resolve_fetch_round_trip() {
     let api = client(&base_url);
 
     // Create the namespace.
-    let pkg = api.create_package("mapper", "A mapper").await.expect("create package");
+    let pkg = api
+        .create_package("mapper", "A mapper")
+        .await
+        .expect("create package");
     assert_eq!(pkg.name, "mapper");
 
     // Publish a version with two modules.
@@ -515,12 +547,19 @@ async fn create_publish_resolve_fetch_round_trip() {
     assert_eq!(published.modules.len(), 2);
 
     // Resolve and fetch each body with the client's integrity check.
-    let resolved = api.resolve_package("wbk", "mapper", None).await.expect("resolve");
+    let resolved = api
+        .resolve_package("wbk", "mapper", None)
+        .await
+        .expect("resolve");
     assert_eq!(resolved.version, "1.0.0");
     assert_eq!(resolved.owner_nickname, "wbk");
     assert_eq!(resolved.modules.len(), 2);
 
-    let entry = resolved.modules.iter().find(|m| m.is_entry).expect("entry module");
+    let entry = resolved
+        .modules
+        .iter()
+        .find(|m| m.is_entry)
+        .expect("entry module");
     let body = api
         .fetch_module_body(&entry.content_url, &entry.content_hash)
         .await
@@ -540,7 +579,10 @@ async fn logged_out_client_resolves_public_package_but_not_writes() {
 
     // A signed-in author publishes a version.
     let author = client(&base_url);
-    let pkg = author.create_package("mapper", "A mapper").await.expect("create");
+    let pkg = author
+        .create_package("mapper", "A mapper")
+        .await
+        .expect("create");
     let modules = vec![PublishModule {
         subpath: "index.ts".to_string(),
         content: "export const x = 1;".to_string().into_bytes(),
@@ -560,7 +602,11 @@ async fn logged_out_client_resolves_public_package_but_not_writes() {
         .await
         .expect("anonymous resolve of a public package");
     assert_eq!(resolved.version, "1.0.0");
-    let entry = resolved.modules.iter().find(|m| m.is_entry).expect("entry module");
+    let entry = resolved
+        .modules
+        .iter()
+        .find(|m| m.is_entry)
+        .expect("entry module");
     let body = anon
         .fetch_module_body(&entry.content_url, &entry.content_hash)
         .await
@@ -587,7 +633,9 @@ async fn fetch_with_wrong_hash_is_integrity_error() {
         media_type: "application/typescript".to_string(),
         is_entry: true,
     }];
-    api.publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None).await.unwrap();
+    api.publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None)
+        .await
+        .unwrap();
     let resolved = api.resolve_package("wbk", "mapper", None).await.unwrap();
     let url = &resolved.modules[0].content_url;
 
@@ -617,10 +665,15 @@ async fn binary_module_round_trips() {
     let m = &resolved.modules[0];
     assert_eq!(m.media_type, "application/octet-stream");
     // The bytes round-trip exactly; a String fetch rejects the non-UTF-8 body.
-    let fetched = api.fetch_module_bytes(&m.content_url, &m.content_hash).await.unwrap();
+    let fetched = api
+        .fetch_module_bytes(&m.content_url, &m.content_hash)
+        .await
+        .unwrap();
     assert_eq!(fetched, bytes);
     assert!(
-        api.fetch_module_body(&m.content_url, &m.content_hash).await.is_err(),
+        api.fetch_module_body(&m.content_url, &m.content_hash)
+            .await
+            .is_err(),
         "a non-UTF-8 body is not fetchable as text"
     );
 }
@@ -637,9 +690,16 @@ async fn publish_dedups_shared_blobs() {
         media_type: "application/typescript".to_string(),
         is_entry: true,
     };
-    api.publish_version(pkg.id, "1.0.0", &json!({}), std::slice::from_ref(&shared), &[], None)
-        .await
-        .unwrap();
+    api.publish_version(
+        pkg.id,
+        "1.0.0",
+        &json!({}),
+        std::slice::from_ref(&shared),
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
 
     // v2 reuses the same body + adds a new one — only the new body is uploaded.
     let extra = PublishModule {
@@ -674,7 +734,9 @@ async fn over_cap_publish_is_rejected() {
             is_entry: i == 0,
         })
         .collect();
-    let result = api.publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None).await;
+    let result = api
+        .publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None)
+        .await;
     assert!(result.is_err(), "an over-cap publish is rejected at begin");
 }
 
@@ -704,7 +766,10 @@ async fn publish_locks_dependency_to_highest_satisfying_version() {
     let resolved = highest_satisfying_version(&versions, Some("^1.2"))
         .expect("valid range")
         .expect("a satisfying version");
-    assert_eq!(resolved, "1.4.0", "^1.2 collapses to the highest published 1.x");
+    assert_eq!(
+        resolved, "1.4.0",
+        "^1.2 collapses to the highest published 1.x"
+    );
 
     // Publish a dependent carrying the locked dependency on the wire.
     let app = api.create_package("app", "").await.unwrap();
@@ -759,7 +824,10 @@ async fn resolve_carries_locked_dependencies() {
         .expect("publish app");
 
     // Resolve surfaces the locked dep (the referrer-aware version-selection input).
-    let resolved = api.resolve_package("wbk", "app", None).await.expect("resolve");
+    let resolved = api
+        .resolve_package("wbk", "app", None)
+        .await
+        .expect("resolve");
     assert_eq!(resolved.dependencies.len(), 1);
     assert_eq!(resolved.dependencies[0].owner_nickname, "wbk");
     assert_eq!(resolved.dependencies[0].name, "util");
@@ -772,7 +840,10 @@ async fn resolve_missing_package_is_not_found() {
     let (base_url, _state) = spawn_mock().await;
     let api = client(&base_url);
     let result = api.resolve_package("wbk", "ghost", None).await;
-    assert!(result.is_err(), "unknown package resolves to an error (404)");
+    assert!(
+        result.is_err(),
+        "unknown package resolves to an error (404)"
+    );
 }
 
 #[tokio::test]
@@ -786,7 +857,9 @@ async fn delete_is_two_step_and_reserves_the_number() {
         media_type: "application/typescript".to_string(),
         is_entry: true,
     }];
-    api.publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None).await.unwrap();
+    api.publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None)
+        .await
+        .unwrap();
 
     // Delete is the heavy, two-step action: a live version can't be deleted until yanked.
     match api.delete_version(pkg.id, "1.0.0").await {
@@ -804,14 +877,21 @@ async fn delete_is_two_step_and_reserves_the_number() {
         media_type: "application/typescript".to_string(),
         is_entry: true,
     }];
-    match api.publish_version(pkg.id, "1.0.0", &json!({}), &altered, &[], None).await {
+    match api
+        .publish_version(pkg.id, "1.0.0", &json!({}), &altered, &[], None)
+        .await
+    {
         Err(CloudError::VersionUnavailable(v)) => assert_eq!(v, "1.0.0"),
         other => panic!("expected VersionUnavailable, got {other:?}"),
     }
 
     // The deleted number surfaces in the list flagged deleted (so the owner UI can show it).
     let versions = api.list_versions(pkg.id).await.unwrap();
-    let deleted: Vec<&str> = versions.iter().filter(|v| v.deleted).map(|v| v.version.as_str()).collect();
+    let deleted: Vec<&str> = versions
+        .iter()
+        .filter(|v| v.deleted)
+        .map(|v| v.version.as_str())
+        .collect();
     assert_eq!(deleted, ["1.0.0"]);
 }
 
@@ -829,15 +909,30 @@ async fn list_versions_is_semver_ordered_with_deleted_interleaved() {
         }]
     };
     // Publish out of order, including an infill below the current max.
-    api.publish_version(pkg.id, "1.0.0", &json!({}), &module("a"), &[], None).await.unwrap();
-    api.publish_version(pkg.id, "2.0.0", &json!({}), &module("b"), &[], None).await.unwrap();
-    api.publish_version(pkg.id, "1.5.0", &json!({}), &module("c"), &[], None).await.unwrap();
+    api.publish_version(pkg.id, "1.0.0", &json!({}), &module("a"), &[], None)
+        .await
+        .unwrap();
+    api.publish_version(pkg.id, "2.0.0", &json!({}), &module("b"), &[], None)
+        .await
+        .unwrap();
+    api.publish_version(pkg.id, "1.5.0", &json!({}), &module("c"), &[], None)
+        .await
+        .unwrap();
     // Yank + delete the highest (2.0.0): it becomes a deleted entry that must STILL sort
     // first by semver, not be buried last — this is where insertion-order mocks drift.
     api.set_version_yanked(pkg.id, "2.0.0", true).await.unwrap();
     api.delete_version(pkg.id, "2.0.0").await.unwrap();
 
-    let order: Vec<String> =
-        api.list_versions(pkg.id).await.unwrap().into_iter().map(|v| v.version).collect();
-    assert_eq!(order, ["2.0.0", "1.5.0", "1.0.0"], "newest-first by semver, deleted interleaved");
+    let order: Vec<String> = api
+        .list_versions(pkg.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.version)
+        .collect();
+    assert_eq!(
+        order,
+        ["2.0.0", "1.5.0", "1.0.0"],
+        "newest-first by semver, deleted interleaved"
+    );
 }

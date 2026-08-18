@@ -1340,11 +1340,9 @@ impl SettingsWindow {
         col = col.push(
             column![
                 dim_text_owned(t!("preferences-bold-is-bright")),
-                pick_list(
-                    bold_mode_choices,
-                    selected_bold_mode,
-                    |choice| Message::PrefBoldModeSelected(choice.mode),
-                )
+                pick_list(bold_mode_choices, selected_bold_mode, |choice| {
+                    Message::PrefBoldModeSelected(choice.mode)
+                },)
                 .text_size(13)
                 .width(280),
                 dim_text_owned(t!("preferences-bold-is-bright-help")),

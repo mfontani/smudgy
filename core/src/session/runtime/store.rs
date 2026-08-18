@@ -186,7 +186,9 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
                         owner: iso_owner,
                         name: iso_name,
                         ..
-                    } => iso_owner.eq_ignore_ascii_case(owner) && iso_name.eq_ignore_ascii_case(name),
+                    } => {
+                        iso_owner.eq_ignore_ascii_case(owner) && iso_name.eq_ignore_ascii_case(name)
+                    }
                     IsolateId::Main => false,
                 },
                 None => false,
@@ -241,7 +243,10 @@ pub enum ProducerKey {
     User,
     /// A host-maintained subtree (consumer address = the platform name, e.g. `"gmcp"`).
     Platform(PlatformProducer),
-    Package { owner: String, name: String },
+    Package {
+        owner: String,
+        name: String,
+    },
 }
 
 impl ProducerKey {
@@ -394,7 +399,10 @@ impl StorePath {
                 }
             }
             if bytes[i] == b'[' {
-                let Some(quote) = bytes.get(i + 1).copied().filter(|b| *b == b'"' || *b == b'\'')
+                let Some(quote) = bytes
+                    .get(i + 1)
+                    .copied()
+                    .filter(|b| *b == b'"' || *b == b'\'')
                 else {
                     return Err(PathError(format!(
                         "brackets take a quoted key (e.g. [\"key\"]) in {raw:?}"
@@ -403,12 +411,13 @@ impl StorePath {
                 // Scan to the closing quote; quoted keys carry no escape syntax (a key
                 // containing a quote of one kind is written with the other).
                 let start = i + 2;
-                let Some(end) = raw[start..].find(char::from(quote)).map(|off| start + off)
-                else {
+                let Some(end) = raw[start..].find(char::from(quote)).map(|off| start + off) else {
                     return Err(PathError(format!("unterminated quoted key in {raw:?}")));
                 };
                 if bytes.get(end + 1) != Some(&b']') {
-                    return Err(PathError(format!("expected ']' after the quoted key in {raw:?}")));
+                    return Err(PathError(format!(
+                        "expected ']' after the quoted key in {raw:?}"
+                    )));
                 }
                 if start == end {
                     return Err(PathError(format!("empty key in {raw:?}")));
@@ -818,7 +827,11 @@ impl SessionStore {
         let would = base
             .saturating_sub(replaced)
             .saturating_add(incoming)
-            .saturating_add(intermediates_usage(&path, missing_segments, conjures_container));
+            .saturating_add(intermediates_usage(
+                &path,
+                missing_segments,
+                conjures_container,
+            ));
         if would.entries > self.budgets.max_entries || would.bytes > self.budgets.max_bytes {
             return Err(BudgetExceeded {
                 producer: producer.to_string(),
@@ -867,8 +880,14 @@ impl SessionStore {
     /// Materializes to the boundary's `Value` form (an O(subtree) copy); the op layer's
     /// JSON-text reads take [`Self::get_json`], which serializes the shared tree directly.
     #[must_use]
-    pub fn get(&self, producer: &ProducerKey, path: &StorePath, reader: &IsolateId) -> Option<Value> {
-        self.projected(producer, path, reader).map(|node| node.to_value())
+    pub fn get(
+        &self,
+        producer: &ProducerKey,
+        path: &StorePath,
+        reader: &IsolateId,
+    ) -> Option<Value> {
+        self.projected(producer, path, reader)
+            .map(|node| node.to_value())
     }
 
     /// [`Self::get`]'s snapshot serialized as compact JSON text — identical visibility, no
@@ -881,7 +900,8 @@ impl SessionStore {
         path: &StorePath,
         reader: &IsolateId,
     ) -> Option<String> {
-        self.projected(producer, path, reader).map(|node| node.to_json())
+        self.projected(producer, path, reader)
+            .map(|node| node.to_json())
     }
 
     /// The node `reader` observes at `(producer, path)`: committed ⊕ the reader's own journal
@@ -1053,7 +1073,8 @@ impl SessionStore {
         path: &StorePath,
         reader: &IsolateId,
     ) -> Option<&Node> {
-        self.previous_anchor(producer, reader)?.extract(path.segments())
+        self.previous_anchor(producer, reader)?
+            .extract(path.segments())
     }
 
     /// [`Self::get_tagged`]'s boundary form over the previous generation `reader` observes:
@@ -1153,11 +1174,14 @@ impl SessionStore {
             node = node.children.entry(segment).or_default();
         }
         node.ids.push(id);
-        self.bindings.insert(id, HostBinding {
-            producer,
-            path,
-            cell,
-        });
+        self.bindings.insert(
+            id,
+            HostBinding {
+                producer,
+                path,
+                cell,
+            },
+        );
         self.binding_ids.insert(key, id);
         id
     }
@@ -1572,7 +1596,9 @@ mod tests {
 
     #[test]
     fn path_grammar_rejects_malformed_paths() {
-        for bad in [".a", "a..b", "a.", "a[b]", "a[\"b\"", "a[\"\"]", "a[\"b\"x", "a b", "1a"] {
+        for bad in [
+            ".a", "a..b", "a.", "a[b]", "a[\"b\"", "a[\"\"]", "a[\"b\"x", "a b", "1a",
+        ] {
             assert!(StorePath::parse(bad).is_err(), "{bad:?} must not parse");
         }
     }
@@ -1589,16 +1615,25 @@ mod tests {
         let joined = root.joined(StorePath::parse("stats.hp").unwrap()).unwrap();
         assert_eq!(joined.segments(), ["vitals", "stats", "hp"]);
         // An empty subpath addresses the root itself; an empty root passes the sub through.
-        assert_eq!(root.joined(StorePath::root()).unwrap().segments(), ["vitals"]);
         assert_eq!(
-            StorePath::root().joined(StorePath::parse("a.b").unwrap()).unwrap().segments(),
+            root.joined(StorePath::root()).unwrap().segments(),
+            ["vitals"]
+        );
+        assert_eq!(
+            StorePath::root()
+                .joined(StorePath::parse("a.b").unwrap())
+                .unwrap()
+                .segments(),
             ["a", "b"]
         );
         // The two halves parse under the cap independently; the combination is re-checked.
         let deep = StorePath::parse(&vec!["s"; 63].join(".")).unwrap();
         assert!(root.joined(deep.clone()).is_ok());
         let over = StorePath::parse("a.b").unwrap();
-        assert!(over.joined(deep).is_err(), "a combined path past the cap is rejected");
+        assert!(
+            over.joined(deep).is_err(),
+            "a combined path past the cap is rejected"
+        );
     }
 
     // ---- fold + casing -------------------------------------------------------------------
@@ -1632,14 +1667,23 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert!(outcome.first_duplicate_key_collapse, "the collapse is reported once");
+        assert!(
+            outcome.first_duplicate_key_collapse,
+            "the collapse is reported once"
+        );
         store.flush();
         let root = user_get(&store, "").unwrap();
         assert_eq!(root.to_string(), r#"{"Foo":2,"bar":3}"#);
         // The second collapse for the same producer is not re-reported.
         let value: Value = serde_json::from_str(r#"{ "A": 1, "a": 2 }"#).expect("parse");
         let outcome = store
-            .set(ProducerKey::User, StorePath::root(), value, main_isolate(), 0)
+            .set(
+                ProducerKey::User,
+                StorePath::root(),
+                value,
+                main_isolate(),
+                0,
+            )
             .unwrap();
         assert!(!outcome.first_duplicate_key_collapse);
     }
@@ -1814,7 +1858,11 @@ mod tests {
         user_set(&mut store, "t.hp", json!({ "deep": 2 }));
         let other = pkg_isolate("wbk", "other");
         assert_eq!(
-            store.get_tagged(&ProducerKey::User, &StorePath::parse("t.hp").unwrap(), &other),
+            store.get_tagged(
+                &ProducerKey::User,
+                &StorePath::parse("t.hp").unwrap(),
+                &other
+            ),
             Some(TaggedSnapshot::Scalar("1".into()))
         );
         assert_eq!(
@@ -1831,10 +1879,7 @@ mod tests {
         let value: Value = serde_json::from_str(r#"{ "z": 1, "A": 2, "m": 3 }"#).expect("parse");
         user_set(&mut store, "t", value);
         store.flush();
-        assert_eq!(
-            user_keys(&store, "t"),
-            Some(vec!["z", "A", "m"])
-        );
+        assert_eq!(user_keys(&store, "t"), Some(vec!["z", "A", "m"]));
         // Non-objects and absent paths have no keys (arrays are addressed whole).
         user_set(&mut store, "arr", json!([1, 2]));
         user_set(&mut store, "n", json!(4));
@@ -1851,26 +1896,17 @@ mod tests {
         store.flush();
         // A strictly-below write adds its first segment as a key, in write order.
         user_set(&mut store, "t.c.deep", json!(1));
-        assert_eq!(
-            user_keys(&store, "t"),
-            Some(vec!["a", "B", "c"])
-        );
+        assert_eq!(user_keys(&store, "t"), Some(vec!["a", "B", "c"]));
         // A fold-equal below-write re-addresses the existing key (stored casing kept).
         user_set(&mut store, "t.b.x", json!(1));
-        assert_eq!(
-            user_keys(&store, "t"),
-            Some(vec!["a", "B", "c"])
-        );
+        assert_eq!(user_keys(&store, "t"), Some(vec!["a", "B", "c"]));
         // A same-turn write AT the path replaces the key set — committed keys must not leak
         // through (the overlay's first branch extracts a slice of the written value).
         user_set(&mut store, "t", json!({ "only": 1 }));
         assert_eq!(user_keys(&store, "t"), Some(vec!["only"]));
         // Below-writes after the replacement patch the fresh value.
         user_set(&mut store, "t.later", json!(2));
-        assert_eq!(
-            user_keys(&store, "t"),
-            Some(vec!["only", "later"])
-        );
+        assert_eq!(user_keys(&store, "t"), Some(vec!["only", "later"]));
     }
 
     #[test]
@@ -1883,10 +1919,7 @@ mod tests {
         user_set(&mut store, "s.k", json!(1));
         user_set(&mut store, "s.j", json!(2));
         user_set(&mut store, "s.k", json!(3));
-        assert_eq!(
-            user_keys(&store, "s"),
-            Some(vec!["k", "j"])
-        );
+        assert_eq!(user_keys(&store, "s"), Some(vec!["k", "j"]));
         // An entirely-journal subtree (no committed base at all) enumerates the same way.
         user_set(&mut store, "fresh.x", json!(1));
         assert_eq!(user_keys(&store, "fresh"), Some(vec!["x"]));
@@ -1910,7 +1943,9 @@ mod tests {
         user_set(&mut store, "s.mana", json!(9));
         let deliveries = store.flush();
         assert_eq!(deliveries.len(), 1, "three writes coalesce to one delivery");
-        let RuntimeAction::CallJavascriptFunction { id, matches, depth, .. } = &deliveries[0]
+        let RuntimeAction::CallJavascriptFunction {
+            id, matches, depth, ..
+        } = &deliveries[0]
         else {
             panic!("watch delivery must be a CallJavascriptFunction");
         };
@@ -2035,7 +2070,10 @@ mod tests {
                 MAX_EVENT_DEPTH,
             )
             .unwrap();
-        assert!(store.flush().is_empty(), "a write at the depth cap delivers nothing");
+        assert!(
+            store.flush().is_empty(),
+            "a write at the depth cap delivers nothing"
+        );
     }
 
     #[test]
@@ -2185,7 +2223,10 @@ mod tests {
         );
         store.reset_engine_state();
         user_set(&mut store, "x", json!(2));
-        assert!(store.flush().is_empty(), "engine reset drops per-write watchers too");
+        assert!(
+            store.flush().is_empty(),
+            "engine reset drops per-write watchers too"
+        );
     }
 
     // ---- widget bindings -------------------------------------------------------------------
@@ -2195,9 +2236,15 @@ mod tests {
         let mut store = SessionStore::new();
         user_set(&mut store, "Char.Vitals.hp", json!(10));
         store.flush();
-        let id = store.bind(ProducerKey::User, StorePath::parse("Char.Vitals.hp").unwrap());
+        let id = store.bind(
+            ProducerKey::User,
+            StorePath::parse("Char.Vitals.hp").unwrap(),
+        );
         // Case-folded and re-spelled paths address the same binding.
-        let same = store.bind(ProducerKey::User, StorePath::parse(r#"char["vitals"].HP"#).unwrap());
+        let same = store.bind(
+            ProducerKey::User,
+            StorePath::parse(r#"char["vitals"].HP"#).unwrap(),
+        );
         assert_eq!(id, same);
         let cell = store.bindings().cell(id).expect("registered cell");
         assert_eq!(*cell.load(), json!(10), "seeded from the committed tree");
@@ -2221,7 +2268,10 @@ mod tests {
             },
             StorePath::root(),
         );
-        assert!(!store.take_bindings_changed(), "registration alone changes nothing");
+        assert!(
+            !store.take_bindings_changed(),
+            "registration alone changes nothing"
+        );
 
         user_set(&mut store, "a.b", json!({ "c": 1 }));
         store.flush();
@@ -2229,17 +2279,32 @@ mod tests {
         assert!(!store.take_bindings_changed(), "reading resets the flag");
         let cells = store.bindings();
         assert_eq!(*cells.cell(exact).unwrap().load(), json!({ "c": 1 }));
-        assert_eq!(*cells.cell(above).unwrap().load(), json!({ "a": { "b": { "c": 1 } } }));
+        assert_eq!(
+            *cells.cell(above).unwrap().load(),
+            json!({ "a": { "b": { "c": 1 } } })
+        );
         assert_eq!(*cells.cell(below).unwrap().load(), json!(1));
-        assert_eq!(*cells.cell(sibling).unwrap().load(), Value::Null, "sibling untouched");
-        assert_eq!(*cells.cell(other).unwrap().load(), Value::Null, "other producer untouched");
+        assert_eq!(
+            *cells.cell(sibling).unwrap().load(),
+            Value::Null,
+            "sibling untouched"
+        );
+        assert_eq!(
+            *cells.cell(other).unwrap().load(),
+            Value::Null,
+            "other producer untouched"
+        );
 
         // A sibling-only turn leaves the flag unset for the bound paths it didn't touch...
         user_set(&mut store, "unrelated", json!(1));
         store.flush();
         // ...but the root binding (`above`) is comparable to everything this producer writes.
         assert!(store.take_bindings_changed());
-        assert_eq!(*cells.cell(exact).unwrap().load(), json!({ "c": 1 }), "exact cell untouched");
+        assert_eq!(
+            *cells.cell(exact).unwrap().load(),
+            json!({ "c": 1 }),
+            "exact cell untouched"
+        );
     }
 
     #[test]
@@ -2289,7 +2354,10 @@ mod tests {
         let id = store.bind(ProducerKey::User, StorePath::parse("keep").unwrap());
         let shared = store.bindings();
         store.reset_engine_state();
-        assert!(shared.cell(id).is_none(), "stale token ids resolve to nothing");
+        assert!(
+            shared.cell(id).is_none(),
+            "stale token ids resolve to nothing"
+        );
         // The same shared registry handle serves the next engine generation.
         let next = store.bind(ProducerKey::User, StorePath::parse("keep").unwrap());
         assert_eq!(*shared.cell(next).unwrap().load(), json!(1));
@@ -2316,10 +2384,17 @@ mod tests {
                 0,
             )
             .expect_err("the write must breach the entry budget");
-        assert!(err.to_string().contains("user"), "names the producer: {err}");
+        assert!(
+            err.to_string().contains("user"),
+            "names the producer: {err}"
+        );
         store.flush();
         assert_eq!(user_get(&store, "ok"), Some(json!([1, 2, 3])));
-        assert_eq!(user_get(&store, "big"), None, "the rejected write journaled nothing");
+        assert_eq!(
+            user_get(&store, "big"),
+            None,
+            "the rejected write journaled nothing"
+        );
     }
 
     #[test]
@@ -2358,7 +2433,10 @@ mod tests {
             main_isolate(),
             0,
         );
-        assert!(err.is_err(), "projected usage must include the unflushed journal");
+        assert!(
+            err.is_err(),
+            "projected usage must include the unflushed journal"
+        );
     }
 
     #[test]
@@ -2399,7 +2477,11 @@ mod tests {
             WatchCadence::Coalesced,
         );
         store.reset_engine_state();
-        assert_eq!(user_get(&store, "keep"), Some(json!(42)), "state survives a reload");
+        assert_eq!(
+            user_get(&store, "keep"),
+            Some(json!(42)),
+            "state survives a reload"
+        );
         user_set(&mut store, "keep", json!(43));
         assert!(
             store.flush().is_empty(),
@@ -2417,7 +2499,10 @@ mod tests {
         );
         // Exactly at the cap still parses.
         let at_cap = vec!["a"; MAX_PATH_SEGMENTS].join(".");
-        assert_eq!(StorePath::parse(&at_cap).unwrap().segments().len(), MAX_PATH_SEGMENTS);
+        assert_eq!(
+            StorePath::parse(&at_cap).unwrap().segments().len(),
+            MAX_PATH_SEGMENTS
+        );
     }
 
     #[test]
@@ -2478,11 +2563,18 @@ mod tests {
             )
             .unwrap();
         let deliveries = store.flush();
-        assert_eq!(deliveries.len(), 1, "the shallow write is not dropped with the deep one");
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "the shallow write is not dropped with the deep one"
+        );
         let RuntimeAction::CallJavascriptFunction { depth, .. } = &deliveries[0] else {
             panic!("expected a delivery");
         };
-        assert_eq!(*depth, 1, "delivered at the shallowest contributing depth + 1");
+        assert_eq!(
+            *depth, 1,
+            "delivered at the shallowest contributing depth + 1"
+        );
     }
 
     // ---- home gate helper --------------------------------------------------------------------
@@ -2490,8 +2582,14 @@ mod tests {
     #[test]
     fn is_home_matches_the_registry() {
         let homes: HomeRegistry = Rc::new(std::cell::RefCell::new(HashMap::from([
-            (("wbk".to_string(), "sandboxed".to_string()), HomeIsolate::OwnSandbox),
-            (("wbk".to_string(), "trusted".to_string()), HomeIsolate::Main),
+            (
+                ("wbk".to_string(), "sandboxed".to_string()),
+                HomeIsolate::OwnSandbox,
+            ),
+            (
+                ("wbk".to_string(), "trusted".to_string()),
+                HomeIsolate::Main,
+            ),
         ])));
         let sandboxed = ProducerKey::Package {
             owner: "wbk".into(),
@@ -2506,7 +2604,11 @@ mod tests {
             name: "ghost".into(),
         };
         // A sandboxed install is home only in its own isolate (any version).
-        assert!(is_home(&homes, &sandboxed, &pkg_isolate("wbk", "sandboxed")));
+        assert!(is_home(
+            &homes,
+            &sandboxed,
+            &pkg_isolate("wbk", "sandboxed")
+        ));
         assert!(!is_home(&homes, &sandboxed, &IsolateId::Main));
         assert!(!is_home(&homes, &sandboxed, &pkg_isolate("wbk", "other")));
         // A trusted install is home on main only.
@@ -2517,7 +2619,11 @@ mod tests {
         assert!(!is_home(&homes, &uninstalled, &pkg_isolate("wbk", "ghost")));
         // User/module code is home exactly on main.
         assert!(is_home(&homes, &ProducerKey::User, &IsolateId::Main));
-        assert!(!is_home(&homes, &ProducerKey::User, &pkg_isolate("wbk", "sandboxed")));
+        assert!(!is_home(
+            &homes,
+            &ProducerKey::User,
+            &pkg_isolate("wbk", "sandboxed")
+        ));
         assert!(is_addressable(&homes, &ProducerKey::User));
         assert!(is_addressable(&homes, &sandboxed));
         assert!(is_addressable(&homes, &trusted));
@@ -2580,7 +2686,10 @@ mod tests {
             .get(&ProducerKey::User)
             .expect("the flush committed a root")
             .usage();
-        assert_eq!(tracked, tree, "tracked usage must equal the committed tree's usage");
+        assert_eq!(
+            tracked, tree,
+            "tracked usage must equal the committed tree's usage"
+        );
     }
 
     #[test]
@@ -2606,7 +2715,10 @@ mod tests {
             "the untouched sibling subtree is shared across flush snapshots"
         );
         assert!(*second.get("hot").unwrap() == json!(2));
-        assert!(*first.get("hot").unwrap() == json!(1), "the pinned snapshot is immutable");
+        assert!(
+            *first.get("hot").unwrap() == json!(1),
+            "the pinned snapshot is immutable"
+        );
     }
 
     #[test]
@@ -2630,13 +2742,21 @@ mod tests {
         });
         let expected = value.to_string();
         user_set(&mut store, "t", value);
-        assert_eq!(user_get(&store, "t").unwrap().to_string(), expected, "journal overlay read");
+        assert_eq!(
+            user_get(&store, "t").unwrap().to_string(),
+            expected,
+            "journal overlay read"
+        );
         let deliveries = store.flush();
         let RuntimeAction::CallJavascriptFunction { matches, .. } = &deliveries[0] else {
             panic!("expected a delivery");
         };
         assert_eq!(matches[0].value, expected, "watcher snapshot text");
-        assert_eq!(user_get(&store, "t").unwrap().to_string(), expected, "committed read");
+        assert_eq!(
+            user_get(&store, "t").unwrap().to_string(),
+            expected,
+            "committed read"
+        );
     }
 
     // ---- previous generations (docs/interop.md §2) ------------------------------
@@ -2676,21 +2796,36 @@ mod tests {
         store.flush();
         // An open journal reads its own base: the committed root, not the (absent) retained map.
         user_set(&mut store, "hp", json!(2));
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("1".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("1".into()))
+        );
         store.flush();
         // Retained: the generation the second commit displaced, held across quiet turns.
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("1".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("1".into()))
+        );
         assert_eq!(
             store.previous_get_json(&ProducerKey::User, &StorePath::root(), &main_isolate()),
             Some(r#"{"hp":1}"#.to_string())
         );
         store.flush(); // a writeless flush moves nothing
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("1".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("1".into()))
+        );
         // The next batch re-anchors: its base is the now-committed hp=2, superseding hp=1.
         user_set(&mut store, "hp", json!(3));
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("2".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("2".into()))
+        );
         store.flush();
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("2".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("2".into()))
+        );
     }
 
     #[test]
@@ -2715,7 +2850,10 @@ mod tests {
             )
             .unwrap();
         store.flush();
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("1".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("1".into()))
+        );
         // And the package, one commit in, still reads absent.
         assert_eq!(
             store.previous_get_tagged(&pkg, &StorePath::root(), &pkg_isolate("wbk", "pkg")),
@@ -2750,8 +2888,14 @@ mod tests {
         );
         store.flush();
         // The committing flush is what moves every reader's anchor; the seats re-converge.
-        assert_eq!(prev_tagged_as(&store, "hp", &reader), Some(TaggedSnapshot::Scalar("2".into())));
-        assert_eq!(user_prev_tagged(&store, "hp"), Some(TaggedSnapshot::Scalar("2".into())));
+        assert_eq!(
+            prev_tagged_as(&store, "hp", &reader),
+            Some(TaggedSnapshot::Scalar("2".into()))
+        );
+        assert_eq!(
+            user_prev_tagged(&store, "hp"),
+            Some(TaggedSnapshot::Scalar("2".into()))
+        );
     }
 
     #[test]
@@ -2775,7 +2919,10 @@ mod tests {
             "keys read the retained generation in publish order, first casing"
         );
         // Lookups fold case like every read; kinds classify off the retained tree.
-        assert_eq!(user_prev_tagged(&store, "T.b"), Some(TaggedSnapshot::Object));
+        assert_eq!(
+            user_prev_tagged(&store, "T.b"),
+            Some(TaggedSnapshot::Object)
+        );
         assert_eq!(
             user_prev_tagged(&store, "t.arr"),
             Some(TaggedSnapshot::Array("[1,2]".into()))
@@ -2824,7 +2971,10 @@ mod tests {
             "the untouched subtree is shared between the retained generation and the head"
         );
         // The generation is immutable: the displaced value stays readable as written.
-        assert_eq!(user_prev_tagged(&store, "hot"), Some(TaggedSnapshot::Scalar("1".into())));
+        assert_eq!(
+            user_prev_tagged(&store, "hot"),
+            Some(TaggedSnapshot::Scalar("1".into()))
+        );
     }
 
     #[test]

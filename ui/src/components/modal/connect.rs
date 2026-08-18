@@ -1,7 +1,7 @@
+use crate::i18n::t;
 use iced::widget::{Id, Row, button, column, container, operation, text, text_editor};
 use iced::{Length, Pixels, Task};
 use log::warn;
-use crate::i18n::t;
 
 use crate::theme::Element;
 use crate::theme::builtins;
@@ -540,10 +540,9 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             // caching again.
             state.image_cache_usage_request += 1;
             let request = state.image_cache_usage_request;
-            task = Task::perform(
-                load_image_cache_usage(server_name),
-                move |(name, bytes)| Message::ImageCacheUsageLoaded(request, name, bytes),
-            );
+            task = Task::perform(load_image_cache_usage(server_name), move |(name, bytes)| {
+                Message::ImageCacheUsageLoaded(request, name, bytes)
+            });
         }
         Message::UpdateServerFormField(field, value) => {
             // Only update if in Create or Edit mode
@@ -632,7 +631,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     task = Task::batch([load_task, operation::focus(profile_name_input_id())]);
                 }
                 Err(e) => {
-                    state.server_crud_error = Some(t!("server-error-create", "error" => e.to_string()));
+                    state.server_crud_error =
+                        Some(t!("server-error-create", "error" => e.to_string()));
                 }
             }
         }
@@ -659,7 +659,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     state.selected_server = Some(updated_server.name);
                 }
                 Err(e) => {
-                    state.server_crud_error = Some(t!("server-error-update", "error" => e.to_string()));
+                    state.server_crud_error =
+                        Some(t!("server-error-update", "error" => e.to_string()));
                 }
             }
         }
@@ -698,7 +699,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 }
                 Err(e) => {
                     // Show error, maybe associate with the server if possible?
-                    state.server_crud_error = Some(t!("server-error-delete", "error" => e.to_string()));
+                    state.server_crud_error =
+                        Some(t!("server-error-delete", "error" => e.to_string()));
                     warn!("Failed to delete server: {e}");
                     // If deletion failed while confirming, reset state back to None
                     // (or maybe back to Edit if that was the origin? Simpler to just reset)
@@ -871,7 +873,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     // Keep the current server selected
                 }
                 Err(e) => {
-                    state.profile_crud_error = Some(t!("profile-error-create", "error" => e.to_string()));
+                    state.profile_crud_error =
+                        Some(t!("profile-error-create", "error" => e.to_string()));
                 }
             }
         }
@@ -919,7 +922,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     // Keep the current server selected
                 }
                 Err(e) => {
-                    state.profile_crud_error = Some(t!("profile-error-update", "error" => e.to_string()));
+                    state.profile_crud_error =
+                        Some(t!("profile-error-update", "error" => e.to_string()));
                 }
             }
         }
@@ -942,7 +946,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 }
                 Err(e) => {
                     // Show error, maybe associate with the server if possible?
-                    state.profile_crud_error = Some(t!("profile-error-delete", "error" => e.to_string()));
+                    state.profile_crud_error =
+                        Some(t!("profile-error-delete", "error" => e.to_string()));
                     warn!("Failed to delete profile: {e}");
                     // Keep the confirmation state active so the user sees the error
                     // Or maybe reset to Edit state? Let's reset to Edit.

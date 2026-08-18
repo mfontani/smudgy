@@ -152,9 +152,7 @@ pub enum StubAxis {
     /// ▼ bottom-left). Drawn lines and routed anchor tips behave exactly as
     /// [`StubAxis::None`]. The marker kinds (External/CrossLevel) own their
     /// glyph treatments and keep the wall-normal fallback.
-    Level {
-        up: bool,
-    },
+    Level { up: bool },
     /// Portal exits (in/out/special): no stub of their own — a drawn line
     /// meets the room directly at the port. Contexts that must stay visible
     /// without a line (explicit `Stub` routing, marker kinds, dangling
@@ -213,9 +211,7 @@ pub fn renders_as_level_triangle(
         ConnectionKind::CrossLevel => true,
         ConnectionKind::Dangling => true,
         ConnectionKind::External => false,
-        ConnectionKind::Internal | ConnectionKind::SelfLoop => {
-            routing == ConnectionRouting::Stub
-        }
+        ConnectionKind::Internal | ConnectionKind::SelfLoop => routing == ConnectionRouting::Stub,
     }
 }
 
@@ -532,9 +528,11 @@ pub fn resolve(input: &GeometryInput<'_>) -> ConnectionGeometry {
         circles: Vec::new(),
         level_markers: Vec::new(),
         start_tangent: stub_direction(a.side, a.stub),
-        end_tangent: input.endpoint_b.map_or(stub_direction(a.side, a.stub), |b| {
-            stub_direction(b.side, b.stub).scale(-1.0)
-        }),
+        end_tangent: input
+            .endpoint_b
+            .map_or(stub_direction(a.side, a.stub), |b| {
+                stub_direction(b.side, b.stub).scale(-1.0)
+            }),
         handles: Vec::new(),
         bounds: Bounds::EMPTY,
     };
@@ -1382,9 +1380,15 @@ mod tests {
         assert_eq!(g.centerline.len(), 2, "no stub vertices survive dedup");
         assert!(g.centerline[0].nearly_equals(g.port_a));
         assert!(g.centerline[1].nearly_equals(g.port_b.expect("endpoint B")));
-        assert!(g.stub_tip_a.nearly_equals(g.port_a), "tip collapses to port");
+        assert!(
+            g.stub_tip_a.nearly_equals(g.port_a),
+            "tip collapses to port"
+        );
         // Tangents follow the actual line, not the wall normals.
-        let along = g.port_a.direction_to(g.port_b.expect("endpoint B")).expect("distinct");
+        let along = g
+            .port_a
+            .direction_to(g.port_b.expect("endpoint B"))
+            .expect("distinct");
         assert!(g.start_tangent.nearly_equals(along));
         assert!(g.end_tangent.nearly_equals(along));
     }
@@ -1448,7 +1452,8 @@ mod tests {
         let g = resolve(&input);
         assert_eq!(g.flattened.len(), 2, "both stubs drawn");
         assert!(
-            g.stub_tip_a.nearly_equals(g.port_a + MapPoint::new(STUB_LENGTH, 0.0)),
+            g.stub_tip_a
+                .nearly_equals(g.port_a + MapPoint::new(STUB_LENGTH, 0.0)),
             "stub-less endpoint degrades to its wall normal under Stub routing"
         );
     }
@@ -1518,7 +1523,11 @@ mod tests {
             thickness: 1.0,
         };
         let g = resolve(&input);
-        assert_eq!(g.flattened.len(), 1, "only the cardinal endpoint keeps a stub");
+        assert_eq!(
+            g.flattened.len(),
+            1,
+            "only the cardinal endpoint keeps a stub"
+        );
         assert_eq!(g.level_markers.len(), 1);
         let (center, up) = g.level_markers[0];
         assert!(up);
@@ -1704,34 +1713,21 @@ mod tests {
     fn waypoint_move_adjusts_both_neighbors_and_clamps_at_the_tips() {
         let tip_a = MapPoint::new(0.4, 0.0);
         let tip_b = MapPoint::new(3.6, 2.0);
-        let points = [
-            MapPoint::new(2.0, 0.0),
-            MapPoint::new(2.0, 2.0),
-        ];
+        let points = [MapPoint::new(2.0, 0.0), MapPoint::new(2.0, 2.0)];
         // The interior-facing move: dragging index 1 pulls its stored
         // neighbor's shared axis and clamps onto the tip-b leg.
-        let moved = reroute_for_waypoint_move(
-            &points,
-            1,
-            tip_a,
-            Some(tip_b),
-            MapPoint::new(2.5, 2.5),
-        )
-        .expect("in range");
+        let moved =
+            reroute_for_waypoint_move(&points, 1, tip_a, Some(tip_b), MapPoint::new(2.5, 2.5))
+                .expect("in range");
         // prev leg (2,0)→(2,2) is vertical → neighbor x follows target.
         assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));
         // next leg (2,2)→tip_b is horizontal → target clamps to y = 2.
         assert!(moved[1].nearly_equals(MapPoint::new(2.5, 2.0)));
         assert_eq!(orthogonal_violation(tip_a, &moved, tip_b), None);
         // First-vertex moves clamp onto the tip-a leg instead of moving it.
-        let moved = reroute_for_waypoint_move(
-            &points,
-            0,
-            tip_a,
-            Some(tip_b),
-            MapPoint::new(2.5, 0.5),
-        )
-        .expect("in range");
+        let moved =
+            reroute_for_waypoint_move(&points, 0, tip_a, Some(tip_b), MapPoint::new(2.5, 0.5))
+                .expect("in range");
         // tip_a leg is horizontal → y clamps to tip_a's; vertical leg to the
         // stored neighbor drags its x.
         assert!(moved[0].nearly_equals(MapPoint::new(2.5, 0.0)));

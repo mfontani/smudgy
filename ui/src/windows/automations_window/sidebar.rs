@@ -58,9 +58,12 @@ impl AutomationsWindow {
                 .font(fonts::BOOTSTRAP_ICONS)
                 .size(12.0)
                 .style(common::faint),
-            text_input(crate::i18n::ts!("automations-search-placeholder"), &self.search)
-                .on_input(Message::SearchChanged)
-                .size(13.0),
+            text_input(
+                crate::i18n::ts!("automations-search-placeholder"),
+                &self.search
+            )
+            .on_input(Message::SearchChanged)
+            .size(13.0),
         ]
         .spacing(6.0)
         .align_y(Vertical::Center);
@@ -342,7 +345,9 @@ impl AutomationsWindow {
                 }
             }
             if !rows.is_empty() {
-                col = col.push(section_header(crate::i18n::ts!("automations-modules-plural")));
+                col = col.push(section_header(crate::i18n::ts!(
+                    "automations-modules-plural"
+                )));
                 for r in rows {
                     col = col.push(r);
                 }
@@ -599,7 +604,9 @@ impl AutomationsWindow {
         }
 
         if !installed_rows.is_empty() {
-            out.push(section_header(crate::i18n::ts!("automations-packages-plural")));
+            out.push(section_header(crate::i18n::ts!(
+                "automations-packages-plural"
+            )));
             out.append(&mut installed_rows);
         }
         if !local_rows.is_empty() {

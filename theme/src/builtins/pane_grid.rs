@@ -20,9 +20,7 @@ impl pane_grid::Catalog for Theme {
 pub fn default(theme: &Theme) -> pane_grid::Style {
     pane_grid::Style {
         hovered_region: pane_grid::Highlight {
-            background: Background::Color(
-                theme.styles.general.accent.scale_alpha(0.3),
-            ),
+            background: Background::Color(theme.styles.general.accent.scale_alpha(0.3)),
             border: Border {
                 width: 2.0,
                 color: theme.styles.general.accent,

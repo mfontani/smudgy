@@ -246,7 +246,10 @@ mod tests {
         // A Big5 lead byte followed by an impossible trail decodes with replacement,
         // never panics, and resyncs for what follows.
         let out = t.decode(&[0xA7, 0x00, b'o', b'k']).to_string();
-        assert!(out.contains('\u{fffd}'), "lossy replacement expected: {out:?}");
+        assert!(
+            out.contains('\u{fffd}'),
+            "lossy replacement expected: {out:?}"
+        );
         assert!(out.ends_with("ok"));
     }
 

@@ -459,7 +459,9 @@ impl CreatorWordSets {
     /// `creator`'s own words, insertion order, registered casing.
     fn list(&self, creator: &WordSetCreator) -> Vec<String> {
         self.seats.get(creator).map_or_else(Vec::new, |seat| {
-            seat.values().map(|word| word.as_str().to_string()).collect()
+            seat.values()
+                .map(|word| word.as_str().to_string())
+                .collect()
         })
     }
 
@@ -505,7 +507,6 @@ impl CreatorWordSets {
         });
         dropped_words
     }
-
 }
 
 /// One input's suggestion set + blacklist, both per-creator.
@@ -598,7 +599,13 @@ impl InputWordSets {
     }
 
     #[must_use]
-    pub fn has(&self, key: PaneKey, kind: WordSetKind, creator: &WordSetCreator, word: &str) -> bool {
+    pub fn has(
+        &self,
+        key: PaneKey,
+        kind: WordSetKind,
+        creator: &WordSetCreator,
+        word: &str,
+    ) -> bool {
         self.inputs
             .get(&key)
             .is_some_and(|entry| entry.set(kind).has(creator, word))
@@ -799,9 +806,8 @@ impl PaneInputCallbacks {
     /// load already landed its registrations synchronously, and they would
     /// otherwise dangle with no live owner.
     pub fn purge_isolate(&mut self, home_session: SessionId, isolate: &IsolateId) {
-        self.callbacks.retain(|_, cb| {
-            cb.home_session != home_session || cb.isolate != *isolate
-        });
+        self.callbacks
+            .retain(|_, cb| cb.home_session != home_session || cb.isolate != *isolate);
     }
 
     /// Drop callback addresses owned by a reloaded/destroyed source runtime.
@@ -909,7 +915,10 @@ mod tests {
             Some(InputSnapshot::default()),
             "later updates report the snapshot they replaced"
         );
-        assert_eq!(mirror.apply(MAIN_PANE_KEY, InputSnapshot::default()), Some(typed));
+        assert_eq!(
+            mirror.apply(MAIN_PANE_KEY, InputSnapshot::default()),
+            Some(typed)
+        );
 
         // The close purge returns the key to never-reported.
         mirror.remove(MAIN_PANE_KEY);
@@ -999,7 +1008,12 @@ mod tests {
             .collect()
     }
 
-    fn add_words(sets: &mut InputWordSets, kind: WordSetKind, creator: &WordSetCreator, words: &[&str]) {
+    fn add_words(
+        sets: &mut InputWordSets,
+        kind: WordSetKind,
+        creator: &WordSetCreator,
+        words: &[&str],
+    ) {
         let words: Vec<String> = words.iter().map(|w| (*w).to_string()).collect();
         sets.add(MAIN_PANE_KEY, kind, creator, &words)
             .expect("test batch under the cap");
@@ -1011,7 +1025,12 @@ mod tests {
         let first = user_creator();
         let second = module_creator();
 
-        add_words(&mut sets, WordSetKind::Suggestions, &first, &["alpha", "gamma"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &first,
+            &["alpha", "gamma"],
+        );
         add_words(&mut sets, WordSetKind::Suggestions, &second, &["beta"]);
         // A later add by the FIRST creator stays in the first creator's run.
         add_words(&mut sets, WordSetKind::Suggestions, &first, &["delta"]);
@@ -1030,7 +1049,12 @@ mod tests {
         let second = module_creator();
 
         add_words(&mut sets, WordSetKind::Suggestions, &first, &["Fjord"]);
-        add_words(&mut sets, WordSetKind::Suggestions, &second, &["fjord", "azure"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &second,
+            &["fjord", "azure"],
+        );
 
         assert_eq!(
             merged_suggestions(&sets),
@@ -1045,7 +1069,12 @@ mod tests {
         let first = user_creator();
         let second = module_creator();
 
-        add_words(&mut sets, WordSetKind::Suggestions, &first, &["alpha", "beta"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &first,
+            &["alpha", "beta"],
+        );
         add_words(&mut sets, WordSetKind::Suggestions, &second, &["gamma"]);
 
         // delete() touches only the caller's contributions...
@@ -1054,7 +1083,10 @@ mod tests {
 
         // ...and so does clear(); the merged view updates accordingly.
         assert!(sets.clear(MAIN_PANE_KEY, WordSetKind::Suggestions, &first));
-        assert_eq!(sets.list(MAIN_PANE_KEY, WordSetKind::Suggestions, &first), Vec::<String>::new());
+        assert_eq!(
+            sets.list(MAIN_PANE_KEY, WordSetKind::Suggestions, &first),
+            Vec::<String>::new()
+        );
         assert_eq!(
             sets.list(MAIN_PANE_KEY, WordSetKind::Suggestions, &second),
             vec!["gamma"],
@@ -1077,7 +1109,12 @@ mod tests {
         );
 
         // Re-adding under another casing updates in place (no duplicate, same position).
-        add_words(&mut sets, WordSetKind::Suggestions, &creator, &["MCCOY", "zed"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &creator,
+            &["MCCOY", "zed"],
+        );
         assert_eq!(
             sets.list(MAIN_PANE_KEY, WordSetKind::Suggestions, &creator),
             vec!["MCCOY", "zed"]
@@ -1094,11 +1131,24 @@ mod tests {
     #[test]
     fn merged_blacklist_is_the_folded_union() {
         let mut sets = InputWordSets::default();
-        add_words(&mut sets, WordSetKind::Blacklist, &user_creator(), &["Bane"]);
-        add_words(&mut sets, WordSetKind::Blacklist, &module_creator(), &["ogre"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Blacklist,
+            &user_creator(),
+            &["Bane"],
+        );
+        add_words(
+            &mut sets,
+            WordSetKind::Blacklist,
+            &module_creator(),
+            &["ogre"],
+        );
 
         let merged = sets.merged(MAIN_PANE_KEY);
-        assert!(merged.blacklist.contains("bane"), "blacklist entries fold to lowercase");
+        assert!(
+            merged.blacklist.contains("bane"),
+            "blacklist entries fold to lowercase"
+        );
         assert!(merged.blacklist.contains("ogre"));
         assert_eq!(merged.blacklist.len(), 2);
     }
@@ -1106,15 +1156,33 @@ mod tests {
     #[test]
     fn push_flag_coalesces_and_reset_flags_populated_inputs() {
         let mut sets = InputWordSets::default();
-        assert!(sets.flag_push(MAIN_PANE_KEY), "the first mutation queues a push");
-        assert!(!sets.flag_push(MAIN_PANE_KEY), "later mutations ride the queued one");
+        assert!(
+            sets.flag_push(MAIN_PANE_KEY),
+            "the first mutation queues a push"
+        );
+        assert!(
+            !sets.flag_push(MAIN_PANE_KEY),
+            "later mutations ride the queued one"
+        );
         sets.take_push(MAIN_PANE_KEY);
-        assert!(sets.flag_push(MAIN_PANE_KEY), "a delivered push re-arms the flag");
+        assert!(
+            sets.flag_push(MAIN_PANE_KEY),
+            "a delivered push re-arms the flag"
+        );
         sets.take_push(MAIN_PANE_KEY);
 
-        add_words(&mut sets, WordSetKind::Suggestions, &user_creator(), &["alpha"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &user_creator(),
+            &["alpha"],
+        );
         let populated = sets.reset_engine_state(SessionId::from(1));
-        assert_eq!(populated, vec![MAIN_PANE_KEY], "reset names the inputs that held words");
+        assert_eq!(
+            populated,
+            vec![MAIN_PANE_KEY],
+            "reset names the inputs that held words"
+        );
         assert!(
             !sets.flag_push(MAIN_PANE_KEY),
             "reset leaves the populated input flagged for the post-rebuild push"
@@ -1123,7 +1191,10 @@ mod tests {
         // A second reset before the resync dispatched re-names the input: its
         // pending flag is still up and the second reload dropped the first
         // resync action, so it needs a fresh one.
-        assert_eq!(sets.reset_engine_state(SessionId::from(1)), vec![MAIN_PANE_KEY]);
+        assert_eq!(
+            sets.reset_engine_state(SessionId::from(1)),
+            vec![MAIN_PANE_KEY]
+        );
         // Once the resync actually dispatches, a further reset has nothing.
         sets.take_push(MAIN_PANE_KEY);
         assert!(
@@ -1146,18 +1217,8 @@ mod tests {
             vec![MAIN_PANE_KEY]
         );
         assert_eq!(merged_suggestions(&sets), vec!["foreign"]);
-        assert!(!sets.has(
-            MAIN_PANE_KEY,
-            WordSetKind::Suggestions,
-            &local,
-            "local"
-        ));
-        assert!(sets.has(
-            MAIN_PANE_KEY,
-            WordSetKind::Suggestions,
-            &foreign,
-            "foreign"
-        ));
+        assert!(!sets.has(MAIN_PANE_KEY, WordSetKind::Suggestions, &local, "local"));
+        assert!(sets.has(MAIN_PANE_KEY, WordSetKind::Suggestions, &foreign, "foreign"));
     }
 
     #[test]
@@ -1220,7 +1281,12 @@ mod tests {
             vec![Arc::new("fresh".to_string())]
         );
         assert_eq!(
-            callbacks.lock().unwrap().get(MAIN_PANE_KEY).unwrap().instance,
+            callbacks
+                .lock()
+                .unwrap()
+                .get(MAIN_PANE_KEY)
+                .unwrap()
+                .instance,
             2
         );
         assert!(
@@ -1266,7 +1332,10 @@ mod tests {
 
         // Reset must name that input for the post-rebuild resync even though
         // it holds no words...
-        assert_eq!(sets.reset_engine_state(SessionId::from(1)), vec![MAIN_PANE_KEY]);
+        assert_eq!(
+            sets.reset_engine_state(SessionId::from(1)),
+            vec![MAIN_PANE_KEY]
+        );
         // ...and once the resync push dispatches, the coalescing is re-armed:
         // the next mutation queues a push instead of riding a ghost.
         sets.take_push(MAIN_PANE_KEY);
@@ -1285,7 +1354,10 @@ mod tests {
         let bulk: Vec<String> = (0..MAX_WORDS_PER_CREATOR - 1)
             .map(|i| format!("word{i}"))
             .collect();
-        assert!(sets.add(MAIN_PANE_KEY, WordSetKind::Suggestions, &creator, &bulk).unwrap());
+        assert!(
+            sets.add(MAIN_PANE_KEY, WordSetKind::Suggestions, &creator, &bulk)
+                .unwrap()
+        );
 
         // A batch that would land two new words overflows — and lands NOTHING.
         let overflow = vec!["fits".to_string(), "spills".to_string()];
@@ -1298,7 +1370,12 @@ mod tests {
         // Exactly reaching the cap is fine, and re-adds (including casing
         // updates and batch-internal duplicates) cost no capacity.
         add_words(&mut sets, WordSetKind::Suggestions, &creator, &["last"]);
-        add_words(&mut sets, WordSetKind::Suggestions, &creator, &["LAST", "word0", "last"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &creator,
+            &["LAST", "word0", "last"],
+        );
         assert!(sets.has(MAIN_PANE_KEY, WordSetKind::Suggestions, &creator, "last"));
         assert_eq!(
             sets.add(
@@ -1313,7 +1390,12 @@ mod tests {
 
         // The other set and other creators are unpinched.
         add_words(&mut sets, WordSetKind::Blacklist, &creator, &["blocked"]);
-        add_words(&mut sets, WordSetKind::Suggestions, &module_creator(), &["fresh"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &module_creator(),
+            &["fresh"],
+        );
     }
 
     #[test]
@@ -1334,23 +1416,47 @@ mod tests {
             },
         );
 
-        add_words(&mut sets, WordSetKind::Suggestions, &main_creator, &["alpha"]);
-        add_words(&mut sets, WordSetKind::Suggestions, &dead_creator, &["zombie"]);
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &main_creator,
+            &["alpha"],
+        );
+        add_words(
+            &mut sets,
+            WordSetKind::Suggestions,
+            &dead_creator,
+            &["zombie"],
+        );
         add_words(&mut sets, WordSetKind::Blacklist, &dead_creator, &["shade"]);
 
         let affected = sets.purge_isolate(dead_creator.0, &dead_creator.1);
-        assert_eq!(affected, vec![MAIN_PANE_KEY], "the purge names the inputs that lost words");
+        assert_eq!(
+            affected,
+            vec![MAIN_PANE_KEY],
+            "the purge names the inputs that lost words"
+        );
 
         let merged = sets.merged(MAIN_PANE_KEY);
         assert_eq!(
-            merged.suggestions.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+            merged
+                .suggestions
+                .iter()
+                .map(|w| w.as_str())
+                .collect::<Vec<_>>(),
             vec!["alpha"],
             "the dead isolate's suggestions are gone, the survivor's stay"
         );
-        assert!(merged.blacklist.is_empty(), "its blacklist words are gone too");
+        assert!(
+            merged.blacklist.is_empty(),
+            "its blacklist words are gone too"
+        );
 
         // A second purge finds nothing: no push spam.
-        assert!(sets.purge_isolate(dead_creator.0, &dead_creator.1).is_empty());
+        assert!(
+            sets.purge_isolate(dead_creator.0, &dead_creator.1)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1404,7 +1510,10 @@ mod tests {
         );
         callbacks.purge_isolate(SessionId::from(1), &dead);
         assert!(callbacks.get(key).is_some(), "the survivor stays");
-        assert!(callbacks.get(other).is_none(), "the dead isolate's entry is purged");
+        assert!(
+            callbacks.get(other).is_none(),
+            "the dead isolate's entry is purged"
+        );
     }
 
     #[test]
@@ -1428,11 +1537,19 @@ mod tests {
             .lock()
             .unwrap()
             .apply_history(key, Arc::new(vec![Arc::new("cmd".to_string())]));
-        mirror.lock().unwrap().apply(other, InputSnapshot::default());
+        mirror
+            .lock()
+            .unwrap()
+            .apply(other, InputSnapshot::default());
         word_sets
             .lock()
             .unwrap()
-            .add(key, WordSetKind::Suggestions, &user_creator(), &["alpha".to_string()])
+            .add(
+                key,
+                WordSetKind::Suggestions,
+                &user_creator(),
+                &["alpha".to_string()],
+            )
             .unwrap();
         word_sets.lock().unwrap().flag_push(key);
         callbacks.lock().unwrap().register(
@@ -1447,7 +1564,10 @@ mod tests {
 
         purge_pane_input_state(&mirror, &word_sets, &callbacks, key);
 
-        assert_eq!(mirror.lock().unwrap().snapshot(key), InputSnapshot::default());
+        assert_eq!(
+            mirror.lock().unwrap().snapshot(key),
+            InputSnapshot::default()
+        );
         assert!(mirror.lock().unwrap().history(key).is_empty());
         assert!(word_sets.lock().unwrap().merged(key).suggestions.is_empty());
         assert!(callbacks.lock().unwrap().get(key).is_none());
@@ -1465,8 +1585,13 @@ mod tests {
         // both halves the close purge must cover, or the reload resync names
         // a key the UI no longer knows.
         add_words(&mut sets, WordSetKind::Suggestions, &creator, &["alpha"]);
-        sets.add(dead, WordSetKind::Suggestions, &creator, &["ghost".to_string()])
-            .unwrap();
+        sets.add(
+            dead,
+            WordSetKind::Suggestions,
+            &creator,
+            &["ghost".to_string()],
+        )
+        .unwrap();
         sets.flag_push(dead);
         sets.remove_input(dead);
 

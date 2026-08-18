@@ -312,8 +312,7 @@ impl GrantRecord {
     /// Whether this grant covers `area` (Area-scope match or Atlas-scope on the
     /// area's CURRENT atlas) — the `effective_area_caps` join predicate.
     pub fn covers_area(&self, area: &AreaRecord) -> bool {
-        self.area_id == Some(area.id)
-            || (self.atlas_id.is_some() && self.atlas_id == area.atlas_id)
+        self.area_id == Some(area.id) || (self.atlas_id.is_some() && self.atlas_id == area.atlas_id)
     }
 }
 
@@ -504,7 +503,11 @@ impl MockState {
         let mut out = Vec::new();
         let mut frontier = vec![root];
         while let Some(cur) = frontier.pop() {
-            for g in self.grants.iter().filter(|g| g.parent_grant_id == Some(cur)) {
+            for g in self
+                .grants
+                .iter()
+                .filter(|g| g.parent_grant_id == Some(cur))
+            {
                 out.push(g.id);
                 frontier.push(g.id);
             }

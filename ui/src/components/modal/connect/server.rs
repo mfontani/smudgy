@@ -111,7 +111,9 @@ fn encoding_field(state: &State) -> Element<'_, Message> {
         .copied()
         .find(|choice| choice.0 == state.server_form_data.encoding);
     column![
-        text(t!("encoding-label")).size(13).style(builtins::text::muted),
+        text(t!("encoding-label"))
+            .size(13)
+            .style(builtins::text::muted),
         pick_list(&ENCODING_CHOICES[..], selected, |val: EncodingChoice| {
             Message::UpdateServerFormField(ServerFormField::Encoding, val.0.to_string())
         })
@@ -189,8 +191,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             config.tls = state.server_form_data.tls;
             config.tls_verify = state.server_form_data.tls_verify;
             if let Err(e) = config.validate() {
-                state.server_crud_error =
-                    Some(t!("server-error-config", "error" => e.to_string()));
+                state.server_crud_error = Some(t!("server-error-config", "error" => e.to_string()));
                 return Task::none();
             }
             let name = state.server_form_data.name.trim().to_string();
@@ -227,8 +228,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             config.tls = state.server_form_data.tls;
             config.tls_verify = state.server_form_data.tls_verify;
             if let Err(e) = config.validate() {
-                state.server_crud_error =
-                    Some(t!("server-error-config", "error" => e.to_string()));
+                state.server_crud_error = Some(t!("server-error-config", "error" => e.to_string()));
                 return Task::none();
             }
             Task::perform(
@@ -293,7 +293,9 @@ pub(super) fn view_server_list(state: &State) -> Element<'_, Message> {
     };
 
     column![
-        text(t!("servers-title")).size(12).style(builtins::text::muted),
+        text(t!("servers-title"))
+            .size(12)
+            .style(builtins::text::muted),
         scrollable(server_list_content).height(Length::Fill),
         button(text(t!("servers-new")))
             .width(Length::Fill)
@@ -316,7 +318,9 @@ pub(super) fn view_server_form<'a>(
         ServerCrudAction::Create => {
             // --- Create Form ---
             let name_field = column![
-                text(t!("server-name")).size(13).style(builtins::text::muted),
+                text(t!("server-name"))
+                    .size(13)
+                    .style(builtins::text::muted),
                 TextInput::new(ts!("server-name-placeholder"), &state.server_form_data.name)
                     .id(server_name_input_id())
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Name, val))
@@ -325,7 +329,9 @@ pub(super) fn view_server_form<'a>(
             .spacing(4);
 
             let host_field = column![
-                text(t!("server-host")).size(13).style(builtins::text::muted),
+                text(t!("server-host"))
+                    .size(13)
+                    .style(builtins::text::muted),
                 TextInput::new("mud.example.com", &state.server_form_data.host)
                     .id(server_host_input_id())
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Host, val))
@@ -334,13 +340,17 @@ pub(super) fn view_server_form<'a>(
             .spacing(4);
 
             let port_field = column![
-                text(t!("server-port")).size(13).style(builtins::text::muted),
+                text(t!("server-port"))
+                    .size(13)
+                    .style(builtins::text::muted),
                 TextInput::new("", &state.server_form_data.port)
                     .id(server_port_input_id())
                     .width(Length::Fixed(120.0))
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Port, val))
                     .on_submit(Message::SubmitServerForm),
-                text(t!("server-port-help")).size(12).style(builtins::text::muted),
+                text(t!("server-port-help"))
+                    .size(12)
+                    .style(builtins::text::muted),
             ]
             .spacing(4);
 
@@ -369,13 +379,17 @@ pub(super) fn view_server_form<'a>(
         ServerCrudAction::Edit(name) => {
             // --- Edit Form — name is the key and stays read-only ---
             let name_field = column![
-                text(t!("server-name")).size(13).style(builtins::text::muted),
+                text(t!("server-name"))
+                    .size(13)
+                    .style(builtins::text::muted),
                 text(name).size(Pixels(16.0)),
             ]
             .spacing(4);
 
             let host_field = column![
-                text(t!("server-host")).size(13).style(builtins::text::muted),
+                text(t!("server-host"))
+                    .size(13)
+                    .style(builtins::text::muted),
                 TextInput::new("mud.example.com", &state.server_form_data.host)
                     .id(server_host_input_id())
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Host, val))
@@ -384,13 +398,17 @@ pub(super) fn view_server_form<'a>(
             .spacing(4);
 
             let port_field = column![
-                text(t!("server-port")).size(13).style(builtins::text::muted),
+                text(t!("server-port"))
+                    .size(13)
+                    .style(builtins::text::muted),
                 TextInput::new("4000", &state.server_form_data.port)
                     .id(server_port_input_id())
                     .width(Length::Fixed(120.0))
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Port, val))
                     .on_submit(Message::SubmitServerForm),
-                text(t!("server-port-help")).size(12).style(builtins::text::muted),
+                text(t!("server-port-help"))
+                    .size(12)
+                    .style(builtins::text::muted),
             ]
             .spacing(4);
 

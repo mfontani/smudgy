@@ -31,8 +31,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
-use http::{header, Request, Response};
+use anyhow::{Context, Result, anyhow, bail};
+use http::{Request, Response, header};
 use rust_embed::RustEmbed;
 use tao::{
     event::{Event, WindowEvent},
@@ -62,7 +62,9 @@ fn main() -> Result<()> {
         .iter()
         .find(|a| !a.starts_with("--"))
         .cloned()
-        .context("usage: smudgy_inspector [--print-url] <inspector-http-addr e.g. 127.0.0.1:9229>")?;
+        .context(
+            "usage: smudgy_inspector [--print-url] <inspector-http-addr e.g. 127.0.0.1:9229>",
+        )?;
 
     let ws = resolve_ws_target(&addr)
         .with_context(|| format!("failed to read inspector targets from http://{addr}/json"))?;
@@ -208,7 +210,10 @@ fn http_get_json(addr: &str, path: &str) -> Result<String> {
         .split_once("\r\n\r\n")
         .ok_or_else(|| anyhow!("malformed HTTP response from inspector"))?;
     if !head.lines().next().unwrap_or_default().contains("200") {
-        bail!("inspector returned non-200: {}", head.lines().next().unwrap_or_default());
+        bail!(
+            "inspector returned non-200: {}",
+            head.lines().next().unwrap_or_default()
+        );
     }
     Ok(body.to_string())
 }

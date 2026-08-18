@@ -619,7 +619,9 @@ fn parse_paint(node: &Node, ledger: &mut BudgetLedger) -> Result<Paint, RecordEr
             .ok_or_else(|| skip(format!("unparseable color {text:?}")));
     }
     let Some(gradient) = node.get("gradient") else {
-        return Err(skip("fill/stroke color must be a CSS color string or { gradient }"));
+        return Err(skip(
+            "fill/stroke color must be a CSS color string or { gradient }",
+        ));
     };
     let start = parse_pair(
         gradient
@@ -632,7 +634,9 @@ fn parse_paint(node: &Node, ledger: &mut BudgetLedger) -> Result<Paint, RecordEr
             .ok_or_else(|| skip("gradient needs to: [x, y]"))?,
     )?;
     let Some(Node::Array(stop_items)) = gradient.get("stops") else {
-        return Err(skip("gradient.stops must be an array of [offset, color] pairs"));
+        return Err(skip(
+            "gradient.stops must be an array of [offset, color] pairs",
+        ));
     };
     if stop_items.items().len() > MAX_GRADIENT_STOPS {
         return Err(SceneReject::Budget("gradient-stops").into());
@@ -665,13 +669,15 @@ fn parse_paint(node: &Node, ledger: &mut BudgetLedger) -> Result<Paint, RecordEr
 }
 
 fn parse_stroke(node: &Node, ledger: &mut BudgetLedger) -> Result<StrokeSpec, RecordError> {
-    let paint = node
-        .get("color")
-        .map_or_else(|| Ok(Paint::Solid(Color::BLACK)), |color| parse_paint(color, ledger))?;
+    let paint = node.get("color").map_or_else(
+        || Ok(Paint::Solid(Color::BLACK)),
+        |color| parse_paint(color, ledger),
+    )?;
     let width = f32_field(node, "width", 1.0);
     let dash = match node.get("dash") {
         None | Some(Node::Null) => Vec::new(),
-        Some(Node::Array(items)) => {
+        Some(Node::Array(items)) =>
+        {
             #[allow(clippy::cast_possible_truncation)]
             items
                 .items()
@@ -728,9 +734,7 @@ fn parse_record(
             y2: f32_field(node, "y2", 0.0),
         },
         "polyline" | "polygon" => {
-            let points = parse_points(
-                node.get("points").ok_or_else(|| skip("missing points"))?,
-            )?;
+            let points = parse_points(node.get("points").ok_or_else(|| skip("missing points"))?)?;
             ledger.segments += points.len();
             ledger.approx_bytes += points.len() * SEGMENT_OVERHEAD_BYTES;
             ledger.check()?;
@@ -823,8 +827,7 @@ fn parse_record(
             let slot = match images.as_deref_mut() {
                 None => {
                     warnings.push(
-                        "image record has no image context here; it will draw nothing"
-                            .to_string(),
+                        "image record has no image context here; it will draw nothing".to_string(),
                     );
                     None
                 }
@@ -834,8 +837,7 @@ fn parse_record(
                         return Err(skip(format!("image src rejected: {reason}")));
                     }
                 },
-                Some(SceneImages::Live(ctx)) => match resolve_src(src, &ctx.creator, ctx.bound)
-                {
+                Some(SceneImages::Live(ctx)) => match resolve_src(src, &ctx.creator, ctx.bound) {
                     Ok(source) => {
                         let key = source.store_key(&ctx.creator.policy);
                         // Known sources ride the existing entry; never-seen ones spawn a
@@ -843,9 +845,7 @@ fn parse_record(
                         let cell = if let Some(cell) = ctx.store.peek(&key) {
                             cell.touch();
                             cell
-                        } else if ctx.bound
-                            && ledger.new_bound_sources >= MAX_NEW_BOUND_SOURCES
-                        {
+                        } else if ctx.bound && ledger.new_bound_sources >= MAX_NEW_BOUND_SOURCES {
                             return Err(skip(
                                 "image budget: too many never-seen sources in one scene write",
                             ));
@@ -978,9 +978,10 @@ fn numeric_field_allowed(shape: &Shape, field: &str) -> bool {
 fn color_field_allowed(shape: &Shape, field: &str) -> bool {
     match field {
         // A texture has no fill/stroke paint (record opacity routes to Image::opacity).
-        "fill" | "stroke" => {
-            !matches!(shape, Shape::Group { .. } | Shape::Text(_) | Shape::Image(_))
-        }
+        "fill" | "stroke" => !matches!(
+            shape,
+            Shape::Group { .. } | Shape::Text(_) | Shape::Image(_)
+        ),
         "color" => matches!(shape, Shape::Text(_)),
         _ => false,
     }
@@ -1000,9 +1001,8 @@ fn parse_animate(
         ledger.animated_fields += 1;
         ledger.check()?;
         let is_color = color_field_allowed(shape, field);
-        let is_number = field == "opacity"
-            || field == "stroke_width"
-            || numeric_field_allowed(shape, field);
+        let is_number =
+            field == "opacity" || field == "stroke_width" || numeric_field_allowed(shape, field);
         if !is_color && !is_number {
             return Err(skip(format!(
                 "field {field:?} is not animatable on a {} record",
@@ -1336,10 +1336,7 @@ pub(crate) mod path_data {
 
     fn reflect(control: Option<Point>, current: Point) -> Point {
         match control {
-            Some(control) => Point::new(
-                2.0 * current.x - control.x,
-                2.0 * current.y - control.y,
-            ),
+            Some(control) => Point::new(2.0 * current.x - control.x, 2.0 * current.y - control.y),
             // No previous curve to reflect: the control coincides with the current point
             // (SVG 2 §9.5.2), degrading S/T to a plain curve start.
             None => current,
@@ -1350,7 +1347,11 @@ pub(crate) mod path_data {
     /// each (the standard SVG implementation-notes conversion, F.6). Degenerate radii draw a
     /// straight line, per spec.
     #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     // Exact float compares are the spec's own degeneracy tests (F.6.2), and the rx/ry pairs
     // are the spec's own names.
     #[allow(clippy::float_cmp, clippy::similar_names)]
@@ -1651,18 +1652,16 @@ fn apply_field(record: &mut Record, field: &str, value: TweenValue) {
     match value {
         TweenValue::Color(color) => match field {
             "fill" => record.fill = Some(Paint::Solid(color)),
-            "stroke" => {
-                match &mut record.stroke {
-                    Some(stroke) => stroke.paint = Paint::Solid(color),
-                    None => {
-                        record.stroke = Some(StrokeSpec {
-                            paint: Paint::Solid(color),
-                            width: 1.0,
-                            dash: Vec::new(),
-                        });
-                    }
+            "stroke" => match &mut record.stroke {
+                Some(stroke) => stroke.paint = Paint::Solid(color),
+                None => {
+                    record.stroke = Some(StrokeSpec {
+                        paint: Paint::Solid(color),
+                        width: 1.0,
+                        dash: Vec::new(),
+                    });
                 }
-            }
+            },
             "color" => {
                 if let Shape::Text(text) = &mut record.shape {
                     text.color = color;
@@ -1789,9 +1788,7 @@ fn shape_path(shape: &Shape) -> Option<canvas::Path> {
                 builder.rectangle(Point::new(*x, *y), Size::new(*width, *height));
             }
         }),
-        Shape::Circle { cx, cy, r } => {
-            canvas::Path::circle(Point::new(*cx, *cy), *r)
-        }
+        Shape::Circle { cx, cy, r } => canvas::Path::circle(Point::new(*cx, *cy), *r),
         Shape::Ellipse { cx, cy, rx, ry } => canvas::Path::new(|builder| {
             builder.ellipse(canvas::path::arc::Elliptical {
                 center: Point::new(*cx, *cy),
@@ -2421,12 +2418,9 @@ mod tests {
     fn image_ctx(bound: bool) -> SceneImageCtx {
         let (store, _) = crate::image_store::tests::test_store();
         let policy = crate::image_store::tests::test_policy();
-        let creator = smudgy_cloud::image_source::register_creator(
-            r#"{"kind":"user"}"#,
-            None,
-            policy,
-        )
-        .expect("user creator registers on a trusted policy");
+        let creator =
+            smudgy_cloud::image_source::register_creator(r#"{"kind":"user"}"#, None, policy)
+                .expect("user creator registers on a trusted policy");
         SceneImageCtx {
             creator: Arc::new(creator),
             store,
@@ -2477,13 +2471,19 @@ mod tests {
         let Shape::Image(image) = &scene.records[8].shape else {
             panic!("expected image");
         };
-        assert_eq!((image.fit, image.nearest, image.rotate_deg), (ImageFit::Cover, true, 15.0));
+        assert_eq!(
+            (image.fit, image.nearest, image.rotate_deg),
+            (ImageFit::Cover, true, 15.0)
+        );
         assert!(image.slot.is_some(), "src resolved and ensured at parse");
         let Shape::Rect { x, rx, .. } = &scene.records[0].shape else {
             panic!("expected rect");
         };
         assert_eq!((*x, *rx), (1.0, 1.0));
-        assert_eq!(scene.records[0].fill, Some(Paint::Solid(Color::from_rgb(1.0, 0.0, 0.0))));
+        assert_eq!(
+            scene.records[0].fill,
+            Some(Paint::Solid(Color::from_rgb(1.0, 0.0, 0.0)))
+        );
         let Shape::Group { children, .. } = &scene.records[9].shape else {
             panic!("expected group");
         };
@@ -2503,7 +2503,10 @@ mod tests {
 
     #[test]
     fn non_array_scene_is_rejected() {
-        assert_eq!(parse(json!({ "kind": "rect" })), Err(SceneReject::NotAnArray));
+        assert_eq!(
+            parse(json!({ "kind": "rect" })),
+            Err(SceneReject::NotAnArray)
+        );
         assert_eq!(parse(json!(null)), Err(SceneReject::NotAnArray));
     }
 
@@ -2517,10 +2520,15 @@ mod tests {
         let Some(Paint::Gradient { start, end, stops }) = &scene.records[0].fill else {
             panic!("expected gradient fill");
         };
-        assert_eq!((*start, *end), (Point::new(4.0, 0.0), Point::new(144.0, 0.0)));
+        assert_eq!(
+            (*start, *end),
+            (Point::new(4.0, 0.0), Point::new(144.0, 0.0))
+        );
         assert_eq!(stops.len(), 2);
 
-        let stops: Vec<_> = (0..=8).map(|i| json!([f64::from(i) / 8.0, "#ffffff"])).collect();
+        let stops: Vec<_> = (0..=8)
+            .map(|i| json!([f64::from(i) / 8.0, "#ffffff"]))
+            .collect();
         assert_eq!(
             parse(json!([
                 { "kind": "rect", "width": 1, "height": 1,
@@ -2607,7 +2615,11 @@ mod tests {
         let record = &scene.records[0];
         assert!(record.transient);
         let tween = &record.animate[0];
-        assert_eq!(tween.from, Some(TweenValue::Number(6.0)), "from defaults to the static r");
+        assert_eq!(
+            tween.from,
+            Some(TweenValue::Number(6.0)),
+            "from defaults to the static r"
+        );
         assert_eq!(tween.to, TweenValue::Number(400.0));
         assert_eq!(tween.ease, Ease::Out);
         assert_eq!(tween.repeat, Repeat::Count(1));
@@ -2675,7 +2687,10 @@ mod tests {
         let (TweenValue::Number(value), finished) = tween_at(&tween, 1.75) else {
             panic!("expected a number");
         };
-        assert!((value - 2.5).abs() < 1e-4, "restarted second run, got {value}");
+        assert!(
+            (value - 2.5).abs() < 1e-4,
+            "restarted second run, got {value}"
+        );
         assert!(!finished);
         assert!(tween_at(&tween, 2.6).1, "two repetitions + delay complete");
     }
@@ -2736,7 +2751,10 @@ mod tests {
         assert_eq!(clocks["ring"].started_s, 10.0);
         // A later generation with the identical record keeps the running clock.
         reconcile_clocks(&ring_scene(400.0).records, &mut clocks, 10.5);
-        assert_eq!(clocks["ring"].started_s, 10.0, "mid-flight rewrite preserves the clock");
+        assert_eq!(
+            clocks["ring"].started_s, 10.0,
+            "mid-flight rewrite preserves the clock"
+        );
         // A changed spec is a retrigger.
         reconcile_clocks(&ring_scene(500.0).records, &mut clocks, 11.0);
         assert_eq!(clocks["ring"].started_s, 11.0);
@@ -2767,7 +2785,10 @@ mod tests {
             resolve_record(&scene.records[0], 0, &clocks, 5.0).is_none(),
             "the retained clock tombstones the re-delivered record"
         );
-        assert!(!any_animation_live(&clocks, 5.0), "no redraw requests for a dead scene");
+        assert!(
+            !any_animation_live(&clocks, 5.0),
+            "no redraw requests for a dead scene"
+        );
     }
 
     #[test]
@@ -2875,9 +2896,15 @@ mod tests {
 
     #[test]
     fn path_data_rejects_garbage_loudly() {
-        assert!(path_data::parse("10 10 L 0 0").is_err(), "must start with a command");
+        assert!(
+            path_data::parse("10 10 L 0 0").is_err(),
+            "must start with a command"
+        );
         assert!(path_data::parse("M 1 banana").is_err());
-        assert!(path_data::parse("M 0 0 X 1 1").is_err(), "unknown command letter");
+        assert!(
+            path_data::parse("M 0 0 X 1 1").is_err(),
+            "unknown command letter"
+        );
     }
 
     #[test]
@@ -2900,23 +2927,33 @@ mod tests {
         // past the budget skip with a warning. Already-known sources ride free.
         let ctx = image_ctx(true);
         let over: Vec<_> = (0..=MAX_NEW_BOUND_SOURCES)
-            .map(|i| json!({ "kind": "image", "src": format!("https://x.example/{i}.png"),
-                             "width": 1, "height": 1 }))
+            .map(|i| {
+                json!({ "kind": "image", "src": format!("https://x.example/{i}.png"),
+                             "width": 1, "height": 1 })
+            })
             .collect();
         let mut images = SceneImages::Live(&ctx);
-        let parsed = parse_scene(&node(serde_json::Value::Array(over.clone())), Some(&mut images))
-            .unwrap();
+        let parsed = parse_scene(
+            &node(serde_json::Value::Array(over.clone())),
+            Some(&mut images),
+        )
+        .unwrap();
         assert_eq!(parsed.records.len(), MAX_NEW_BOUND_SOURCES);
         assert_eq!(parsed.warnings.len(), 1);
-        assert!(parsed.warnings[0].contains("image budget"), "{:?}", parsed.warnings);
+        assert!(
+            parsed.warnings[0].contains("image budget"),
+            "{:?}",
+            parsed.warnings
+        );
         // A re-write of the same scene: every source is now known — all records parse.
         let mut images = SceneImages::Live(&ctx);
-        let parsed = parse_scene(&node(serde_json::Value::Array(over)), Some(&mut images))
-            .unwrap();
+        let parsed = parse_scene(&node(serde_json::Value::Array(over)), Some(&mut images)).unwrap();
         assert_eq!(parsed.records.len(), MAX_NEW_BOUND_SOURCES + 1);
         // Static scenes are author-written: never budgeted.
         let many: Vec<_> = (0..MAX_NEW_BOUND_SOURCES + 8)
-            .map(|i| json!({ "kind": "image", "src": format!("s{i}.png"), "width": 1, "height": 1 }))
+            .map(
+                |i| json!({ "kind": "image", "src": format!("s{i}.png"), "width": 1, "height": 1 }),
+            )
             .collect();
         let parsed = parse_with_images(serde_json::Value::Array(many), false).unwrap();
         assert_eq!(parsed.records.len(), MAX_NEW_BOUND_SOURCES + 8);
@@ -2948,7 +2985,9 @@ mod tests {
     #[test]
     fn image_records_have_their_own_budget() {
         let over: Vec<_> = (0..=MAX_IMAGE_RECORDS)
-            .map(|i| json!({ "kind": "image", "src": format!("a{i}.png"), "width": 1, "height": 1 }))
+            .map(
+                |i| json!({ "kind": "image", "src": format!("a{i}.png"), "width": 1, "height": 1 }),
+            )
             .collect();
         assert_eq!(
             parse_with_images(serde_json::Value::Array(over), false),
@@ -2964,11 +3003,19 @@ mod tests {
             { "kind": "image", "src": "../outside.png", "width": 1, "height": 1 },
         ]);
         let parsed = parse_with_images(scene.clone(), false).unwrap();
-        assert_eq!(parsed.records.len(), 1, "static: `..` allowed for a user module");
+        assert_eq!(
+            parsed.records.len(),
+            1,
+            "static: `..` allowed for a user module"
+        );
         let parsed = parse_with_images(scene, true).unwrap();
         assert_eq!(parsed.records.len(), 0, "bound: descend-only");
         assert_eq!(parsed.warnings.len(), 1);
-        assert!(parsed.warnings[0].contains("rejected"), "{:?}", parsed.warnings);
+        assert!(
+            parsed.warnings[0].contains("rejected"),
+            "{:?}",
+            parsed.warnings
+        );
 
         // Absolute paths are always denied for bound values.
         let parsed = parse_with_images(
@@ -3000,7 +3047,11 @@ mod tests {
             { "kind": "image", "src": "x.png", "width": 1, "height": 1 },
         ]))
         .unwrap();
-        assert_eq!(parsed.records.len(), 1, "record kept (cell-less, draws nothing)");
+        assert_eq!(
+            parsed.records.len(),
+            1,
+            "record kept (cell-less, draws nothing)"
+        );
         assert_eq!(parsed.warnings.len(), 1);
         let Shape::Image(image) = &parsed.records[0].shape else {
             panic!("expected image");
@@ -3035,7 +3086,11 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert_eq!(parsed.records.len(), 0, "animate.{field} must reject the record");
+            assert_eq!(
+                parsed.records.len(),
+                0,
+                "animate.{field} must reject the record"
+            );
         }
     }
 
@@ -3053,16 +3108,28 @@ mod tests {
         };
         // Fill: the box, exactly.
         let bounds = fitted_image_bounds(&spec(ImageFit::Fill), 40.0, 40.0);
-        assert_eq!(bounds, Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 50.0)));
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 50.0))
+        );
         // Contain on a square 40x40 image in a 100x50 box: 50x50, centered horizontally.
         let bounds = fitted_image_bounds(&spec(ImageFit::Contain), 40.0, 40.0);
-        assert_eq!(bounds, Rectangle::new(Point::new(35.0, 20.0), Size::new(50.0, 50.0)));
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(35.0, 20.0), Size::new(50.0, 50.0))
+        );
         // Cover: 100x100, vertically centered spill (clipped at the widget bounds).
         let bounds = fitted_image_bounds(&spec(ImageFit::Cover), 40.0, 40.0);
-        assert_eq!(bounds, Rectangle::new(Point::new(10.0, -5.0), Size::new(100.0, 100.0)));
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(10.0, -5.0), Size::new(100.0, 100.0))
+        );
         // None: intrinsic pixels, centered.
         let bounds = fitted_image_bounds(&spec(ImageFit::None), 40.0, 40.0);
-        assert_eq!(bounds, Rectangle::new(Point::new(40.0, 25.0), Size::new(40.0, 40.0)));
+        assert_eq!(
+            bounds,
+            Rectangle::new(Point::new(40.0, 25.0), Size::new(40.0, 40.0))
+        );
     }
 
     // ---- pointer mapping ------------------------------------------------------------------
@@ -3071,7 +3138,10 @@ mod tests {
     fn view_box_maps_pointer_coordinates_into_scene_space() {
         let program = SceneProgram {
             scene: SceneSource::Static(Arc::new(ParsedScene::default())),
-            view_box: Some(Rectangle::new(Point::new(10.0, 20.0), Size::new(100.0, 50.0))),
+            view_box: Some(Rectangle::new(
+                Point::new(10.0, 20.0),
+                Size::new(100.0, 50.0),
+            )),
             fit: ViewFit::Fill,
             on_pointer: None,
             image_store: None,
@@ -3110,7 +3180,10 @@ mod tests {
         assert!(top_left.x.abs() < 1e-3 && top_left.y.abs() < 1e-3);
         let bottom_right = program.to_scene(Point::new(600.0, 400.0), bounds);
         assert!((bottom_right.x - 480.0).abs() < 1e-3 && (bottom_right.y - 480.0).abs() < 1e-3);
-        assert!(program.to_scene(Point::new(0.0, 0.0), bounds).x < 0.0, "margin maps outside");
+        assert!(
+            program.to_scene(Point::new(0.0, 0.0), bounds).x < 0.0,
+            "margin maps outside"
+        );
     }
 
     // ---- bound-scene memoization ----------------------------------------------------------
@@ -3142,7 +3215,10 @@ mod tests {
         // A rejected generation keeps the previous scene on screen.
         cell.set(json!("not a scene"));
         let after_reject = program.current();
-        assert!(Arc::ptr_eq(&first, &after_reject), "rejected write leaves the prior scene");
+        assert!(
+            Arc::ptr_eq(&first, &after_reject),
+            "rejected write leaves the prior scene"
+        );
 
         // An accepted one replaces it.
         cell.set(json!([

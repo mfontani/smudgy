@@ -173,17 +173,14 @@ impl UiImageFetcher {
                             .fetch(&self.client, url, &policy.server_name, grants.as_ref())
                             .await?
                     }
-                    None => {
-                        http_cache::fetch_uncached(&self.client, url, grants.as_ref()).await?
-                    }
+                    None => http_cache::fetch_uncached(&self.client, url, grants.as_ref()).await?,
                 };
                 Ok((bytes, None))
             }
             ResolvedImageSource::LocalFile(path) => read_local(path, policy),
-            ResolvedImageSource::Data { uri, .. } => Ok((
-                decode_data_uri(uri).map_err(FetchError::permanent)?,
-                None,
-            )),
+            ResolvedImageSource::Data { uri, .. } => {
+                Ok((decode_data_uri(uri).map_err(FetchError::permanent)?, None))
+            }
             ResolvedImageSource::PackageAsset {
                 owner,
                 name,
@@ -255,8 +252,10 @@ async fn load_package_asset(
     // The same refusal module_hash applies locally: a CODE module is not an image, and the
     // network fallback must not become the bypass (nor waste a resolve + download per app
     // run on a src typo that could never decode).
-    if smudgy_core::session::runtime::image_assets::is_code_module(&module.media_type, &module.subpath)
-    {
+    if smudgy_core::session::runtime::image_assets::is_code_module(
+        &module.media_type,
+        &module.subpath,
+    ) {
         return Err(FetchError::permanent(format!(
             "{owner}/{name}@{version}/{subpath} is a code module, not an image asset"
         )));
@@ -279,7 +278,9 @@ async fn load_package_asset(
     let bytes = client
         .fetch_module_bytes(&module.content_url, &module.content_hash)
         .await
-        .map_err(|err| FetchError::transient(format!("{owner}/{name}@{version}/{subpath}: {err}")))?;
+        .map_err(|err| {
+            FetchError::transient(format!("{owner}/{name}@{version}/{subpath}: {err}"))
+        })?;
     if bytes.len() as u64 > MAX_BODY_BYTES {
         return Err(FetchError::permanent(format!(
             "{owner}/{name}@{version}/{subpath} is {} bytes; images are capped at {MAX_BODY_BYTES}",
@@ -313,8 +314,8 @@ fn read_local_package_asset(
     let root = dunce::canonicalize(packages_root.join(name))
         .map_err(|e| FetchError::transient(format!("{name}: {e}")))?;
     let path = local_package_asset_path(packages_root, name, subpath);
-    let canonical =
-        dunce::canonicalize(&path).map_err(|e| FetchError::transient(format!("{}: {e}", path.display())))?;
+    let canonical = dunce::canonicalize(&path)
+        .map_err(|e| FetchError::transient(format!("{}: {e}", path.display())))?;
     if !canonical.starts_with(&root) {
         return Err(FetchError::permanent(format!(
             "{} escapes its package directory after resolving links",
@@ -341,9 +342,8 @@ impl ImageFetcher for UiImageFetcher {
         &self,
         source: ResolvedImageSource,
         policy: Arc<ImageSourcePolicy>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<DecodedImage, FetchError>> + Send + 'static>,
-    > {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DecodedImage, FetchError>> + Send + 'static>>
+    {
         // `self` is behind an `Arc<dyn ImageFetcher>` owned by the store; clone the cheap
         // parts into the future instead of threading a self-Arc through the trait.
         let client = self.client.clone();
@@ -422,7 +422,10 @@ fn read_local(
             .iter()
             .filter_map(|root| dunce::canonicalize(root).ok())
             .collect();
-        if !canonical_roots.iter().any(|root| canonical.starts_with(root)) {
+        if !canonical_roots
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
             return Err(FetchError::permanent(format!(
                 "{} escapes the granted read roots after resolving links",
                 path.display()
@@ -460,7 +463,10 @@ fn decode_data_uri(uri: &str) -> Result<Vec<u8>, String> {
 /// orientation. Runs inside `block_in_place` under the decode semaphore.
 fn decode_and_orient(bytes: &[u8]) -> Result<DecodedImage, String> {
     if bytes.len() as u64 > MAX_BODY_BYTES {
-        return Err(format!("image is {} bytes; capped at {MAX_BODY_BYTES}", bytes.len()));
+        return Err(format!(
+            "image is {} bytes; capped at {MAX_BODY_BYTES}",
+            bytes.len()
+        ));
     }
     if looks_like_svg(bytes) {
         return Err("SVG sources are not supported yet (raster images only)".to_string());
@@ -579,8 +585,7 @@ mod tests {
         std::fs::write(dir.join("outside.png"), b"outside").unwrap();
 
         // A validated subpath reads fine and stamps for the freshness probe.
-        let (bytes, stamp) =
-            read_local_package_asset(&packages, "hud", "assets/logo.png").unwrap();
+        let (bytes, stamp) = read_local_package_asset(&packages, "hud", "assets/logo.png").unwrap();
         assert_eq!(bytes, b"not-really-png");
         assert!(stamp.is_some());
 
@@ -588,8 +593,11 @@ mod tests {
         // recheck even though the lexical subpath looked fine.
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(dir.join("outside.png"), pkg.join("assets").join("sneaky.png"))
-                .unwrap();
+            std::os::unix::fs::symlink(
+                dir.join("outside.png"),
+                pkg.join("assets").join("sneaky.png"),
+            )
+            .unwrap();
             let err = read_local_package_asset(&packages, "hud", "assets/sneaky.png")
                 .expect_err("symlink escape must be refused");
             assert!(!err.transient, "confinement violations are permanent");

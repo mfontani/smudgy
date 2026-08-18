@@ -50,9 +50,8 @@ pub const BASELINE_REPORTS: [&str; 6] = [
 /// Frame one outbound `VAR <name> VAL <value> [VAL <value> …]` subnegotiation, `0xFF`
 /// doubled by the telnet framer.
 pub fn frame_command(name: &str, values: &[&str], into: &mut Vec<u8>) {
-    let mut payload = Vec::with_capacity(
-        1 + name.len() + values.iter().map(|v| v.len() + 1).sum::<usize>(),
-    );
+    let mut payload =
+        Vec::with_capacity(1 + name.len() + values.iter().map(|v| v.len() + 1).sum::<usize>());
     payload.push(marker::VAR);
     payload.extend_from_slice(name.as_bytes());
     for value in values {
@@ -75,7 +74,10 @@ pub fn frame_handshake(into: &mut Vec<u8>) {
 #[must_use]
 pub fn parse_variables(payload: &[u8]) -> Vec<(String, Value)> {
     let mut variables = Vec::new();
-    let mut cursor = Cursor { bytes: payload, at: 0 };
+    let mut cursor = Cursor {
+        bytes: payload,
+        at: 0,
+    };
     // Skip to the first VAR.
     while cursor.peek().is_some_and(|b| b != marker::VAR) {
         cursor.at += 1;
@@ -267,7 +269,10 @@ mod tests {
         ]);
         assert_eq!(
             parse_variables(&marked),
-            vec![("REPORTABLE_VARIABLES".to_string(), json!(["ROOM", "AREA_NAME"]))]
+            vec![(
+                "REPORTABLE_VARIABLES".to_string(),
+                json!(["ROOM", "AREA_NAME"])
+            )]
         );
 
         // God Wars II sends top-level lists as bare repeated VALs.
@@ -290,7 +295,14 @@ mod tests {
     #[test]
     fn liberal_decode_survives_malformed_payloads() {
         // Unterminated table closes at end of payload.
-        let unterminated = bytes(&[&[VAR], b"ROOM", &[VAL, TABLE_OPEN, VAR], b"VNUM", &[VAL], b"1"]);
+        let unterminated = bytes(&[
+            &[VAR],
+            b"ROOM",
+            &[VAL, TABLE_OPEN, VAR],
+            b"VNUM",
+            &[VAL],
+            b"1",
+        ]);
         assert_eq!(
             parse_variables(&unterminated),
             vec![("ROOM".to_string(), json!({ "VNUM": "1" }))]
@@ -298,7 +310,10 @@ mod tests {
 
         // Garbage lead-in is skipped; a VAR with no VAL is null; empty payload is empty.
         let lead_in = bytes(&[b"junk", &[VAR], b"PING"]);
-        assert_eq!(parse_variables(&lead_in), vec![("PING".to_string(), Value::Null)]);
+        assert_eq!(
+            parse_variables(&lead_in),
+            vec![("PING".to_string(), Value::Null)]
+        );
         assert!(parse_variables(&[]).is_empty());
 
         // Invalid UTF-8 decodes lossily rather than dropping the variable.

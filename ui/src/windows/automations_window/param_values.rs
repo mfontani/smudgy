@@ -561,7 +561,11 @@ fn list_block<'a>(
         .spacing(6.0)
         .push(text(label.to_string()).size(13.0));
     if items.is_empty() {
-        col = col.push(text(crate::i18n::t!("param-value-no-entries")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("param-value-no-entries"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (i, item) in items.iter().enumerate() {
         let control: Elem<'a> = match element {
@@ -642,7 +646,11 @@ fn table_block<'a>(
     col = col.push(header);
 
     if rows.is_empty() {
-        col = col.push(text(crate::i18n::t!("param-value-no-rows")).size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("param-value-no-rows"))
+                .size(12.0)
+                .style(common::faint),
+        );
     }
     for (r, row_state) in rows.iter().enumerate() {
         let mut cells = row![].spacing(8.0).align_y(Vertical::Center);

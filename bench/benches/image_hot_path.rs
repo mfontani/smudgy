@@ -38,9 +38,8 @@ impl ImageFetcher for StubFetcher {
         &self,
         _source: smudgy_cloud::image_source::ResolvedImageSource,
         _policy: Arc<ImageSourcePolicy>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<DecodedImage, FetchError>> + Send + 'static>,
-    > {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DecodedImage, FetchError>> + Send + 'static>>
+    {
         Box::pin(async {
             Ok(DecodedImage {
                 width: 1,
@@ -176,12 +175,12 @@ fn sanity_check() {
     let key: Arc<str> = Arc::from(source.store_key(&policy));
     let first = store.ensure_keyed(&key, &source, &policy);
     let second = store.ensure_keyed(&key, &source, &policy);
-    assert!(Arc::ptr_eq(&first, &second), "steady-state probe must hit the same cell");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "steady-state probe must hit the same cell"
+    );
     for _ in 0..500 {
-        if !matches!(
-            &*first.state(),
-            smudgy_widgets::EntryState::Loading
-        ) {
+        if !matches!(&*first.state(), smudgy_widgets::EntryState::Loading) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));

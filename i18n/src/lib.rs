@@ -369,8 +369,7 @@ mod tests {
             .unwrap();
         let known = catalog_ids(fallback.source);
         let invocation =
-            Regex::new(r#"(?:[a-z_][a-z0-9_]*::)*t(?:s)?!\s*\(\s*"([a-z][a-z0-9-]*)""#)
-                .unwrap();
+            Regex::new(r#"(?:[a-z_][a-z0-9_]*::)*t(?:s)?!\s*\(\s*"([a-z][a-z0-9-]*)""#).unwrap();
         let mut missing = Vec::new();
         for path in workspace_sources() {
             let source = std::fs::read_to_string(&path)

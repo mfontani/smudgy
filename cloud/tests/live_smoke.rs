@@ -161,10 +161,10 @@ enum Target {
 type ExitFingerprint = (
     String, // from_direction
     Target,
-    Option<String>, // to_direction
-    String,         // path
-    String,         // command
-    u32,            // weight bits
+    Option<String>,           // to_direction
+    String,                   // path
+    String,                   // command
+    u32,                      // weight bits
     (bool, bool, bool, bool), // hidden/closed/locked/secret
 );
 
@@ -193,7 +193,12 @@ fn room_fingerprints(
             let mut properties: Vec<String> = room
                 .properties
                 .iter()
-                .map(|property| format!("{}={} secret={}", property.name, property.value, property.is_secret))
+                .map(|property| {
+                    format!(
+                        "{}={} secret={}",
+                        property.name, property.value, property.is_secret
+                    )
+                })
                 .collect();
             properties.sort();
             meta.extend(properties);
@@ -202,11 +207,9 @@ fn room_fingerprints(
                 .iter()
                 .map(|exit| {
                     let target = match exit.to_area_id {
-                        Some(area) if area == own => {
-                            exit.to_room_number.map_or(Target::Dangling, |number| {
-                                Target::InArea(number.0)
-                            })
-                        }
+                        Some(area) if area == own => exit
+                            .to_room_number
+                            .map_or(Target::Dangling, |number| Target::InArea(number.0)),
                         Some(area) if demote_external => {
                             let _ = area;
                             Target::Dangling
@@ -227,7 +230,12 @@ fn room_fingerprints(
                         exit.path.clone(),
                         exit.command.clone(),
                         exit.weight.to_bits(),
-                        (exit.is_hidden, exit.is_closed, exit.is_locked, exit.is_secret),
+                        (
+                            exit.is_hidden,
+                            exit.is_closed,
+                            exit.is_locked,
+                            exit.is_secret,
+                        ),
                     )
                 })
                 .collect();
@@ -314,7 +322,12 @@ fn shape_fingerprints(doc: &AreaWithDetails) -> BTreeSet<String> {
 fn area_properties(doc: &AreaWithDetails) -> BTreeSet<String> {
     doc.properties
         .iter()
-        .map(|property| format!("{}={} secret={}", property.name, property.value, property.is_secret))
+        .map(|property| {
+            format!(
+                "{}={} secret={}",
+                property.name, property.value, property.is_secret
+            )
+        })
         .collect()
 }
 
@@ -394,18 +407,30 @@ fn compare_copy(
         src_connection_ids.is_disjoint(&dst_connection_ids),
         "copy reuses source connection ids"
     );
-    let src_label_ids: BTreeSet<String> =
-        src.labels.iter().map(|label| label.id.to_string()).collect();
-    let dst_label_ids: BTreeSet<String> =
-        dst.labels.iter().map(|label| label.id.to_string()).collect();
+    let src_label_ids: BTreeSet<String> = src
+        .labels
+        .iter()
+        .map(|label| label.id.to_string())
+        .collect();
+    let dst_label_ids: BTreeSet<String> = dst
+        .labels
+        .iter()
+        .map(|label| label.id.to_string())
+        .collect();
     ensure!(
         src_label_ids.is_disjoint(&dst_label_ids),
         "copy reuses source label ids"
     );
-    let src_shape_ids: BTreeSet<String> =
-        src.shapes.iter().map(|shape| shape.id.to_string()).collect();
-    let dst_shape_ids: BTreeSet<String> =
-        dst.shapes.iter().map(|shape| shape.id.to_string()).collect();
+    let src_shape_ids: BTreeSet<String> = src
+        .shapes
+        .iter()
+        .map(|shape| shape.id.to_string())
+        .collect();
+    let dst_shape_ids: BTreeSet<String> = dst
+        .shapes
+        .iter()
+        .map(|shape| shape.id.to_string())
+        .collect();
     ensure!(
         src_shape_ids.is_disjoint(&dst_shape_ids),
         "copy reuses source shape ids"
@@ -527,7 +552,12 @@ async fn run(
     mapper
         .create_exit(
             room_key(src, 1),
-            exit_to(Some(src), Some(2), ExitDirection::East, Some(ExitDirection::West)),
+            exit_to(
+                Some(src),
+                Some(2),
+                ExitDirection::East,
+                Some(ExitDirection::West),
+            ),
         )
         .await
         .map_err(|error| format!("paired exit: {error}"))?;
@@ -699,7 +729,10 @@ async fn run(
     let replay_elapsed = started.elapsed();
     let dest2 = relocation2.destination_ids[0];
     created.areas.push(dest2);
-    ensure!(dest2 != src && dest2 != dest, "replay copy must be a fresh area");
+    ensure!(
+        dest2 != src && dest2 != dest,
+        "replay copy must be a fresh area"
+    );
     eprintln!("replay copy: {src} -> {dest2} in {replay_elapsed:?}");
 
     let raw2 = fetch_area_raw(http, base_url, token, dest2).await?;

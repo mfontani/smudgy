@@ -62,8 +62,15 @@ fn session_params(session_id: u32, server: &str) -> Arc<SessionParams> {
 #[derive(Debug, PartialEq, Eq)]
 enum WireRecord {
     Op(PaneKey, InputOp),
-    Words { key: PaneKey, suggestions: Vec<String> },
-    PaneOpened { key: PaneKey, has_input: bool, placeholder: Option<String> },
+    Words {
+        key: PaneKey,
+        suggestions: Vec<String>,
+    },
+    PaneOpened {
+        key: PaneKey,
+        has_input: bool,
+        placeholder: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -83,7 +90,9 @@ impl Recording {
                 }
             }
             SessionEvent::InputOp { key, op } => self.records.push(WireRecord::Op(key, op)),
-            SessionEvent::InputWordSets { key, suggestions, .. } => {
+            SessionEvent::InputWordSets {
+                key, suggestions, ..
+            } => {
                 self.records.push(WireRecord::Words {
                     key,
                     suggestions: suggestions.iter().map(|w| w.as_str().to_string()).collect(),
@@ -112,7 +121,11 @@ impl Recording {
     /// The most recently opened pane that hosts an input.
     fn opened_input_pane(&self) -> Option<PaneKey> {
         self.records.iter().rev().find_map(|record| match record {
-            WireRecord::PaneOpened { key, has_input: true, .. } => Some(*key),
+            WireRecord::PaneOpened {
+                key,
+                has_input: true,
+                ..
+            } => Some(*key),
             _ => None,
         })
     }
@@ -177,7 +190,11 @@ echo("MAIN_PANE_INPUT_" + (session.mainPane.input === undefined ? "UNDEFINED" : 
 async fn pane_submissions_deliver_to_on_submit_only_and_survive_reload() {
     let server = "PaneInputSubmit";
     let server_dir = prepare_server(server);
-    std::fs::write(server_dir.join("modules").join("pane.ts"), ON_SUBMIT_HARNESS_TS).unwrap();
+    std::fs::write(
+        server_dir.join("modules").join("pane.ts"),
+        ON_SUBMIT_HARNESS_TS,
+    )
+    .unwrap();
 
     let mut events = Box::pin(spawn(session_params(7401, server)));
     let mut recording = Recording::default();
@@ -194,7 +211,9 @@ async fn pane_submissions_deliver_to_on_submit_only_and_survive_reload() {
         "the main pane's input is the session input, not a pane input.\n{:#?}",
         recording.lines
     );
-    let key = recording.opened_input_pane().expect("PaneOpened with an input");
+    let key = recording
+        .opened_input_pane()
+        .expect("PaneOpened with an input");
     assert_ne!(key, MAIN_PANE_KEY);
     assert!(
         recording.records.iter().any(|r| matches!(
@@ -232,10 +251,15 @@ async fn pane_submissions_deliver_to_on_submit_only_and_survive_reload() {
     );
 
     // Sanity: a typed MAIN submission of the same text reaches both.
-    tx.send(RuntimeAction::SubmitInput(Arc::new("hello pane".to_string())))
-        .unwrap();
+    tx.send(RuntimeAction::SubmitInput(Arc::new(
+        "hello pane".to_string(),
+    )))
+    .unwrap();
     drain_quiet(&mut events, &mut recording).await;
-    assert!(recording.has_line("SYS_INPUT_FIRED"), "the subscriber is live");
+    assert!(
+        recording.has_line("SYS_INPUT_FIRED"),
+        "the subscriber is live"
+    );
     assert!(recording.has_line("ALIAS_FIRED"), "the alias is live");
     assert_eq!(
         recording.count_lines("ONSUBMIT:"),
@@ -303,14 +327,20 @@ createAlias("^checkhist$", () => {
 async fn pane_input_handle_addresses_the_pane_and_leaves_main_untouched() {
     let server = "PaneInputHandle";
     let server_dir = prepare_server(server);
-    std::fs::write(server_dir.join("modules").join("handle.ts"), HANDLE_HARNESS_TS).unwrap();
+    std::fs::write(
+        server_dir.join("modules").join("handle.ts"),
+        HANDLE_HARNESS_TS,
+    )
+    .unwrap();
 
     let mut events = Box::pin(spawn(session_params(7402, server)));
     let mut recording = Recording::default();
     let tx = wait_runtime_ready(&mut events, &mut recording).await;
     drain_quiet(&mut events, &mut recording).await;
 
-    let key = recording.opened_input_pane().expect("PaneOpened with an input");
+    let key = recording
+        .opened_input_pane()
+        .expect("PaneOpened with an input");
 
     // The pane write and the main write each address their own input.
     assert!(
@@ -333,8 +363,16 @@ async fn pane_input_handle_addresses_the_pane_and_leaves_main_untouched() {
 
     // Word sets: the pane's contribution merges under the pane's key; the
     // main input's registry stays empty (per-input scoping).
-    assert!(recording.has_line(r#"PANE_WORDS:["alpha"]"#), "{:#?}", recording.lines);
-    assert!(recording.has_line("MAIN_WORDS:[]"), "{:#?}", recording.lines);
+    assert!(
+        recording.has_line(r#"PANE_WORDS:["alpha"]"#),
+        "{:#?}",
+        recording.lines
+    );
+    assert!(
+        recording.has_line("MAIN_WORDS:[]"),
+        "{:#?}",
+        recording.lines
+    );
     assert!(
         recording
             .records
@@ -356,8 +394,11 @@ async fn pane_input_handle_addresses_the_pane_and_leaves_main_untouched() {
     // (what the UI would send once the push lands) is readable through the
     // pane handle while the main list stays empty.
     assert!(
-        recording.records.iter().any(|r| *r
-            == WireRecord::Op(key, InputOp::HistoryPush(Arc::new("note one".to_string())))),
+        recording
+            .records
+            .iter()
+            .any(|r| *r
+                == WireRecord::Op(key, InputOp::HistoryPush(Arc::new("note one".to_string())))),
         "the history push targets the pane's key; got {:#?}",
         recording.records
     );
@@ -369,7 +410,11 @@ async fn pane_input_handle_addresses_the_pane_and_leaves_main_untouched() {
     tx.send(RuntimeAction::Send(Arc::new("checkhist".to_string())))
         .unwrap();
     drain_quiet(&mut events, &mut recording).await;
-    assert!(recording.has_line(r#"PANE_HIST:["note one"]"#), "{:#?}", recording.lines);
+    assert!(
+        recording.has_line(r#"PANE_HIST:["note one"]"#),
+        "{:#?}",
+        recording.lines
+    );
     assert!(recording.has_line("MAIN_HIST:[]"), "{:#?}", recording.lines);
 
     tx.send(RuntimeAction::Shutdown).ok();
@@ -407,14 +452,22 @@ try {
 async fn panes_without_inputs_teach_instead_of_half_working() {
     let server = "PaneInputAbsent";
     let server_dir = prepare_server(server);
-    std::fs::write(server_dir.join("modules").join("noinput.ts"), NO_INPUT_HARNESS_TS).unwrap();
+    std::fs::write(
+        server_dir.join("modules").join("noinput.ts"),
+        NO_INPUT_HARNESS_TS,
+    )
+    .unwrap();
 
     let mut events = Box::pin(spawn(session_params(7403, server)));
     let mut recording = Recording::default();
     let tx = wait_runtime_ready(&mut events, &mut recording).await;
     drain_quiet(&mut events, &mut recording).await;
 
-    assert!(recording.has_line("RECREATED_INPUT_UNDEFINED"), "{:#?}", recording.lines);
+    assert!(
+        recording.has_line("RECREATED_INPUT_UNDEFINED"),
+        "{:#?}",
+        recording.lines
+    );
     assert!(
         recording.has_line("STALE_THREW:") && recording.has_line("has no input"),
         "a stale handle to a no-input pane teaches.\n{:#?}",
@@ -569,13 +622,22 @@ async fn panes_capability_covers_own_pane_input_but_not_main() {
 
     let mut events = Box::pin(spawn_with_package_provider(
         session_params(7404, server),
-        factory_for(vec![make_package("wbk", "paneful", "1.0.0", PANES_ONLY_PACKAGE_JS)]),
+        factory_for(vec![make_package(
+            "wbk",
+            "paneful",
+            "1.0.0",
+            PANES_ONLY_PACKAGE_JS,
+        )]),
     ));
     let mut recording = Recording::default();
     let tx = wait_runtime_ready(&mut events, &mut recording).await;
     drain_quiet(&mut events, &mut recording).await;
 
-    assert!(recording.has_line("DONE"), "the probe ran to completion.\n{:#?}", recording.lines);
+    assert!(
+        recording.has_line("DONE"),
+        "the probe ran to completion.\n{:#?}",
+        recording.lines
+    );
     for probe in ["write", "read", "words", "hist"] {
         assert!(
             recording.has_line(&format!("{probe}:OK")),
@@ -598,7 +660,9 @@ async fn panes_capability_covers_own_pane_input_but_not_main() {
 
     // The pane write went out keyed by the package's pane, and its word
     // contribution merged there.
-    let key = recording.opened_input_pane().expect("the package's pane opened");
+    let key = recording
+        .opened_input_pane()
+        .expect("the package's pane opened");
     assert!(
         recording
             .records

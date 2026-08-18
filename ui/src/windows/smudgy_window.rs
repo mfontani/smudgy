@@ -2044,7 +2044,8 @@ impl SmudgyWindow {
         let Some(tab) = self.tab_of(slot) else {
             return false;
         };
-        let Some((target_group, insertion_slot)) = self.tab_merge_target(reference, position) else {
+        let Some((target_group, insertion_slot)) = self.tab_merge_target(reference, position)
+        else {
             return false;
         };
         let source_group = self.layout.group_of(tab);
@@ -3294,13 +3295,12 @@ impl SmudgyWindow {
         drag: DragViewContext<'a>,
     ) -> ThemedElement<'a, Message> {
         let session_context = self.create_session_context(sessions);
-        let toolbar_element =
-            toolbar::view(
-                self.toolbar_expanded,
-                self.maximized,
-                self.fullscreen,
-                &session_context,
-            );
+        let toolbar_element = toolbar::view(
+            self.toolbar_expanded,
+            self.maximized,
+            self.fullscreen,
+            &session_context,
+        );
 
         // Header-visibility rule (§2.11): a pane's title bar is attached only
         // when its policy pins it, the toolbar is expanded, or the global
@@ -3714,10 +3714,8 @@ impl SmudgyWindow {
             stack(vec![
                 main_layout,
                 opaque(
-                    mouse_area(
-                        center(opaque(modal_view)).style(self.backdrop_style()),
-                    )
-                    .on_press(Message::CloseModal),
+                    mouse_area(center(opaque(modal_view)).style(self.backdrop_style()))
+                        .on_press(Message::CloseModal),
                 ),
             ])
             .into()

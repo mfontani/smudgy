@@ -46,7 +46,10 @@ fn inspector_addresses() -> &'static Mutex<HashMap<SessionId, SocketAddr>> {
 ///
 /// Panics if the inspector-address mutex is poisoned.
 pub fn set_inspector_address(session_id: SessionId, addr: SocketAddr) {
-    inspector_addresses().lock().unwrap().insert(session_id, addr);
+    inspector_addresses()
+        .lock()
+        .unwrap()
+        .insert(session_id, addr);
 }
 
 /// Get the v8 inspector endpoint for a session, if one is listening (debug mode).
@@ -156,9 +159,7 @@ pub fn unregister_session(session_id: SessionId) {
     if sessions.remove(&session_id).is_some() {
         log::info!("Unregistered session {session_id} from global registry");
     } else {
-        log::warn!(
-            "Attempted to unregister non-existent session {session_id}"
-        );
+        log::warn!("Attempted to unregister non-existent session {session_id}");
     }
 }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::Result;
-use deno_core::{serde_v8, ModuleSpecifier, PollEventLoopOptions};
+use deno_core::{ModuleSpecifier, PollEventLoopOptions, serde_v8};
 use smudgy_script::{
     InMemoryPackageProvider, ModulePolicy, ModuleSet, PackageKey, PackageManifest,
     PackageModuleSource, ResolvedPackage, ScriptRuntime, ScriptRuntimeOptions,
@@ -61,7 +61,10 @@ fn runtime_with_packages(
         extensions: Vec::new(),
         data_dir: data_dir.to_path_buf(),
         webstorage_dir: None,
-        module_policy: ModulePolicy { allow_https: true, ..Default::default() },
+        module_policy: ModulePolicy {
+            allow_https: true,
+            ..Default::default()
+        },
         inspector: None,
         tokio: tokio.clone(),
         package_provider: Some(Rc::new(provider)),
@@ -172,7 +175,10 @@ fn package_json_module_imports_with_attribute() -> Result<()> {
         "export const ok = globalThis.__json_map.name === \"Kalaman (Newbie)\"\n\
              && globalThis.__json_map.rooms.length === 3;",
     )?;
-    assert!(ok, "the JSON module's parsed value must round-trip through the package import");
+    assert!(
+        ok,
+        "the JSON module's parsed value must round-trip through the package import"
+    );
     Ok(())
 }
 
@@ -251,7 +257,10 @@ fn package_relative_submodule_resolves() -> Result<()> {
         export const ok = u === 42;
         "#,
     )?;
-    assert!(ok, "relative submodule import within a package must resolve");
+    assert!(
+        ok,
+        "relative submodule import within a package must resolve"
+    );
     Ok(())
 }
 
@@ -318,7 +327,11 @@ fn load_report_surfaces_manifest_metadata() -> Result<()> {
     // the host can prompt for required params at install time (see `DESIGN.md`). The manifest
     // here uses the "options" key, an accepted alias for "params", to exercise that alias.
     let temp = tempfile::tempdir()?;
-    let mut package = resolved("configured", "2.1.0", &[("index.js", "export const x = 1;")]);
+    let mut package = resolved(
+        "configured",
+        "2.1.0",
+        &[("index.js", "export const x = 1;")],
+    );
     package.manifest = PackageManifest::parse(
         r#"{
             "name": "configured",
@@ -338,7 +351,10 @@ fn load_report_surfaces_manifest_metadata() -> Result<()> {
     };
     let report = tokio.block_on(async { rt.load_modules(&set).await })?;
 
-    let info = report.modules[0].package.as_ref().expect("package metadata");
+    let info = report.modules[0]
+        .package
+        .as_ref()
+        .expect("package metadata");
     assert_eq!(info.resolved_version, "2.1.0");
     assert_eq!(info.integrity, "sha256-configured-2.1.0");
     assert_eq!(info.hosts, vec!["mud.arctic.org"]);
@@ -359,12 +375,18 @@ fn smudgy_params_is_scoped_to_the_importing_package() -> Result<()> {
     let app = resolved(
         "app",
         "1.0.0",
-        &[("index.js", "import { get } from \"smudgy:params\";\nexport const readUrl = () => get(\"pg.url\");")],
+        &[(
+            "index.js",
+            "import { get } from \"smudgy:params\";\nexport const readUrl = () => get(\"pg.url\");",
+        )],
     );
     let other = resolved(
         "other",
         "1.0.0",
-        &[("index.js", "import { get } from \"smudgy:params\";\nexport const readUrl = () => get(\"pg.url\");")],
+        &[(
+            "index.js",
+            "import { get } from \"smudgy:params\";\nexport const readUrl = () => get(\"pg.url\");",
+        )],
     );
     let (tokio, mut rt) = runtime_with_packages(temp.path(), vec![app, other])?;
 
@@ -393,7 +415,10 @@ fn smudgy_params_is_scoped_to_the_importing_package() -> Result<()> {
             otherUrl() === "smudgy://wbk/other|pg.url";
         "#,
     )?;
-    assert!(ok, "each package's smudgy:params.get must resolve to its own namespace");
+    assert!(
+        ok,
+        "each package's smudgy:params.get must resolve to its own namespace"
+    );
     Ok(())
 }
 
@@ -406,6 +431,9 @@ fn missing_package_fails_load() -> Result<()> {
         packages: vec!["smudgy://wbk/absent".to_string()],
     };
     let result = tokio.block_on(async { rt.load_modules(&set).await });
-    assert!(result.is_err(), "an unresolvable package must fail the load");
+    assert!(
+        result.is_err(),
+        "an unresolvable package must fail the load"
+    );
     Ok(())
 }

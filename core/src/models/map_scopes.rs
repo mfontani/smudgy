@@ -234,9 +234,12 @@ impl MapScopes {
         pruned.areas.retain(|_, assoc| !assoc.is_unassigned());
 
         let path = get_smudgy_home()?.join(MAP_SCOPES_FILE);
-        let json = serde_json::to_string_pretty(&pruned).context("Failed to serialize map scopes")?;
-        write_atomic(&path, json.as_bytes())
-            .context(format!("Failed to write map-scopes.json at {}", path.display()))?;
+        let json =
+            serde_json::to_string_pretty(&pruned).context("Failed to serialize map scopes")?;
+        write_atomic(&path, json.as_bytes()).context(format!(
+            "Failed to write map-scopes.json at {}",
+            path.display()
+        ))?;
         Ok(())
     }
 
@@ -407,13 +410,19 @@ mod tests {
     fn unassigned_participates_everywhere() {
         let scopes = MapScopes::default();
         // Absent: unassigned, so excluded on no entry.
-        assert_eq!(scopes.atlas_scope(&atlas(1), "Arctic"), ScopeState::Unassigned);
+        assert_eq!(
+            scopes.atlas_scope(&atlas(1), "Arctic"),
+            ScopeState::Unassigned
+        );
         assert!(scopes.excluded_atlases("Arctic").is_empty());
 
         // Present but empty: still unassigned.
         let mut scopes = MapScopes::default();
         scopes.set_atlas_entries(atlas(1), entries(&[]));
-        assert_eq!(scopes.atlas_scope(&atlas(1), "Arctic"), ScopeState::Unassigned);
+        assert_eq!(
+            scopes.atlas_scope(&atlas(1), "Arctic"),
+            ScopeState::Unassigned
+        );
         assert!(scopes.excluded_atlases("Arctic").is_empty());
     }
 
@@ -429,9 +438,18 @@ mod tests {
         assert_eq!(scopes.atlas_scope(&atlas(1), "Arctic"), ScopeState::Here);
 
         // On Aardwolf: both excluded (associated only with Arctic).
-        assert_eq!(scopes.excluded_atlases("Aardwolf"), [atlas(1)].into_iter().collect());
-        assert_eq!(scopes.excluded_areas("Aardwolf"), [area(2)].into_iter().collect());
-        assert_eq!(scopes.atlas_scope(&atlas(1), "Aardwolf"), ScopeState::Elsewhere);
+        assert_eq!(
+            scopes.excluded_atlases("Aardwolf"),
+            [atlas(1)].into_iter().collect()
+        );
+        assert_eq!(
+            scopes.excluded_areas("Aardwolf"),
+            [area(2)].into_iter().collect()
+        );
+        assert_eq!(
+            scopes.atlas_scope(&atlas(1), "Aardwolf"),
+            ScopeState::Elsewhere
+        );
     }
 
     #[test]
@@ -439,12 +457,21 @@ mod tests {
         let mut scopes = MapScopes::default();
         scopes.set_atlas_entry(atlas(1), "Arctic", true);
         scopes.set_atlas_entry(atlas(1), "arctic-scripts", true);
-        assert_eq!(scopes.atlas_entries(&atlas(1)), entries(&["Arctic", "arctic-scripts"]));
+        assert_eq!(
+            scopes.atlas_entries(&atlas(1)),
+            entries(&["Arctic", "arctic-scripts"])
+        );
 
         scopes.set_atlas_entry(atlas(1), "Arctic", false);
-        assert_eq!(scopes.atlas_entries(&atlas(1)), entries(&["arctic-scripts"]));
+        assert_eq!(
+            scopes.atlas_entries(&atlas(1)),
+            entries(&["arctic-scripts"])
+        );
         // Still excluded on Arctic (associated only with arctic-scripts now).
-        assert_eq!(scopes.atlas_scope(&atlas(1), "Arctic"), ScopeState::Elsewhere);
+        assert_eq!(
+            scopes.atlas_scope(&atlas(1), "Arctic"),
+            ScopeState::Elsewhere
+        );
     }
 
     #[test]
@@ -500,7 +527,10 @@ mod tests {
         scopes.apply(&ScopeDelta::MarkSeen { atlas_id: atlas(5) });
 
         assert_eq!(scopes.atlas_entries(&atlas(1)), entries(&["Arctic"]));
-        assert_eq!(scopes.atlas_entries(&atlas(2)), entries(&["Aardwolf", "Achaea"]));
+        assert_eq!(
+            scopes.atlas_entries(&atlas(2)),
+            entries(&["Aardwolf", "Achaea"])
+        );
         assert_eq!(scopes.area_entries(&area(3)), entries(&["Arctic"]));
         assert_eq!(scopes.area_entries(&area(4)), entries(&["Aardwolf"]));
         assert!(scopes.has_seen(&atlas(5)));
@@ -589,6 +619,9 @@ mod tests {
 
         let mut pruned = scopes.clone();
         pruned.atlases.retain(|_, assoc| !assoc.is_unassigned());
-        assert!(pruned.atlases.is_empty(), "empty record pruned before write");
+        assert!(
+            pruned.atlases.is_empty(),
+            "empty record pruned before write"
+        );
     }
 }

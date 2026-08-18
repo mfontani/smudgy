@@ -76,8 +76,11 @@ async fn off_stops_further_delivery() {
 
     // First location change → `map:room` delivered → the handler echoes `ROOM:1`, then unsubscribes
     // itself. Drain to quiescence so the handler (and its `off()`) has run before the second emit.
-    tx.send(RuntimeAction::SetCurrentLocation(AreaId(Uuid::nil()), Some(1)))
-        .unwrap();
+    tx.send(RuntimeAction::SetCurrentLocation(
+        AreaId(Uuid::nil()),
+        Some(1),
+    ))
+    .unwrap();
     let mut first = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
@@ -90,8 +93,11 @@ async fn off_stops_further_delivery() {
     }
 
     // Second location change → the subscriber is gone → no `ROOM:2` echo should appear.
-    tx.send(RuntimeAction::SetCurrentLocation(AreaId(Uuid::nil()), Some(2)))
-        .unwrap();
+    tx.send(RuntimeAction::SetCurrentLocation(
+        AreaId(Uuid::nil()),
+        Some(2),
+    ))
+    .unwrap();
     let mut second = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {

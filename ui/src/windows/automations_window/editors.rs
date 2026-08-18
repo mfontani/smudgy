@@ -254,12 +254,11 @@ impl AutomationsWindow {
                     });
                 }
                 Err(e) => {
-                    self.pane =
-                        Pane::Error(Arc::new(vec![crate::i18n::t!(
-                            "editor-failed-read",
-                            "path" => subpath,
-                            "error" => e.to_string()
-                        )]));
+                    self.pane = Pane::Error(Arc::new(vec![crate::i18n::t!(
+                        "editor-failed-read",
+                        "path" => subpath,
+                        "error" => e.to_string()
+                    )]));
                 }
             }
         }
@@ -344,7 +343,9 @@ impl AutomationsWindow {
         state.enabled = next;
         packages::set_folder_enabled(&mut self.packages, &path, next);
         if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
-            return warn_none(crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()));
+            return warn_none(
+                crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()),
+            );
         }
         Update::with_event(Event::UserAutomationsChanged {
             server_name: self.server_name.clone(),
@@ -640,10 +641,14 @@ impl AutomationsWindow {
         }
         self.confirm_folder_delete = false;
         if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
-            return warn_none(crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()));
+            return warn_none(
+                crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()),
+            );
         }
         if let Err(e) = self.serialize_scripts() {
-            return warn_none(crate::i18n::t!("editor-failed-save-scripts", "error" => e.to_string()));
+            return warn_none(
+                crate::i18n::t!("editor-failed-save-scripts", "error" => e.to_string()),
+            );
         }
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
@@ -665,7 +670,9 @@ impl AutomationsWindow {
             _ => return Update::none(),
         };
         if let Err(e) = std::fs::write(&path, self.editor_content.text()) {
-            return warn_none(crate::i18n::t!("editor-failed-save-module", "error" => e.to_string()));
+            return warn_none(
+                crate::i18n::t!("editor-failed-save-module", "error" => e.to_string()),
+            );
         }
         self.dirty = false;
         self.pending_nav = None;
@@ -706,13 +713,15 @@ impl AutomationsWindow {
             && let Err(e) = std::fs::create_dir_all(parent)
         {
             if let Pane::Module(state) = &mut self.pane {
-                state.error = Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
+                state.error =
+                    Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
             }
             return Update::none();
         }
         if let Err(e) = std::fs::write(&target, self.editor_content.text()) {
             if let Pane::Module(state) = &mut self.pane {
-                state.error = Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
+                state.error =
+                    Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
             }
             return Update::none();
         }
@@ -938,7 +947,11 @@ impl AutomationsWindow {
         }
         if self.dirty {
             bar = bar.push(text("\u{25CF}").size(9.0).style(common::accent));
-            bar = bar.push(text(crate::i18n::t!("editor-unsaved")).size(13.0).style(common::muted));
+            bar = bar.push(
+                text(crate::i18n::t!("editor-unsaved"))
+                    .size(13.0)
+                    .style(common::muted),
+            );
             bar = bar.push(iced::widget::space::horizontal());
             bar = bar.push(
                 button(text(crate::i18n::t!("editor-discard")).size(13.0))
@@ -1126,7 +1139,9 @@ impl AutomationsWindow {
     /// picker, with the dropdown sized to match the switch above it.
     fn folder_aside<'a>(&self, folder: Option<&str>) -> Elem<'a> {
         row![
-            text(crate::i18n::t!("editor-folder")).size(13.0).style(common::muted),
+            text(crate::i18n::t!("editor-folder"))
+                .size(13.0)
+                .style(common::muted),
             self.folder_picker(folder),
         ]
         .spacing(8.0)
@@ -1150,7 +1165,11 @@ impl AutomationsWindow {
         } else {
             state.name.as_str()
         };
-        let subtitle = subtitle_for(create, crate::i18n::ts!("automation-alias"), alias.package.as_deref());
+        let subtitle = subtitle_for(
+            create,
+            crate::i18n::ts!("automation-alias"),
+            alias.package.as_deref(),
+        );
         let status = Self::editor_status(create, alias.enabled, false);
 
         let mut body = column![self.scene_header_with_aside(
@@ -1175,12 +1194,19 @@ impl AutomationsWindow {
         ));
         body = body.push(field_row(
             crate::i18n::ts!("editor-pattern"),
-            text_input(crate::i18n::ts!("editor-example-alias-pattern"), &alias.pattern)
-                .on_input(Message::SetAliasPattern)
-                .size(14.0)
-                .into(),
+            text_input(
+                crate::i18n::ts!("editor-example-alias-pattern"),
+                &alias.pattern,
+            )
+            .on_input(Message::SetAliasPattern)
+            .size(14.0)
+            .into(),
         ));
-        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-command"), &alias.pattern, true));
+        body = body.push(self.tester_box(
+            crate::i18n::ts!("editor-test-command"),
+            &alias.pattern,
+            true,
+        ));
         body = body.push(self.matching_options(alias.priority, alias.fallthrough));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
         body = body.push(self.code_editor(alias.language));
@@ -1214,7 +1240,11 @@ impl AutomationsWindow {
         } else {
             state.name.as_str()
         };
-        let subtitle = subtitle_for(create, crate::i18n::ts!("automation-hotkey"), hotkey.package.as_deref());
+        let subtitle = subtitle_for(
+            create,
+            crate::i18n::ts!("automation-hotkey"),
+            hotkey.package.as_deref(),
+        );
         let status = Self::editor_status(create, hotkey.enabled, false);
 
         let mut body = column![self.scene_header_with_aside(
@@ -1244,7 +1274,10 @@ impl AutomationsWindow {
                     .on_action(Message::MarkHotkeyState),
             ),
         ));
-        body = body.push(field_row(crate::i18n::ts!("editor-behavior"), self.behavior_radios(hotkey.language)));
+        body = body.push(field_row(
+            crate::i18n::ts!("editor-behavior"),
+            self.behavior_radios(hotkey.language),
+        ));
         body = body.push(self.code_editor(hotkey.language));
         if let Some(bar) = self.save_bar(
             create,
@@ -1275,7 +1308,11 @@ impl AutomationsWindow {
         } else {
             state.name.as_str()
         };
-        let subtitle = subtitle_for(create, crate::i18n::ts!("automation-trigger"), trigger_package(state));
+        let subtitle = subtitle_for(
+            create,
+            crate::i18n::ts!("automation-trigger"),
+            trigger_package(state),
+        );
         let any_invalid = rows
             .iter()
             .any(|(_, p)| !p.is_empty() && regex::Regex::new(p).is_err());
@@ -1366,7 +1403,10 @@ impl AutomationsWindow {
             .style(button_style::secondary)
             .on_press(Message::AddPattern),
         );
-        body = body.push(field_row(crate::i18n::ts!("editor-patterns"), patterns.into()));
+        body = body.push(field_row(
+            crate::i18n::ts!("editor-patterns"),
+            patterns.into(),
+        ));
 
         body = body.push(self.tester_box(crate::i18n::ts!("editor-test-line"), "", false));
         body = body.push(self.matching_options(priority, fallthrough));
@@ -1428,10 +1468,7 @@ impl AutomationsWindow {
                 ..
             }) => rows,
             _ => {
-                return (
-                    crate::i18n::t!("editor-no-match"),
-                    NodeStatus::Disabled,
-                );
+                return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
             }
         };
         let line = &self.test_input;
@@ -1444,34 +1481,22 @@ impl AutomationsWindow {
             let re = match regex::Regex::new(pattern) {
                 Ok(re) => re,
                 Err(_) => {
-                    return (
-                        crate::i18n::t!("editor-invalid-pattern"),
-                        NodeStatus::Error,
-                    );
+                    return (crate::i18n::t!("editor-invalid-pattern"), NodeStatus::Error);
                 }
             };
             let matches = re.is_match(line);
             match kind {
                 PatternKind::Match | PatternKind::Raw if !matches => {
-                    return (
-                        crate::i18n::t!("editor-no-match"),
-                        NodeStatus::Disabled,
-                    );
+                    return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
                 }
                 PatternKind::Anti if matches => {
-                    return (
-                        crate::i18n::t!("editor-no-match"),
-                        NodeStatus::Disabled,
-                    );
+                    return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
                 }
                 _ => {}
             }
         }
         if !any || line.is_empty() {
-            return (
-                crate::i18n::t!("editor-enter-line"),
-                NodeStatus::Disabled,
-            );
+            return (crate::i18n::t!("editor-enter-line"), NodeStatus::Disabled);
         }
         (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
     }
@@ -1619,8 +1644,8 @@ impl AutomationsWindow {
                     })
                     .size(13.0),
                 )
-                    .style(button_style::primary)
-                    .on_press(Message::SaveFolder),
+                .style(button_style::primary)
+                .on_press(Message::SaveFolder),
             );
             body = body.push(bar);
         }

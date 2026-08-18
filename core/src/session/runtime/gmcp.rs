@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use super::IsolateId;
 use super::catalogue::{CatalogueKind, SharedCatalogue};
 use super::store::{PlatformProducer, ProducerKey, SessionStore, StorePath};
-use super::IsolateId;
 use crate::session::connection::gmcp as wire;
 
 /// Compact JSON array of strings (module tokens are host-composed but module *names* come
@@ -179,14 +179,11 @@ impl GmcpProducer {
     /// the module already active with a sufficient version.
     pub fn enable_module(&mut self, isolate: IsolateId, module: &str, version: u32) -> Vec<u8> {
         let folded = module.to_ascii_lowercase();
-        let entry = self
-            .modules
-            .entry(folded)
-            .or_insert_with(|| ModuleEntry {
-                display: module.to_string(),
-                version: 1,
-                holders: HashSet::new(),
-            });
+        let entry = self.modules.entry(folded).or_insert_with(|| ModuleEntry {
+            display: module.to_string(),
+            version: 1,
+            holders: HashSet::new(),
+        });
         let was_active = !entry.holders.is_empty();
         entry.holders.insert(isolate);
         let version_bumped = version > entry.version;
@@ -198,7 +195,11 @@ impl GmcpProducer {
         }
         let tokens = self.supports_tokens(&display, leaf_version);
         let mut frame = Vec::new();
-        wire::frame_message("Core.Supports.Add", Some(&json_string_array(&tokens)), &mut frame);
+        wire::frame_message(
+            "Core.Supports.Add",
+            Some(&json_string_array(&tokens)),
+            &mut frame,
+        );
         frame
     }
 
@@ -244,7 +245,11 @@ impl GmcpProducer {
             }
         }
         let mut frame = Vec::new();
-        wire::frame_message("Core.Supports.Add", Some(&json_string_array(&tokens)), &mut frame);
+        wire::frame_message(
+            "Core.Supports.Add",
+            Some(&json_string_array(&tokens)),
+            &mut frame,
+        );
         frame
     }
 
@@ -620,9 +625,19 @@ mod tests {
         assert_eq!(read(&store, "Char.Status.guild.rank"), Some(json!(2)));
 
         // A non-merge-keyed name replaces wholesale.
-        gmcp.ingest(&mut store, &catalogue, "Char.Vitals", Some(r#"{ "hp": 1 }"#));
+        gmcp.ingest(
+            &mut store,
+            &catalogue,
+            "Char.Vitals",
+            Some(r#"{ "hp": 1 }"#),
+        );
         store.flush();
-        gmcp.ingest(&mut store, &catalogue, "Char.Vitals", Some(r#"{ "mp": 2 }"#));
+        gmcp.ingest(
+            &mut store,
+            &catalogue,
+            "Char.Vitals",
+            Some(r#"{ "mp": 2 }"#),
+        );
         store.flush();
         assert_eq!(read(&store, "Char.Vitals.hp"), None);
         assert_eq!(read(&store, "Char.Vitals.mp"), Some(json!(2)));
@@ -656,7 +671,12 @@ mod tests {
         let (mut gmcp, mut store, catalogue) = harness();
         gmcp.on_enabled(&mut store);
         assert!(gmcp.enabled());
-        gmcp.ingest(&mut store, &catalogue, "Char.Vitals", Some(r#"{ "hp": 5 }"#));
+        gmcp.ingest(
+            &mut store,
+            &catalogue,
+            "Char.Vitals",
+            Some(r#"{ "hp": 5 }"#),
+        );
         store.flush();
         assert_eq!(read(&store, "Char.Vitals.hp"), Some(json!(5)));
 
@@ -715,13 +735,19 @@ mod tests {
         // without prefix expansion.
         assert!(gmcp.disable_module(&IsolateId::Main, "IRE.Rift").is_empty());
         let frame = frame_text(&gmcp.disable_module(&sandbox_isolate(), "IRE.RIFT"));
-        assert!(frame.contains(r#"Core.Supports.Remove ["IRE.Rift"]"#), "{frame}");
+        assert!(
+            frame.contains(r#"Core.Supports.Remove ["IRE.Rift"]"#),
+            "{frame}"
+        );
 
         // Engine rebuild releases refs silently; nothing is re-sent until re-registration.
         let frame = frame_text(&gmcp.enable_module(IsolateId::Main, "Comm.Channel", 1));
         assert!(frame.contains(r#"["Comm 1","Comm.Channel 1"]"#), "{frame}");
         gmcp.reset_engine_refs();
-        assert!(gmcp.supports_add_frame().is_empty(), "no holders after rebuild");
+        assert!(
+            gmcp.supports_add_frame().is_empty(),
+            "no holders after rebuild"
+        );
         // Version memory survives the rebuild.
         let frame = frame_text(&gmcp.enable_module(IsolateId::Main, "ire.rift", 1));
         assert!(frame.contains("IRE.Rift 3"), "version memory kept: {frame}");
@@ -738,7 +764,12 @@ mod tests {
             Some(r#"{ "shield": true, "armor": 5 }"#),
         );
         store.flush();
-        gmcp.ingest(&mut store, &catalogue, "char.defences", Some(r#"{ "armor": 6 }"#));
+        gmcp.ingest(
+            &mut store,
+            &catalogue,
+            "char.defences",
+            Some(r#"{ "armor": 6 }"#),
+        );
         store.flush();
         assert_eq!(read(&store, "Char.Defences.shield"), Some(json!(true)));
         assert_eq!(read(&store, "Char.Defences.armor"), Some(json!(6)));
@@ -762,8 +793,7 @@ mod tests {
         );
         store.flush();
         assert_eq!(
-            read(&store, "Char.Items.List.items")
-                .and_then(|v| v.as_array().map(Vec::len)),
+            read(&store, "Char.Items.List.items").and_then(|v| v.as_array().map(Vec::len)),
             Some(2),
             "Add appends to the maintained list"
         );
@@ -779,7 +809,11 @@ mod tests {
         store.flush();
         let items = read(&store, "Char.Items.List.items").unwrap();
         assert!(
-            items.as_array().unwrap().iter().any(|i| i["name"] == json!("a tower shield")),
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["name"] == json!("a tower shield")),
             "Update replaces by id: {items}"
         );
 
@@ -791,8 +825,7 @@ mod tests {
         );
         store.flush();
         assert_eq!(
-            read(&store, "Char.Items.List.items")
-                .and_then(|v| v.as_array().map(Vec::len)),
+            read(&store, "Char.Items.List.items").and_then(|v| v.as_array().map(Vec::len)),
             Some(1),
             "Remove drops by id"
         );
@@ -806,8 +839,7 @@ mod tests {
         );
         store.flush();
         assert_eq!(
-            read(&store, "Char.Items.List.items")
-                .and_then(|v| v.as_array().map(Vec::len)),
+            read(&store, "Char.Items.List.items").and_then(|v| v.as_array().map(Vec::len)),
             Some(1),
             "cross-location delta degrades to its plain set-at-name"
         );
@@ -843,7 +875,12 @@ mod tests {
             "AddPlayer dedupes by name"
         );
         // RemovePlayer accepts the bare-name form.
-        gmcp.ingest(&mut store, &catalogue, "Room.RemovePlayer", Some(r#""Bob""#));
+        gmcp.ingest(
+            &mut store,
+            &catalogue,
+            "Room.RemovePlayer",
+            Some(r#""Bob""#),
+        );
         store.flush();
         let players = read(&store, "Room.Players").unwrap();
         assert_eq!(players.as_array().map(Vec::len), Some(1), "{players}");

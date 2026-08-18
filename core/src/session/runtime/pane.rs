@@ -241,18 +241,14 @@ impl PanePlacement {
     pub fn with_reference(self, reference: PaneKey) -> Self {
         match self {
             Self::Split {
-                direction,
-                size_px,
-                ..
+                direction, size_px, ..
             } => Self::Split {
                 reference,
                 direction,
                 size_px,
             },
             Self::Tab {
-                position,
-                selected,
-                ..
+                position, selected, ..
             } => Self::Tab {
                 reference,
                 position,
@@ -274,11 +270,11 @@ pub enum PaneError {
     CapExceeded,
     #[error("pane '{0}' already exists with a different kind")]
     KindMismatch(String),
-    #[error(
-        "pane '{0}' already exists without an input; close it first to recreate it with one"
-    )]
+    #[error("pane '{0}' already exists without an input; close it first to recreate it with one")]
     InputMismatch(String),
-    #[error("the main pane's input is the session's command input (session.input), not a pane input")]
+    #[error(
+        "the main pane's input is the session's command input (session.input), not a pane input"
+    )]
     MainInput,
     #[error("the main pane cannot be closed")]
     CloseMain,
@@ -673,8 +669,7 @@ impl PaneRegistry {
             .defs
             .iter()
             .filter(|(key, def)| {
-                !def.is_main
-                    && self.claimed.get(key).copied().unwrap_or(0) < self.claim_epoch
+                !def.is_main && self.claimed.get(key).copied().unwrap_or(0) < self.claim_epoch
             })
             .map(|(key, _)| *key)
             .collect();
@@ -915,15 +910,39 @@ mod tests {
     #[test]
     fn reload_sweep_closes_only_unclaimed_panes() {
         let mut reg = PaneRegistry::new();
-        let stale = reg.split(&user(), "stale", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
-        let kept = reg.split(&pkg("a", "map"), "map", PaneKind::Widgets, DefStateSpec::default(), None).unwrap();
+        let stale = reg
+            .split(
+                &user(),
+                "stale",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
+        let kept = reg
+            .split(
+                &pkg("a", "map"),
+                "map",
+                PaneKind::Widgets,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
 
         // Nothing to sweep before an epoch begins (session start).
         assert!(reg.sweep_unclaimed().is_empty());
 
         // Reload: only "map" is re-claimed (a get-or-create hit counts).
         reg.begin_claim_epoch();
-        let hit = reg.split(&pkg("a", "map"), "MAP", PaneKind::Widgets, DefStateSpec::default(), None).unwrap();
+        let hit = reg
+            .split(
+                &pkg("a", "map"),
+                "MAP",
+                PaneKind::Widgets,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(!hit.created);
         let swept = reg.sweep_unclaimed();
         assert_eq!(swept, vec![stale.def.key]);
@@ -935,7 +954,15 @@ mod tests {
 
         // The interned name identity survives the sweep: a later recreate
         // keeps the widget re-attach id while minting a fresh key.
-        let again = reg.split(&user(), "stale", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let again = reg
+            .split(
+                &user(),
+                "stale",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(again.created);
         assert_eq!(again.def.name_id, stale.def.name_id);
         assert_ne!(again.def.key, stale.def.key);
@@ -945,7 +972,11 @@ mod tests {
         // fails to re-claim it.
         reg.begin_claim_epoch();
         let swept = reg.sweep_unclaimed();
-        assert_eq!(swept.len(), 2, "neither pane was re-claimed this time: {swept:?}");
+        assert_eq!(
+            swept.len(),
+            2,
+            "neither pane was re-claimed this time: {swept:?}"
+        );
         assert_eq!(reg.list(&user()).len(), 1, "only main remains");
     }
 
@@ -953,31 +984,74 @@ mod tests {
     fn title_bar_policy_defaults_sets_and_updates() {
         let mut reg = PaneRegistry::new();
         // Omitted => Normal.
-        let created = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let created = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert_eq!(created.def.title_bar, TitleBarPolicy::Normal);
         assert!(!created.def_changed);
 
         // Explicit on creation.
         let pinned = reg
-            .split(&user(), "map", PaneKind::Widgets, DefStateSpec { title_bar: Some(TitleBarPolicy::AlwaysShow), ..Default::default() }, None)
+            .split(
+                &user(),
+                "map",
+                PaneKind::Widgets,
+                DefStateSpec {
+                    title_bar: Some(TitleBarPolicy::AlwaysShow),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(pinned.def.title_bar, TitleBarPolicy::AlwaysShow);
         assert!(!pinned.def_changed);
 
         // Get-or-create with the key omitted leaves the policy alone...
-        let hit = reg.split(&user(), "map", PaneKind::Widgets, DefStateSpec::default(), None).unwrap();
+        let hit = reg
+            .split(
+                &user(),
+                "map",
+                PaneKind::Widgets,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert_eq!(hit.def.title_bar, TitleBarPolicy::AlwaysShow);
         assert!(!hit.def_changed);
         // ...an explicit differing policy updates it and reports the change...
         let updated = reg
-            .split(&user(), "chat", PaneKind::Terminal, DefStateSpec { title_bar: Some(TitleBarPolicy::AlwaysShow), ..Default::default() }, None)
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    title_bar: Some(TitleBarPolicy::AlwaysShow),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert!(!updated.created);
         assert!(updated.def_changed);
         assert_eq!(updated.def.title_bar, TitleBarPolicy::AlwaysShow);
         // ...and an explicit same policy is not a change.
         let same = reg
-            .split(&user(), "chat", PaneKind::Terminal, DefStateSpec { title_bar: Some(TitleBarPolicy::AlwaysShow), ..Default::default() }, None)
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    title_bar: Some(TitleBarPolicy::AlwaysShow),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert!(!same.def_changed);
     }
@@ -986,7 +1060,16 @@ mod tests {
     fn title_bar_policy_is_settable_on_main() {
         let mut reg = PaneRegistry::new();
         let outcome = reg
-            .split(&user(), "main", PaneKind::Terminal, DefStateSpec { title_bar: Some(TitleBarPolicy::AlwaysShow), ..Default::default() }, None)
+            .split(
+                &user(),
+                "main",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    title_bar: Some(TitleBarPolicy::AlwaysShow),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert!(!outcome.created);
         assert!(outcome.def_changed);
@@ -995,21 +1078,54 @@ mod tests {
             TitleBarPolicy::AlwaysShow
         );
         // A recreated pane starts from its own spec, not the retired def's.
-        reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec { title_bar: Some(TitleBarPolicy::AlwaysShow), ..Default::default() }, None)
-            .unwrap();
+        reg.split(
+            &user(),
+            "chat",
+            PaneKind::Terminal,
+            DefStateSpec {
+                title_bar: Some(TitleBarPolicy::AlwaysShow),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
         reg.close(&user(), "chat").unwrap();
-        let again = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let again = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert_eq!(again.def.title_bar, TitleBarPolicy::Normal);
     }
 
     #[test]
     fn split_is_get_or_create_with_case_folding() {
         let mut reg = PaneRegistry::new();
-        let first = reg.split(&user(), "Chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let first = reg
+            .split(
+                &user(),
+                "Chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(first.created);
         // Display case is preserved; identity is folded.
         assert_eq!(&*first.def.name, "Chat");
-        let second = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let second = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(!second.created);
         assert_eq!(second.def.key, first.def.key);
         assert_eq!(second.def.name_id, first.def.name_id);
@@ -1018,9 +1134,22 @@ mod tests {
     #[test]
     fn kind_mismatch_throws() {
         let mut reg = PaneRegistry::new();
-        reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        reg.split(
+            &user(),
+            "chat",
+            PaneKind::Terminal,
+            DefStateSpec::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            reg.split(&user(), "chat", PaneKind::Widgets, DefStateSpec::default(), None),
+            reg.split(
+                &user(),
+                "chat",
+                PaneKind::Widgets,
+                DefStateSpec::default(),
+                None
+            ),
             Err(PaneError::KindMismatch("chat".to_string()))
         );
     }
@@ -1036,20 +1165,44 @@ mod tests {
         let mut reg = PaneRegistry::new();
         // Pre-hidden creation (reveal-on-event panes never flash at load).
         let created = reg
-            .split(&user(), "combat", PaneKind::Terminal, DefStateSpec { hidden: Some(true), ..Default::default() }, None)
+            .split(
+                &user(),
+                "combat",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    hidden: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert!(created.created && created.def.hidden);
         assert!(!created.hidden_changed, "creation is not a toggle");
 
         // Omitted hidden on a re-claim keeps the toggle (the user's included).
         let hit = reg
-            .split(&user(), "combat", PaneKind::Terminal, DefStateSpec::default(), None)
+            .split(
+                &user(),
+                "combat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
             .unwrap();
         assert!(hit.def.hidden && !hit.def_changed);
 
         // Explicit restatement updates and reports the toggle.
         let shown = reg
-            .split(&user(), "combat", PaneKind::Terminal, DefStateSpec { hidden: Some(false), ..Default::default() }, None)
+            .split(
+                &user(),
+                "combat",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    hidden: Some(false),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert!(!shown.def.hidden && shown.def_changed && shown.hidden_changed);
 
@@ -1062,15 +1215,33 @@ mod tests {
         );
 
         // Scripts never drive main's visibility, in either direction...
-        assert_eq!(reg.set_hidden(&user(), "main", true), Err(PaneError::HideMain));
-        assert_eq!(reg.set_hidden(&user(), "MAIN", false), Err(PaneError::HideMain));
         assert_eq!(
-            reg.split(&user(), "main", PaneKind::Terminal, DefStateSpec { hidden: Some(false), ..Default::default() }, None),
+            reg.set_hidden(&user(), "main", true),
+            Err(PaneError::HideMain)
+        );
+        assert_eq!(
+            reg.set_hidden(&user(), "MAIN", false),
+            Err(PaneError::HideMain)
+        );
+        assert_eq!(
+            reg.split(
+                &user(),
+                "main",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    hidden: Some(false),
+                    ..Default::default()
+                },
+                None
+            ),
             Err(PaneError::HideMain)
         );
         // ...but the user's eyeball (the by-key path) may hide any pane.
         assert!(reg.set_hidden_by_key(MAIN_PANE_KEY, true).is_some());
-        assert!(reg.set_hidden_by_key(MAIN_PANE_KEY, true).is_none(), "already so");
+        assert!(
+            reg.set_hidden_by_key(MAIN_PANE_KEY, true).is_none(),
+            "already so"
+        );
         assert!(reg.get(MAIN_PANE_KEY).unwrap().hidden);
         // A retired key drops the report whole.
         let key = reg.resolve(&user(), "combat").unwrap().key;
@@ -1082,22 +1253,55 @@ mod tests {
     fn font_size_is_validated_and_main_accepts_it() {
         let mut reg = PaneRegistry::new();
         assert_eq!(
-            reg.split(&user(), "big", PaneKind::Terminal, DefStateSpec { font_size: Some(64.0), ..Default::default() }, None),
+            reg.split(
+                &user(),
+                "big",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    font_size: Some(64.0),
+                    ..Default::default()
+                },
+                None
+            ),
             Err(PaneError::InvalidFontSize(64.0))
         );
         let created = reg
-            .split(&user(), "big", PaneKind::Terminal, DefStateSpec { font_size: Some(24.0), ..Default::default() }, None)
+            .split(
+                &user(),
+                "big",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    font_size: Some(24.0),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(created.def.font_size, Some(24.0));
 
         // Explicit restatement updates; omitted keeps; there is no spec
         // spelling for "revert" — that is set_font_size(None).
         let hit = reg
-            .split(&user(), "big", PaneKind::Terminal, DefStateSpec::default(), None)
+            .split(
+                &user(),
+                "big",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
             .unwrap();
         assert_eq!(hit.def.font_size, Some(24.0));
         let updated = reg
-            .split(&user(), "big", PaneKind::Terminal, DefStateSpec { font_size: Some(12.0), ..Default::default() }, None)
+            .split(
+                &user(),
+                "big",
+                PaneKind::Terminal,
+                DefStateSpec {
+                    font_size: Some(12.0),
+                    ..Default::default()
+                },
+                None,
+            )
             .unwrap();
         assert!(updated.def_changed && !updated.hidden_changed);
         assert_eq!(updated.def.font_size, Some(12.0));
@@ -1106,8 +1310,16 @@ mod tests {
 
         // Main accepts the override (the op layer adds the change-display
         // gate); the same value twice is no news.
-        assert!(reg.set_font_size(&user(), "main", Some(18.0)).unwrap().is_some());
-        assert!(reg.set_font_size(&user(), "MAIN", Some(18.0)).unwrap().is_none());
+        assert!(
+            reg.set_font_size(&user(), "main", Some(18.0))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reg.set_font_size(&user(), "MAIN", Some(18.0))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(reg.get(MAIN_PANE_KEY).unwrap().font_size, Some(18.0));
         assert_eq!(
             reg.set_font_size(&user(), "main", Some(7.0)),
@@ -1126,10 +1338,16 @@ mod tests {
         let key = PaneKey::from_raw_for_tests(3);
         assert_eq!(mirror.get(key), None, "no size before the first report");
         // The first report is a baseline (no prior), the second an edge.
-        let size = PaneSize { width: 320.0, height: 200.0 };
+        let size = PaneSize {
+            width: 320.0,
+            height: 200.0,
+        };
         assert_eq!(mirror.apply(key, size), None);
         assert_eq!(mirror.get(key), Some(size));
-        let grown = PaneSize { width: 400.0, height: 200.0 };
+        let grown = PaneSize {
+            width: 400.0,
+            height: 200.0,
+        };
         assert_eq!(mirror.apply(key, grown), Some(size));
         // A close purges; the next same-key report would be a baseline again
         // (keys are never reused, so this is belt-and-braces).
@@ -1143,7 +1361,13 @@ mod tests {
         let mut reg = PaneRegistry::new();
         // Both pane kinds may host an input.
         let chat = reg
-            .split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), Some(input_def(Some("say..."))))
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                Some(input_def(Some("say..."))),
+            )
             .unwrap();
         assert_eq!(
             chat.def.input,
@@ -1151,48 +1375,122 @@ mod tests {
             "the created def carries the input"
         );
         let notes = reg
-            .split(&user(), "notes", PaneKind::Widgets, DefStateSpec::default(), Some(input_def(None)))
+            .split(
+                &user(),
+                "notes",
+                PaneKind::Widgets,
+                DefStateSpec::default(),
+                Some(input_def(None)),
+            )
             .unwrap();
         assert!(notes.def.input.is_some());
 
         // A spec omitting the input on a pane that has one is an ignored
         // difference (the reload re-claim path); the input survives.
-        let hit = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let hit = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(!hit.created);
         assert!(hit.def.input.is_some());
 
         // Placeholder differences on an existing input are ignored too.
         let re_hit = reg
-            .split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), Some(input_def(Some("other"))))
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                Some(input_def(Some("other"))),
+            )
             .unwrap();
         assert_eq!(re_hit.def.input, Some(input_def(Some("say..."))));
 
         // Asking for an input on an existing pane without one throws.
-        reg.split(&user(), "plain", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        reg.split(
+            &user(),
+            "plain",
+            PaneKind::Terminal,
+            DefStateSpec::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            reg.split(&user(), "plain", PaneKind::Terminal, DefStateSpec::default(), Some(input_def(None))),
+            reg.split(
+                &user(),
+                "plain",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                Some(input_def(None))
+            ),
             Err(PaneError::InputMismatch("plain".to_string()))
         );
 
         // Main's fused input is the session input, never a pane input.
         assert_eq!(
-            reg.split(&user(), "main", PaneKind::Terminal, DefStateSpec::default(), Some(input_def(None))),
+            reg.split(
+                &user(),
+                "main",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                Some(input_def(None))
+            ),
             Err(PaneError::MainInput)
         );
 
         // Close-and-recreate starts from the new spec, like title_bar.
         reg.close(&user(), "chat").unwrap();
-        let again = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let again = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(again.created);
-        assert!(again.def.input.is_none(), "a recreated pane starts from its own spec");
+        assert!(
+            again.def.input.is_none(),
+            "a recreated pane starts from its own spec"
+        );
     }
 
     #[test]
     fn namespaces_are_isolated() {
         let mut reg = PaneRegistry::new();
-        let a = reg.split(&pkg("alice", "chat-pkg"), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
-        let b = reg.split(&pkg("bob", "chat-pkg"), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
-        let c = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let a = reg
+            .split(
+                &pkg("alice", "chat-pkg"),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
+        let b = reg
+            .split(
+                &pkg("bob", "chat-pkg"),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
+        let c = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert_ne!(a.def.key, b.def.key);
         assert_ne!(a.def.key, c.def.key);
         assert!(reg.resolve(&user(), "chat").is_some());
@@ -1207,13 +1505,30 @@ mod tests {
     #[test]
     fn main_resolves_in_every_namespace_and_cannot_close() {
         let mut reg = PaneRegistry::new();
-        let via_pkg = reg.split(&pkg("a", "b"), "MAIN", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let via_pkg = reg
+            .split(
+                &pkg("a", "b"),
+                "MAIN",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(!via_pkg.created);
         assert!(via_pkg.def.is_main);
-        assert_eq!(reg.resolve(&pkg("a", "b"), "main").unwrap().key, MAIN_PANE_KEY);
+        assert_eq!(
+            reg.resolve(&pkg("a", "b"), "main").unwrap().key,
+            MAIN_PANE_KEY
+        );
         assert_eq!(reg.close(&user(), "main"), Err(PaneError::CloseMain));
         assert_eq!(
-            reg.split(&user(), "main", PaneKind::Widgets, DefStateSpec::default(), None),
+            reg.split(
+                &user(),
+                "main",
+                PaneKind::Widgets,
+                DefStateSpec::default(),
+                None
+            ),
             Err(PaneError::KindMismatch("main".to_string()))
         );
     }
@@ -1221,13 +1536,29 @@ mod tests {
     #[test]
     fn close_retires_key_and_recreate_keeps_name_id() {
         let mut reg = PaneRegistry::new();
-        let first = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let first = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         let closed_key = reg.close(&user(), "chat").unwrap();
         assert_eq!(closed_key, first.def.key);
         assert!(!reg.is_live(closed_key));
         assert!(reg.resolve(&user(), "chat").is_none());
 
-        let again = reg.split(&user(), "chat", PaneKind::Terminal, DefStateSpec::default(), None).unwrap();
+        let again = reg
+            .split(
+                &user(),
+                "chat",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         assert!(again.created);
         // Fresh incarnation key (never reused)...
         assert_ne!(again.def.key, first.def.key);
@@ -1252,41 +1583,105 @@ mod tests {
     fn cap_is_enforced_across_kinds() {
         let mut reg = PaneRegistry::new();
         for i in 0..NON_MAIN_PANE_CAP {
-            let kind = if i % 2 == 0 { PaneKind::Terminal } else { PaneKind::Widgets };
-            reg.split(&user(), &format!("p{i}"), kind, DefStateSpec::default(), None).unwrap();
+            let kind = if i % 2 == 0 {
+                PaneKind::Terminal
+            } else {
+                PaneKind::Widgets
+            };
+            reg.split(
+                &user(),
+                &format!("p{i}"),
+                kind,
+                DefStateSpec::default(),
+                None,
+            )
+            .unwrap();
         }
         assert_eq!(
-            reg.split(&user(), "overflow", PaneKind::Terminal, DefStateSpec::default(), None),
+            reg.split(
+                &user(),
+                "overflow",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None
+            ),
             Err(PaneError::CapExceeded)
         );
         // Get-or-create of an existing pane still works at the cap.
-        assert!(!reg.split(&user(), "p0", PaneKind::Terminal, DefStateSpec::default(), None).unwrap().created);
+        assert!(
+            !reg.split(
+                &user(),
+                "p0",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None
+            )
+            .unwrap()
+            .created
+        );
         // Closing one frees a slot.
         reg.close(&user(), "p0").unwrap();
-        assert!(reg.split(&user(), "overflow", PaneKind::Terminal, DefStateSpec::default(), None).unwrap().created);
+        assert!(
+            reg.split(
+                &user(),
+                "overflow",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None
+            )
+            .unwrap()
+            .created
+        );
     }
 
     #[test]
     fn name_validation_and_reserved_names() {
         let mut reg = PaneRegistry::new();
         assert!(matches!(
-            reg.split(&user(), "", PaneKind::Terminal, DefStateSpec::default(), None),
+            reg.split(
+                &user(),
+                "",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None
+            ),
             Err(PaneError::InvalidName(_))
         ));
         let long = "x".repeat(65);
         assert!(matches!(
-            reg.split(&user(), &long, PaneKind::Terminal, DefStateSpec::default(), None),
+            reg.split(
+                &user(),
+                &long,
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None
+            ),
             Err(PaneError::InvalidName(_))
         ));
         assert!(matches!(
-            reg.split(&user(), "a\nb", PaneKind::Terminal, DefStateSpec::default(), None),
+            reg.split(
+                &user(),
+                "a\nb",
+                PaneKind::Terminal,
+                DefStateSpec::default(),
+                None
+            ),
             Err(PaneError::InvalidName(_))
         ));
         for reserved in ["get", "list", "exists", "then", "GET"] {
-            assert!(matches!(
-                reg.split(&user(), reserved, PaneKind::Terminal, DefStateSpec::default(), None),
-                Err(PaneError::ReservedName(_))
-            ), "{reserved} should be reserved");
+            assert!(
+                matches!(
+                    reg.split(
+                        &user(),
+                        reserved,
+                        PaneKind::Terminal,
+                        DefStateSpec::default(),
+                        None
+                    ),
+                    Err(PaneError::ReservedName(_))
+                ),
+                "{reserved} should be reserved"
+            );
         }
         // Reserved names are read-only misses on lookup.
         assert!(reg.resolve(&user(), "get").is_none());

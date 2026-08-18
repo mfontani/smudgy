@@ -115,10 +115,9 @@ async fn run_msdp_session() -> Vec<String> {
         ]),
     })
     .unwrap();
-    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
-        "A Small Island Beach",
-        Vec::new(),
-    ))))
+    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(
+        StyledLine::new("A Small Island Beach", Vec::new()),
+    )))
     .unwrap();
     tx.send(RuntimeAction::MsdpDisabled).unwrap();
 

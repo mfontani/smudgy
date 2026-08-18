@@ -187,7 +187,9 @@ impl HttpImageCache {
                 // stale-if-error, for *transient* failures only (network gone, 5xx): a
                 // client that plays offline should keep showing the image. Permanent
                 // failures (policy denial, 4xx) must not resurrect a stale copy.
-                if err.transient && let Some(bytes) = cached_body {
+                if err.transient
+                    && let Some(bytes) = cached_body
+                {
                     log::warn!(
                         "smudgy images: {url} fetch failed ({}); serving stale copy",
                         err.reason
@@ -338,12 +340,9 @@ impl HttpImageCache {
                 for file in files.filter_map(Result::ok) {
                     let name = file.file_name().to_string_lossy().to_string();
                     let stale_tmp = name.contains(".tmp-")
-                        && file
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .is_ok_and(|t| {
-                                t.elapsed().unwrap_or_default() > Duration::from_secs(24 * 3600)
-                            });
+                        && file.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
+                            t.elapsed().unwrap_or_default() > Duration::from_secs(24 * 3600)
+                        });
                     if stale_tmp || (!name.contains(".tmp-") && !referenced.contains(&name)) {
                         let _ = std::fs::remove_file(file.path());
                     }
@@ -431,7 +430,9 @@ async fn fetch_following_redirects(
         // Validators belong to the stored resource — the *original* URL. A redirect
         // target is a different resource: sending it our ETag both leaks cache state
         // cross-host and invites a bogus 304.
-        if current == *url && let Some(cond) = &conditional {
+        if current == *url
+            && let Some(cond) = &conditional
+        {
             if let Some(etag) = &cond.etag {
                 req = req.header(reqwest::header::IF_NONE_MATCH, etag);
             }
@@ -513,7 +514,10 @@ async fn fetch_following_redirects(
 fn freshness_from(resp: &reqwest::Response) -> Freshness {
     let headers = resp.headers();
     let get = |name: reqwest::header::HeaderName| {
-        headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
     };
     freshness_from_parts(
         &get(reqwest::header::CACHE_CONTROL).unwrap_or_default(),
@@ -536,8 +540,12 @@ fn freshness_from_parts(
     etag: Option<String>,
 ) -> Freshness {
     let directives: Vec<&str> = cache_control.split(',').map(str::trim).collect();
-    let no_store = directives.iter().any(|d| d.eq_ignore_ascii_case("no-store"));
-    let no_cache = directives.iter().any(|d| d.eq_ignore_ascii_case("no-cache"));
+    let no_store = directives
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case("no-store"));
+    let no_cache = directives
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case("no-cache"));
 
     // Directive names are case-insensitive tokens.
     let max_age = directives.iter().find_map(|d| {
@@ -560,17 +568,25 @@ fn freshness_from_parts(
                 let date = date
                     .and_then(parse_http_date)
                     .unwrap_or_else(SystemTime::now);
-                Some(expires.duration_since(date).map(|d| d.as_secs()).unwrap_or(0))
+                Some(
+                    expires
+                        .duration_since(date)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
             }
             // An unparseable Expires ("0" is the classic) means already expired
             // (RFC 9111 §5.3), not "no opinion".
             None => Some(0),
         }
     } else {
-        last_modified.as_deref().and_then(parse_http_date).map(|lm| {
-            let age = SystemTime::now().duration_since(lm).unwrap_or_default();
-            (age / 10).min(HEURISTIC_MAX).as_secs()
-        })
+        last_modified
+            .as_deref()
+            .and_then(parse_http_date)
+            .map(|lm| {
+                let age = SystemTime::now().duration_since(lm).unwrap_or_default();
+                (age / 10).min(HEURISTIC_MAX).as_secs()
+            })
     };
 
     Freshness {
@@ -692,10 +708,19 @@ mod tests {
         let cache = HttpImageCache::new(PathBuf::from("/tmp/imgcache"));
         let url = Url::parse("https://example.com/a.png").unwrap();
         let meta = cache.meta_path("srv", &url);
-        assert!(meta.ends_with(Path::new("meta/srv").join(format!("{}.json", hex(url.as_str().as_bytes())))));
+        assert!(meta.ends_with(
+            Path::new("meta/srv").join(format!("{}.json", hex(url.as_str().as_bytes())))
+        ));
         let blob = cache.blob_path(&"ab".repeat(32));
         // Component-wise (Path::ends_with), so the assertion is separator-agnostic.
-        assert!(blob.ends_with(Path::new("blobs").join("ab").join("ab").join("ab".repeat(32))));
+        assert!(
+            blob.ends_with(
+                Path::new("blobs")
+                    .join("ab")
+                    .join("ab")
+                    .join("ab".repeat(32))
+            )
+        );
     }
 
     #[test]
@@ -774,12 +799,31 @@ mod tests {
         let shared = vec![1u8; 1000];
         let only_a = vec![2u8; 300];
         let url = |s: &str| Url::parse(s).unwrap();
-        cache.write_entry("srvA", &url("https://x/shared.png"), &meta_for(&shared, 100), &shared);
-        cache.write_entry("srvB", &url("https://x/shared.png"), &meta_for(&shared, 50), &shared);
-        cache.write_entry("srvA", &url("https://x/a.png"), &meta_for(&only_a, 10), &only_a);
+        cache.write_entry(
+            "srvA",
+            &url("https://x/shared.png"),
+            &meta_for(&shared, 100),
+            &shared,
+        );
+        cache.write_entry(
+            "srvB",
+            &url("https://x/shared.png"),
+            &meta_for(&shared, 50),
+            &shared,
+        );
+        cache.write_entry(
+            "srvA",
+            &url("https://x/a.png"),
+            &meta_for(&only_a, 10),
+            &only_a,
+        );
 
         assert_eq!(cache.server_usage_bytes("srvA"), 1300);
-        assert_eq!(cache.server_usage_bytes("srvB"), 1000, "shared blob counts per server");
+        assert_eq!(
+            cache.server_usage_bytes("srvB"),
+            1000,
+            "shared blob counts per server"
+        );
 
         // Clearing A drops its metas and the now-unreferenced blob; the shared blob
         // survives because B still references it.
@@ -788,7 +832,12 @@ mod tests {
         assert_eq!(cache.server_usage_bytes("srvB"), 1000);
 
         // Orphan sweep: a dead server's namespace goes.
-        cache.write_entry("dead", &url("https://x/d.png"), &meta_for(&only_a, 5), &only_a);
+        cache.write_entry(
+            "dead",
+            &url("https://x/d.png"),
+            &meta_for(&only_a, 5),
+            &only_a,
+        );
         cache.startup_sweep(&["srvB".to_string()], u64::MAX);
         assert_eq!(cache.server_usage_bytes("dead"), 0);
         assert_eq!(cache.server_usage_bytes("srvB"), 1000);
@@ -851,7 +900,11 @@ mod tests {
                 fetch_uncached(&client, &url, None).await
             })
             .expect_err("an over-cap chunked body must error");
-        assert!(err.reason.contains("cap"), "unexpected error: {}", err.reason);
+        assert!(
+            err.reason.contains("cap"),
+            "unexpected error: {}",
+            err.reason
+        );
         assert!(!err.transient, "size-cap violations are permanent");
         let _ = server.join();
     }

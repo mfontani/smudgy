@@ -139,7 +139,15 @@ async fn substitute_shapes_replace_matched_text() {
         let red_texts: Vec<&str> = styled_line
             .spans
             .iter()
-            .filter(|span| matches!(span.style.fg, Color::Ansi { color: AnsiColor::Red, .. }))
+            .filter(|span| {
+                matches!(
+                    span.style.fg,
+                    Color::Ansi {
+                        color: AnsiColor::Red,
+                        ..
+                    }
+                )
+            })
             .map(|span| &styled_line.text[span.begin_pos..span.end_pos])
             .collect();
         assert_eq!(
