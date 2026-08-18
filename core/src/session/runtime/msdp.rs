@@ -186,13 +186,21 @@ mod tests {
     #[test]
     fn enable_clears_the_subtree_and_disable_reports_prior_state() {
         let (mut msdp, mut store, catalogue) = harness();
-        msdp.ingest(&mut store, &catalogue, &payload(&[&[VAR], b"HEALTH", &[VAL], b"50"]));
+        msdp.ingest(
+            &mut store,
+            &catalogue,
+            &payload(&[&[VAR], b"HEALTH", &[VAL], b"50"]),
+        );
         store.flush();
         assert_eq!(read(&store, "HEALTH"), Some(json!("50")));
 
         msdp.on_enabled(&mut store);
         store.flush();
-        assert_eq!(read(&store, "HEALTH"), None, "fresh negotiation clears stale truth");
+        assert_eq!(
+            read(&store, "HEALTH"),
+            None,
+            "fresh negotiation clears stale truth"
+        );
 
         assert!(msdp.on_disabled(), "was enabled");
         assert!(!msdp.on_disabled(), "second disable is idempotent");

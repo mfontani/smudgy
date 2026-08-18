@@ -277,7 +277,8 @@ async fn absent_and_empty_capture_groups() {
         }
     };
 
-    tx.send(RuntimeAction::Send(Arc::new("first x".to_string()))).unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("first x".to_string())))
+        .unwrap();
 
     let mut lines = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
@@ -301,7 +302,9 @@ async fn absent_and_empty_capture_groups() {
         "a group of a pattern that did not fire is absent (reads as undefined).\nTranscript:\n{transcript}"
     );
     assert!(
-        lines.iter().any(|l| l == "EMITCHECK v=undefined has=false nan=NULL"),
+        lines
+            .iter()
+            .any(|l| l == "EMITCHECK v=undefined has=false nan=NULL"),
         "emit payloads travel as JSON: undefined-valued properties are dropped and NaN \
          arrives as null.\nTranscript:\n{transcript}"
     );
@@ -926,23 +929,22 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         }
     }
 
-    beta_tx.send(RuntimeAction::Disconnected {
-        connection_generation: 0,
-    })
-    .unwrap();
     beta_tx
-        .send(RuntimeAction::Send(Arc::new("fire-cross-session".to_string())))
+        .send(RuntimeAction::Disconnected {
+            connection_generation: 0,
+        })
+        .unwrap();
+    beta_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "fire-cross-session".to_string(),
+        )))
         .unwrap();
 
     let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < delivery_deadline
         && !(alpha_lines.iter().any(|line| line == "EVENT:Beta:42")
-            && alpha_lines
-                .iter()
-                .any(|line| line == "ORDERED_STATE:42")
-            && alpha_lines
-                .iter()
-                .any(|line| line == "BROADCAST:Beta:42")
+            && alpha_lines.iter().any(|line| line == "ORDERED_STATE:42")
+            && alpha_lines.iter().any(|line| line == "BROADCAST:Beta:42")
             && alpha_lines
                 .iter()
                 .any(|line| line == "ONCE_PAYLOAD:42:false")
@@ -1040,12 +1042,8 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         );
     }
     assert!(
-        alpha_lines
-            .iter()
-            .any(|line| line == "BOOT_SESSION:true")
-            && beta_lines
-                .iter()
-                .any(|line| line == "BOOT_SESSION:true"),
+        alpha_lines.iter().any(|line| line == "BOOT_SESSION:true")
+            && beta_lines.iter().any(|line| line == "BOOT_SESSION:true"),
         "top-level enumeration must include the already-registered current session.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
     );
     assert!(
@@ -1061,7 +1059,9 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         "cross-session pane/input lookup and completion registry failed.\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
     );
     assert!(
-        beta_lines.iter().any(|line| line == "PANE_SUBMIT:from-alpha-ui"),
+        beta_lines
+            .iter()
+            .any(|line| line == "PANE_SUBMIT:from-alpha-ui"),
         "a foreign pane input must route onSubmit back to its creating runtime (key={remote_input_key:?}, ops={saw_remote_input_ops}, swap={saw_cross_session_swap}).\nAlpha:\n{alpha_transcript}\nBeta:\n{beta_transcript}"
     );
     assert!(remote_input_key.is_some() && saw_remote_input_ops >= 3 && saw_cross_session_swap);

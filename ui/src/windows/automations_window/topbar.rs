@@ -18,15 +18,19 @@ impl AutomationsWindow {
     pub(super) fn view_topbar(&self) -> Elem<'_> {
         // ---- breadcrumb ----
         let mut crumbs = row![
-            button(text(crate::i18n::t!("automations-title")).size(13.0).style(common::muted))
-                .style(button_style::list_item)
-                .on_press(Message::ShowDashboard)
-                .padding(Padding {
-                    top: 2.0,
-                    bottom: 2.0,
-                    left: 2.0,
-                    right: 2.0,
-                }),
+            button(
+                text(crate::i18n::t!("automations-title"))
+                    .size(13.0)
+                    .style(common::muted)
+            )
+            .style(button_style::list_item)
+            .on_press(Message::ShowDashboard)
+            .padding(Padding {
+                top: 2.0,
+                bottom: 2.0,
+                left: 2.0,
+                right: 2.0,
+            }),
         ]
         .spacing(6.0)
         .align_y(Vertical::Center);
@@ -116,7 +120,9 @@ impl AutomationsWindow {
                 v
             }
             Selection::Folder(path) => path.split('/').map(str::to_string).collect(),
-            Selection::Module(subpath) => vec![crate::i18n::t!("automations-modules"), subpath.clone()],
+            Selection::Module(subpath) => {
+                vec![crate::i18n::t!("automations-modules"), subpath.clone()]
+            }
             Selection::OwnedPackage(name) => vec![name.clone()],
             Selection::InstalledPackage(spec) => vec![package_display_name(spec).to_string()],
             Selection::Dependency { parent, spec } => vec![

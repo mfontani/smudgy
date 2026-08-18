@@ -25,14 +25,18 @@ impl AutomationsWindow {
         let header = column![
             row![
                 common::status_dot(NodeStatus::Ok),
-                text(crate::i18n::t!("automations-title")).size(30.0).font(Font {
-                    weight: iced::font::Weight::Light,
-                    ..fonts::GEIST_VF
-                }),
+                text(crate::i18n::t!("automations-title"))
+                    .size(30.0)
+                    .font(Font {
+                        weight: iced::font::Weight::Light,
+                        ..fonts::GEIST_VF
+                    }),
                 iced::widget::space::horizontal(),
                 row![
                     common::status_dot(NodeStatus::Ok),
-                    text(crate::i18n::t!("automations-connected")).size(13.0).style(common::muted),
+                    text(crate::i18n::t!("automations-connected"))
+                        .size(13.0)
+                        .style(common::muted),
                 ]
                 .spacing(6.0)
                 .align_y(Vertical::Center),
@@ -44,8 +48,8 @@ impl AutomationsWindow {
                 "server" => &self.server_name,
                 "host" => host
             ))
-                .size(13.0)
-                .style(common::muted),
+            .size(13.0)
+            .style(common::muted),
             iced::widget::rule::horizontal(1.0),
         ]
         .spacing(10.0);
@@ -91,11 +95,31 @@ impl AutomationsWindow {
         let create = column![
             common::section_label(crate::i18n::ts!("automations-create")),
             wrap_row(vec![
-                create_tile(bootstrap_icons::AT, crate::i18n::ts!("automation-alias"), Message::NewAlias),
-                create_tile(bootstrap_icons::LIGHTNING, crate::i18n::ts!("automation-trigger"), Message::NewTrigger),
-                create_tile(bootstrap_icons::DPAD, crate::i18n::ts!("automation-hotkey"), Message::NewHotkey),
-                create_tile(bootstrap_icons::FOLDER_PLUS, crate::i18n::ts!("automation-folder"), Message::NewFolder),
-                create_tile(bootstrap_icons::FONTS, crate::i18n::ts!("automation-module"), Message::NewModule),
+                create_tile(
+                    bootstrap_icons::AT,
+                    crate::i18n::ts!("automation-alias"),
+                    Message::NewAlias
+                ),
+                create_tile(
+                    bootstrap_icons::LIGHTNING,
+                    crate::i18n::ts!("automation-trigger"),
+                    Message::NewTrigger
+                ),
+                create_tile(
+                    bootstrap_icons::DPAD,
+                    crate::i18n::ts!("automation-hotkey"),
+                    Message::NewHotkey
+                ),
+                create_tile(
+                    bootstrap_icons::FOLDER_PLUS,
+                    crate::i18n::ts!("automation-folder"),
+                    Message::NewFolder
+                ),
+                create_tile(
+                    bootstrap_icons::FONTS,
+                    crate::i18n::ts!("automation-module"),
+                    Message::NewModule
+                ),
                 create_tile(
                     bootstrap_icons::BOUNDING_BOX,
                     crate::i18n::ts!("automation-package"),
@@ -110,9 +134,12 @@ impl AutomationsWindow {
         // Discover teaser: the top featured public packages (a default-scope, empty-query search
         // loaded on window init) plus a jump into the full Discover pane. Public discovery works
         // without an account, so the teaser loads for everyone.
-        let mut discover = Column::new()
-            .spacing(8.0)
-            .push(common::section_label(crate::i18n::ts!("automations-discover")));
+        let mut discover =
+            Column::new()
+                .spacing(8.0)
+                .push(common::section_label(crate::i18n::ts!(
+                    "automations-discover"
+                )));
         if self.featured_packages.is_empty() {
             discover = discover.push(
                 text(crate::i18n::t!("automations-discover-help"))

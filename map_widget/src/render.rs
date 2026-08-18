@@ -960,10 +960,7 @@ pub fn draw_room_styled(
             y: y - MAP_ROOM_SIZE / 2.0,
         },
         MAP_ROOM_SIZE_AS_SIZE,
-        paint
-            .border_radius
-            .unwrap_or(MAP_ROOM_BORDER_RADIUS)
-            .into(),
+        paint.border_radius.unwrap_or(MAP_ROOM_BORDER_RADIUS).into(),
     );
 
     let fill = paint.fill.unwrap_or_else(|| room.get_iced_color());

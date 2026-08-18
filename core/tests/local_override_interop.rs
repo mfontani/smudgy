@@ -166,8 +166,13 @@ async fn local_producer_consumed_over_events_does_not_trip_the_stumble_notice() 
         setTimeout(() => { prompt.emit({ hp: 43 }); }, 200);
         "#,
     );
-    shared_packages::install_package(server, "smudgy://local/arctic-prompt", UpdateMode::Auto, true)
-        .unwrap();
+    shared_packages::install_package(
+        server,
+        "smudgy://local/arctic-prompt",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
 
     // Consumer: local package, TRUSTED → runs in main (allow-all), so it needs no manifest
     // grants; `requires` authorizes the interop consume through the dependency gate.
@@ -189,8 +194,14 @@ async fn local_producer_consumed_over_events_does_not_trip_the_stumble_notice() 
 
     let lines = run_session_real_provider(9801, server).await;
 
-    assert!(has_line(&lines, "HUD_RAN"), "the consumer package must load; transcript:\n{lines:#?}");
-    assert!(has_line(&lines, "PROMPT_RAN"), "the producer sandbox must load; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "HUD_RAN"),
+        "the consumer package must load; transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "PROMPT_RAN"),
+        "the producer sandbox must load; transcript:\n{lines:#?}"
+    );
     // The regression: a `smudgy:events/…` consume of an installed LOCAL producer must not be
     // mistaken for a code import of it.
     assert!(
@@ -225,8 +236,13 @@ async fn local_producer_actually_code_imported_still_stumbles() {
         echo("PROMPT_RAN");
         "#,
     );
-    shared_packages::install_package(server, "smudgy://local/arctic-prompt", UpdateMode::Auto, true)
-        .unwrap();
+    shared_packages::install_package(
+        server,
+        "smudgy://local/arctic-prompt",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
 
     // Consumer code-IMPORTS the producer (a `dependencies` edge), evaluating a copy of it in
     // main — the very thing the stumble diagnostic exists to catch.
@@ -247,7 +263,10 @@ async fn local_producer_actually_code_imported_still_stumbles() {
 
     let lines = run_session_real_provider(9802, server).await;
 
-    assert!(has_line(&lines, "HUD_RAN"), "the consumer package must load; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "HUD_RAN"),
+        "the consumer package must load; transcript:\n{lines:#?}"
+    );
     assert!(
         has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
         "a genuine code import of an installed local producer MUST still trip the stumble notice; \
@@ -421,8 +440,13 @@ async fn local_producer_consumed_over_state_and_procedures_does_not_stumble() {
         echo("PROMPT_RAN");
         "#,
     );
-    shared_packages::install_package(server, "smudgy://local/arctic-prompt", UpdateMode::Auto, true)
-        .unwrap();
+    shared_packages::install_package(
+        server,
+        "smudgy://local/arctic-prompt",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
 
     write_local_package(
         server,
@@ -445,7 +469,10 @@ async fn local_producer_consumed_over_state_and_procedures_does_not_stumble() {
 
     let lines = run_session_real_provider(9803, server).await;
 
-    assert!(has_line(&lines, "HUD_RAN"), "the consumer package must load; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "HUD_RAN"),
+        "the consumer package must load; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
         "consuming a local producer over the state/procedures schemes must NOT trip the stumble \
@@ -564,7 +591,10 @@ async fn two_consumers_across_isolates_each_stay_stumble_free() {
 
     let lines = run_session_real_provider(9811, server).await;
 
-    assert!(has_line(&lines, "A_RAN") && has_line(&lines, "B_RAN"), "both consumers must load; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "A_RAN") && has_line(&lines, "B_RAN"),
+        "both consumers must load; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
         "neither consumer isolate may trip the stumble — a stub fetch records nothing in either \
@@ -609,8 +639,14 @@ async fn a_required_but_unconsumed_producer_does_not_stumble() {
 
     let lines = run_session_real_provider(9812, server).await;
 
-    assert!(has_line(&lines, "HUD_RAN"), "the requirer must load; transcript:\n{lines:#?}");
-    assert!(has_line(&lines, "PROMPT_RAN"), "the required producer must run in its own home; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "HUD_RAN"),
+        "the requirer must load; transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "PROMPT_RAN"),
+        "the required producer must run in its own home; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
         "a `requires` root the requirer never imports must not appear in its served set; transcript:\n{lines:#?}"
@@ -675,13 +711,11 @@ async fn kind_mismatch_and_unknown_handle_are_reported_for_a_local_producer() {
     let lines = run_session_real_provider(9807, server).await;
 
     assert!(
-        !has_line(&lines, "WRONGKIND_RAN")
-            && has_line(&lines, "declared as a state handle"),
+        !has_line(&lines, "WRONGKIND_RAN") && has_line(&lines, "declared as a state handle"),
         "importing a state handle over the events scheme must fail with a kind hint; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "GHOST_RAN")
-            && has_line(&lines, "declares no state handle named ghost"),
+        !has_line(&lines, "GHOST_RAN") && has_line(&lines, "declares no state handle named ghost"),
         "importing an undeclared handle must fail naming it; transcript:\n{lines:#?}"
     );
 }
@@ -725,13 +759,19 @@ async fn a_deferred_dynamic_import_is_caught_at_write_not_by_the_load_stumble() 
 
     let lines = run_session_real_provider(9808, server).await;
 
-    assert!(has_line(&lines, "DYN_IMPORTED"), "the deferred dynamic import must complete; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "DYN_IMPORTED"),
+        "the deferred dynamic import must complete; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
         "a dynamic import after the load graph settles must NOT trip the load-time stumble; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "[interop] smudgy://local/arctic-prompt: state write ignored"),
+        has_line(
+            &lines,
+            "[interop] smudgy://local/arctic-prompt: state write ignored"
+        ),
         "the copy's non-home write must be refused at write time with the teaching diagnostic; transcript:\n{lines:#?}"
     );
 }
@@ -779,7 +819,10 @@ async fn one_isolate_mixes_a_local_and_a_platform_producer_without_stumbling() {
 
     let lines = run_session_real_provider(9809, server).await;
 
-    assert!(has_line(&lines, "HUD_RAN"), "the mixed-provenance consumer must load; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "HUD_RAN"),
+        "the mixed-provenance consumer must load; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "you code-imported"),
         "consuming a local package and a platform producer together must not stumble on either; transcript:\n{lines:#?}"

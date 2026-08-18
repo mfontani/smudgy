@@ -488,9 +488,9 @@ impl SocialPanel {
                     crate::i18n::ts!("social-nickname-placeholder"),
                     &self.add_nickname_input,
                 )
-                    .on_input(Message::AddHandleChanged)
-                    .on_submit(Message::SendRequestPressed)
-                    .width(220),
+                .on_input(Message::AddHandleChanged)
+                .on_submit(Message::SendRequestPressed)
+                .width(220),
                 button(text(crate::i18n::t!("social-send-request")).size(13))
                     .style(theme::builtins::button::primary)
                     .padding([4, 10])
@@ -654,9 +654,9 @@ impl SocialPanel {
                     crate::i18n::ts!("social-nickname-placeholder"),
                     &self.block_nickname_input,
                 )
-                    .on_input(Message::BlockHandleChanged)
-                    .on_submit(Message::BlockPressed)
-                    .width(220),
+                .on_input(Message::BlockHandleChanged)
+                .on_submit(Message::BlockPressed)
+                .width(220),
                 button(text(crate::i18n::t!("social-block")).size(13))
                     .style(theme::builtins::button::secondary)
                     .padding([4, 10])
@@ -670,8 +670,8 @@ impl SocialPanel {
                 container(
                     column![
                         text(crate::i18n::t!("social-block-warning"))
-                        .size(13)
-                        .style(theme::builtins::text::danger),
+                            .size(13)
+                            .style(theme::builtins::text::danger),
                         row![
                             button(text(crate::i18n::t!("social-confirm-block")).size(12))
                                 .style(theme::builtins::button::primary)
@@ -737,8 +737,8 @@ impl SocialPanel {
                 container(
                     column![
                         text(crate::i18n::t!("social-unfriend-warning"))
-                        .size(13)
-                        .style(theme::builtins::text::danger),
+                            .size(13)
+                            .style(theme::builtins::text::danger),
                         row![
                             button(text(crate::i18n::t!("action-confirm")).size(12))
                                 .style(theme::builtins::button::primary)

@@ -392,12 +392,15 @@ impl AutomationsWindow {
             &mut hotkeys_map,
             &mut triggers_map,
         );
-        aliases::save_aliases(&self.server_name, &aliases_map)
-            .map_err(|e| crate::i18n::t!("automation-save-aliases-failed", "error" => e.to_string()))?;
-        hotkeys::save_hotkeys(&self.server_name, &hotkeys_map)
-            .map_err(|e| crate::i18n::t!("automation-save-hotkeys-failed", "error" => e.to_string()))?;
-        triggers::save_triggers(&self.server_name, &triggers_map)
-            .map_err(|e| crate::i18n::t!("automation-save-triggers-failed", "error" => e.to_string()))?;
+        aliases::save_aliases(&self.server_name, &aliases_map).map_err(
+            |e| crate::i18n::t!("automation-save-aliases-failed", "error" => e.to_string()),
+        )?;
+        hotkeys::save_hotkeys(&self.server_name, &hotkeys_map).map_err(
+            |e| crate::i18n::t!("automation-save-hotkeys-failed", "error" => e.to_string()),
+        )?;
+        triggers::save_triggers(&self.server_name, &triggers_map).map_err(
+            |e| crate::i18n::t!("automation-save-triggers-failed", "error" => e.to_string()),
+        )?;
         Ok(())
     }
 

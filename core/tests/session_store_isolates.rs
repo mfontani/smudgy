@@ -198,7 +198,10 @@ async fn sandboxed_package_publishes_and_main_consumes_cross_isolate() {
     )
     .await;
 
-    assert!(has_line(&lines, "PKG_SET_OK"), "the producer's write must succeed; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "PKG_SET_OK"),
+        "the producer's write must succeed; transcript:\n{lines:#?}"
+    );
     assert!(
         has_line(&lines, r#"MAIN_SAW:{"hp":42,"maxhp":50}"#),
         "main's watcher must receive the sandboxed producer's flushed state; transcript:\n{lines:#?}"
@@ -219,8 +222,7 @@ async fn interop_capabilities_gate_store_ops_and_removed_events_tokens_grant_not
     prepare_server(server);
     shared_packages::install_package(server, "smudgy://wbk/nostore", UpdateMode::Auto, true)
         .unwrap();
-    shared_packages::record_consent(server, "smudgy://wbk/nostore", &consent_with(|_| {}))
-        .unwrap();
+    shared_packages::record_consent(server, "smudgy://wbk/nostore", &consent_with(|_| {})).unwrap();
 
     let denied_src = r#"
         import { echo } from "smudgy:core";
@@ -242,7 +244,10 @@ async fn interop_capabilities_gate_store_ops_and_removed_events_tokens_grant_not
         factory_for(vec![make_package("wbk", "nostore", "1.0.0", denied_src)]),
     )
     .await;
-    assert!(has_line(&lines, "DONE"), "the package must finish; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "DONE"),
+        "the package must finish; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "SET_OK")
             && has_line(&lines, "SET_DENIED:")
@@ -311,7 +316,8 @@ async fn interop_capabilities_gate_store_ops_and_removed_events_tokens_grant_not
         !has_line(&lines, "REMOVED_EVENTS_SET_OK")
             && lines
                 .iter()
-                .any(|line| line.contains("REMOVED_EVENTS_DENIED:") && line.contains("interop:write")),
+                .any(|line| line.contains("REMOVED_EVENTS_DENIED:")
+                    && line.contains("interop:write")),
         "removed events tokens must not grant interop:write; transcript:\n{lines:#?}"
     );
 }
@@ -378,7 +384,10 @@ async fn non_home_writes_are_inert_with_teaching_diagnostics() {
     );
     // The teaching diagnostics: the refused write and the load-time code-import stumble.
     assert!(
-        has_line(&lines, "[interop] smudgy://wbk/tracker: state write ignored"),
+        has_line(
+            &lines,
+            "[interop] smudgy://wbk/tracker: state write ignored"
+        ),
         "the refused write must explain itself once; transcript:\n{lines:#?}"
     );
     assert!(
@@ -651,8 +660,7 @@ const GEN_CONSUMER_JS: &str = r#"
 async fn consumer_previous_anchor_ignores_the_producers_open_journal() {
     let server = "ss_prev_anchor";
     prepare_server(server);
-    shared_packages::install_package(server, "smudgy://wbk/red", UpdateMode::Auto, true)
-        .unwrap();
+    shared_packages::install_package(server, "smudgy://wbk/red", UpdateMode::Auto, true).unwrap();
     shared_packages::record_consent(
         server,
         "smudgy://wbk/red",
@@ -696,7 +704,10 @@ async fn consumer_previous_anchor_ignores_the_producers_open_journal() {
         has_line(&lines, "JOURNAL_OPEN"),
         "the producer must open its third batch; transcript:\n{lines:#?}"
     );
-    assert!(has_line(&lines, "PROBES_DONE"), "the consumer must see the third commit; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "PROBES_DONE"),
+        "the consumer must see the third commit; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, r#":42|{"hp":42}"#),
         "the consumer's previousValue must never anchor to the committed head just because the producer holds an open journal; transcript:\n{lines:#?}"
@@ -796,7 +807,10 @@ async fn per_write_watch_and_procedures_cross_isolates() {
     )
     .await;
 
-    assert!(has_line(&lines, "PRODUCER_READY"), "transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "PRODUCER_READY"),
+        "transcript:\n{lines:#?}"
+    );
     assert!(
         has_line(&lines, "PKG_GOT:7:user:test"),
         "the early post must drain to the producer at registration with the host-stamped origin and session; transcript:\n{lines:#?}"
@@ -908,7 +922,10 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
         })
     };
 
-    let mut alpha_events = Box::pin(spawn_with_package_provider(params(9710, "Alpha"), factory.clone()));
+    let mut alpha_events = Box::pin(spawn_with_package_provider(
+        params(9710, "Alpha"),
+        factory.clone(),
+    ));
     let alpha_tx = loop {
         let event = tokio::time::timeout(Duration::from_mins(1), alpha_events.next())
             .await
@@ -977,7 +994,10 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
         "REMOTE_WRITE:hp=3",
         "REMOTE_TERMINAL:true",
     ] {
-        assert!(has_line(&alpha_lines, expected), "missing {expected}; {transcript}");
+        assert!(
+            has_line(&alpha_lines, expected),
+            "missing {expected}; {transcript}"
+        );
     }
     assert!(
         has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7"),
@@ -1046,7 +1066,10 @@ async fn importable_false_blocks_code_import_but_not_interop_consumption() {
 
     let lines = run_session(9708, server, factory_for(vec![lib, app])).await;
 
-    assert!(has_line(&lines, "LIB_RAN") && has_line(&lines, "APP_RAN"), "both must load; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "LIB_RAN") && has_line(&lines, "APP_RAN"),
+        "both must load; transcript:\n{lines:#?}"
+    );
     assert!(
         has_line(&lines, "APP_TICK:1"),
         "an importable:false library's event must still deliver to a cross-owner consumer; transcript:\n{lines:#?}"

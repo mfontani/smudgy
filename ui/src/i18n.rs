@@ -4,8 +4,8 @@
 //! selected preference, platform detection, launch override, and the active
 //! translator used by Smudgy's windows.
 
-use std::fmt;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Mutex;
 use std::sync::{LazyLock, RwLock};
 
@@ -15,9 +15,8 @@ const SYSTEM_PREFERENCE: &str = "system";
 
 static ACTIVE_TRANSLATOR: LazyLock<RwLock<Translator>> =
     LazyLock::new(|| RwLock::new(Translator::default()));
-static STATIC_TRANSLATIONS: LazyLock<
-    Mutex<HashMap<(&'static str, &'static str), &'static str>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static STATIC_TRANSLATIONS: LazyLock<Mutex<HashMap<(&'static str, &'static str), &'static str>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// One application locale picker item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

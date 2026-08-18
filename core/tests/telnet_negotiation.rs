@@ -302,7 +302,8 @@ fn nested_marker_at_stream_end_does_not_strand_the_latch() {
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let mut rx = Vec::new();
 
-    sock.write_all(&[IAC, WILL, MCCP2]).expect("send WILL MCCP2");
+    sock.write_all(&[IAC, WILL, MCCP2])
+        .expect("send WILL MCCP2");
     read_until(&mut sock, &mut rx, &[IAC, DO, MCCP2], "DO MCCP2");
 
     // A deflate stream that decompresses to a line, then a nested MCCP2 start marker, all

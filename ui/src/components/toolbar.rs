@@ -132,14 +132,10 @@ fn window_controls(maximized: bool) -> Element<'static, Message> {
 /// behavior as the rest of the titlebar.
 #[cfg(target_os = "macos")]
 fn traffic_light_inset() -> Element<'static, Message> {
-    mouse_area(
-        Space::new()
-            .width(TRAFFIC_LIGHT_INSET)
-            .height(Length::Fill),
-    )
-    .on_press(Message::DragWindow)
-    .on_double_click(Message::ToggleMaximizePressed)
-    .into()
+    mouse_area(Space::new().width(TRAFFIC_LIGHT_INSET).height(Length::Fill))
+        .on_press(Message::DragWindow)
+        .on_double_click(Message::ToggleMaximizePressed)
+        .into()
 }
 
 pub fn view(

@@ -12,8 +12,8 @@ use deno_core::{FastString, ModuleSource, ModuleSourceCode, ModuleSpecifier};
 use deno_error::JsErrorBox;
 use deno_maybe_sync::new_rc;
 use deno_node::{NodeExtInitServices, NodeRequireLoader};
-use deno_npm::resolution::{AddPkgReqsOptions, NpmResolutionSnapshot, NpmVersionResolver};
 use deno_npm::NpmSystemInfo;
+use deno_npm::resolution::{AddPkgReqsOptions, NpmResolutionSnapshot, NpmVersionResolver};
 use deno_npm_cache::{
     DownloadError, NpmCache, NpmCacheHttpClient, NpmCacheHttpClientBytesResponse,
     NpmCacheHttpClientResponse, NpmCacheSetting, NpmPackumentFormat, RegistryInfoProvider,
@@ -496,8 +496,8 @@ impl ModuleForExportAnalysis for AnalyzedModule {
     }
 
     fn analyze_member_export_props(&self) -> BTreeMap<String, Vec<String>> {
-        use deno_ast::swc::ast::ModuleItem;
         use deno_ast::ProgramRef;
+        use deno_ast::swc::ast::ModuleItem;
 
         // One top-level walk composes `exports.MEMBER = IDENT` aliases with static
         // `IDENT.X = ...` assignments, then advertises only X for the selected MEMBER.
@@ -540,8 +540,8 @@ impl ModuleForExportAnalysis for AnalyzedModule {
 }
 
 fn find_module_exports_require_member(parsed: &deno_ast::ParsedSource) -> Option<(String, String)> {
-    use deno_ast::swc::ast::ModuleItem;
     use deno_ast::ProgramRef;
+    use deno_ast::swc::ast::ModuleItem;
 
     match parsed.program_ref() {
         ProgramRef::Module(module) => module.body.iter().find_map(|item| match item {
@@ -791,10 +791,12 @@ mod tests {
             inner.analyze_member_export_props().get("unrelated"),
             Some(&vec!["secret".to_string()])
         );
-        assert!(inner
-            .analyze_es_runtime_exports()
-            .member_reexports
-            .is_empty());
+        assert!(
+            inner
+                .analyze_es_runtime_exports()
+                .member_reexports
+                .is_empty()
+        );
     }
 
     #[test]

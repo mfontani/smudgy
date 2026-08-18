@@ -2505,14 +2505,16 @@ pub(crate) async fn load_kind_scheme_module(
                     ))
                 })?;
                 let entry_url = canonical_url(key, &fetched.resolved_version, &entry.subpath);
-                let extraction =
-                    crate::interop_extract::extract_interop_handles(&entry_url, &entry.text)
-                        .map_err(|err| {
-                            crate::generic_loader_error(format!(
+                let extraction = crate::interop_extract::extract_interop_handles(
+                    &entry_url,
+                    &entry.text,
+                )
+                .map_err(|err| {
+                    crate::generic_loader_error(format!(
                         "cannot consume {display}/{}/{}: its entry module failed to parse: {err}",
                         key.owner, key.name
                     ))
-                        })?;
+                })?;
                 if !extraction.duplicates.is_empty() {
                     log::warn!(
                         "smudgy: package {}/{} declares duplicate interop handle name(s): {} (first declaration wins)",
@@ -2873,9 +2875,11 @@ mod tests {
         assert_eq!(widgets_jsx_runtime_url().path(), "/jsx-runtime");
         assert_eq!(widgets_module_url("repl").scheme(), WIDGETS_SCHEME);
         assert_eq!(widgets_module_url("repl").path(), "/user");
-        assert!(widgets_module_url("file:///srv/modules/hud.tsx")
-            .path()
-            .starts_with("/mod"));
+        assert!(
+            widgets_module_url("file:///srv/modules/hud.tsx")
+                .path()
+                .starts_with("/mod")
+        );
     }
 
     #[test]
@@ -3563,9 +3567,11 @@ mod tests {
         assert!(json.contains(r#""description":"A handy mapper""#));
         // …but an empty one is omitted (skip_serializing_if).
         let empty = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
-        assert!(!serde_json::to_string(&empty)
-            .unwrap()
-            .contains("description"));
+        assert!(
+            !serde_json::to_string(&empty)
+                .unwrap()
+                .contains("description")
+        );
     }
 
     #[test]

@@ -376,13 +376,23 @@ impl ImageStore {
                 existing.touched_ms.store(now, Ordering::Relaxed);
                 return existing.clone();
             }
-            let cell = Arc::new(ImageEntryCell::new(EntryState::Loading, now, self.inner.epoch));
+            let cell = Arc::new(ImageEntryCell::new(
+                EntryState::Loading,
+                now,
+                self.inner.epoch,
+            ));
             let mut map: EntryMap = (**self.inner.map.load()).clone();
             map.insert(key.to_owned(), cell.clone());
             self.inner.map.store(Arc::new(map));
             (cell, self.inner.flush_generation.load(Ordering::Acquire))
         };
-        self.spawn_fetch(key.to_owned(), &cell, source.clone(), policy.clone(), flush_gen);
+        self.spawn_fetch(
+            key.to_owned(),
+            &cell,
+            source.clone(),
+            policy.clone(),
+            flush_gen,
+        );
         cell
     }
 
@@ -518,7 +528,13 @@ impl ImageStore {
                     }
                 };
                 if let Some(flush_gen) = respawn {
-                    self.spawn_fetch(key.to_string(), cell, source.clone(), policy.clone(), flush_gen);
+                    self.spawn_fetch(
+                        key.to_string(),
+                        cell,
+                        source.clone(),
+                        policy.clone(),
+                        flush_gen,
+                    );
                 }
             }
             EntryState::Ready {
@@ -541,8 +557,7 @@ impl ImageStore {
                     let probe = self.inner.fetcher.probe(source.clone(), policy.clone());
                     self.runtime().spawn(async move {
                         if probe.await.is_some_and(|current| current != expected) {
-                            let flush_gen =
-                                store.inner.flush_generation.load(Ordering::Acquire);
+                            let flush_gen = store.inner.flush_generation.load(Ordering::Acquire);
                             store.spawn_fetch(key, &cell, source, policy, flush_gen);
                         }
                     });
@@ -726,7 +741,12 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&a, &b), "same source shares one cell");
         let state = wait_ready(&a);
         match &*state {
-            EntryState::Ready { width, height, decoded_bytes, .. } => {
+            EntryState::Ready {
+                width,
+                height,
+                decoded_bytes,
+                ..
+            } => {
                 assert_eq!((*width, *height), (2, 2));
                 assert_eq!(*decoded_bytes, 16);
             }
@@ -746,7 +766,13 @@ pub(crate) mod tests {
         let cell = store.ensure(&src("bad.png"), &server);
         let state = wait_ready(&cell);
         assert!(
-            matches!(&*state, EntryState::Failed { retry_at: Some(_), .. }),
+            matches!(
+                &*state,
+                EntryState::Failed {
+                    retry_at: Some(_),
+                    ..
+                }
+            ),
             "transient failures carry a retry deadline"
         );
         // Re-ensure within the TTL is side-effect-free.
@@ -780,7 +806,11 @@ pub(crate) mod tests {
         gate.add_permits(1);
         // The late completion must be discarded: no resurrected entry, no phantom bytes.
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(store.ready_bytes(), 0, "late completion accounted after clear");
+        assert_eq!(
+            store.ready_bytes(),
+            0,
+            "late completion accounted after clear"
+        );
         assert!(cell.is_evicted());
         assert!(store.inner.map.load().is_empty(), "no resurrected entry");
     }

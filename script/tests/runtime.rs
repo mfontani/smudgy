@@ -2,7 +2,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::Result;
-use deno_core::{serde_v8, FastString, ModuleSpecifier, PollEventLoopOptions};
+use deno_core::{FastString, ModuleSpecifier, PollEventLoopOptions, serde_v8};
 use smudgy_script::{
     ImportPolicy, InMemoryBroadcastChannel, InspectorConfig, ModulePolicy, ScriptRuntime,
     ScriptRuntimeOptions,
@@ -50,7 +50,10 @@ fn script_runtime_with_broadcast(
         extensions: Vec::new(),
         data_dir: data_dir.to_path_buf(),
         webstorage_dir: None,
-        module_policy: ModulePolicy { allow_https: true, import_policy: ImportPolicy::Any },
+        module_policy: ModulePolicy {
+            allow_https: true,
+            import_policy: ImportPolicy::Any,
+        },
         inspector: None,
         tokio: tokio.clone(),
         package_provider: None,
@@ -66,12 +69,9 @@ fn broadcast_channel_backend_is_shared_only_when_explicitly_reused() -> Result<(
     let shared = InMemoryBroadcastChannel::default();
     let (sender_tokio, mut sender) =
         script_runtime_with_broadcast(temp.path(), Some(shared.clone()))?;
-    let (receiver_tokio, mut receiver) =
-        script_runtime_with_broadcast(temp.path(), Some(shared))?;
-    let (isolated_tokio, mut isolated) = script_runtime_with_broadcast(
-        temp.path(),
-        Some(InMemoryBroadcastChannel::default()),
-    )?;
+    let (receiver_tokio, mut receiver) = script_runtime_with_broadcast(temp.path(), Some(shared))?;
+    let (isolated_tokio, mut isolated) =
+        script_runtime_with_broadcast(temp.path(), Some(InMemoryBroadcastChannel::default()))?;
 
     assert!(eval_bool_in_tokio(
         &receiver_tokio,
@@ -133,7 +133,10 @@ fn inspector_script_runtime(
         extensions: Vec::new(),
         data_dir: data_dir.to_path_buf(),
         webstorage_dir: None,
-        module_policy: ModulePolicy { allow_https: true, import_policy: ImportPolicy::Any },
+        module_policy: ModulePolicy {
+            allow_https: true,
+            import_policy: ImportPolicy::Any,
+        },
         inspector: Some(InspectorConfig {
             address: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -211,7 +214,10 @@ fn eval_module_bool(
 fn basic_eval_load_smoke() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (tokio, mut rt) = script_runtime(temp.path())?;
-    assert!(eval_bool(&mut rt, "globalThis.__smoke = 2 + 2 === 4; __smoke")?);
+    assert!(eval_bool(
+        &mut rt,
+        "globalThis.__smoke = 2 + 2 === 4; __smoke"
+    )?);
 
     let module_path = temp.path().join("smoke.js");
     std::fs::write(&module_path, "export const ok = 40 + 2 === 42;")?;
@@ -354,7 +360,11 @@ fn typescript_transpile() -> Result<()> {
 fn fs_read_write_cwd() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (tokio, mut rt) = script_runtime(temp.path())?;
-    let file = temp.path().join("fs.txt").to_string_lossy().replace('\\', "\\\\");
+    let file = temp
+        .path()
+        .join("fs.txt")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
     let source = format!(
         r#"
         (async () => {{

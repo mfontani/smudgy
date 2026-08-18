@@ -250,10 +250,9 @@ impl SmudgyPackageProvider {
         if !self.is_local_owner_segment(&key.owner) {
             return None;
         }
-        let local =
-            crate::models::local_packages::load_local_package(&self.server_name, &key.name)
-                .ok()
-                .flatten()?;
+        let local = crate::models::local_packages::load_local_package(&self.server_name, &key.name)
+            .ok()
+            .flatten()?;
         let version = local.manifest.version.clone();
         let modules = local
             .modules
@@ -263,7 +262,10 @@ impl SmudgyPackageProvider {
             .filter_map(|m| {
                 String::from_utf8(m.content)
                     .ok()
-                    .map(|text| PackageModuleSource { subpath: m.subpath, text })
+                    .map(|text| PackageModuleSource {
+                        subpath: m.subpath,
+                        text,
+                    })
             })
             .collect();
         let resolved = Rc::new(ResolvedPackage {
@@ -387,13 +389,14 @@ impl SmudgyPackageProvider {
                 // notice (a pin, or a first-ever resolve with no prior, never notifies).
                 if matches!(entry.mode, UpdateMode::Auto)
                     && let Some(prior) = &entry.last_resolved_version
-                        && prior != version {
-                            self.version_changes.borrow_mut().push((
-                                specifier.to_string(),
-                                prior.clone(),
-                                version.to_string(),
-                            ));
-                        }
+                    && prior != version
+                {
+                    self.version_changes.borrow_mut().push((
+                        specifier.to_string(),
+                        prior.clone(),
+                        version.to_string(),
+                    ));
+                }
                 entry.last_resolved_version = Some(version.to_string());
                 entry.integrity = Some(integrity.to_string());
                 true
@@ -434,7 +437,13 @@ impl SmudgyPackageProvider {
             .iter()
             .filter_map(|dep| {
                 let key = dep_package_key(&dep.owner_nickname, &dep.name)?;
-                Some((key, (dep.resolved_version.clone(), package_solver::is_exact_pin(&dep.range))))
+                Some((
+                    key,
+                    (
+                        dep.resolved_version.clone(),
+                        package_solver::is_exact_pin(&dep.range),
+                    ),
+                ))
             })
             .collect();
         if !map.is_empty() {
@@ -462,10 +471,10 @@ impl SmudgyPackageProvider {
     /// dep collapses to the highest compatible version any dependent locked; a pin keeps
     /// its exact version. With no solve (pre-pass skipped), the locked version is returned.
     fn solve_resolve(&self, target: &PackageKey, version: &str, is_pin: bool) -> String {
-        self.solve
-            .borrow()
-            .as_ref()
-            .map_or_else(|| version.to_string(), |solve| solve.resolve(target, version, is_pin))
+        self.solve.borrow().as_ref().map_or_else(
+            || version.to_string(),
+            |solve| solve.resolve(target, version, is_pin),
+        )
     }
 
     /// Pre-pass: walk the install closure to gather every requirement on each
@@ -598,7 +607,12 @@ impl SmudgyPackageProvider {
         // class instead of floating to non-yanked latest.
         let top_level_solved = roots
             .iter()
-            .map(|root| (root.package.clone(), solve.resolve(&root.package, &root.version, root.is_pin)))
+            .map(|root| {
+                (
+                    root.package.clone(),
+                    solve.resolve(&root.package, &root.version, root.is_pin),
+                )
+            })
             .collect();
         // Warn over the ACTUALLY-loaded closure (BFS from solved roots), so deps of a
         // collapsed-away version don't produce a phantom coexistence warning.
@@ -885,8 +899,11 @@ impl SmudgyPackageProvider {
                 // Offline: serve from the in-memory session cache, then the persistent
                 // disk cache (works for pinned + auto, the latter via last-resolved).
                 if let Some(version) = selected.clone().or(last_known) {
-                    if let Some(package) =
-                        self.cache.borrow().get(&(key.clone(), version.clone())).cloned()
+                    if let Some(package) = self
+                        .cache
+                        .borrow()
+                        .get(&(key.clone(), version.clone()))
+                        .cloned()
                     {
                         return Ok(package);
                     }
@@ -894,8 +911,7 @@ impl SmudgyPackageProvider {
                         // The disk cache was written by a resolve that passed the version-floor
                         // gate — but under a possibly NEWER smudgy since downgraded, so re-check
                         // the cached manifest's floor before serving it.
-                        if let Some(reason) = manifest_floor_refusal(&key.name, &package.manifest)
-                        {
+                        if let Some(reason) = manifest_floor_refusal(&key.name, &package.manifest) {
                             return Err(PackageError::Other(format!(
                                 "{specifier} not loaded: {reason}"
                             )));
@@ -914,14 +930,21 @@ impl SmudgyPackageProvider {
                         return Ok(package);
                     }
                 }
-                return Err(PackageError::Network(format!("resolving {specifier}: {err}")));
+                return Err(PackageError::Network(format!(
+                    "resolving {specifier}: {err}"
+                )));
             }
         };
 
         let version = wire.version.clone();
         // Record this instance's locked deps so imports IT makes resolve referrer-aware.
         self.store_locked_deps(key, &version, &wire.dependencies);
-        if let Some(package) = self.cache.borrow().get(&(key.clone(), version.clone())).cloned() {
+        if let Some(package) = self
+            .cache
+            .borrow()
+            .get(&(key.clone(), version.clone()))
+            .cloned()
+        {
             if track && referrer.is_none() {
                 self.resolved_versions
                     .borrow_mut()
@@ -938,7 +961,9 @@ impl SmudgyPackageProvider {
         // pre-pass gates don't walk) is refused with a clear reason instead of evaluating
         // against script APIs this smudgy doesn't have.
         if let Some(reason) = manifest_floor_refusal(&key.name, &manifest) {
-            return Err(PackageError::Other(format!("{specifier} not loaded: {reason}")));
+            return Err(PackageError::Other(format!(
+                "{specifier} not loaded: {reason}"
+            )));
         }
 
         // Required-param load-gate, at RESOLUTION time so it also catches a package
@@ -946,8 +971,11 @@ impl SmudgyPackageProvider {
         // blocked package that's also a dependency would otherwise evaluate misconfigured).
         // A package with unmet required params must not evaluate; failing here surfaces a
         // clear load error (and fails any dependent that needs it).
-        let missing =
-            crate::models::shared_packages::missing_required_params(&self.server_name, &specifier, &manifest.params);
+        let missing = crate::models::shared_packages::missing_required_params(
+            &self.server_name,
+            &specifier,
+            &manifest.params,
+        );
         if !missing.is_empty() {
             return Err(PackageError::Other(format!(
                 "{specifier} not loaded: required param(s) {} are unset; configure them in settings",
@@ -1100,14 +1128,24 @@ impl PackageProvider for SmudgyPackageProvider {
     /// manifest walk, so its keys are this isolate's actually-served package set — what the
     /// engine's code-import stumble diagnostic inspects after module loading.
     fn loaded_packages(&self) -> Vec<PackageKey> {
-        let mut keys: Vec<PackageKey> = self.cache.borrow().keys().map(|(key, _)| key.clone()).collect();
+        let mut keys: Vec<PackageKey> = self
+            .cache
+            .borrow()
+            .keys()
+            .map(|(key, _)| key.clone())
+            .collect();
         keys.sort_by(|a, b| (&a.owner, &a.name).cmp(&(&b.owner, &b.name)));
         keys.dedup();
         keys
     }
 
     fn set_home_packages(&self, homes: Vec<PackageKey>) {
-        *self.home_packages.borrow_mut() = Some(homes.iter().map(smudgy_script::PackageKey::folded).collect());
+        *self.home_packages.borrow_mut() = Some(
+            homes
+                .iter()
+                .map(smudgy_script::PackageKey::folded)
+                .collect(),
+        );
     }
 
     fn is_home_load(&self, key: &PackageKey) -> bool {
@@ -1162,7 +1200,10 @@ fn fetch_error(specifier: &str, module: &ResolvedModuleWire, err: &CloudError) -
             actual: message,
         }
     } else {
-        PackageError::Network(format!("fetching {} for {specifier}: {message}", module.subpath))
+        PackageError::Network(format!(
+            "fetching {} for {specifier}: {message}",
+            module.subpath
+        ))
     }
 }
 
@@ -1219,7 +1260,11 @@ mod tests {
 
         // app@1.0.0 locked util@1.3.0 (a range); other@1.0.0 pinned util@=2.0.0.
         provider.store_locked_deps(&pkg_key("app"), "1.0.0", &[dep("util", "^1.3", "1.3.0")]);
-        provider.store_locked_deps(&pkg_key("other"), "1.0.0", &[dep("util", "=2.0.0", "2.0.0")]);
+        provider.store_locked_deps(
+            &pkg_key("other"),
+            "1.0.0",
+            &[dep("util", "=2.0.0", "2.0.0")],
+        );
 
         // The heart of referrer-aware resolution: each importer selects the version IT
         // locked, with the declared range classified into the exact-pin flag.
@@ -1237,7 +1282,10 @@ mod tests {
             provider.referrer_locked_version(&referrer("app", "1.0.0"), &pkg_key("absent")),
             None
         );
-        assert_eq!(provider.referrer_locked_version(&referrer("unknown", "1.0.0"), &util), None);
+        assert_eq!(
+            provider.referrer_locked_version(&referrer("unknown", "1.0.0"), &util),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1326,12 +1374,14 @@ mod tests {
         for provider in [&main, &sandbox] {
             let lock = provider.lock.borrow();
             assert_eq!(
-                lock.find("smudgy://wbk/mapper").and_then(|p| p.last_resolved_version.as_deref()),
+                lock.find("smudgy://wbk/mapper")
+                    .and_then(|p| p.last_resolved_version.as_deref()),
                 Some("1.4.0"),
                 "main's install survives the sandbox's later write into the shared lock"
             );
             assert_eq!(
-                lock.find("smudgy://cor/combat").and_then(|p| p.last_resolved_version.as_deref()),
+                lock.find("smudgy://cor/combat")
+                    .and_then(|p| p.last_resolved_version.as_deref()),
                 Some("2.0.0"),
                 "the sandbox's install is recorded into the same shared lock"
             );
@@ -1353,8 +1403,13 @@ mod tests {
         // main's closure locked util@1.4.0; the sandboxed isolate's closure locked util@1.2.0.
         *main.solve.borrow_mut() = Some(package_solver::solve(&[util_req("1.4.0", false)]));
         *sandbox.solve.borrow_mut() = Some(package_solver::solve(&[util_req("1.2.0", false)]));
-        main.top_level_solved.borrow_mut().insert(util.clone(), "1.4.0".into());
-        sandbox.top_level_solved.borrow_mut().insert(util.clone(), "1.2.0".into());
+        main.top_level_solved
+            .borrow_mut()
+            .insert(util.clone(), "1.4.0".into());
+        sandbox
+            .top_level_solved
+            .borrow_mut()
+            .insert(util.clone(), "1.2.0".into());
 
         // Each isolate resolves the dep at its own collapsed version.
         assert_eq!(main.solve_resolve(&util, "1.4.0", false), "1.4.0");
@@ -1365,8 +1420,21 @@ mod tests {
         // ...while main, asked about 1.2.0, collapses to ITS OWN 1.4.0 — two distinct solve heaps.
         assert_eq!(main.solve_resolve(&util, "1.2.0", false), "1.4.0");
         // Top-level reads are isolate-local too.
-        assert_eq!(main.top_level_solved.borrow().get(&util).map(String::as_str), Some("1.4.0"));
-        assert_eq!(sandbox.top_level_solved.borrow().get(&util).map(String::as_str), Some("1.2.0"));
+        assert_eq!(
+            main.top_level_solved
+                .borrow()
+                .get(&util)
+                .map(String::as_str),
+            Some("1.4.0")
+        );
+        assert_eq!(
+            sandbox
+                .top_level_solved
+                .borrow()
+                .get(&util)
+                .map(String::as_str),
+            Some("1.2.0")
+        );
     }
 
     #[test]

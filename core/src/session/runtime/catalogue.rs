@@ -401,7 +401,14 @@ impl RuntimeCatalogue {
         sender: &Arc<str>,
         payload_json: &str,
     ) {
-        self.record_sample(producer, kind, name, name_folded, Arc::clone(sender), payload_json);
+        self.record_sample(
+            producer,
+            kind,
+            name,
+            name_folded,
+            Arc::clone(sender),
+            payload_json,
+        );
     }
 
     /// Whether shape merging should happen for a sample recorded right now: the attached
@@ -425,7 +432,14 @@ impl RuntimeCatalogue {
         sender: &str,
         payload_json: &str,
     ) {
-        self.record_sample(producer, kind, name, &folded(name), Arc::from(sender), payload_json);
+        self.record_sample(
+            producer,
+            kind,
+            name,
+            &folded(name),
+            Arc::from(sender),
+            payload_json,
+        );
     }
 
     /// The one sample choke point (`docs/interop.md` §10): a bounded insert, recorded
@@ -453,9 +467,7 @@ impl RuntimeCatalogue {
         entry.occurrences += 1;
         let truncated = payload_json.len() > SAMPLE_PAYLOAD_CAP;
         if subscribed {
-            if !truncated
-                && let Ok(value) = serde_json::from_str::<Value>(payload_json)
-            {
+            if !truncated && let Ok(value) = serde_json::from_str::<Value>(payload_json) {
                 entry.shape.add(&value, &mut entry.shape_budget);
             }
             entry.shape_merged = entry.occurrences;
@@ -868,10 +880,7 @@ mod tests {
         assert_eq!(shape(&[json!([1, 2, 3])]), "number[]");
         assert_eq!(shape(&[json!([1, "x"])]), "(number | string)[]");
         assert_eq!(shape(&[json!([])]), "unknown[]");
-        assert_eq!(
-            shape(&[json!({ "Mr. Foo": 1 })]),
-            "{ \"Mr. Foo\": number }"
-        );
+        assert_eq!(shape(&[json!({ "Mr. Foo": 1 })]), "{ \"Mr. Foo\": number }");
         assert_eq!(shape(&[]), "unknown");
     }
 
@@ -879,7 +888,13 @@ mod tests {
     fn catalogue_entries_index_samples_and_survive_engine_reset() {
         let mut cat = RuntimeCatalogue::new();
         let producer = arc("smudgy://wbk/tracker");
-        cat.declare(&producer, CatalogueKind::Event, "Prompt", Some("PromptEvent"), None);
+        cat.declare(
+            &producer,
+            CatalogueKind::Event,
+            "Prompt",
+            Some("PromptEvent"),
+            None,
+        );
         cat.sample_dynamic(
             &producer,
             CatalogueKind::Event,
@@ -963,7 +978,13 @@ mod tests {
         // Early samples carry `tag`; enough later ones without it evict every early sample
         // from the ring. The accumulator still remembers them: `tag` renders optional.
         for _ in 0..3 {
-            cat.sample_dynamic(&user, CatalogueKind::Event, "e", "user", r#"{"hp":1,"tag":"a"}"#);
+            cat.sample_dynamic(
+                &user,
+                CatalogueKind::Event,
+                "e",
+                "user",
+                r#"{"hp":1,"tag":"a"}"#,
+            );
         }
         for _ in 0..(SAMPLE_RING_CAP + 5) {
             cat.sample_dynamic(&user, CatalogueKind::Event, "e", "user", r#"{"hp":2}"#);
@@ -1022,7 +1043,13 @@ mod tests {
         }
         // A retained (early) key keeps merging after exhaustion — the budget binds new
         // positions only.
-        cat.sample_dynamic(&user, CatalogueKind::Event, "e", "user", r#"{"dyn_00000":"x"}"#);
+        cat.sample_dynamic(
+            &user,
+            CatalogueKind::Event,
+            "e",
+            "user",
+            r#"{"dyn_00000":"x"}"#,
+        );
         let snap = cat.snapshot(&SessionStore::new());
         let shape = snap.entries[0]
             .inferred_shape
@@ -1058,7 +1085,13 @@ mod tests {
         // record also catches up the still-ringed unsubscribed backlog (`cold`).
         let rx = tx.subscribe();
         for _ in 0..3 {
-            cat.sample_dynamic(&user, CatalogueKind::Event, "e", "user", r#"{"hp":1,"tag":"a"}"#);
+            cat.sample_dynamic(
+                &user,
+                CatalogueKind::Event,
+                "e",
+                "user",
+                r#"{"hp":1,"tag":"a"}"#,
+            );
         }
         for _ in 0..(SAMPLE_RING_CAP + 5) {
             cat.sample_dynamic(&user, CatalogueKind::Event, "e", "user", r#"{"hp":2}"#);
@@ -1077,9 +1110,18 @@ mod tests {
         let mut cat = RuntimeCatalogue::new();
         let producer = arc("smudgy://wbk/minty");
         for i in 0..MAX_ENTRIES_PER_PRODUCER {
-            cat.sample_dynamic(&producer, CatalogueKind::Event, &format!("e{i}"), "user", "1");
+            cat.sample_dynamic(
+                &producer,
+                CatalogueKind::Event,
+                &format!("e{i}"),
+                "user",
+                "1",
+            );
         }
-        assert!(cat.take_refusal_notices().is_empty(), "under the cap: no notice");
+        assert!(
+            cat.take_refusal_notices().is_empty(),
+            "under the cap: no notice"
+        );
         let _ = cat.take_dirty();
 
         // At the cap: an undeclared entry is refused (not recorded at all) with one notice…
@@ -1114,9 +1156,15 @@ mod tests {
         let t0 = tokio::time::Instant::now();
 
         // Nobody subscribed: always idle, dirty or not.
-        assert_eq!(cadence.on_drain(true, false, false, t0), CadenceDecision::Idle);
+        assert_eq!(
+            cadence.on_drain(true, false, false, t0),
+            CadenceDecision::Idle
+        );
         // First dirty drain: leading edge, no window yet.
-        assert_eq!(cadence.on_drain(true, true, false, t0), CadenceDecision::SendNow);
+        assert_eq!(
+            cadence.on_drain(true, true, false, t0),
+            CadenceDecision::SendNow
+        );
         cadence.sent(t0);
         // Clean drain inside the window: nothing owed.
         assert_eq!(

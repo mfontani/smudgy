@@ -234,7 +234,11 @@ impl HostedPackages {
             version.to_string(),
         );
         if self.identities.load().contains(&identity)
-            && (!local_override || self.local.load().contains(&(identity.0.clone(), identity.1.clone())))
+            && (!local_override
+                || self
+                    .local
+                    .load()
+                    .contains(&(identity.0.clone(), identity.1.clone())))
         {
             return;
         }
@@ -442,7 +446,10 @@ pub fn register_creator(
 /// `lib/hud.tsx` → `lib`. Every component is strictly validated (the `?mod=` value is
 /// JS-supplied); `..` is rejected outright — a forged base still cannot escape the root.
 fn dir_of_validated(module_subpath: &str) -> Result<String, SrcError> {
-    let mut parts: Vec<&str> = module_subpath.split('/').filter(|s| !s.is_empty()).collect();
+    let mut parts: Vec<&str> = module_subpath
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     parts.pop(); // drop the filename
     let mut out = Vec::with_capacity(parts.len());
     for part in parts {
@@ -839,11 +846,7 @@ enum ParentRule {
 
 /// Split `rest` on `/`, validate every component, and resolve `.`/`..` lexically against
 /// `base` (a component stack). Never touches the filesystem, never percent-decodes.
-fn lexical_resolve(
-    base: &[String],
-    rest: &str,
-    rule: ParentRule,
-) -> Result<Vec<String>, SrcError> {
+fn lexical_resolve(base: &[String], rest: &str, rule: ParentRule) -> Result<Vec<String>, SrcError> {
     let mut stack: Vec<String> = base.to_vec();
     let mut any = false;
     for part in rest.split('/') {
@@ -1060,8 +1063,13 @@ mod tests {
     #[test]
     fn degenerate_srcs_are_rejected() {
         let c = pkg_creator("", policy(false, &[], &[]));
-        for bad in ["", " ", ".", "./", "@/", "@", "@x", "a//b.png", "a/", "/x/../"] {
-            assert!(resolve_src(bad, &c, false).is_err(), "{bad:?} must be rejected");
+        for bad in [
+            "", " ", ".", "./", "@/", "@", "@x", "a//b.png", "a/", "/x/../",
+        ] {
+            assert!(
+                resolve_src(bad, &c, false).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
     }
 
@@ -1240,7 +1248,11 @@ mod tests {
     #[test]
     fn unparseable_grants_drop_fail_closed() {
         let (grants, dropped) = NetGrants::parse(&["10.0.0.0/8".into(), "bad host".into()]);
-        assert_eq!(dropped.len(), 2, "CIDR + malformed are dropped, not mis-matched");
+        assert_eq!(
+            dropped.len(),
+            2,
+            "CIDR + malformed are dropped, not mis-matched"
+        );
         assert!(!grants.allows_url(&Url::parse("http://10.1.2.3/x").unwrap()));
     }
 
@@ -1256,7 +1268,10 @@ mod tests {
     fn data_uris_validate_shape_and_cap() {
         let c = pkg_creator("", policy(false, &[], &[]));
         assert!(resolve_src("data:image/png;base64,iVBORw0KGgo=", &c, false).is_ok());
-        assert!(resolve_src("data:image/png;base64,AAAA", &c, true).is_ok(), "bound data: ok");
+        assert!(
+            resolve_src("data:image/png;base64,AAAA", &c, true).is_ok(),
+            "bound data: ok"
+        );
         assert_eq!(
             resolve_src("data:text/html;base64,PGI+", &c, false),
             Err(SrcError::BadDataUri)
@@ -1326,11 +1341,9 @@ mod tests {
         // Referrers must be platform-valid file URLs: a drive-less unix path fails
         // `to_file_path` on Windows and would coarsen the module dir to the modules root.
         #[cfg(not(windows))]
-        let module =
-            r#"{"kind":"module","referrer":"file:///home/u/smudgy/testserver/modules/ui/bars.tsx"}"#;
+        let module = r#"{"kind":"module","referrer":"file:///home/u/smudgy/testserver/modules/ui/bars.tsx"}"#;
         #[cfg(windows)]
-        let module =
-            r#"{"kind":"module","referrer":"file:///C:/home/u/smudgy/testserver/modules/ui/bars.tsx"}"#;
+        let module = r#"{"kind":"module","referrer":"file:///C:/home/u/smudgy/testserver/modules/ui/bars.tsx"}"#;
         assert!(register_creator(user, None, trusted.clone()).is_some());
         assert!(register_creator(module, None, trusted.clone()).is_some());
         // A sandbox hosts only packages — user/module descriptors are forgery there.
@@ -1406,7 +1419,10 @@ mod tests {
         // evaluate and register — the clone inside the policy sees the same live set.
         hosted.insert("wbk", "MAPPER", "1.0.0", true);
         assert!(hosted.contains(&("wbk".into(), "mapper".into(), "1.0.0".into())));
-        assert!(!hosted.contains(&("wbk".into(), "mapper".into(), "2.0.0".into())), "version exact");
+        assert!(
+            !hosted.contains(&("wbk".into(), "mapper".into(), "2.0.0".into())),
+            "version exact"
+        );
         assert!(hosted.is_local_override("WbK", "mapper"));
         assert!(!hosted.is_local_override("wbk", "other"));
 
@@ -1450,11 +1466,11 @@ mod tests {
         let pol = policy(true, &[], &[]);
         let c = user_creator("/x", pol);
         for raw in [
-            "日本語.png",        // 3-byte chars from byte 0
-            "dat€.png",          // € straddles byte 5 ("data:" length)
-            "aaaaaaé.png",       // é straddles byte 7 ("http://" length)
-            "assets/ölogo.png",  // ö straddles byte 8 ("https://" length)
-            "smudgyö//x.png",    // ö straddles byte 9 ("smudgy://" length)
+            "日本語.png",       // 3-byte chars from byte 0
+            "dat€.png",         // € straddles byte 5 ("data:" length)
+            "aaaaaaé.png",      // é straddles byte 7 ("http://" length)
+            "assets/ölogo.png", // ö straddles byte 8 ("https://" length)
+            "smudgyö//x.png",   // ö straddles byte 9 ("smudgy://" length)
             "é",
         ] {
             let _ = resolve_src(raw, &c, false);

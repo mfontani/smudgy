@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::transpiler::transpile;
-use crate::{generic_loader_error, ModulePolicy};
+use crate::{ModulePolicy, generic_loader_error};
 
 type SourceMapCache = Rc<RefCell<HashMap<String, Vec<u8>>>>;
 

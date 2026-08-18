@@ -13,10 +13,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use smudgy_cloud::{
-    highest_satisfying_version, PackageApiClient, PublishDependency, PublishModule, Uuid,
+    PackageApiClient, PublishDependency, PublishModule, Uuid, highest_satisfying_version,
 };
 use smudgy_script::PackageManifest;
 
@@ -198,7 +198,11 @@ pub fn load_local_package(server_name: &str, name: &str) -> Result<Option<LocalP
     load_local_package_in(&get_smudgy_home()?, server_name, name)
 }
 
-fn load_local_package_in(home: &Path, server_name: &str, name: &str) -> Result<Option<LocalPackage>> {
+fn load_local_package_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+) -> Result<Option<LocalPackage>> {
     let dir = packages_dir_in(home, server_name).join(name);
     let manifest_path = dir.join(MANIFEST_FILE);
     if !manifest_path.is_file() {
@@ -277,7 +281,10 @@ fn scaffold_local_package_in(home: &Path, server_name: &str, name: &str) -> Resu
     let manifest =
         "{\n  \"version\": \"0.1.0\",\n  \"description\": \"\",\n  \"entry\": \"index.ts\"\n}\n";
     fs::write(dir.join(MANIFEST_FILE), manifest)?;
-    fs::write(dir.join("index.ts"), "// smudgy package entry\nexport {};\n")?;
+    fs::write(
+        dir.join("index.ts"),
+        "// smudgy package entry\nexport {};\n",
+    )?;
     let readme = format!("# {name}\n\nDescribe your package here.\n");
     fs::write(dir.join(README_FILE), readme)?;
     // Same editor project pointer a copied package gets, so a new package opened standalone in
@@ -527,7 +534,11 @@ fn is_declaration_file(subpath: &str) -> bool {
     let is_ts = path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| ["ts", "mts", "cts"].iter().any(|t| ext.eq_ignore_ascii_case(t)));
+        .is_some_and(|ext| {
+            ["ts", "mts", "cts"]
+                .iter()
+                .any(|t| ext.eq_ignore_ascii_case(t))
+        });
     let stem_is_decl = path
         .file_stem()
         .map(Path::new)
@@ -545,7 +556,11 @@ fn is_typescript_source(subpath: &str) -> bool {
     let is_ts = path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| ["ts", "mts", "cts", "tsx"].iter().any(|t| ext.eq_ignore_ascii_case(t)));
+        .is_some_and(|ext| {
+            ["ts", "mts", "cts", "tsx"]
+                .iter()
+                .any(|t| ext.eq_ignore_ascii_case(t))
+        });
     is_ts && !is_declaration_file(subpath)
 }
 
@@ -598,9 +613,18 @@ async fn generate_publish_typings(modules: &[LocalModule]) -> (Vec<PublishModule
 
     let mut ambient = BTreeMap::new();
     ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
-    ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
-    ambient.insert("smudgy-widgets.d.ts".to_string(), SMUDGY_WIDGETS_DTS.to_string());
-    ambient.insert("smudgy-params.d.ts".to_string(), SMUDGY_PARAMS_DTS.to_string());
+    ambient.insert(
+        "smudgy-mapper.d.ts".to_string(),
+        SMUDGY_MAPPER_DTS.to_string(),
+    );
+    ambient.insert(
+        "smudgy-widgets.d.ts".to_string(),
+        SMUDGY_WIDGETS_DTS.to_string(),
+    );
+    ambient.insert(
+        "smudgy-params.d.ts".to_string(),
+        SMUDGY_PARAMS_DTS.to_string(),
+    );
 
     match tokio::task::spawn_blocking(move || {
         smudgy_script::dts::generate_declarations(&sources, &ambient)
@@ -623,11 +647,15 @@ async fn generate_publish_typings(modules: &[LocalModule]) -> (Vec<PublishModule
         }
         Ok(Err(e)) => (
             Vec::new(),
-            vec![format!("declaration generation failed — publishing without typings: {e:#}")],
+            vec![format!(
+                "declaration generation failed — publishing without typings: {e:#}"
+            )],
         ),
         Err(e) => (
             Vec::new(),
-            vec![format!("declaration generation panicked — publishing without typings: {e}")],
+            vec![format!(
+                "declaration generation panicked — publishing without typings: {e}"
+            )],
         ),
     }
 }
@@ -663,7 +691,9 @@ async fn lock_dependencies(
             .await
             .map_err(|e| anyhow!("lock dependency {owner_nickname}/{name}: {e}"))?;
         let resolved_version = highest_satisfying_version(&versions, Some(&range))
-            .map_err(|e| anyhow!("dependency {owner_nickname}/{name} has an invalid range {range}: {e}"))?
+            .map_err(|e| {
+                anyhow!("dependency {owner_nickname}/{name} has an invalid range {range}: {e}")
+            })?
             .ok_or_else(|| {
                 anyhow!("no published version of {owner_nickname}/{name} satisfies {range}")
             })?;
@@ -701,7 +731,10 @@ async fn lock_dependencies(
 /// shape of the silent "can't move past 0.0.x" footgun. A tilde (`~0.0.1`) or comparator
 /// (`>=0.0.1`) range is *not* flagged: those do admit higher 0.0.x patches.
 fn excludes_zero_zero_patch(range: &str, resolved: &str) -> bool {
-    let core = range.trim().strip_prefix('^').unwrap_or_else(|| range.trim());
+    let core = range
+        .trim()
+        .strip_prefix('^')
+        .unwrap_or_else(|| range.trim());
     core.starts_with("0.0.") && resolved.starts_with("0.0.")
 }
 
@@ -760,11 +793,9 @@ fn fork_to_local_in(
         // Subpaths are always forward-slashed + validated; join is in-package.
         let path = dir.join(module.subpath.replace('/', std::path::MAIN_SEPARATOR_STR));
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
-        fs::write(&path, &module.content)
-            .with_context(|| format!("write {}", path.display()))?;
+        fs::write(&path, &module.content).with_context(|| format!("write {}", path.display()))?;
     }
 
     // A copied package is its own editor project: drop a thin `tsconfig.json` pointing at the
@@ -803,8 +834,7 @@ fn rename_local_package_in(home: &Path, server_name: &str, old: &str, new: &str)
     if to.exists() {
         bail!("a package named {new} already exists");
     }
-    fs::rename(&from, &to)
-        .with_context(|| format!("rename {} -> {}", from.display(), to.display()))
+    fs::rename(&from, &to).with_context(|| format!("rename {} -> {}", from.display(), to.display()))
 }
 
 #[cfg(test)]
@@ -834,9 +864,15 @@ mod tests {
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 
         let names: Vec<&str> = dts.iter().map(|m| m.subpath.as_str()).collect();
-        assert!(names.contains(&"index.d.ts"), "missing index.d.ts: {names:?}");
+        assert!(
+            names.contains(&"index.d.ts"),
+            "missing index.d.ts: {names:?}"
+        );
         assert!(names.contains(&"util.d.ts"), "missing util.d.ts: {names:?}");
-        assert!(dts.iter().all(|m| !m.is_entry), "generated .d.ts must not be entry");
+        assert!(
+            dts.iter().all(|m| !m.is_entry),
+            "generated .d.ts must not be entry"
+        );
 
         let index = dts.iter().find(|m| m.subpath == "index.d.ts").unwrap();
         let text = String::from_utf8(index.content.clone()).unwrap();
@@ -937,14 +973,21 @@ mod tests {
         ];
         // `^1.2` collapses to the highest non-yanked `1.x` (1.4.0 is yanked).
         assert_eq!(
-            highest_satisfying_version(&versions, Some("^1.2")).unwrap().as_deref(),
+            highest_satisfying_version(&versions, Some("^1.2"))
+                .unwrap()
+                .as_deref(),
             Some("1.3.0")
         );
         // No published `3.x` -> no match (the publish path turns this into a named error).
-        assert_eq!(highest_satisfying_version(&versions, Some("^3")).unwrap(), None);
+        assert_eq!(
+            highest_satisfying_version(&versions, Some("^3")).unwrap(),
+            None
+        );
         // No range constraint -> the highest published version overall.
         assert_eq!(
-            highest_satisfying_version(&versions, None).unwrap().as_deref(),
+            highest_satisfying_version(&versions, None)
+                .unwrap()
+                .as_deref(),
             Some("2.0.0")
         );
     }
@@ -970,7 +1013,11 @@ mod tests {
     fn scaffold_then_load_round_trips() {
         let home = tempfile::tempdir().unwrap();
         let server = "Arctic";
-        assert!(list_local_packages_in(home.path(), server).unwrap().is_empty());
+        assert!(
+            list_local_packages_in(home.path(), server)
+                .unwrap()
+                .is_empty()
+        );
 
         scaffold_local_package_in(home.path(), server, "mymapper").unwrap();
         assert_eq!(
@@ -1003,11 +1050,17 @@ mod tests {
         let server = "Arctic";
         let dir = packages_dir_in(home.path(), server).join("multi");
         fs::create_dir_all(dir.join("lib")).unwrap();
-        fs::write(dir.join(MANIFEST_FILE), r#"{ "name": "multi", "version": "1.0.0" }"#).unwrap();
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            r#"{ "name": "multi", "version": "1.0.0" }"#,
+        )
+        .unwrap();
         fs::write(dir.join("index.ts"), "export {};").unwrap();
         fs::write(dir.join("lib").join("util.ts"), "export const u = 1;").unwrap();
 
-        let pkg = load_local_package_in(home.path(), server, "multi").unwrap().unwrap();
+        let pkg = load_local_package_in(home.path(), server, "multi")
+            .unwrap()
+            .unwrap();
         let subpaths: Vec<&str> = pkg.modules.iter().map(|m| m.subpath.as_str()).collect();
         assert!(subpaths.contains(&"index.ts"));
         assert!(subpaths.contains(&"lib/util.ts"));
@@ -1020,31 +1073,49 @@ mod tests {
         let dir = packages_dir_in(home.path(), server).join("pkg");
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::create_dir_all(dir.join("node_modules").join("dep")).unwrap();
-        fs::write(dir.join(MANIFEST_FILE), r#"{ "name": "pkg", "version": "1.0.0" }"#).unwrap();
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            r#"{ "name": "pkg", "version": "1.0.0" }"#,
+        )
+        .unwrap();
         fs::write(dir.join(README_FILE), "# pkg").unwrap();
         fs::write(dir.join("index.ts"), "export {};").unwrap();
         fs::write(dir.join(".env"), "SECRET=1").unwrap();
         // The editor-only tsconfig is excluded from publish like a dotfile.
         fs::write(dir.join(TSCONFIG_FILE), PACKAGE_TSCONFIG).unwrap();
         // Cruft that must NEVER be published as modules:
-        fs::write(dir.join(".git").join("config"), "[remote] url=https://x:tok@h/r").unwrap();
+        fs::write(
+            dir.join(".git").join("config"),
+            "[remote] url=https://x:tok@h/r",
+        )
+        .unwrap();
         fs::write(
             dir.join("node_modules").join("dep").join("index.js"),
             "module.exports={}",
         )
         .unwrap();
 
-        let pkg = load_local_package_in(home.path(), server, "pkg").unwrap().unwrap();
+        let pkg = load_local_package_in(home.path(), server, "pkg")
+            .unwrap()
+            .unwrap();
         let subpaths: Vec<&str> = pkg.modules.iter().map(|m| m.subpath.as_str()).collect();
         // Only the real source module is collected — not .git/config (secrets!), not
         // node_modules, not the .env dotfile, not the README/manifest, not the editor tsconfig.
-        assert_eq!(subpaths, vec!["index.ts"], "only index.ts is a module; got {subpaths:?}");
+        assert_eq!(
+            subpaths,
+            vec!["index.ts"],
+            "only index.ts is a module; got {subpaths:?}"
+        );
     }
 
     #[test]
     fn missing_package_is_none() {
         let home = tempfile::tempdir().unwrap();
-        assert!(load_local_package_in(home.path(), "Arctic", "ghost").unwrap().is_none());
+        assert!(
+            load_local_package_in(home.path(), "Arctic", "ghost")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1052,15 +1123,22 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let server = "Arctic";
         let manifest = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
-        let modules = vec![LocalModule { subpath: "index.ts".into(), content: "export {};".into() }];
+        let modules = vec![LocalModule {
+            subpath: "index.ts".into(),
+            content: "export {};".into(),
+        }];
         fork_to_local_in(home.path(), server, "boo", &manifest, &modules).unwrap();
 
         rename_local_package_in(home.path(), server, "boo", "myboo").unwrap();
         assert!(
-            load_local_package_in(home.path(), server, "boo").unwrap().is_none(),
+            load_local_package_in(home.path(), server, "boo")
+                .unwrap()
+                .is_none(),
             "the old name is gone after rename"
         );
-        let pkg = load_local_package_in(home.path(), server, "myboo").unwrap().unwrap();
+        let pkg = load_local_package_in(home.path(), server, "myboo")
+            .unwrap()
+            .unwrap();
         assert_eq!(pkg.name, "myboo");
 
         // Renaming onto an existing name, or from a missing source, is rejected; a no-op is fine.
@@ -1074,9 +1152,10 @@ mod tests {
     fn fork_creates_a_renamed_local_copy() {
         let home = tempfile::tempdir().unwrap();
         let server = "Arctic";
-        let manifest =
-            PackageManifest::parse(r#"{ "version": "1.2.0", "description": "A mapper", "entry": "index.ts" }"#)
-                .unwrap();
+        let manifest = PackageManifest::parse(
+            r#"{ "version": "1.2.0", "description": "A mapper", "entry": "index.ts" }"#,
+        )
+        .unwrap();
         let modules = vec![
             LocalModule {
                 subpath: "index.ts".into(),
@@ -1108,7 +1187,9 @@ mod tests {
         assert!(PACKAGE_TSCONFIG.contains("../../tsconfig.json"));
 
         // The fork loads as a local package with the NEW (folder) name + the copied manifest/modules.
-        let pkg = load_local_package_in(home.path(), server, "mymapper").unwrap().unwrap();
+        let pkg = load_local_package_in(home.path(), server, "mymapper")
+            .unwrap()
+            .unwrap();
         assert_eq!(pkg.name, "mymapper");
         assert_eq!(pkg.manifest.description, "A mapper");
         assert_eq!(pkg.manifest.version, "1.2.0");
@@ -1116,15 +1197,24 @@ mod tests {
         assert!(subpaths.contains(&"index.ts"));
         assert!(subpaths.contains(&"lib/util.ts"));
         // The tsconfig is not a publishable module.
-        assert!(!subpaths.contains(&TSCONFIG_FILE), "tsconfig must be excluded; got {subpaths:?}");
+        assert!(
+            !subpaths.contains(&TSCONFIG_FILE),
+            "tsconfig must be excluded; got {subpaths:?}"
+        );
         // Generated declarations are not copied — they'd collide with publish-time regeneration.
         assert!(
             !subpaths.iter().any(|s| s.ends_with(".d.ts")),
             "generated .d.ts must not be copied into the fork; got {subpaths:?}"
         );
         let dir = packages_dir_in(home.path(), server).join("mymapper");
-        assert!(!dir.join("index.d.ts").exists(), "index.d.ts must not be written to disk");
-        assert!(!dir.join("lib").join("util.d.ts").exists(), "lib/util.d.ts must not be written to disk");
+        assert!(
+            !dir.join("index.d.ts").exists(),
+            "index.d.ts must not be written to disk"
+        );
+        assert!(
+            !dir.join("lib").join("util.d.ts").exists(),
+            "lib/util.d.ts must not be written to disk"
+        );
 
         // Forking over an existing name is rejected.
         assert!(fork_to_local_in(home.path(), server, "mymapper", &manifest, &modules).is_err());

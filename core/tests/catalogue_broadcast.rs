@@ -172,8 +172,7 @@ async fn catalogue_broadcast_sends_on_subscribe_then_leads_and_trails_bursts() {
 
 #[tokio::test]
 async fn entry_budget_notice_is_echoed_into_the_session() {
-    let (tx, mut events, mut lines) =
-        spawn_session(7412, "CatalogueNotice", MINT_TS).await;
+    let (tx, mut events, mut lines) = spawn_session(7412, "CatalogueNotice", MINT_TS).await;
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             collect(&updates, &mut lines);

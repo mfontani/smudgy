@@ -90,8 +90,11 @@ async fn emit_delivers_to_on_handler_via_the_host() {
     };
 
     // Drive a host-native event: a location change must emit `map:room` to the subscriber.
-    tx.send(RuntimeAction::SetCurrentLocation(AreaId(Uuid::nil()), Some(42)))
-        .unwrap();
+    tx.send(RuntimeAction::SetCurrentLocation(
+        AreaId(Uuid::nil()),
+        Some(42),
+    ))
+    .unwrap();
 
     let mut lines = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
@@ -118,7 +121,9 @@ async fn emit_delivers_to_on_handler_via_the_host() {
     let guard_on = lines
         .iter()
         .find(|l| l.starts_with("GUARD-ON:"))
-        .unwrap_or_else(|| panic!("on(\"name\", fn) must throw at subscription time.\nTranscript:\n{transcript}"));
+        .unwrap_or_else(|| {
+            panic!("on(\"name\", fn) must throw at subscription time.\nTranscript:\n{transcript}")
+        });
     assert!(
         guard_on.contains("on() expects a callback function (got string)")
             && guard_on.contains("\"room\" event"),

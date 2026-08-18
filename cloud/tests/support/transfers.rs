@@ -124,9 +124,11 @@ fn create_transfer(
         return not_found();
     }
     // One live offer per subject -> 409.
-    if st.pending_transfers.iter().any(|t| {
-        t.status == "Offered" && t.area_id == area_id && t.atlas_id == atlas_id
-    }) {
+    if st
+        .pending_transfers
+        .iter()
+        .any(|t| t.status == "Offered" && t.area_id == area_id && t.atlas_id == atlas_id)
+    {
         return err(409, "transfer_already_pending");
     }
 
@@ -261,9 +263,11 @@ pub async fn accept_transfer(
             !((g.atlas_id == Some(subj) || g.area_id.is_some_and(|a| members.contains(&a)))
                 && (g.grantee_id == to || g.can_admin))
         });
-        for g in st.grants.iter_mut().filter(|g| {
-            g.atlas_id == Some(subj) || g.area_id.is_some_and(|a| members.contains(&a))
-        }) {
+        for g in st
+            .grants
+            .iter_mut()
+            .filter(|g| g.atlas_id == Some(subj) || g.area_id.is_some_and(|a| members.contains(&a)))
+        {
             g.owner_id = to;
         }
         if let Some(at) = st.atlases.get_mut(&subj) {
@@ -301,7 +305,11 @@ pub async fn accept_transfer(
     });
 
     let view = {
-        if let Some(t) = st.pending_transfers.iter_mut().find(|t| t.id == transfer_id) {
+        if let Some(t) = st
+            .pending_transfers
+            .iter_mut()
+            .find(|t| t.id == transfer_id)
+        {
             t.status = "Accepted".to_string();
             t.responded_at = Some(Utc::now());
         }

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use deno_core::{serde_v8, FastString};
+use deno_core::{FastString, serde_v8};
 use serde::{Deserialize, Serialize};
 
 use crate::{ModulePolicy, ScriptRuntime, ScriptRuntimeOptions};

@@ -108,7 +108,9 @@ fn find_covering_parent(
     req_can_edit: bool,
     req_can_copy: bool,
 ) -> Option<Uuid> {
-    let area_atlas = child_area.and_then(|a| st.areas.get(&a)).and_then(|a| a.atlas_id);
+    let area_atlas = child_area
+        .and_then(|a| st.areas.get(&a))
+        .and_then(|a| a.atlas_id);
     let mut candidates: Vec<&GrantRecord> = st
         .grants
         .iter()
@@ -119,9 +121,7 @@ fn find_covering_parent(
                 && (g.can_edit || !req_can_edit)
                 && (g.can_copy || !req_can_copy)
                 && ((child_area.is_some() && g.area_id == child_area)
-                    || (child_area.is_some()
-                        && g.atlas_id.is_some()
-                        && g.atlas_id == area_atlas)
+                    || (child_area.is_some() && g.atlas_id.is_some() && g.atlas_id == area_atlas)
                     || (child_atlas.is_some() && g.atlas_id == child_atlas))
         })
         .collect();
@@ -220,7 +220,11 @@ fn normalize_host_hints(hints: Option<&[String]>) -> Result<Option<Vec<String>>,
 }
 
 /// POST /shares — create or idempotently re-grant; ALL denials uniform 404.
-pub async fn create_share(State(state): State<Shared>, headers: HeaderMap, body: String) -> Response {
+pub async fn create_share(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let mut st = state.lock();
     let caller = match share_gate(&st, &headers) {
         Ok(v) => v,
@@ -488,7 +492,11 @@ pub async fn patch_share(
         } else {
             (new_can_reshare, new_include_secrets)
         };
-        let v_admin = if cur.parent_grant_id.is_some() { false } else { new_can_admin };
+        let v_admin = if cur.parent_grant_id.is_some() {
+            false
+        } else {
+            new_can_admin
+        };
         if let Err(e) = validate_grant_write(
             &st,
             cur.grantor_id,
@@ -588,8 +596,7 @@ pub async fn area_shares(
         .grants
         .iter()
         .filter(|g| {
-            g.area_id == Some(area_id)
-                || (g.atlas_id.is_some() && g.atlas_id == area.atlas_id)
+            g.area_id == Some(area_id) || (g.atlas_id.is_some() && g.atlas_id == area.atlas_id)
         })
         .collect();
     let reaching_ids: Vec<Uuid> = reaching.iter().map(|g| g.id).collect();

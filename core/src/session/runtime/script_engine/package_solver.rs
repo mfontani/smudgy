@@ -114,10 +114,14 @@ impl Solve {
         let mut loaded: HashMap<PackageKey, BTreeSet<String>> = HashMap::new();
         let mut queue: VecDeque<(PackageKey, String)> = VecDeque::new();
         let enqueue = |loaded: &mut HashMap<PackageKey, BTreeSet<String>>,
-                           queue: &mut VecDeque<(PackageKey, String)>,
-                           package: PackageKey,
-                           version: String| {
-            if loaded.entry(package.clone()).or_default().insert(version.clone()) {
+                       queue: &mut VecDeque<(PackageKey, String)>,
+                       package: PackageKey,
+                       version: String| {
+            if loaded
+                .entry(package.clone())
+                .or_default()
+                .insert(version.clone())
+            {
                 queue.push_back((package, version));
             }
         };
@@ -128,10 +132,9 @@ impl Solve {
         while let Some((importer, importer_version)) = queue.pop_front() {
             // Only the loaded (solved) module's own deps load; a collapsed-away version's
             // edges (importer_version != the surviving version) never fire.
-            for edge in edges
-                .iter()
-                .filter(|edge| edge.importer == importer && edge.importer_version == importer_version)
-            {
+            for edge in edges.iter().filter(|edge| {
+                edge.importer == importer && edge.importer_version == importer_version
+            }) {
                 let version = self.resolve(&edge.dep, &edge.dep_version, edge.dep_is_pin);
                 enqueue(&mut loaded, &mut queue, edge.dep.clone(), version);
             }
@@ -205,7 +208,9 @@ mod tests {
     /// Build a closure where each `(importer, dep_version, is_pin)` is a distinct top-level
     /// install at `1.0.0` depending on `util` at the given version. Returns the solve plus
     /// the roots + edges for `loaded_duplicates`.
-    fn util_closure(importers: &[(&str, &str, bool)]) -> (Solve, Vec<DepRequirement>, Vec<DepEdge>) {
+    fn util_closure(
+        importers: &[(&str, &str, bool)],
+    ) -> (Solve, Vec<DepRequirement>, Vec<DepEdge>) {
         let mut requirements = Vec::new();
         let mut roots = Vec::new();
         let mut edges = Vec::new();
@@ -245,8 +250,7 @@ mod tests {
     #[test]
     fn compatible_ranges_collapse_to_highest_locked() {
         // A and B both depend on util in the 1.x class, locking 1.3.0 and 1.4.0.
-        let (solve, roots, edges) =
-            util_closure(&[("a", "1.3.0", false), ("b", "1.4.0", false)]);
+        let (solve, roots, edges) = util_closure(&[("a", "1.3.0", false), ("b", "1.4.0", false)]);
         assert_eq!(solve.resolve(&key("util"), "1.3.0", false), "1.4.0");
         assert_eq!(solve.resolve(&key("util"), "1.4.0", false), "1.4.0");
         // One instance loads -> no duplicate-version warning.
@@ -264,8 +268,7 @@ mod tests {
 
     #[test]
     fn incompatible_majors_coexist() {
-        let (solve, roots, edges) =
-            util_closure(&[("a", "1.4.0", false), ("b", "2.0.1", false)]);
+        let (solve, roots, edges) = util_closure(&[("a", "1.4.0", false), ("b", "2.0.1", false)]);
         assert_eq!(solve.resolve(&key("util"), "1.4.0", false), "1.4.0");
         assert_eq!(solve.resolve(&key("util"), "2.0.1", false), "2.0.1");
         let dups = solve.loaded_duplicates(&roots, &edges);
@@ -360,8 +363,20 @@ mod tests {
             range_req("helper", "2.0.0"),
         ];
         let edges = vec![
-            DepEdge { importer: key("app"), importer_version: "1.0.0".into(), dep: key("helper"), dep_version: "1.0.0".into(), dep_is_pin: false },
-            DepEdge { importer: key("app"), importer_version: "2.0.0".into(), dep: key("helper"), dep_version: "2.0.0".into(), dep_is_pin: false },
+            DepEdge {
+                importer: key("app"),
+                importer_version: "1.0.0".into(),
+                dep: key("helper"),
+                dep_version: "1.0.0".into(),
+                dep_is_pin: false,
+            },
+            DepEdge {
+                importer: key("app"),
+                importer_version: "2.0.0".into(),
+                dep: key("helper"),
+                dep_version: "2.0.0".into(),
+                dep_is_pin: false,
+            },
         ];
         let coexisting = solve(&requirements);
         let dups = coexisting.loaded_duplicates(&roots, &edges);
@@ -382,13 +397,31 @@ mod tests {
             range_req("helper", "2.0.0"),
         ];
         let edges = vec![
-            DepEdge { importer: key("app"), importer_version: "1.0.0".into(), dep: key("helper"), dep_version: "1.0.0".into(), dep_is_pin: false },
-            DepEdge { importer: key("app"), importer_version: "1.4.0".into(), dep: key("helper"), dep_version: "2.0.0".into(), dep_is_pin: false },
+            DepEdge {
+                importer: key("app"),
+                importer_version: "1.0.0".into(),
+                dep: key("helper"),
+                dep_version: "1.0.0".into(),
+                dep_is_pin: false,
+            },
+            DepEdge {
+                importer: key("app"),
+                importer_version: "1.4.0".into(),
+                dep: key("helper"),
+                dep_version: "2.0.0".into(),
+                dep_is_pin: false,
+            },
         ];
         let collapsing = solve(&requirements);
         let loaded = collapsing.loaded_versions(&roots, &edges);
-        assert_eq!(loaded[&key("app")].iter().collect::<Vec<_>>(), vec!["1.4.0"]);
-        assert_eq!(loaded[&key("helper")].iter().collect::<Vec<_>>(), vec!["2.0.0"]);
+        assert_eq!(
+            loaded[&key("app")].iter().collect::<Vec<_>>(),
+            vec!["1.4.0"]
+        );
+        assert_eq!(
+            loaded[&key("helper")].iter().collect::<Vec<_>>(),
+            vec!["2.0.0"]
+        );
         assert!(
             collapsing.loaded_duplicates(&roots, &edges).is_empty(),
             "helper@1.0.0 was pulled only by the collapsed-away app@1.0.0 -> no warning"

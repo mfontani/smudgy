@@ -70,8 +70,10 @@ impl AutomationsWindow {
 
     /// The committed store tree per producer, collapsible per node.
     fn view_store_trees<'a>(&'a self, snapshot: &'a CatalogueSnapshot) -> Elem<'a> {
-        let mut section = column![common::section_label(crate::i18n::ts!("store-published-state"))]
-            .spacing(8.0);
+        let mut section = column![common::section_label(crate::i18n::ts!(
+            "store-published-state"
+        ))]
+        .spacing(8.0);
         if snapshot.producers.is_empty() {
             return section
                 .push(
@@ -230,8 +232,8 @@ impl AutomationsWindow {
 
     /// The interop catalogue: one block per entry, grouped under producer sub-headers.
     fn view_catalogue_entries<'a>(&'a self, snapshot: &'a CatalogueSnapshot) -> Elem<'a> {
-        let mut section = column![common::section_label(crate::i18n::ts!("store-catalogue"))]
-            .spacing(10.0);
+        let mut section =
+            column![common::section_label(crate::i18n::ts!("store-catalogue"))].spacing(10.0);
         if snapshot.entries.is_empty() {
             return section
                 .push(
@@ -311,9 +313,9 @@ fn entry_block(entry: &CatalogueEntryView) -> Elem<'_> {
                 "store-declared-shape",
                 "shape" => first_lines(declared, 6)
             ))
-                .size(11.0)
-                .font(MONO)
-                .style(common::faint),
+            .size(11.0)
+            .font(MONO)
+            .style(common::faint),
         );
     }
     for sample in entry.samples.iter().rev().take(SAMPLES_SHOWN) {

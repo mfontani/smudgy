@@ -208,7 +208,11 @@ input.masked = true;
 async fn input_writes_arrive_in_order_and_reads_flag_interest_once() {
     let server = "InputApi";
     let server_dir = prepare_server(server);
-    std::fs::write(server_dir.join("modules").join("input.ts"), INPUT_HARNESS_TS).unwrap();
+    std::fs::write(
+        server_dir.join("modules").join("input.ts"),
+        INPUT_HARNESS_TS,
+    )
+    .unwrap();
 
     let mut events = Box::pin(spawn(session_params(7301, server)));
     let mut lines = Vec::new();
@@ -217,7 +221,13 @@ async fn input_writes_arrive_in_order_and_reads_flag_interest_once() {
     drain_quiet(&mut events, &mut lines, &mut records).await;
 
     let transcript = lines.join("\n");
-    for marker in ["COLD_READ_OK", "ALIAS_OK", "FORGE_OK", "REAIM_OK", "BARE_SESSION_OK"] {
+    for marker in [
+        "COLD_READ_OK",
+        "ALIAS_OK",
+        "FORGE_OK",
+        "REAIM_OK",
+        "BARE_SESSION_OK",
+    ] {
         assert!(
             lines.iter().any(|l| l == marker),
             "expected {marker}.\nTranscript:\n{transcript}"
@@ -311,7 +321,11 @@ async fn feed_and_read(
 async fn mirror_reads_track_delivered_state_and_masked_content_is_suppressed() {
     let server = "InputApiMirror";
     let server_dir = prepare_server(server);
-    std::fs::write(server_dir.join("modules").join("input.ts"), MIRROR_HARNESS_TS).unwrap();
+    std::fs::write(
+        server_dir.join("modules").join("input.ts"),
+        MIRROR_HARNESS_TS,
+    )
+    .unwrap();
 
     let mut events = Box::pin(spawn(session_params(7304, server)));
     let mut lines = Vec::new();
@@ -1118,7 +1132,9 @@ async fn word_set_registration_rejects_non_token_words() {
             "add() must reject a non-token word ({probe}).\nTranscript:\n{transcript}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with(&format!("{probe}:THREW:"))),
+            lines
+                .iter()
+                .any(|l| l.starts_with(&format!("{probe}:THREW:"))),
             "the {probe} rejection must surface.\nTranscript:\n{transcript}"
         );
     }
@@ -1127,7 +1143,9 @@ async fn word_set_registration_rejects_non_token_words() {
         "nothing registers from a rejected call.\nTranscript:\n{transcript}"
     );
     assert!(
-        !records.iter().any(|r| matches!(r, WireRecord::Words { .. })),
+        !records
+            .iter()
+            .any(|r| matches!(r, WireRecord::Words { .. })),
         "no push goes out when nothing changed; got {records:#?}"
     );
 }
@@ -1329,7 +1347,13 @@ async fn word_set_caps_reject_long_words_and_overfull_sets_atomically() {
             .any(|l| l.starts_with("overflow:THREW:") && l.contains("clear()")),
         "the teaching error names the remedy.\nTranscript:\n{transcript}"
     );
-    for marker in ["LEN64:true", "ATOMIC:OK", "FULL:512", "readd:NO_THROW", "READD:true"] {
+    for marker in [
+        "LEN64:true",
+        "ATOMIC:OK",
+        "FULL:512",
+        "readd:NO_THROW",
+        "READD:true",
+    ] {
         assert!(
             lines.iter().any(|l| l == marker),
             "expected {marker}.\nTranscript:\n{transcript}"
@@ -1692,7 +1716,9 @@ async fn history_push_rejects_blank_and_multiline_entries() {
             "push() must reject a {probe} entry.\nTranscript:\n{transcript}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with(&format!("{probe}:THREW:"))),
+            lines
+                .iter()
+                .any(|l| l.starts_with(&format!("{probe}:THREW:"))),
             "the {probe} rejection must surface.\nTranscript:\n{transcript}"
         );
     }
@@ -1769,19 +1795,59 @@ async fn input_change_and_focus_events_deliver_edges_with_source() {
         // interest lands on an untouched input. Seeds the mirror, no events.
         feed_state(tx, MAIN_PANE_KEY, "", 0, false, false, InputSource::Other);
         // Typed text arriving focused: one change (user) + one focus edge.
-        feed_state(tx, MAIN_PANE_KEY, "kill ", 5, true, false, InputSource::User);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "kill ",
+            5,
+            true,
+            false,
+            InputSource::User,
+        );
         // A cursor-only move: no content news, no focus edge — no events.
-        feed_state(tx, MAIN_PANE_KEY, "kill ", 2, true, false, InputSource::User);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "kill ",
+            2,
+            true,
+            false,
+            InputSource::User,
+        );
         // A script finished the command: change attributed to the script.
-        feed_state(tx, MAIN_PANE_KEY, "kill rat", 8, true, false, InputSource::Script);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "kill rat",
+            8,
+            true,
+            false,
+            InputSource::Script,
+        );
         // Masking engaged (the update wrongly carries content; the mirror
         // suppresses it): one change with masked and no value.
-        feed_state(tx, MAIN_PANE_KEY, "hunter2", 7, true, true, InputSource::User);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "hunter2",
+            7,
+            true,
+            true,
+            InputSource::User,
+        );
         // Blur while masked: a focus edge carrying the masked flag.
         feed_state(tx, MAIN_PANE_KEY, "", 0, false, true, InputSource::Other);
         // The mask releases, restoring the pre-mask stash: an ordinary
         // change with the restored value and no masked key.
-        feed_state(tx, MAIN_PANE_KEY, "kill rat", 8, false, false, InputSource::Other);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "kill rat",
+            8,
+            false,
+            false,
+            InputSource::Other,
+        );
     })
     .await;
 
@@ -1882,17 +1948,31 @@ async fn warm_up_state_is_a_baseline_and_fires_no_events() {
     let (lines, _records) = run_module_session(7330, "InputWarmup", INPUT_EVENTS_TS, |tx| {
         // The warm-up push: the input already held focused text when
         // interest was flagged.
-        feed_state(tx, MAIN_PANE_KEY, "half typed", 10, true, false, InputSource::User);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "half typed",
+            10,
+            true,
+            false,
+            InputSource::User,
+        );
         // A real change after the baseline.
-        feed_state(tx, MAIN_PANE_KEY, "half typed more", 15, true, false, InputSource::User);
+        feed_state(
+            tx,
+            MAIN_PANE_KEY,
+            "half typed more",
+            15,
+            true,
+            false,
+            InputSource::User,
+        );
     })
     .await;
 
     let transcript = lines.join("\n");
     assert!(
-        !lines
-            .iter()
-            .any(|l| l.contains(r#"value="half typed" "#)),
+        !lines.iter().any(|l| l.contains(r#"value="half typed" "#)),
         "the pre-existing state must not replay as a change.\nTranscript:\n{transcript}"
     );
     assert_eq!(
@@ -1908,7 +1988,8 @@ async fn warm_up_state_is_a_baseline_and_fires_no_events() {
     assert!(
         lines
             .iter()
-            .any(|l| l == r#"CHG value="half typed more" masked=undefined pane=undefined source=user"#),
+            .any(|l| l
+                == r#"CHG value="half typed more" masked=undefined pane=undefined source=user"#),
         "the post-baseline change delivers normally.\nTranscript:\n{transcript}"
     );
 }
@@ -1965,8 +2046,24 @@ async fn stale_pane_state_after_close_is_dropped_not_replayed_as_main() {
     // main change proving the event machinery still runs.
     feed_state(&tx, MAIN_PANE_KEY, "", 0, false, false, InputSource::Other);
     feed_state(&tx, pane_key, "ghost", 5, true, false, InputSource::User);
-    feed_state(&tx, pane_key, "ghost more", 10, true, false, InputSource::User);
-    feed_state(&tx, MAIN_PANE_KEY, "north", 5, false, false, InputSource::User);
+    feed_state(
+        &tx,
+        pane_key,
+        "ghost more",
+        10,
+        true,
+        false,
+        InputSource::User,
+    );
+    feed_state(
+        &tx,
+        MAIN_PANE_KEY,
+        "north",
+        5,
+        false,
+        false,
+        InputSource::User,
+    );
     drain_quiet(&mut events, &mut lines, &mut records).await;
     tx.send(RuntimeAction::Shutdown).ok();
 
@@ -2070,7 +2167,15 @@ async fn input_event_subscription_works_with_the_input_capability() {
     // The warm-up baseline first (an input's first report never fires
     // events), then the change the handler must receive.
     feed_state(&tx, MAIN_PANE_KEY, "", 0, false, false, InputSource::Other);
-    feed_state(&tx, MAIN_PANE_KEY, "north", 5, true, false, InputSource::User);
+    feed_state(
+        &tx,
+        MAIN_PANE_KEY,
+        "north",
+        5,
+        true,
+        false,
+        InputSource::User,
+    );
     drain_quiet(&mut events, &mut lines, &mut records).await;
     tx.send(RuntimeAction::Shutdown).ok();
 
@@ -2111,7 +2216,10 @@ async fn server_echo_actions_forward_to_the_ui_in_order() {
         .collect();
     assert_eq!(
         echoes,
-        vec![&WireRecord::ServerEcho(true), &WireRecord::ServerEcho(false)],
+        vec![
+            &WireRecord::ServerEcho(true),
+            &WireRecord::ServerEcho(false)
+        ],
         "the negotiation actions must forward as ServerEcho events in order"
     );
 }

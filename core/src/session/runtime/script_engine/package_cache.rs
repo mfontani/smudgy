@@ -90,10 +90,36 @@ fn has_binary_media_extension(subpath: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" | "tiff" | "tif"
-            | "svg" | "svgz" | "mp3" | "ogg" | "wav" | "flac" | "mp4" | "webm" | "mkv"
-            | "avi" | "mov" | "woff" | "woff2" | "ttf" | "otf" | "eot" | "zip" | "gz"
-            | "tar" | "pdf"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "bmp"
+            | "ico"
+            | "tiff"
+            | "tif"
+            | "svg"
+            | "svgz"
+            | "mp3"
+            | "ogg"
+            | "wav"
+            | "flac"
+            | "mp4"
+            | "webm"
+            | "mkv"
+            | "avi"
+            | "mov"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+            | "zip"
+            | "gz"
+            | "tar"
+            | "pdf"
     )
 }
 
@@ -226,14 +252,22 @@ mod tests {
         let cache = cache_in(dir.path());
         assert!(cache.read_blob("abc123").is_none());
         cache.write_blob("abc123", "export const x = 1;").unwrap();
-        assert_eq!(cache.read_blob("abc123").as_deref(), Some("export const x = 1;"));
+        assert_eq!(
+            cache.read_blob("abc123").as_deref(),
+            Some("export const x = 1;")
+        );
         // Byte twins share the same content-addressed pool.
         assert_eq!(
             cache.read_blob_bytes("abc123").as_deref(),
             Some(b"export const x = 1;".as_slice())
         );
-        cache.write_blob_bytes("bin1", &[0u8, 159, 146, 150]).unwrap();
-        assert_eq!(cache.read_blob_bytes("bin1").as_deref(), Some([0u8, 159, 146, 150].as_slice()));
+        cache
+            .write_blob_bytes("bin1", &[0u8, 159, 146, 150])
+            .unwrap();
+        assert_eq!(
+            cache.read_blob_bytes("bin1").as_deref(),
+            Some([0u8, 159, 146, 150].as_slice())
+        );
         // A binary blob is not silently lossy-read as a string.
         assert!(cache.read_blob("bin1").is_none());
     }
@@ -245,7 +279,8 @@ mod tests {
         let resolution = CachedResolution {
             version: "1.4.0".into(),
             integrity: "sum".into(),
-            manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.4.0" }"#).unwrap(),
+            manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.4.0" }"#)
+                .unwrap(),
             modules: vec![
                 CachedModule {
                     subpath: "index.ts".into(),
@@ -285,7 +320,10 @@ mod tests {
             ("application/octet-stream", "lib/helper.cts"),
             ("application/octet-stream", "LICENSE"),
         ] {
-            assert!(is_code_module(code, subpath), "{code} {subpath} should be code");
+            assert!(
+                is_code_module(code, subpath),
+                "{code} {subpath} should be code"
+            );
         }
         for (asset, subpath) in [
             ("image/png", "assets/logo.png"),
@@ -296,7 +334,10 @@ mod tests {
             ("audio/ogg", "sounds/hit.ogg"),
             ("font/woff2", "fonts/ui.woff2"),
         ] {
-            assert!(!is_code_module(asset, subpath), "{asset} {subpath} should be an asset");
+            assert!(
+                !is_code_module(asset, subpath),
+                "{asset} {subpath} should be an asset"
+            );
         }
         // Pre-field cache files deserialize to text/plain, i.e. code — matching how they
         // were treated when written.

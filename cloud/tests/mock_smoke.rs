@@ -60,7 +60,10 @@ async fn cloud_mapper_crud_roundtrip() {
     let access = item.access.expect("access block present on list rows");
     assert!(access.is_owner, "creator owns the area");
     assert!(access.can_edit && access.can_copy && access.include_secrets);
-    assert!(item.owner_nickname.is_none(), "owned rows carry no owner_nickname");
+    assert!(
+        item.owner_nickname.is_none(),
+        "owned rows carry no owner_nickname"
+    );
 
     // Detail fetch.
     let details = mapper.get_area(&area.id).await.expect("get_area");
@@ -264,7 +267,12 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
     let e_secret = server.add_exit(area, 3, "South", None, true);
     let e_cross = server.add_exit(area, 1, "West", Some((hidden, 1)), false);
 
-    server.grant(&owner, &grantee, GrantScope::Area(area), GrantFlags::VIEW_ONLY);
+    server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(area),
+        GrantFlags::VIEW_ONLY,
+    );
 
     let client = reqwest::Client::new();
     let base = server.base_url.clone();
@@ -282,7 +290,10 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
         .collect();
     assert_eq!(room_numbers, vec![1, 3], "secret room 2 is filtered out");
 
-    let room1 = rooms.iter().find(|r| r["room_number"] == 1).expect("room 1");
+    let room1 = rooms
+        .iter()
+        .find(|r| r["room_number"] == 1)
+        .expect("room 1");
     let exit_ids: Vec<&str> = room1["exits"]
         .as_array()
         .expect("exits")
@@ -308,7 +319,10 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
     assert!(token.starts_with("u_") && token.len() == 18);
     assert_eq!(cross["is_secret"], false);
 
-    let room3 = rooms.iter().find(|r| r["room_number"] == 3).expect("room 3");
+    let room3 = rooms
+        .iter()
+        .find(|r| r["room_number"] == 3)
+        .expect("room 3");
     assert!(
         room3["exits"].as_array().expect("exits").is_empty(),
         "secret exit is dropped for the grantee"
@@ -346,7 +360,10 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
         .collect();
     assert_eq!(room_numbers, vec![1, 2, 3], "owner sees the secret room");
 
-    let room1 = rooms.iter().find(|r| r["room_number"] == 1).expect("room 1");
+    let room1 = rooms
+        .iter()
+        .find(|r| r["room_number"] == 1)
+        .expect("room 1");
     let exits1 = room1["exits"].as_array().expect("exits");
     assert!(
         exits1.iter().any(|e| e["id"] == e_to_secret.to_string()),
@@ -363,7 +380,10 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
         "owner sees the real cross-area target"
     );
 
-    let room3 = rooms.iter().find(|r| r["room_number"] == 3).expect("room 3");
+    let room3 = rooms
+        .iter()
+        .find(|r| r["room_number"] == 3)
+        .expect("room 3");
     let secret_exit = room3["exits"]
         .as_array()
         .expect("exits")
@@ -448,7 +468,10 @@ async fn shared_rev_and_fingerprint_semantics() {
         grantee_rev1 > grantee_rev0,
         "the shared rev reports secret-only activity without exposing content"
     );
-    assert_eq!(grantee_fp1, grantee_fp0, "share writes change no fingerprint");
+    assert_eq!(
+        grantee_fp1, grantee_fp0,
+        "share writes change no fingerprint"
+    );
 
     // Owner raises include_secrets on the grant (root Area-scope: allowed).
     let response = client

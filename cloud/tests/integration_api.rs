@@ -10,8 +10,8 @@ use smudgy_cloud::cloud_api::{
     SecretMarksRequest, ShareDirection, ShareScope,
 };
 use smudgy_cloud::{
-    AreaId, AtlasId, CloudApiClient, CloudMapper, CreateAreaRequest, Credential, CredentialSource,
-    ExitId, LabelId, CloudError, MapperBackend, RoomNumber, ShapeId,
+    AreaId, AtlasId, CloudApiClient, CloudError, CloudMapper, CreateAreaRequest, Credential,
+    CredentialSource, ExitId, LabelId, MapperBackend, RoomNumber, ShapeId,
 };
 use support::{GrantFlags, GrantScope, MockHandle, MockServer, TestUser};
 use uuid::Uuid;
@@ -59,7 +59,10 @@ async fn full_account_lifecycle() {
     let client = CloudApiClient::new(server.base_url.clone(), credentials.clone());
 
     // Signup is enumeration-flat; the emailed code is fished out of state.
-    client.signup(EMAIL, "lifer").await.expect("signup accepted");
+    client
+        .signup(EMAIL, "lifer")
+        .await
+        .expect("signup accepted");
     let code = server.verify_code_for(EMAIL).expect("code minted");
 
     // Wrong code and unknown email are the same uniform 404.
@@ -185,10 +188,18 @@ async fn login_creates_account_on_first_sight() {
     let client = CloudApiClient::new(server.base_url.clone(), credentials.clone());
 
     // No signup: the email-only entry creates the account and mails a code.
-    client.login(EMAIL).await.expect("login provisions on first sight");
-    let code = server.verify_code_for(EMAIL).expect("code minted for the new account");
+    client
+        .login(EMAIL)
+        .await
+        .expect("login provisions on first sight");
+    let code = server
+        .verify_code_for(EMAIL)
+        .expect("code minted for the new account");
 
-    let session = client.verify_email(EMAIL, &code).await.expect("verify-email");
+    let session = client
+        .verify_email(EMAIL, &code)
+        .await
+        .expect("verify-email");
     assert!(session.user.is_verified(), "the email is verified");
     assert!(
         session.needs_nickname,
@@ -204,7 +215,10 @@ async fn login_creates_account_on_first_sight() {
     // A returning login for the same email now keeps that handle (no re-prompt).
     client.login(EMAIL).await.expect("returning login");
     let code = server.verify_code_for(EMAIL).expect("returning code");
-    let again = client.verify_email(EMAIL, &code).await.expect("verify again");
+    let again = client
+        .verify_email(EMAIL, &code)
+        .await
+        .expect("verify again");
     assert!(!again.needs_nickname, "a returning user keeps their handle");
     assert_eq!(again.user.nickname.as_deref(), Some("newcomer"));
 }
@@ -453,7 +467,12 @@ async fn shares_validator_uniform_404() {
     assert!(matches!(err, CloudError::NotFoundOrNoAccess));
 
     // Re-share attempt without can_reshare.
-    server.grant(&owner, &friend, GrantScope::Area(area), GrantFlags::VIEW_ONLY);
+    server.grant(
+        &owner,
+        &friend,
+        GrantScope::Area(area),
+        GrantFlags::VIEW_ONLY,
+    );
     let friend_client = api_client(&server.base_url, &friend.api_key);
     let err = friend_client
         .create_share(view_only_share(third.id, area))
@@ -479,7 +498,10 @@ async fn shares_validator_uniform_404() {
         .await
         .expect("include_secrets may ride an atlas-scope root grant (M6)");
     assert!(grant.area_id.is_none(), "atlas-scope grant");
-    assert!(grant.include_secrets, "the atlas grant carries include_secrets");
+    assert!(
+        grant.include_secrets,
+        "the atlas grant carries include_secrets"
+    );
 }
 
 /// §4.2: `host_hints` ride the `create_share` body, echo on the created grant,
@@ -571,7 +593,12 @@ async fn secret_marks_and_audit() {
     server.set_area_property(area, "notes", "owner notes", false);
     server.set_room_property(area, 1, "loot", "diamonds", false);
 
-    let grant_id = server.grant(&owner, &grantee, GrantScope::Area(area), GrantFlags::VIEW_ONLY);
+    let grant_id = server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Area(area),
+        GrantFlags::VIEW_ONLY,
+    );
 
     // Bulk-mark everything; bogus ids are silently ignored by the server.
     let owner_client = api_client(&server.base_url, &owner.api_key);
@@ -654,7 +681,10 @@ async fn secret_marks_and_audit() {
         "the secret exit (into the secret room) is hidden"
     );
     assert!(preview.properties.is_empty(), "secret area property hidden");
-    assert!(preview.rooms[0].properties.is_empty(), "secret room property hidden");
+    assert!(
+        preview.rooms[0].properties.is_empty(),
+        "secret room property hidden"
+    );
     assert!(preview.labels.is_empty(), "secret label hidden");
     assert!(preview.shapes.is_empty(), "secret shape hidden");
 
@@ -716,15 +746,26 @@ async fn clone_flow() {
         .copy_area(source, &CopyAreaRequest::default())
         .await
         .expect("can_copy grantee clones the area");
-    assert_eq!(cloned.user_id, Some(grantee.id), "the caller owns the clone");
+    assert_eq!(
+        cloned.user_id,
+        Some(grantee.id),
+        "the caller owns the clone"
+    );
     assert_eq!(cloned.name, "Original (copy)");
-    assert_eq!(cloned.copied_from_area_id, Some(source), "provenance source");
+    assert_eq!(
+        cloned.copied_from_area_id,
+        Some(source),
+        "provenance source"
+    );
     assert!(cloned.copied_from_rev.is_some(), "provenance rev");
     assert!(cloned.copied_at.is_some(), "provenance timestamp");
 
     // Access is OWNER in the /areas listing.
     let listed = grantee_mapper.list_areas().await.expect("grantee list");
-    let row = listed.iter().find(|a| a.id == cloned.id).expect("clone listed");
+    let row = listed
+        .iter()
+        .find(|a| a.id == cloned.id)
+        .expect("clone listed");
     let access = row.access.expect("access block on the clone");
     assert!(access.is_owner && access.can_edit && access.include_secrets);
 
@@ -734,7 +775,10 @@ async fn clone_flow() {
     assert_eq!(source_after.rooms.len(), source_before.rooms.len());
 
     // Cross-area links: still-shared target stays real; unshared one dangles.
-    let clone_details = grantee_mapper.get_area(&cloned.id).await.expect("clone details");
+    let clone_details = grantee_mapper
+        .get_area(&cloned.id)
+        .await
+        .expect("clone details");
     let room = clone_details
         .rooms
         .iter()
@@ -778,7 +822,12 @@ async fn clone_flow() {
         .await
         .expect("member two");
     // Atlas-scope view covers both members; copy is added on member one only.
-    server.grant(&owner, &grantee, GrantScope::Atlas(atlas), GrantFlags::VIEW_ONLY);
+    server.grant(
+        &owner,
+        &grantee,
+        GrantScope::Atlas(atlas),
+        GrantFlags::VIEW_ONLY,
+    );
     server.grant(
         &owner,
         &grantee,
@@ -806,7 +855,10 @@ async fn clone_flow() {
     );
 
     // The copied member is owned by the grantee.
-    let listed = grantee_mapper.list_areas().await.expect("grantee list again");
+    let listed = grantee_mapper
+        .list_areas()
+        .await
+        .expect("grantee list again");
     let copied_row = listed
         .iter()
         .find(|a| a.id == report.copied[0])
@@ -880,18 +932,30 @@ async fn transfer_decline_and_conflict() {
     let owner_client = api_client(&server.base_url, &owner.api_key);
     let recip_client = api_client(&server.base_url, &recip.api_key);
 
-    let offer = owner_client.offer_area_transfer(area, recip.id).await.unwrap();
+    let offer = owner_client
+        .offer_area_transfer(area, recip.id)
+        .await
+        .unwrap();
 
     // A second live offer for the same subject conflicts.
     assert!(
-        owner_client.offer_area_transfer(area, recip.id).await.is_err(),
+        owner_client
+            .offer_area_transfer(area, recip.id)
+            .await
+            .is_err(),
         "one live offer per subject"
     );
 
     // Recipient declines -> the offer is no longer acceptable; ownership unchanged.
-    recip_client.decline_transfer(offer.id).await.expect("decline ok");
+    recip_client
+        .decline_transfer(offer.id)
+        .await
+        .expect("decline ok");
     assert!(
-        recip_client.accept_transfer(offer.id, None, None).await.is_err(),
+        recip_client
+            .accept_transfer(offer.id, None, None)
+            .await
+            .is_err(),
         "a declined offer cannot be accepted"
     );
     assert_eq!(

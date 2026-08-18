@@ -44,7 +44,11 @@ pub async fn lookup(
         return e;
     }
 
-    let Some(nick) = params.get("nickname").map(|h| h.trim()).filter(|h| valid_nickname(h)) else {
+    let Some(nick) = params
+        .get("nickname")
+        .map(|h| h.trim())
+        .filter(|h| valid_nickname(h))
+    else {
         return not_found();
     };
     match st.users.iter().find(|u| {

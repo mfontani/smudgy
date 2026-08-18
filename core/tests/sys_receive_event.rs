@@ -76,10 +76,9 @@ async fn sys_receive_fires_post_trigger_sees_original_and_can_gag() {
     };
 
     let feed = |text: &str| {
-        tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
-            text,
-            Vec::new(),
-        ))))
+        tx.send(RuntimeAction::HandleIncomingLine(Arc::new(
+            StyledLine::new(text, Vec::new()),
+        )))
         .unwrap();
     };
     feed("hello world");
@@ -193,10 +192,9 @@ async fn continuation_resuming_during_a_later_line_acts_on_that_line() {
     };
 
     let feed = |text: &str| {
-        tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
-            text,
-            Vec::new(),
-        ))))
+        tx.send(RuntimeAction::HandleIncomingLine(Arc::new(
+            StyledLine::new(text, Vec::new()),
+        )))
         .unwrap();
     };
     feed("first line");
@@ -298,10 +296,9 @@ async fn continuation_resuming_between_lines_throws() {
         }
     };
 
-    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
-        "only line",
-        Vec::new(),
-    ))))
+    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(
+        StyledLine::new("only line", Vec::new()),
+    )))
     .unwrap();
 
     let mut lines = Vec::new();

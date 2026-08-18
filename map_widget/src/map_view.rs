@@ -1067,12 +1067,7 @@ mod tests {
     /// selects them.
     #[test]
     fn terminal_connections_select_via_the_anchor_endpoint_alone() {
-        let keys = exit_keys(
-            RoomNumber(5),
-            FarEnd::Terminal,
-            ExitDirection::East,
-            None,
-        );
+        let keys = exit_keys(RoomNumber(5), FarEnd::Terminal, ExitDirection::East, None);
         assert_eq!(keys.0, exit(5, ExitDirection::East));
         assert_eq!(keys.1, None);
     }

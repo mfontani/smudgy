@@ -1942,7 +1942,10 @@ fn op_smudgy_widget_build_map_view(
         Into::into,
     );
     let styles = get_static_styles(scope, props);
-    let apply = get_serde_prop::<Vec<MapStyleApplicationProp>, Vec<smudgy_map_widget::MapStyleApplication>>(
+    let apply = get_serde_prop::<
+        Vec<MapStyleApplicationProp>,
+        Vec<smudgy_map_widget::MapStyleApplication>,
+    >(
         scope,
         state,
         props,
@@ -1976,10 +1979,7 @@ fn op_smudgy_widget_build_map_view(
             crate::map::with_active_store(|store| {
                 let widget_id = reap.id();
                 let presentation = smudgy_map_widget::MapViewPresentation {
-                    room_spacing: room_spacing
-                        .as_ref()
-                        .and_then(DynProp::get)
-                        .unwrap_or(1.0),
+                    room_spacing: room_spacing.as_ref().and_then(DynProp::get).unwrap_or(1.0),
                     player_color: player_color.as_ref().and_then(DynProp::get),
                     show_doors: show_doors.as_ref().and_then(DynProp::get).unwrap_or(true),
                     default_style: default_style
@@ -2214,7 +2214,11 @@ impl MapStyleApplicationProp {
         };
         Some(smudgy_map_widget::MapStyleApplication {
             style: self.style,
-            rooms: self.rooms.into_iter().map(smudgy_cloud::RoomNumber).collect(),
+            rooms: self
+                .rooms
+                .into_iter()
+                .map(smudgy_cloud::RoomNumber)
+                .collect(),
             exits: self.exits.into_iter().map(Into::into).collect(),
             area,
         })
@@ -3563,7 +3567,10 @@ mod tests {
         // Same snapshot: the memo must hit (observable as the same cached
         // Arc snapshot rather than a fresh parse).
         let _second = prop.get().expect("cached snapshot returns");
-        if let SerdeProp::Bound { prop: inner, cache, .. } = &prop {
+        if let SerdeProp::Bound {
+            prop: inner, cache, ..
+        } = &prop
+        {
             let cached = cache.borrow();
             let (snapshot, _) = cached.as_ref().expect("cache is populated");
             assert!(

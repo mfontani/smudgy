@@ -32,7 +32,8 @@ explore an idea.
 
 ## Building Smudgy
 
-Smudgy uses the stable Rust toolchain. From the repository root:
+Smudgy pins its stable Rust toolchain in `rust-toolchain.toml`; rustup selects
+and installs it automatically. From the repository root:
 
 ```sh
 cargo run
@@ -64,6 +65,7 @@ cargo clippy -p <package> --all-targets --locked
 The full checks used by CI are:
 
 ```sh
+cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --lib --tests --locked -- \
   --skip models::shared_packages::tests::missing_required_params_tracks_only_unset_required_keys

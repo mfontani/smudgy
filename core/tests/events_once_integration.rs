@@ -86,8 +86,11 @@ async fn once_delivers_exactly_one_time() {
     // First location change → the host emits `map:room` → the `once` handler echoes, then auto-offs.
     // This is also the first thing to wake the idle event loop after startup, so the load-time
     // `emit("ping", …)` deliveries (queued during module evaluation) are dispatched here too.
-    tx.send(RuntimeAction::SetCurrentLocation(AreaId(Uuid::nil()), Some(1)))
-        .unwrap();
+    tx.send(RuntimeAction::SetCurrentLocation(
+        AreaId(Uuid::nil()),
+        Some(1),
+    ))
+    .unwrap();
     let mut first = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
@@ -100,8 +103,11 @@ async fn once_delivers_exactly_one_time() {
     }
 
     // Second location change → the subscriber is gone → no `ROOM:2` echo.
-    tx.send(RuntimeAction::SetCurrentLocation(AreaId(Uuid::nil()), Some(2)))
-        .unwrap();
+    tx.send(RuntimeAction::SetCurrentLocation(
+        AreaId(Uuid::nil()),
+        Some(2),
+    ))
+    .unwrap();
     let mut second = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {

@@ -19,7 +19,7 @@ use smudgy_cloud::{
     PortMode, RoomNumber, RoomSide, SegmentShape,
     connection_geometry::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
-        port_position, resolve, reroute_for_port_move, reroute_for_waypoint_move, stub_tip,
+        port_position, reroute_for_port_move, reroute_for_waypoint_move, resolve, stub_tip,
     },
     mapper::{RoomKey, room_connection::RoomConnection},
 };
@@ -1088,16 +1088,14 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             // The drag legend appears when a drag actually
                             // starts — a bare click never was one.
                             return Some(
-                                canvas::Action::publish(Message::ActivityChanged(
-                                    match handle {
-                                        ConnectionHandle::Waypoint(..) => {
-                                            super::EditorActivity::DraggingConnectionWaypoint
-                                        }
-                                        ConnectionHandle::PortA(_) | ConnectionHandle::PortB(_) => {
-                                            super::EditorActivity::DraggingConnectionPort
-                                        }
-                                    },
-                                ))
+                                canvas::Action::publish(Message::ActivityChanged(match handle {
+                                    ConnectionHandle::Waypoint(..) => {
+                                        super::EditorActivity::DraggingConnectionWaypoint
+                                    }
+                                    ConnectionHandle::PortA(_) | ConnectionHandle::PortB(_) => {
+                                        super::EditorActivity::DraggingConnectionPort
+                                    }
+                                }))
                                 .and_capture(),
                             );
                         }
@@ -1125,9 +1123,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             _ => None,
                         };
                         let connection = match top {
-                            Some(EntityId::Connection(id)) if self.tool == Tool::Select => {
-                                Some(id)
-                            }
+                            Some(EntityId::Connection(id)) if self.tool == Tool::Select => Some(id),
                             _ => None,
                         };
                         if room == self.hovered_room && connection == self.hovered_connection {
@@ -1305,9 +1301,10 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     && self.tool == Tool::Select
                     && matches!(state.interaction, Interaction::Idle)
                     && !self.selection.contains(EntityId::Connection(hovered))
-                    && let Some(connection) = area.get_room_connections().iter().find(|item| {
-                        item.connection_id == hovered && item.from_level == self.level
-                    })
+                    && let Some(connection) = area
+                        .get_room_connections()
+                        .iter()
+                        .find(|item| item.connection_id == hovered && item.from_level == self.level)
                 {
                     Self::stroke_resolved_connection_outline(
                         frame,
@@ -1586,11 +1583,7 @@ fn endpoint_at_pointer(
     if snap {
         port_offset = PORT_SNAP_OFFSETS
             .into_iter()
-            .min_by(|a, b| {
-                (a - port_offset)
-                    .abs()
-                    .total_cmp(&(b - port_offset).abs())
-            })
+            .min_by(|a, b| (a - port_offset).abs().total_cmp(&(b - port_offset).abs()))
             .unwrap_or(port_offset);
     }
     ConnectionEndpoint {
@@ -1760,7 +1753,9 @@ impl MapEditor {
             }
             match treatment {
                 render::LevelTreatment::Triangle { center, up } => {
-                    render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, halo);
+                    render::draw_level_triangle_outline(
+                        frame, center.x, center.y, up, accent, halo,
+                    );
                     render::draw_level_triangle(frame, center.x, center.y, up, connection.color);
                 }
                 render::LevelTreatment::FadingStub { edge, tip } => {

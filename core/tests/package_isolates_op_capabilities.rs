@@ -178,7 +178,10 @@ async fn send_granted_but_send_direct_denied() {
     )
     .await;
 
-    assert!(has_line(&lines, "SEND_OK"), "the granted `send` must work; transcript:\n{lines:#?}");
+    assert!(
+        has_line(&lines, "SEND_OK"),
+        "the granted `send` must work; transcript:\n{lines:#?}"
+    );
     assert!(
         !has_line(&lines, "SENDRAW_OK") && has_line(&lines, "SENDRAW_DENIED:"),
         "the un-granted `sendRaw` must throw; transcript:\n{lines:#?}"
@@ -402,9 +405,9 @@ async fn reach_others_gates_foreign_input_panes_and_swap_directly() {
     .await;
     assert!(
         !has_line(&allowed, "reach-others")
-            && ["input", "panes", "swap"].iter().all(|probe| allowed.iter().any(|line| {
-                line.contains(&format!("{probe}:ERR:smudgy: no live session"))
-            })),
+            && ["input", "panes", "swap"].iter().all(|probe| allowed
+                .iter()
+                .any(|line| { line.contains(&format!("{probe}:ERR:smudgy: no live session")) })),
         "with reach granted, each child surface must advance to live-target validation; transcript:\n{allowed:#?}"
     );
 }
@@ -560,7 +563,9 @@ async fn change_display_gates_line_manipulation() {
     )
     .await;
     assert!(
-        !has_line(&denied, "GAG_OK") && has_line(&denied, "GAG_DENIED:") && has_line(&denied, "change-display"),
+        !has_line(&denied, "GAG_OK")
+            && has_line(&denied, "GAG_DENIED:")
+            && has_line(&denied, "change-display"),
         "without change-display, gag must throw naming the capability; transcript:\n{denied:#?}"
     );
 
@@ -671,7 +676,9 @@ async fn set_enabled_is_gated_and_own_origin_scoped() {
     )
     .await;
     assert!(
-        !has_line(&denied, "TOGGLE_OK") && has_line(&denied, "TOGGLE_ERR:") && has_line(&denied, "aliases"),
+        !has_line(&denied, "TOGGLE_OK")
+            && has_line(&denied, "TOGGLE_ERR:")
+            && has_line(&denied, "aliases"),
         "without create-aliases the alias create must throw naming the capability; transcript:\n{denied:#?}"
     );
 }

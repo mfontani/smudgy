@@ -84,8 +84,10 @@ async fn session_log_is_line_structured_under_redirects_and_gags() {
     tx.send(RuntimeAction::RequestRepaint).unwrap();
     tx.send(RuntimeAction::HandleIncomingLine(sl("REDIR-REST")))
         .unwrap();
-    tx.send(RuntimeAction::HandleIncomingLine(sl("GAGME"))).unwrap();
-    tx.send(RuntimeAction::HandleIncomingLine(sl("AFTER"))).unwrap();
+    tx.send(RuntimeAction::HandleIncomingLine(sl("GAGME")))
+        .unwrap();
+    tx.send(RuntimeAction::HandleIncomingLine(sl("AFTER")))
+        .unwrap();
     tx.send(RuntimeAction::RequestRepaint).unwrap();
 
     // Wait until the last line has flowed through the pipeline (observed on
@@ -249,7 +251,8 @@ async fn session_log_persists_open_line_before_completion() {
 
     // Complete the line: the provisional bytes are rewound and the whole line
     // written once — no duplicated prefix.
-    tx.send(RuntimeAction::HandleIncomingLine(sl("DONE"))).unwrap();
+    tx.send(RuntimeAction::HandleIncomingLine(sl("DONE")))
+        .unwrap();
     tx.send(RuntimeAction::RequestRepaint).unwrap();
     drain_until(&mut events, "DONE").await;
     tx.send(apply_settings(false)).unwrap();

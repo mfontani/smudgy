@@ -75,7 +75,9 @@ pub fn set_keyring_user(user: impl Into<String>) {
 /// The keyring user/slot in effect: the [`set_keyring_user`] override if one was set at
 /// startup, otherwise the default [`KEYRING_USER`].
 fn keyring_user() -> &'static str {
-    KEYRING_USER_OVERRIDE.get().map_or(KEYRING_USER, String::as_str)
+    KEYRING_USER_OVERRIDE
+        .get()
+        .map_or(KEYRING_USER, String::as_str)
 }
 
 /// Repeating XOR key for the fallback token file. See [`obfuscate`] — this is
@@ -347,10 +349,8 @@ mod tests {
 
     /// A unique temp directory per test so parallel tests don't collide.
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "smudgy-auth-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("smudgy-auth-test-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("failed to create temp dir");
         dir
     }

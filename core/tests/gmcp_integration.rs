@@ -116,7 +116,9 @@ async fn run_gmcp_session() -> Vec<String> {
     .unwrap();
     tx.send(RuntimeAction::GmcpMessage {
         name: Arc::from("Room.Info"),
-        data: Some(Arc::from(r#"{ "num": 32519, "name": "The Fen of Sorrows" }"#)),
+        data: Some(Arc::from(
+            r#"{ "num": 32519, "name": "The Fen of Sorrows" }"#,
+        )),
     })
     .unwrap();
     // Two Char.Defences deltas: the module's mergeKeys("Char.Defences") makes the second
@@ -131,10 +133,9 @@ async fn run_gmcp_session() -> Vec<String> {
         data: Some(Arc::from(r#"{ "armor": 5 }"#)),
     })
     .unwrap();
-    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
-        "The Fen of Sorrows",
-        Vec::new(),
-    ))))
+    tx.send(RuntimeAction::HandleIncomingLine(Arc::new(
+        StyledLine::new("The Fen of Sorrows", Vec::new()),
+    )))
     .unwrap();
     tx.send(RuntimeAction::GmcpDisabled).unwrap();
 

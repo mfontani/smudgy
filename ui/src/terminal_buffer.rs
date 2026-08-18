@@ -3530,7 +3530,10 @@ mod tests {
         );
         assert!(buffer.link_keys().next().is_none());
         assert_eq!(shared.borrow().selection_references(&selection_state), 0);
-        assert_eq!(buffer.find_recent_word_by_prefix("edit", None, &[], 10), None);
+        assert_eq!(
+            buffer.find_recent_word_by_prefix("edit", None, &[], 10),
+            None
+        );
     }
 
     #[test]

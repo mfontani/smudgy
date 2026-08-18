@@ -138,14 +138,14 @@ async fn handle_crud_and_registries() {
 
     // Feed a server line so triggers are evaluated against it.
     let feed_line = |text: &str| {
-        tx.send(RuntimeAction::HandleIncomingLine(Arc::new(StyledLine::new(
-            text,
-            Vec::new(),
-        ))))
+        tx.send(RuntimeAction::HandleIncomingLine(Arc::new(
+            StyledLine::new(text, Vec::new()),
+        )))
         .unwrap();
     };
     let send_input = |text: &str| {
-        tx.send(RuntimeAction::Send(Arc::new(text.to_string()))).unwrap();
+        tx.send(RuntimeAction::Send(Arc::new(text.to_string())))
+            .unwrap();
     };
 
     // Drive the whole scenario in FIFO order in one shot: every action lands at the back of the
@@ -182,7 +182,10 @@ async fn handle_crud_and_registries() {
     let count = |s: &str| lines.iter().filter(|l| *l == s).count();
 
     // Registry reads + delete.
-    assert!(has("INTRO_OK"), "registry get/list/exists/pattern + delete must work.\n{transcript}");
+    assert!(
+        has("INTRO_OK"),
+        "registry get/list/exists/pattern + delete must work.\n{transcript}"
+    );
     // The doomed alias is freed from the matcher: its input passes through unmatched (no
     // DOOMED_FIRED after the delete; it was never sent before the delete).
     assert!(
@@ -190,12 +193,25 @@ async fn handle_crud_and_registries() {
         "a deleted alias must not fire on a later matching input.\n{transcript}"
     );
     // ...and it is gone from the registry too.
-    assert!(has("DOOMED_GONE"), "a deleted alias must drop from the registry.\n{transcript}");
+    assert!(
+        has("DOOMED_GONE"),
+        "a deleted alias must drop from the registry.\n{transcript}"
+    );
     // fireLimit:1 — fires exactly once, then self-removes.
-    assert_eq!(count("ONCE_FIRED"), 1, "fireLimit:1 trigger must fire exactly once.\n{transcript}");
-    assert!(has("ONCE_GONE"), "fireLimit:1 trigger must self-remove after firing.\n{transcript}");
+    assert_eq!(
+        count("ONCE_FIRED"),
+        1,
+        "fireLimit:1 trigger must fire exactly once.\n{transcript}"
+    );
+    assert!(
+        has("ONCE_GONE"),
+        "fireLimit:1 trigger must self-remove after firing.\n{transcript}"
+    );
     // lineLimit:2 — self-removes after 2 tested lines.
-    assert!(has("COUNTED_GONE"), "lineLimit trigger must self-remove after its line budget.\n{transcript}");
+    assert!(
+        has("COUNTED_GONE"),
+        "lineLimit trigger must self-remove after its line budget.\n{transcript}"
+    );
     assert!(
         !has("COUNTED_FIRED"),
         "the lineLimit trigger never matches, so it must never fire.\n{transcript}"

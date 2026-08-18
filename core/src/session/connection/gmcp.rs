@@ -82,7 +82,11 @@ mod tests {
     #[test]
     fn frame_message_produces_the_wire_form() {
         let mut framed = Vec::new();
-        frame_message("Char.Skills.Get", Some("{\"group\":\"combat\"}"), &mut framed);
+        frame_message(
+            "Char.Skills.Get",
+            Some("{\"group\":\"combat\"}"),
+            &mut framed,
+        );
         let expected: Vec<u8> = [
             &[IAC, SB, GMCP][..],
             b"Char.Skills.Get {\"group\":\"combat\"}",
@@ -102,8 +106,12 @@ mod tests {
         let mut framed = Vec::new();
         frame_handshake(&mut framed);
         let text = String::from_utf8_lossy(&framed);
-        let hello = text.find("Core.Hello {\"client\":\"smudgy\"").expect("hello framed");
-        let supports = text.find("Core.Supports.Set [\"Char 1\"").expect("supports framed");
+        let hello = text
+            .find("Core.Hello {\"client\":\"smudgy\"")
+            .expect("hello framed");
+        let supports = text
+            .find("Core.Supports.Set [\"Char 1\"")
+            .expect("supports framed");
         assert!(hello < supports, "Core.Hello precedes Core.Supports.Set");
         for module in BASELINE_SUPPORTS {
             assert!(text.contains(module), "baseline advertises {module}");

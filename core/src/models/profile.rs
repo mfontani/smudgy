@@ -36,13 +36,18 @@ pub struct Profile {
 /// Returns an error if the file cannot be opened, read, or if the contents
 /// cannot be deserialized into a `ProfileConfig` or fail validation.
 fn load_profile_config(path: &PathBuf) -> Result<ProfileConfig> {
-    let file_content = fs::read_to_string(path)
-        .context(format!("Failed to read profile config file: {}", path.display()))?;
-    let config: ProfileConfig = serde_json::from_str(&file_content)
-        .context(format!("Failed to parse profile config file: {}", path.display()))?;
-    config
-        .validate()
-        .context(format!("Profile config validation failed: {}", path.display()))?;
+    let file_content = fs::read_to_string(path).context(format!(
+        "Failed to read profile config file: {}",
+        path.display()
+    ))?;
+    let config: ProfileConfig = serde_json::from_str(&file_content).context(format!(
+        "Failed to parse profile config file: {}",
+        path.display()
+    ))?;
+    config.validate().context(format!(
+        "Profile config validation failed: {}",
+        path.display()
+    ))?;
     Ok(config)
 }
 
@@ -522,7 +527,10 @@ pub fn clear_profile_password(server_name: &str, profile_name: &str) -> Result<(
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
-                log::warn!("Failed to delete password fallback file {}: {e}", path.display());
+                log::warn!(
+                    "Failed to delete password fallback file {}: {e}",
+                    path.display()
+                );
             }
         }
     }
@@ -568,7 +576,9 @@ pub fn substitute_password_with_redactions(
 
 #[cfg(test)]
 mod password_tests {
-    use super::{PASSWORD_TOKEN, contains_password_token, password_keyring_slot, substitute_password};
+    use super::{
+        PASSWORD_TOKEN, contains_password_token, password_keyring_slot, substitute_password,
+    };
 
     #[test]
     fn detects_token() {

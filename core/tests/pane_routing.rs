@@ -226,7 +226,8 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
                 .any(|s| matches!(s, Seen::AppendTo(_, text) if text == needle))
         };
         let send_line = |text: &str| {
-            tx.send(RuntimeAction::HandleIncomingLine(sl(text))).unwrap();
+            tx.send(RuntimeAction::HandleIncomingLine(sl(text)))
+                .unwrap();
             tx.send(RuntimeAction::RequestRepaint).unwrap();
         };
 
@@ -343,7 +344,10 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
             _ => None,
         })
         .collect();
-    assert!(setups.len() >= 2, "expected two SETUP lines (initial + reload).\n{transcript}");
+    assert!(
+        setups.len() >= 2,
+        "expected two SETUP lines (initial + reload).\n{transcript}"
+    );
     assert!(
         setups[0].contains("created=true")
             && setups[0].contains("again=false")
@@ -368,9 +372,12 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
     let opened: Vec<(&String, PaneKey, PaneNameId, PanePlacement)> = seen
         .iter()
         .filter_map(|s| match s {
-            Seen::Opened { name, key, name_id, placement } => {
-                Some((name, *key, *name_id, *placement))
-            }
+            Seen::Opened {
+                name,
+                key,
+                name_id,
+                placement,
+            } => Some((name, *key, *name_id, *placement)),
             _ => None,
         })
         .collect();
@@ -419,14 +426,18 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
             selected: true,
         } if *key == alerts.1 && *reference == MAIN_PANE_KEY
     )));
-    assert!(seen.iter().any(|event| matches!(event, Seen::Selected(key) if *key == alerts.1)));
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, Seen::Selected(key) if *key == alerts.1))
+    );
     let chat_key = chat.1;
     let info_key = info.1;
 
     // ---- Name-id stability across close/recreate (fresh PaneKey) ----------
     let recreated = find_opened("INFO");
     assert!(
-        seen.iter().any(|s| matches!(s, Seen::Closed(k) if *k == info_key)),
+        seen.iter()
+            .any(|s| matches!(s, Seen::Closed(k) if *k == info_key)),
         "closing 'info' must emit PaneClosed for its key.\n{transcript}"
     );
     assert_eq!(
@@ -563,8 +574,12 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
         .unwrap();
     let fresh_append_at = seen
         .iter()
-        .position(|s| matches!(s, Seen::AppendTo(key, text) if *key == fresh.1 && text == "SPLITREDIR"))
-        .unwrap_or_else(|| panic!("the fresh pane must receive the redirected line.\n{transcript}"));
+        .position(
+            |s| matches!(s, Seen::AppendTo(key, text) if *key == fresh.1 && text == "SPLITREDIR"),
+        )
+        .unwrap_or_else(|| {
+            panic!("the fresh pane must receive the redirected line.\n{transcript}")
+        });
     assert!(
         fresh_opened_at < fresh_append_at,
         "PaneOpened must precede the first AppendTo for the key.\n{transcript}"
@@ -572,7 +587,9 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
 
     // ---- Cap + kind mismatch -------------------------------------------------
     assert!(
-        main_appends.iter().any(|text| text.as_str() == "KIND_THROWN=true"),
+        main_appends
+            .iter()
+            .any(|text| text.as_str() == "KIND_THROWN=true"),
         "a kind mismatch on get-or-create must throw.\n{transcript}"
     );
     assert!(
@@ -732,7 +749,8 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
                 .any(|s| matches!(s, Seen::Append(text) if text == needle))
         };
         let send_line = |text: &str| {
-            tx.send(RuntimeAction::HandleIncomingLine(sl(text))).unwrap();
+            tx.send(RuntimeAction::HandleIncomingLine(sl(text)))
+                .unwrap();
             tx.send(RuntimeAction::RequestRepaint).unwrap();
         };
 
@@ -745,7 +763,9 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
                 send_line("ECHOCLOSE");
                 true
             }
-            2 if log_key.is_some_and(|k| seen.iter().any(|s| matches!(s, Seen::Closed(c) if *c == k))) => {
+            2 if log_key
+                .is_some_and(|k| seen.iter().any(|s| matches!(s, Seen::Closed(c) if *c == k))) =>
+            {
                 done = true;
                 false
             }
@@ -765,11 +785,14 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
 
     // Redirect to a widgets-only pane throws (and never silently loses the line).
     assert!(
-        seen.iter().any(|s| matches!(s, Seen::Append(t) if t == "REDIR_THREW")),
+        seen.iter()
+            .any(|s| matches!(s, Seen::Append(t) if t == "REDIR_THREW")),
         "line.redirect to a widgets-only pane must throw.\n{transcript}"
     );
     assert!(
-        !seen.iter().any(|s| matches!(s, Seen::Append(t) if t == "REDIR_OK")),
+        !seen
+            .iter()
+            .any(|s| matches!(s, Seen::Append(t) if t == "REDIR_OK")),
         "line.redirect to a widgets-only pane must NOT succeed.\n{transcript}"
     );
 
@@ -781,10 +804,11 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
     let close_idx = seen
         .iter()
         .position(|s| matches!(s, Seen::Closed(k) if *k == log_key));
-    let echo_idx = echo_idx
-        .unwrap_or_else(|| panic!("echo issued before close() must still be delivered.\n{transcript}"));
-    let close_idx = close_idx
-        .unwrap_or_else(|| panic!("the 'log' pane must have been closed.\n{transcript}"));
+    let echo_idx = echo_idx.unwrap_or_else(|| {
+        panic!("echo issued before close() must still be delivered.\n{transcript}")
+    });
+    let close_idx =
+        close_idx.unwrap_or_else(|| panic!("the 'log' pane must have been closed.\n{transcript}"));
     assert!(
         echo_idx < close_idx,
         "the pre-close echo must arrive before the PaneClosed.\n{transcript}"

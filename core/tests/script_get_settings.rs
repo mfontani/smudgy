@@ -104,8 +104,7 @@ async fn script_reads_settings_via_get_settings() {
 
     let line = settings_line.expect("script never echoed the settings it read");
     assert_eq!(
-        line,
-        "SETTINGS sep=:: theme=TestTheme size=22 fg=#abcdef",
+        line, "SETTINGS sep=:: theme=TestTheme size=22 fg=#abcdef",
         "getSettings() did not reflect the pushed snapshot"
     );
 }

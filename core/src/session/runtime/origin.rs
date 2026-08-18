@@ -341,7 +341,13 @@ mod tests {
     fn malformed_widget_token_is_inert() {
         // No live isolate carries NO_ISOLATE_INSTANCE, so each of these parses to a pair the
         // dispatch instance check rejects — never a runnable (Main, live-instance) pair.
-        for token in ["", "main", "garbage", "pkg\u{1f}a\u{1f}b\u{1f}c", "\u{1f}main"] {
+        for token in [
+            "",
+            "main",
+            "garbage",
+            "pkg\u{1f}a\u{1f}b\u{1f}c",
+            "\u{1f}main",
+        ] {
             let (_, instance) = IsolateId::from_widget_token(token);
             assert_eq!(instance, NO_ISOLATE_INSTANCE, "token {token:?}");
         }

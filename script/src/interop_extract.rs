@@ -18,11 +18,11 @@
 
 use std::collections::HashMap;
 
+use deno_ast::SourceRangedForSpanned;
 use deno_ast::swc::ast::{
     CallExpr, Callee, Decl, ExportSpecifier, Expr, ImportSpecifier, Lit, Module, ModuleDecl,
     ModuleExportName, ModuleItem, Pat, Stmt, TsEntityName, TsType, TsTypeQueryExpr, VarDecl,
 };
-use deno_ast::SourceRangedForSpanned;
 use deno_ast::{MediaType, ParseParams};
 use deno_core::ModuleSpecifier;
 
@@ -959,31 +959,37 @@ const explicit = createState<{ x: number }>('pinned');
     fn injection_is_none_when_nothing_applies() {
         let spec = ModuleSpecifier::parse("file:///index.ts").expect("valid url");
         // Explicit names only.
-        assert!(inject_inferred_handle_names(
-            &spec,
-            r#"import { createState } from "smudgy:core"; const v = createState("v");"#,
-        )
-        .is_none());
+        assert!(
+            inject_inferred_handle_names(
+                &spec,
+                r#"import { createState } from "smudgy:core"; const v = createState("v");"#,
+            )
+            .is_none()
+        );
         // No smudgy:core import at all.
         assert!(
             inject_inferred_handle_names(&spec, "const createState = () => 1; createState();")
                 .is_none()
         );
         // Nested scopes are dynamic creation: the runtime demands an explicit name there.
-        assert!(inject_inferred_handle_names(
-            &spec,
-            r#"
+        assert!(
+            inject_inferred_handle_names(
+                &spec,
+                r#"
                 import { createState } from "smudgy:core";
                 function make() { return createState(); }
                 "#,
-        )
-        .is_none());
+            )
+            .is_none()
+        );
         // A parse error is not the injector's problem to report.
-        assert!(inject_inferred_handle_names(
-            &spec,
-            r#"import { createState } from "smudgy:core"; const = createState();"#,
-        )
-        .is_none());
+        assert!(
+            inject_inferred_handle_names(
+                &spec,
+                r#"import { createState } from "smudgy:core"; const = createState();"#,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1094,15 +1100,17 @@ export interface VitalData { hp: number }
     fn scrub_is_none_without_handle_exports() {
         let spec = ModuleSpecifier::parse("file:///index.ts").expect("valid url");
         // Handles exist but none are exported: nothing to scrub.
-        assert!(scrub_handle_exports(
-            &spec,
-            r#"
+        assert!(
+            scrub_handle_exports(
+                &spec,
+                r#"
                 import { createState } from "smudgy:core";
                 const vitals = createState("vitals");
                 export function read() { return vitals.value; }
                 "#,
-        )
-        .is_none());
+            )
+            .is_none()
+        );
         // No handles at all.
         assert!(scrub_handle_exports(&spec, "export const x = 1;").is_none());
     }

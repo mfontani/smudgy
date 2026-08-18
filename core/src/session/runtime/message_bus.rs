@@ -137,7 +137,10 @@ mod tests {
         );
         let drained = bus.subscribe("user#req".into(), receiver(0));
         assert_eq!(
-            drained.iter().map(|p| p.payload.as_str()).collect::<Vec<_>>(),
+            drained
+                .iter()
+                .map(|p| p.payload.as_str())
+                .collect::<Vec<_>>(),
             ["1", "2"]
         );
         // Drained means drained: a re-registration gets nothing — and REPLACES the prior
@@ -159,7 +162,11 @@ mod tests {
                     session: "{}".into(),
                 },
             );
-            assert_eq!(dropped, i == PENDING_POST_CAP, "only the overflowing push drops");
+            assert_eq!(
+                dropped,
+                i == PENDING_POST_CAP,
+                "only the overflowing push drops"
+            );
         }
         let drained = bus.subscribe("user#req".into(), receiver(0));
         assert_eq!(drained.len(), PENDING_POST_CAP);

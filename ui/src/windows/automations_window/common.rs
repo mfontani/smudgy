@@ -199,23 +199,27 @@ pub fn badge<'a>(label: impl Into<String>) -> ThemedElement<'a, Message> {
 
 /// The small `DEP` tag shown on nested dependency rows.
 pub fn dep_tag<'a>() -> ThemedElement<'a, Message> {
-    container(text(crate::i18n::t!("badge-dependency")).size(9.0).style(faint))
-        .padding(Padding {
-            top: 1.0,
-            bottom: 1.0,
-            left: 5.0,
-            right: 5.0,
-        })
-        .style(|theme: &Theme| container::Style {
-            background: None,
-            border: Border {
-                color: theme.styles.general.border,
-                width: 1.0,
-                radius: 3.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+    container(
+        text(crate::i18n::t!("badge-dependency"))
+            .size(9.0)
+            .style(faint),
+    )
+    .padding(Padding {
+        top: 1.0,
+        bottom: 1.0,
+        left: 5.0,
+        right: 5.0,
+    })
+    .style(|theme: &Theme| container::Style {
+        background: None,
+        border: Border {
+            color: theme.styles.general.border,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 /// A raised surface card (stat cards, panels).

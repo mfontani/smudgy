@@ -171,14 +171,21 @@ mod tests {
 
     #[test]
     fn allows_spaces_and_punctuation() {
-        for name in ["Combat (PvP)", "healer's macros", "My Triggers!", "v1.2 notes"] {
+        for name in [
+            "Combat (PvP)",
+            "healer's macros",
+            "My Triggers!",
+            "v1.2 notes",
+        ] {
             assert!(validate_name(name).is_ok(), "should allow {name:?}");
         }
     }
 
     #[test]
     fn rejects_illegal_filename_chars() {
-        for name in ["a/b", "a\\b", "a:b", "a|b", "a?b", "a*b", "a\"b", "a<b", "a>b"] {
+        for name in [
+            "a/b", "a\\b", "a:b", "a|b", "a?b", "a*b", "a\"b", "a<b", "a>b",
+        ] {
             assert!(validate_name(name).is_err(), "should reject {name:?}");
         }
     }

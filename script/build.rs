@@ -33,8 +33,7 @@ fn main() {
     generated.push_str("];\n");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("dts_libs.rs");
-    fs::write(&out_path, generated)
-        .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
+    fs::write(&out_path, generated).unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
 
     println!("cargo:rerun-if-changed={}", lib_dir.display());
     println!(

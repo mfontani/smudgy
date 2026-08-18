@@ -282,12 +282,17 @@ impl AutomationsWindow {
                         .font(fonts::BOOTSTRAP_ICONS)
                         .size(13.0)
                         .style(common::faint),
-                    text_input(crate::i18n::ts!("palette-input-placeholder"), &self.palette_query)
-                        .id(palette_input_id())
-                        .on_input(Message::PaletteInput)
-                        .on_submit(Message::PaletteRun)
-                        .size(15.0),
-                    text(crate::i18n::t!("palette-escape")).size(11.0).style(common::faint),
+                    text_input(
+                        crate::i18n::ts!("palette-input-placeholder"),
+                        &self.palette_query
+                    )
+                    .id(palette_input_id())
+                    .on_input(Message::PaletteInput)
+                    .on_submit(Message::PaletteRun)
+                    .size(15.0),
+                    text(crate::i18n::t!("palette-escape"))
+                        .size(11.0)
+                        .style(common::faint),
                 ]
                 .spacing(8.0)
                 .align_y(Vertical::Center),
