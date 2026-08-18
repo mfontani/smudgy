@@ -19,6 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   styling (`link: null` strips links from matches instead). Mistakes are loud: unknown
   color names and misspelled attribute keys now throw where they are written instead
   of silently styling nothing.
+- **Servers introduce themselves on the Connect screen.** Smudgy now reads MSSP — the
+  status block many MUD servers volunteer on connect — and remembers it per server:
+  the game's own name when it differs from yours, the player count from your last
+  visit shown with its age (a point-in-time number is honest only with one), how long
+  the server has been up, a TLS-available badge, its status when not live, and
+  Discord / website / contact links, which go through the same confirmation as links
+  a server prints in-session. Every server also shows when you last connected,
+  whether or not it speaks MSSP. All of it is optional display data — a server that
+  sends nothing looks exactly as before — and none of it ever changes how smudgy
+  connects. Scripts get a read-only live view: `smudgy:state/mssp` holds the
+  variables as sent (strings, arrays where the server sent several values) and
+  `smudgy:events/mssp` fires `updated` as data arrives.
+- **A guarded offer to encrypt.** When a plain connection advertises a TLS port, an
+  in-session banner offers to switch: accepting flips the server to TLS on that port
+  and reconnects; "Not for this server" is remembered and the offer never returns.
+  The banner appears at most once per connection, and only when the offer holds up —
+  a real port different from the one in use, a server dialed by hostname (a
+  certificate cannot validate against an IP address), and no conflicting `HOSTNAME`
+  claim from the server itself.
+- **Game icons, fetched carefully.** A server advertising an icon URL gets it shown
+  beside its name on the Connect screen. The fetch is https-only and automatic only
+  when the icon lives on the game's own host (or a parent domain of it) or on a host
+  you have already trusted for links — any other host waits for that same per-host
+  approval. Downloads are size-capped, refused for private and internal addresses,
+  and the image is strictly decoded and re-encoded before being cached beside the
+  server's files, refetched only when the advertised value changes.
 
 ### Changed
 

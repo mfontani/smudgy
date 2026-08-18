@@ -4248,7 +4248,7 @@ function __smudgy_canonical_event(spec: string, name: string): string {
     // Platform producers key their events `producer:name` -- the form the host's
     // `host_emit` registers and emits ("sys:receive", "gmcp:ready", "input:change");
     // package events use the meatball form.
-    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "input" || spec === "pane" || spec === "sessions"
+    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "mssp" || spec === "input" || spec === "pane" || spec === "sessions"
         ? `${spec}:${name}`
         : `${spec}#${name}`;
 }

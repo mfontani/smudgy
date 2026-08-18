@@ -399,10 +399,21 @@ pub(super) fn view_server_details_and_profiles<'a>(
     .padding([2, 8])
     .on_press(Message::RequestEditServer(server_name.clone()));
 
-    let title_row = Row::new()
+    let mut title_row = Row::new();
+    // The game's advertised icon (the MSSP `ICON` pipeline's cached artifact)
+    // beside the name; without one the title renders exactly as it always has.
+    if let Some(handle) = state.icons.get(server_name) {
+        title_row = title_row.push(
+            iced::widget::image(handle.clone())
+                .width(Pixels(28.0))
+                .height(Pixels(28.0)),
+        );
+    }
+    let title_row = title_row
         .push(text(server_name).size(Pixels(24.0)))
         .push(horizontal_space())
         .push(edit_action)
+        .spacing(10)
         .align_y(Alignment::Center);
 
     // Address: host : port together, in mono.
@@ -461,7 +472,19 @@ pub(super) fn view_server_details_and_profiles<'a>(
                 .into()
         });
 
-    let mut content_col = Column::new().push(title_row).push(address);
+    let mut content_col = Column::new().push(title_row);
+    // Observed metadata (the `observed.json` sidecar), all optional: the
+    // game's own name as a subtitle, then the band under the address. A
+    // server with no sidecar renders exactly as it always has.
+    if let Some(subtitle) = super::observed::game_name_subtitle(state, server_name) {
+        content_col = content_col.push(subtitle);
+    }
+    content_col = content_col.push(address);
+    if let Some(band) =
+        server_details.and_then(|server| super::observed::metadata_band(state, server))
+    {
+        content_col = content_col.push(band);
+    }
     if let Some(restore_last) = restore_last {
         content_col = content_col.push(restore_last);
     }

@@ -16,8 +16,12 @@
 //!   handles bypass it), bounded to [`MAX_CONCURRENT_DECODES`] at a time.
 //! - **SVG is rejected** (raster-only v1). When SVG lands it must NOT go through iced's
 //!   svg pipeline — usvg's default href resolver reads arbitrary local files.
+//!
+//! The MSSP `ICON` pipeline ([`server_icon`]) shares this module's decode distrust but
+//! carries its own, tighter fetch posture and a per-server-directory cache.
 
 mod http_cache;
+pub mod server_icon;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

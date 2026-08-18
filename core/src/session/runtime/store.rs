@@ -222,6 +222,9 @@ pub enum PlatformProducer {
     /// The MSDP tree: variable name = single-segment path, decoded value replaces
     /// (`docs/gmcp-mapping.md` §9 item 3).
     Msdp,
+    /// The MSSP snapshot: variable name = single-segment path (raw spec names, spaces
+    /// included), value replaces — display/advisory server metadata only.
+    Mssp,
 }
 
 impl PlatformProducer {
@@ -230,6 +233,7 @@ impl PlatformProducer {
         match self {
             Self::Gmcp => "gmcp",
             Self::Msdp => "msdp",
+            Self::Mssp => "mssp",
         }
     }
 }
@@ -277,6 +281,9 @@ impl ProducerKey {
         }
         if spec.eq_ignore_ascii_case(PlatformProducer::Msdp.as_str()) {
             return Some(Self::Platform(PlatformProducer::Msdp));
+        }
+        if spec.eq_ignore_ascii_case(PlatformProducer::Mssp.as_str()) {
+            return Some(Self::Platform(PlatformProducer::Mssp));
         }
         let coords = spec.strip_prefix("smudgy://").unwrap_or(spec);
         let (owner, name) = coords.split_once('/')?;

@@ -2688,6 +2688,16 @@ impl SmudgyWindow {
         }
     }
 
+    /// Refresh an open Connect modal's observed-state copy for `server` — the
+    /// daemon's response to `SessionEvent::ObservedServerChanged` (a session
+    /// rewrote that server's `observed.json`). A no-op when no Connect modal
+    /// is up.
+    pub fn refresh_connect_observed(&mut self, server: &str) {
+        if let Some(modal::Modal::Connect(state)) = &mut self.modal {
+            state.refresh_observed(server);
+        }
+    }
+
     pub fn update(
         &mut self,
         message: Message,

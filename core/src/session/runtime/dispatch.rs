@@ -103,6 +103,41 @@ impl Inner<'_> {
         }
     }
 
+    /// Read-modify-write this server's `observed.json` sidecar, then nudge the
+    /// UI to re-read it (`SessionEvent::ObservedServerChanged` — the connect
+    /// screen's refresh signal; no file watching). Runs on the session thread,
+    /// off the connection hot path, and only on rare edges (a connect stamp,
+    /// an MSSP merge), so the synchronous atomic write is fine here. The
+    /// read-modify-write keeps fields other writers own (the TLS decline
+    /// flag) intact; concurrent same-server sessions are last-writer-wins,
+    /// torn-write-safe through `write_atomic`. Returns the merged state, so
+    /// a caller weighing sidecar-persisted fields (the decline flag) reads
+    /// the copy just reconciled instead of loading the file again.
+    async fn persist_observed(
+        &mut self,
+        mutate: impl FnOnce(&mut crate::models::observed::ObservedServer),
+    ) -> Result<crate::models::observed::ObservedServer, anyhow::Error> {
+        let mut observed =
+            crate::models::observed::load_observed(self.server_name.as_str()).unwrap_or_default();
+        mutate(&mut observed);
+        if let Err(err) =
+            crate::models::observed::save_observed(self.server_name.as_str(), &observed)
+        {
+            warn!(
+                "Failed to persist observed state for '{}': {err:?}",
+                self.server_name
+            );
+            return Ok(observed);
+        }
+        self.ui_tx
+            .send(TaggedSessionEvent {
+                session_id: self.session_id,
+                event: SessionEvent::ObservedServerChanged,
+            })
+            .await?;
+        Ok(observed)
+    }
+
     /// Emit a host event only when someone is subscribed, building the payload only
     /// then. The subscriber gate MUST run before payload construction — `sys:receive`
     /// rides the per-line hot path and `sys:input` every typed submission, so the
@@ -346,6 +381,17 @@ impl Inner<'_> {
             } => {
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 let connection_generation = self.connection_generation;
+                // The MSSP snapshot describes one server's one connection; the new
+                // connect clears it before any fresh variables can arrive. (GMCP/MSDP
+                // clear on their negotiation-on arms instead — MSSP has none.) The
+                // endpoint being dialed is latched alongside: it is the connection
+                // half of the TLS upgrade-offer guard.
+                self.mssp.on_connect(
+                    &mut self.session_store.borrow_mut(),
+                    host.clone(),
+                    port,
+                    tls != crate::session::connection::TlsMode::Off,
+                );
                 self.pending_send_on_connect = send_on_connect.map(|text| {
                     // When the auto-login text carries secrets (a substituted
                     // $PASSWORD), send it with redactions so it reaches the wire
@@ -1162,6 +1208,14 @@ impl Inner<'_> {
                         event: SessionEvent::Connected,
                     })
                     .await?;
+                // Every successful connect stamps the observed sidecar,
+                // whether or not the server speaks MSSP — the connect
+                // screen's "Last connected …" line reads it.
+                let connected_at = chrono::Utc::now();
+                self.persist_observed(|observed| {
+                    observed.last_connected_at = Some(connected_at);
+                })
+                .await?;
                 Ok(self.run_host_event("sys:connect", "{}"))
             }
             RuntimeAction::Disconnected {
@@ -1175,6 +1229,11 @@ impl Inner<'_> {
                     self.pending_send_on_connect = None;
                     self.send_on_connect_armed
                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                    // The advertised TLS port and offer latch die with the
+                    // connection — and only with their own connection: a
+                    // replaced socket's late teardown must not clear the NEW
+                    // connection's guard state, hence inside this gate.
+                    self.mssp.on_disconnect();
                 }
                 if self
                     .connected
@@ -1307,6 +1366,77 @@ impl Inner<'_> {
                 } else {
                     Ok(ActionResult::None)
                 }
+            }
+            RuntimeAction::MsspVariables {
+                connection_generation,
+                pairs,
+            } => {
+                // A replaced socket's late payload describes the OLD server:
+                // merging it into the new connection's just-cleared snapshot —
+                // or feeding its TLS/SSL/HOSTNAME values to the new dial's
+                // upgrade-offer guard — would persist and offer on another
+                // game's word (the same staleness guard as `Disconnected`).
+                if connection_generation != self.connection_generation {
+                    return Ok(ActionResult::None);
+                }
+                let effects = self.mssp.ingest(
+                    &mut self.session_store.borrow_mut(),
+                    &self.catalogue,
+                    &pairs,
+                );
+                // Same flush point as GmcpMessage: the write is readable by every
+                // consumer of any line that followed it on the wire. `mssp:updated`
+                // subscribers dispatch behind that flush too, so they read the
+                // merged snapshot.
+                self.queue_gmcp_echoes(effects.echoes);
+                // The sidecar mirrors the merged snapshot so the connect
+                // screen shows the last-known metadata across restarts;
+                // `received_at` keeps point-in-time values (a player count)
+                // honest about their age. Persisted only when the merge
+                // changed it: payload frequency is server-controlled, and an
+                // identical re-advertisement must not buy a disk write and a
+                // UI nudge.
+                let observed = if effects.observed_changed {
+                    let snapshot = self.mssp.observed_snapshot().clone();
+                    let received_at = chrono::Utc::now();
+                    Some(
+                        self.persist_observed(move |observed| {
+                            observed.mssp = snapshot;
+                            observed.mssp_received_at = Some(received_at);
+                        })
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                // The TLS upgrade offer rides the merge edge: `TLS`/`SSL` and
+                // `HOSTNAME` are tracked by now, and the producer latches so a
+                // re-advertisement storm shows one banner. The persisted
+                // refusal comes from the sidecar just reconciled — or, when
+                // nothing was persisted, from a read gated behind the
+                // candidate check so the no-offer common case touches no
+                // file. The UI owns everything past this point — the
+                // accept/decline verdicts are user actions on user-owned
+                // files, never wire-driven.
+                if self.mssp.tls_upgrade_candidate().is_some() {
+                    let offer_declined = match &observed {
+                        Some(observed) => observed.tls_offer_declined,
+                        None => {
+                            crate::models::observed::load_observed(self.server_name.as_str())
+                                .unwrap_or_default()
+                                .tls_offer_declined
+                        }
+                    };
+                    if let Some(port) = self.mssp.tls_upgrade_offer(offer_declined) {
+                        self.ui_tx
+                            .send(TaggedSessionEvent {
+                                session_id: self.session_id,
+                                event: SessionEvent::OfferTlsUpgrade { port },
+                            })
+                            .await?;
+                    }
+                }
+                Ok(self.run_host_event("mssp:updated", "{}"))
             }
             RuntimeAction::GmcpSend { name, data } => {
                 let (allowed, notice) = self.gmcp.send_gate();

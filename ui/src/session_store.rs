@@ -27,6 +27,7 @@ use smudgy_cloud::{
 use smudgy_core::get_smudgy_home;
 use smudgy_core::models::input_history::{load_input_history, save_input_history};
 use smudgy_core::models::map_scopes::MapScopes;
+use smudgy_core::models::observed::{load_observed, save_observed};
 use smudgy_core::models::profile::load_profile;
 use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
 use smudgy_core::models::settings::{ScriptSettings, Settings, load_settings};
@@ -291,6 +292,13 @@ pub struct ManagedSession {
     /// otherwise consulted only at ECHO edges, and a preference toggled while
     /// the server holds ECHO must act now, not when the option next cycles.
     server_echo: bool,
+
+    /// A server-advertised TLS port awaiting the user's verdict, rendered as
+    /// the in-session offer banner ([`SessionEvent::OfferTlsUpgrade`] — at
+    /// most one per connection, latched core-side). Cleared on disconnect:
+    /// dismissal-by-disconnect persists nothing, so the next connect may
+    /// re-offer. Only the explicit decline persists (`observed.json`).
+    tls_offer: Option<u16>,
 }
 
 /// One server-sent link (OSC 8) held at the trust gate, with the dialog's
@@ -357,6 +365,12 @@ pub enum Message {
     LinkConfirmProceed,
     /// Dismiss the pending server link without acting.
     LinkConfirmCancel,
+    /// Accept the TLS upgrade offer: persist `tls` + the advertised port to
+    /// `server.json` and reconnect over the new transport.
+    TlsOfferAccept,
+    /// Decline the TLS upgrade offer for good: persist the per-server
+    /// refusal in `observed.json` and dismiss the banner.
+    TlsOfferDecline,
 }
 
 impl Message {
@@ -465,7 +479,7 @@ fn open_url_in_browser(url: &str) {
 /// Middle-elide `s` to at most `max` chars (keeping both ends), so a long
 /// unbroken token can't blow out a fixed-width dialog. Counts by `char` to
 /// stay on boundaries.
-fn elide_middle(s: &str, max: usize) -> String {
+pub(crate) fn elide_middle(s: &str, max: usize) -> String {
     let len = s.chars().count();
     if len <= max {
         return s.to_string();
@@ -912,6 +926,7 @@ impl ManagedSession {
             pending_link_confirm: Rc::new(RefCell::new(None)),
             bind_tracker: BindTracker::default(),
             server_echo: false,
+            tls_offer: None,
             server_name,
             profile_name,
             input,
@@ -1960,6 +1975,21 @@ impl ManagedSession {
                     SessionEvent::Disconnected => {
                         self.connected = false;
                         self.connected_at_unix_ms = None;
+                        // The TLS offer dies with the connection it described.
+                        // Dismissal-by-disconnect persists nothing (only the
+                        // explicit decline does), so a re-offer next connect
+                        // is by design.
+                        self.tls_offer = None;
+                        Task::none()
+                    }
+                    SessionEvent::OfferTlsUpgrade { port } => {
+                        self.tls_offer = Some(port);
+                        Task::none()
+                    }
+                    SessionEvent::ObservedServerChanged => {
+                        // Daemon-owned: the connect modal's observed-state copy
+                        // is refreshed by the daemon (which owns the windows)
+                        // before this forward; no session-store state exists.
                         Task::none()
                     }
                     SessionEvent::StoreBindingsChanged => {
@@ -2197,6 +2227,50 @@ impl ManagedSession {
                 }
                 Task::none()
             }
+            Message::TlsOfferAccept => {
+                let Some(port) = self.tls_offer.take() else {
+                    return Task::none();
+                };
+                // Persist by re-reading the on-disk config and flipping only
+                // the transport fields (the link-grant pattern above), so a
+                // concurrent grant or address edit is not clobbered by a
+                // stale whole-config snapshot. `tls_verify` keeps whatever
+                // the config says — verification stays default-on.
+                let mut config = load_server(&self.server_name)
+                    .map_or_else(|_| self.server_config.borrow().clone(), |s| s.config);
+                config.tls = true;
+                config.port = port;
+                if let Err(e) = update_server(&self.server_name, config.clone()) {
+                    log::error!(
+                        "Failed to persist the TLS upgrade for '{}': {e}",
+                        self.server_name
+                    );
+                    // Reconnecting would come back plain; keep the banner so
+                    // the user can retry (or decline).
+                    self.tls_offer = Some(port);
+                    return Task::none();
+                }
+                *self.server_config.borrow_mut() = config;
+                // Reconnect picks the flipped config up from disk
+                // (`load_connect_action` re-reads on every connect).
+                self.send_runtime_action(RuntimeAction::Disconnect);
+                Task::done(Message::Reconnect)
+            }
+            Message::TlsOfferDecline => {
+                self.tls_offer = None;
+                // "No" means "stop asking for this server": the refusal is
+                // the one piece of the offer that persists, read back by the
+                // core-side guard on every future advertisement.
+                let mut observed = load_observed(&self.server_name).unwrap_or_default();
+                observed.tls_offer_declined = true;
+                if let Err(e) = save_observed(&self.server_name, &observed) {
+                    log::error!(
+                        "Failed to persist the TLS-offer refusal for '{}': {e}",
+                        self.server_name
+                    );
+                }
+                Task::none()
+            }
             Message::None => Task::none(),
         }
     }
@@ -2234,7 +2308,14 @@ impl ManagedSession {
             .view_with_font_size(self.main_font_size)
             .map(Message::Input);
 
-        let body: Element<'_, Message> = column![terminal_area, input]
+        // The TLS upgrade-offer banner sits above the terminal: a notice
+        // strip, not a modal — the session stays fully interactive while the
+        // offer waits (or is ignored until disconnect dismisses it).
+        let body = match self.tls_offer {
+            Some(port) => column![self.tls_offer_banner(port), terminal_area, input],
+            None => column![terminal_area, input],
+        };
+        let body: Element<'_, Message> = body
             .spacing(10)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -2258,6 +2339,35 @@ impl ManagedSession {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// The TLS upgrade-offer banner: the one MSSP fact allowed to touch
+    /// connection config, and only through the explicit choice made here.
+    /// Accept flips `server.json` to TLS + the advertised port and
+    /// reconnects; decline persists the per-server refusal and never asks
+    /// again for this server.
+    fn tls_offer_banner(&self, port: u16) -> Element<'_, Message> {
+        // The port renders as digits, not a locale-grouped number.
+        let port = port.to_string();
+        container(
+            row![
+                text(crate::i18n::t!("tls-offer-body", "port" => port)).size(13),
+                space::horizontal(),
+                button(text(crate::i18n::t!("tls-offer-accept")).size(13))
+                    .padding([4, 14])
+                    .on_press(Message::TlsOfferAccept),
+                button(text(crate::i18n::t!("tls-offer-decline")).size(13))
+                    .style(smudgy_theme::builtins::button::subtle)
+                    .padding([4, 14])
+                    .on_press(Message::TlsOfferDecline),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([6, 10])
+        .style(smudgy_theme::builtins::container::notice)
+        .into()
     }
 
     /// The trust-gate dialog for a server-sent link: a safely escaped,

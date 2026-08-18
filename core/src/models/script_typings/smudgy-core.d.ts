@@ -716,6 +716,27 @@ declare module "smudgy:core" {
   }
 
   /**
+   * The shape of the MSSP snapshot (`import mssp from "smudgy:state/mssp"`):
+   * the status variables the server volunteered about itself, one entry per
+   * variable. Everything is a wire-string (`"52"`, not 52) — or an array of
+   * them where the server sent several values (`PORT`) — and every value is
+   * the game's own claim: display it, never act on it. Keys are the raw spec
+   * names, several of which contain spaces, so bracket access is normal:
+   * `mssp.value?.["MINIMUM AGE"]`. Empty until the server sends MSSP.
+   */
+  export interface MsspVariables {
+    /** The game's name — one of the three variables every MSSP server sends. */
+    NAME?: string;
+    /** Player count at the time the server sent it — point-in-time, not live. */
+    PLAYERS?: string;
+    /** Unix time the server started (a start time, not a duration). */
+    UPTIME?: string;
+    /** The server's port(s); an array lists alternates, preferred last. */
+    PORT?: string | string[];
+    [variable: string]: string | string[] | undefined;
+  }
+
+  /**
    * GMCP protocol status and control for the current session.
    */
   export const gmcp: {
@@ -2631,4 +2652,31 @@ declare module "smudgy:state/msdp" {
   const msdp: StateConsumer<MsdpTree>;
   export { msdp };
   export default msdp;
+}
+
+declare module "smudgy:events/mssp" {
+  import type { EventConsumer } from "smudgy:core";
+
+  /**
+   * Fires after each MSSP payload is merged into the snapshot — once on
+   * connect for most games, again if the server re-sends on change. Read the
+   * merged variables through `smudgy:state/mssp`.
+   */
+  export const updated: EventConsumer<Record<string, never>>;
+}
+
+declare module "smudgy:state/mssp" {
+  import type { StateConsumer, MsspVariables } from "smudgy:core";
+
+  /**
+   * The server's self-reported status variables (see {@link MsspVariables}),
+   * merged last-write-wins as payloads arrive and cleared on reconnect: read
+   * with `mssp.value`, subscribe with `mssp.watch(path, ...)`, and wire
+   * widgets with `mssp.bind(path)`. Read-only — MSSP has no client-to-server
+   * direction — and live-session data only: nothing persists across sessions
+   * here.
+   */
+  const mssp: StateConsumer<MsspVariables>;
+  export { mssp };
+  export default mssp;
 }

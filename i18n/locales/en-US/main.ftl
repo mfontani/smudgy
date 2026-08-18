@@ -249,6 +249,31 @@ server-error-action-missing = Unexpected error: No action in progress.
 server-edit-short = Edit
 server-details-missing = Server details not found.
 
+# Observed server metadata (MSSP sidecar) on the connect screen
+observed-players = { $players ->
+    [one] 1 player when last connected · { $ago }
+   *[other] { $players } players when last connected · { $ago }
+}
+observed-last-connected = Last connected { $ago }
+observed-uptime = { $days ->
+    [one] up { $days } day
+   *[other] up { $days } days
+}
+observed-tls-available = TLS available
+observed-contact = Contact: { $contact }
+observed-link-discord = Discord
+observed-link-website = Website
+observed-link-contact = Contact
+ago-just-now = just now
+ago-minutes = { $minutes }m ago
+ago-hours = { $hours }h ago
+ago-days = { $days }d ago
+
+# In-session TLS upgrade offer (a plain connection advertised an encrypted port)
+tls-offer-body = This server offers an encrypted connection on port { $port }.
+tls-offer-accept = Switch and reconnect
+tls-offer-decline = Not for this server
+
 profiles-title = Profiles
 profiles-saved-help = Saved logins for this server.
 profiles-load-error = Couldn't load profiles for this server.

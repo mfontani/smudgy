@@ -2236,6 +2236,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 SessionEvent::MapAtlasCreated(atlas_id) => {
                     associate_created_atlas(smudgy, session_id, *atlas_id)
                 }
+                SessionEvent::ObservedServerChanged => {
+                    // A session rewrote its server's observed.json sidecar:
+                    // refresh any open Connect modal's copy so the metadata
+                    // band tracks the file without a reopen.
+                    if let Some(server) = smudgy
+                        .sessions
+                        .get(session_id)
+                        .map(|session| session.server_name.clone())
+                    {
+                        for window in smudgy.smudgy_windows.values_mut() {
+                            window.refresh_connect_observed(&server);
+                        }
+                    }
+                    Task::none()
+                }
                 _ => Task::none(),
             };
             // Pane lifecycle, def-state, and placement events touch both the

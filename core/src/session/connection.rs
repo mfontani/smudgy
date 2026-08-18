@@ -22,6 +22,7 @@ use super::{TaggedSessionEvent, runtime::RuntimeAction};
 pub mod gmcp;
 pub mod inflow;
 pub mod msdp;
+pub mod mssp;
 pub mod responders;
 pub mod telnet;
 pub mod transcode;
@@ -41,7 +42,7 @@ mod ingest {
     use super::responders::{self, ProtocolState};
     use super::transcode::Transcode;
     use super::vt_processor::VtProcessor;
-    use super::{gmcp, msdp, telnet};
+    use super::{gmcp, msdp, mssp, telnet};
 
     /// Bridges the telnet preprocessor to the rest of the inbound pipeline for one socket read.
     ///
@@ -180,6 +181,30 @@ mod ingest {
                 self.runtime_tx
                     .send(RuntimeAction::MsdpMessage {
                         payload: Arc::from(payload),
+                    })
+                    .ok();
+                return;
+            }
+            if option == telnet::option::MSSP {
+                if payload.len() > mssp::MAX_INBOUND_PAYLOAD {
+                    log::warn!(
+                        "MSSP payload of {} bytes exceeds the {} byte cap; dropped",
+                        payload.len(),
+                        mssp::MAX_INBOUND_PAYLOAD
+                    );
+                    return;
+                }
+                // Decoded against the configured (connect-time) encoding — MSSP can
+                // arrive before CHARSET negotiation settles, so the live transcoder is
+                // deliberately not consulted (`mssp` module docs).
+                let pairs = mssp::parse_variables(payload, self.transcode.configured_encoding());
+                if pairs.is_empty() {
+                    return;
+                }
+                self.runtime_tx
+                    .send(RuntimeAction::MsspVariables {
+                        connection_generation: self.vt_processor.connection_generation(),
+                        pairs: Arc::new(pairs),
                     })
                     .ok();
                 return;
@@ -1606,6 +1631,189 @@ mod tests {
             ),
             "the lifecycle must queue enable then disable; got {actions:?}"
         );
+    }
+
+    /// An MSSP subnegotiation end to end through the ingest bridge: the payload decodes
+    /// to `MsspVariables` pairs (no reply — MSSP has no client→server direction), and a
+    /// payload past the cap is dropped whole, never parsed.
+    #[test]
+    fn mssp_subnegotiation_forwards_decoded_variables_and_enforces_the_cap() {
+        let mut input = vec![command::IAC, command::SB, option::MSSP, mssp::marker::VAR];
+        input.extend_from_slice(b"NAME");
+        input.push(mssp::marker::VAL);
+        input.extend_from_slice(b"ArcticMUD");
+        input.extend_from_slice(&[command::IAC, command::SE]);
+        let (replies, actions) = ingest_buffer(&input);
+        assert!(replies.is_empty(), "MSSP is inbound-only");
+        match actions.as_slice() {
+            [RuntimeAction::MsspVariables { pairs, .. }] => assert_eq!(
+                pairs.as_slice(),
+                &[(
+                    "NAME".to_string(),
+                    mssp::MsspValue::Text("ArcticMUD".to_string())
+                )]
+            ),
+            other => panic!("expected one MsspVariables action; got {other:?}"),
+        }
+
+        // One byte past the cap: dropped whole.
+        let mut oversized = vec![command::IAC, command::SB, option::MSSP, mssp::marker::VAR];
+        oversized.extend_from_slice(b"NAME");
+        oversized.push(mssp::marker::VAL);
+        oversized.resize(3 + mssp::MAX_INBOUND_PAYLOAD + 1, b'a');
+        oversized.extend_from_slice(&[command::IAC, command::SE]);
+        let (replies, actions) = ingest_buffer(&oversized);
+        assert!(replies.is_empty());
+        assert!(actions.is_empty(), "an over-cap payload must be dropped");
+    }
+
+    /// The cap boundary through the wire: a payload of exactly
+    /// `MAX_INBOUND_PAYLOAD` bytes parses whole — the drop threshold is
+    /// strictly past the cap.
+    #[test]
+    fn mssp_payload_at_the_cap_parses_through_the_bridge() {
+        let mut input = vec![command::IAC, command::SB, option::MSSP, mssp::marker::VAR];
+        input.extend_from_slice(b"NAME");
+        input.push(mssp::marker::VAL);
+        input.resize(3 + mssp::MAX_INBOUND_PAYLOAD, b'a');
+        input.extend_from_slice(&[command::IAC, command::SE]);
+        let (replies, actions) = ingest_buffer(&input);
+        assert!(replies.is_empty());
+        match actions.as_slice() {
+            [RuntimeAction::MsspVariables { pairs, .. }] => {
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].0, "NAME");
+                assert!(matches!(
+                    &pairs[0].1,
+                    mssp::MsspValue::Text(value) if value.len() == mssp::MAX_INBOUND_PAYLOAD - 6
+                ));
+            }
+            other => panic!("expected one MsspVariables action; got {other:?}"),
+        }
+    }
+
+    /// Malformed MSSP shapes through the wire: an orphan `VAL` lead-in is
+    /// skipped, a nameless `VAR` is dropped whole, a `VAR` with no `VAL`
+    /// carries empty text, and a payload yielding no variables queues no
+    /// action at all — never a panic, never a reply.
+    #[test]
+    fn mssp_hostile_shapes_through_the_wire_forward_only_named_variables() {
+        // Orphan VAL before the first VAR: the named variable behind it survives.
+        let mut input = vec![command::IAC, command::SB, option::MSSP, mssp::marker::VAL];
+        input.extend_from_slice(b"orphan");
+        input.push(mssp::marker::VAR);
+        input.extend_from_slice(b"CONTACT");
+        input.push(mssp::marker::VAR);
+        input.extend_from_slice(b"NAME");
+        input.push(mssp::marker::VAL);
+        input.extend_from_slice(b"x");
+        input.extend_from_slice(&[command::IAC, command::SE]);
+        let (replies, actions) = ingest_buffer(&input);
+        assert!(replies.is_empty());
+        match actions.as_slice() {
+            [RuntimeAction::MsspVariables { pairs, .. }] => assert_eq!(
+                pairs.as_slice(),
+                &[
+                    ("CONTACT".to_string(), mssp::MsspValue::Text(String::new())),
+                    ("NAME".to_string(), mssp::MsspValue::Text("x".to_string())),
+                ]
+            ),
+            other => panic!("expected one MsspVariables action; got {other:?}"),
+        }
+
+        // Nothing parseable — a nameless VAR, marker-free noise, an empty
+        // subnegotiation — queues nothing.
+        for payload in [
+            &[mssp::marker::VAR, mssp::marker::VAL, b'l', b'o', b's', b't'][..],
+            b"marker-free noise",
+            &[],
+        ] {
+            let mut input = vec![command::IAC, command::SB, option::MSSP];
+            input.extend_from_slice(payload);
+            input.extend_from_slice(&[command::IAC, command::SE]);
+            let (replies, actions) = ingest_buffer(&input);
+            assert!(replies.is_empty());
+            assert!(actions.is_empty(), "payload {payload:?} must queue nothing");
+        }
+    }
+
+    /// Volume abuse through the wire: an array bomb (hundreds of `VAL`s under
+    /// one variable) and a kilobytes-long value both arrive intact under the
+    /// cap — the store budget downstream is the sizing authority, not the
+    /// parser.
+    #[test]
+    fn mssp_array_bombs_and_kilobyte_values_arrive_intact() {
+        let mut input = vec![command::IAC, command::SB, option::MSSP, mssp::marker::VAR];
+        input.extend_from_slice(b"PORT");
+        for _ in 0..300 {
+            input.push(mssp::marker::VAL);
+            input.extend_from_slice(b"6667");
+        }
+        input.push(mssp::marker::VAR);
+        input.extend_from_slice(b"CONTACT");
+        input.push(mssp::marker::VAL);
+        input.extend_from_slice(&vec![b'a'; 4096]);
+        input.extend_from_slice(&[command::IAC, command::SE]);
+        let (replies, actions) = ingest_buffer(&input);
+        assert!(replies.is_empty());
+        match actions.as_slice() {
+            [RuntimeAction::MsspVariables { pairs, .. }] => {
+                assert_eq!(pairs.len(), 2);
+                assert!(matches!(
+                    &pairs[0].1,
+                    mssp::MsspValue::List(items)
+                        if items.len() == 300 && items.iter().all(|item| item == "6667")
+                ));
+                assert!(matches!(
+                    &pairs[1].1,
+                    mssp::MsspValue::Text(value) if value.len() == 4096
+                ));
+            }
+            other => panic!("expected one MsspVariables action; got {other:?}"),
+        }
+    }
+
+    /// MSSP values decode against the connect-time configured encoding, with
+    /// the telnet layer's `IAC IAC` un-escape applied first — an escaped
+    /// `0xFF` is one text byte by the time the decoder sees it.
+    #[test]
+    fn mssp_values_decode_against_the_configured_encoding() {
+        let mut input = vec![command::IAC, command::SB, option::MSSP, mssp::marker::VAR];
+        input.extend_from_slice(b"NAME");
+        input.push(mssp::marker::VAL);
+        input.extend_from_slice(b"Caf\xE9 ");
+        // 0xFF, escaped on the wire as IAC IAC.
+        input.extend_from_slice(&[command::IAC, command::IAC]);
+        input.extend_from_slice(&[command::IAC, command::SE]);
+
+        // A Latin-1 configured server decodes both bytes as it meant them…
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::WINDOWS_1252);
+        let (_, actions) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+        match actions.as_slice() {
+            [RuntimeAction::MsspVariables { pairs, .. }] => assert_eq!(
+                pairs.as_slice(),
+                &[(
+                    "NAME".to_string(),
+                    mssp::MsspValue::Text("Caf\u{e9} \u{ff}".to_string())
+                )]
+            ),
+            other => panic!("expected one MsspVariables action; got {other:?}"),
+        }
+
+        // …while the UTF-8 default replaces them rather than dropping the
+        // variable.
+        let (_, actions) = ingest_buffer(&input);
+        match actions.as_slice() {
+            [RuntimeAction::MsspVariables { pairs, .. }] => assert_eq!(
+                pairs.as_slice(),
+                &[(
+                    "NAME".to_string(),
+                    mssp::MsspValue::Text("Caf\u{fffd} \u{fffd}".to_string())
+                )]
+            ),
+            other => panic!("expected one MsspVariables action; got {other:?}"),
+        }
     }
 
     /// The TTYPE/MTTS identity handshake end to end through the ingest bridge:

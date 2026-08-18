@@ -831,6 +831,14 @@ impl VtProcessor {
         }
     }
 
+    /// The generation stamped into the staleness-guarded actions this
+    /// processor's connection emits — shared with the telnet bridge so
+    /// protocol payloads carry the same socket identity as the packet
+    /// markers.
+    pub(super) fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
     /// Ties packet-completion markers to the given flag (the runtime's
     /// "a deferred profile send is pending" bit). While the flag is clear the
     /// batch boundary emits no marker; a marker skipped this way is never

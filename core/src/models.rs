@@ -8,6 +8,7 @@ pub mod local_packages;
 pub mod map_scopes;
 pub mod modules;
 pub mod naming;
+pub mod observed;
 pub mod packages;
 pub mod persistence;
 pub mod profile;

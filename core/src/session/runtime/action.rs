@@ -674,6 +674,23 @@ pub enum RuntimeAction {
     /// MSDP negotiated off mid-connection (`WONT`); disconnect-while-enabled takes the
     /// `Disconnected` arm's path instead. Emits `msdp:closed` if it was enabled.
     MsdpDisabled,
+    /// One inbound MSSP subnegotiation, decoded to its `(name, value)` variables at the
+    /// connection layer (`connection/mssp.rs`; MSSP frames are control-marked, so the
+    /// decode never touches the live charset stream). Display/advisory metadata only —
+    /// every value is attacker-controlled input from the game, and nothing an MSSP
+    /// variable says may change connection behavior or config. The dispatch arm merges
+    /// the pairs into the `mssp` store subtree (last-write-wins per variable) and emits
+    /// `mssp:updated`. Rides the same channel as `HandleIncomingLine`, so the GMCP §3.3
+    /// wire-order guarantee holds for MSSP identically.
+    ///
+    /// `connection_generation` identifies the socket that decoded the payload: a
+    /// replaced socket's late payload must not merge into the NEW connection's
+    /// snapshot — or feed its TLS upgrade-offer guard — after that connection's
+    /// dial state was latched (the same staleness guard as [`Self::Disconnected`]).
+    MsspVariables {
+        connection_generation: u64,
+        pairs: Arc<Vec<(String, crate::session::connection::mssp::MsspValue)>>,
+    },
     /// The server's telnet ECHO option flipped (RFC 857: `WILL ECHO` = the
     /// server has taken over echoing, the classic password-prompt signal;
     /// `WONT` hands it back). Enqueued by the connection task at the exact
