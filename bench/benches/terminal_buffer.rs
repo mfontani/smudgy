@@ -45,7 +45,7 @@ use criterion::{
 use smudgy_bench::log_corpora;
 use smudgy_core::session::{
     connection::vt_processor::AnsiColor,
-    runtime::line_operation::LineOperation,
+    runtime::line_operation::{LineOperation, LinkUpdate},
     styled_line::{Color, Style, StyledLine, VtSpan},
 };
 use smudgy_ui::terminal_buffer::{BufferLine, TerminalBuffer};
@@ -419,7 +419,8 @@ fn terminal_buffer(c: &mut Criterion) {
             LineOperation::Highlight {
                 begin: 0,
                 end: floor_char_boundary(text, 20),
-                style: HIGHLIGHT_STYLE,
+                style: HIGHLIGHT_STYLE.into(),
+                link: LinkUpdate::Keep,
             },
         ));
     }

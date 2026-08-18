@@ -51,6 +51,63 @@ impl TextAttributes {
     };
 }
 
+/// A partial [`TextAttributes`]: the write-path twin of the complete readback
+/// struct. Script style options arrive as any subset of the attributes; a
+/// `Some` field overrides the base the update is applied over, a `None` field
+/// leaves the base's value untouched.
+#[allow(clippy::struct_excessive_bools)] // Mirrors `TextAttributes` field for field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextAttributesUpdate {
+    pub bold: Option<bool>,
+    pub faint: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<Underline>,
+    pub blink: Option<Blink>,
+    pub crossed_out: Option<bool>,
+    pub reverse: Option<bool>,
+}
+
+impl TextAttributesUpdate {
+    pub const UNSET: Self = Self {
+        bold: None,
+        faint: None,
+        italic: None,
+        underline: None,
+        blink: None,
+        crossed_out: None,
+        reverse: None,
+    };
+
+    #[must_use]
+    pub fn apply_to(self, base: TextAttributes) -> TextAttributes {
+        TextAttributes {
+            bold: self.bold.unwrap_or(base.bold),
+            faint: self.faint.unwrap_or(base.faint),
+            italic: self.italic.unwrap_or(base.italic),
+            underline: self.underline.unwrap_or(base.underline),
+            blink: self.blink.unwrap_or(base.blink),
+            crossed_out: self.crossed_out.unwrap_or(base.crossed_out),
+            reverse: self.reverse.unwrap_or(base.reverse),
+        }
+    }
+}
+
+/// A complete attribute set as an update overrides every field — the lossless
+/// round-trip for a read-back span passed straight back to a styling method.
+impl From<TextAttributes> for TextAttributesUpdate {
+    fn from(value: TextAttributes) -> Self {
+        Self {
+            bold: Some(value.bold),
+            faint: Some(value.faint),
+            italic: Some(value.italic),
+            underline: Some(value.underline),
+            blink: Some(value.blink),
+            crossed_out: Some(value.crossed_out),
+            reverse: Some(value.reverse),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: vt_processor::Color,
@@ -69,6 +126,50 @@ impl Style {
 impl Default for Style {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+/// A partial [`Style`]: the channels a script write actually set. An unset
+/// channel keeps whatever the style being written over already carries —
+/// existing span styles for a highlight, the splice-point or delivery default
+/// for inserted text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StyleUpdate {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub attributes: TextAttributesUpdate,
+}
+
+impl StyleUpdate {
+    pub const UNSET: Self = Self {
+        fg: None,
+        bg: None,
+        attributes: TextAttributesUpdate::UNSET,
+    };
+
+    #[must_use]
+    pub fn apply_to(self, base: Style) -> Style {
+        Style {
+            fg: self.fg.unwrap_or(base.fg),
+            bg: self.bg.unwrap_or(base.bg),
+            attributes: self.attributes.apply_to(base.attributes),
+        }
+    }
+
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::UNSET
+    }
+}
+
+/// A complete style as an update overrides every channel.
+impl From<Style> for StyleUpdate {
+    fn from(value: Style) -> Self {
+        Self {
+            fg: Some(value.fg),
+            bg: Some(value.bg),
+            attributes: value.attributes.into(),
+        }
     }
 }
 
@@ -703,6 +804,18 @@ pub struct StyledLine {
     raw: Option<String>,
 }
 
+/// Clamp `pos` into `text` and snap it down to a char boundary. The line-edit
+/// methods run every script-supplied byte offset through this: a mid-code-point
+/// span or link boundary would panic the first `&text[a..b]` slice it meets
+/// (here or in the renderer), and scripts address lines by raw byte offsets.
+fn floor_char_boundary(text: &str, pos: usize) -> usize {
+    let mut pos = pos.min(text.len());
+    while pos > 0 && !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
 impl StyledLine {
     #[must_use]
     pub fn new(text: &str, span_info: Vec<VtSpan>) -> Self {
@@ -812,9 +925,9 @@ impl StyledLine {
 
     #[must_use]
     pub fn insert(&self, str: &str, begin: usize, end: usize, style: Style) -> Self {
-        // Clamp bounds to text length
-        let begin = begin.min(self.text.len());
-        let end = end.min(self.text.len().max(begin));
+        // Clamp bounds into the text and onto char boundaries
+        let begin = floor_char_boundary(&self.text, begin);
+        let end = floor_char_boundary(&self.text, end).max(begin);
 
         // Create new text by inserting the string
         let mut new_text = String::new();
@@ -879,65 +992,96 @@ impl StyledLine {
     }
 
     #[must_use]
-    pub fn highlight(&self, begin: usize, end: usize, style: Style) -> Self {
-        // Clamp bounds to text length
-        let begin = begin.min(self.text.len());
-        let end = end.min(self.text.len().max(begin));
+    pub fn highlight(&self, begin: usize, end: usize, update: StyleUpdate) -> Self {
+        // Clamp bounds into the text and onto char boundaries
+        let begin = floor_char_boundary(&self.text, begin);
+        let end = floor_char_boundary(&self.text, end).max(begin);
 
-        // If range is empty, return unchanged
-        if begin >= end {
+        // An empty range, or an update that sets nothing, changes nothing.
+        if begin >= end || update.is_unset() {
             return self.clone();
         }
 
-        let mut new_spans = Vec::new();
+        // Restyled pieces collect separately so adjacent equal results merge with
+        // each other (a full update over many spans collapses back to one span)
+        // without ever merging into a span the range did not touch.
+        fn push_restyled(
+            restyled: &mut Vec<VtSpan>,
+            style: Style,
+            begin_pos: usize,
+            end_pos: usize,
+        ) {
+            if begin_pos >= end_pos {
+                return;
+            }
+            if let Some(last) = restyled.last_mut()
+                && last.end_pos == begin_pos
+                && last.style == style
+            {
+                last.end_pos = end_pos;
+                return;
+            }
+            restyled.push(VtSpan {
+                style,
+                begin_pos,
+                end_pos,
+            });
+        }
 
-        // We want to keep spans that are completely outside the range of the new style,
-        // and shrink any spans that have partial overlap with the new style.
-        // Any spans that are completely inside the new style are replaced with a single span.
+        // The base an uncovered stretch of the range takes: spans normally tile
+        // the line, but edited lines can carry gaps, and those render as the
+        // terminal defaults — the same fallback the splice path uses.
+        let gap_base = Style::DEFAULT;
+
+        let mut new_spans = Vec::new();
+        let mut restyled = Vec::new();
+        let mut cursor = begin;
+
+        // Keep the parts of spans outside the range (split at its boundaries);
+        // apply the update over each part inside, span by span, so everything
+        // the update leaves unset keeps the value that part already had.
         for span in &self.spans {
-            if span.end_pos <= begin {
-                // Span is completely before highlight range
+            if span.end_pos <= begin || span.begin_pos >= end {
                 new_spans.push(*span);
-            } else if span.begin_pos >= end {
-                // Span is completely after highlight range
-                new_spans.push(*span);
-            } else if span.begin_pos < begin && span.end_pos > begin && span.end_pos <= end {
-                // Span starts before and ends within highlight range - keep the part before
+                continue;
+            }
+            if span.begin_pos < begin {
                 new_spans.push(VtSpan {
                     style: span.style,
                     begin_pos: span.begin_pos,
                     end_pos: begin,
                 });
-            } else if span.begin_pos >= begin && span.begin_pos < end && span.end_pos > end {
-                // Span starts within and ends after highlight range - keep the part after
-                new_spans.push(VtSpan {
-                    style: span.style,
-                    begin_pos: end,
-                    end_pos: span.end_pos,
-                });
-            } else if span.begin_pos < begin && span.end_pos > end {
-                // Span completely encompasses highlight range - split into before and after
-                new_spans.push(VtSpan {
-                    style: span.style,
-                    begin_pos: span.begin_pos,
-                    end_pos: begin,
-                });
+            }
+            let overlap_begin = span.begin_pos.max(begin);
+            let overlap_end = span.end_pos.min(end);
+            if cursor < overlap_begin {
+                push_restyled(
+                    &mut restyled,
+                    update.apply_to(gap_base),
+                    cursor,
+                    overlap_begin,
+                );
+            }
+            push_restyled(
+                &mut restyled,
+                update.apply_to(span.style),
+                overlap_begin,
+                overlap_end,
+            );
+            cursor = overlap_end;
+            if span.end_pos > end {
                 new_spans.push(VtSpan {
                     style: span.style,
                     begin_pos: end,
                     end_pos: span.end_pos,
                 });
             }
-            // Case where span is completely within highlight range:
-            // do nothing (gets replaced by highlight span)
+        }
+        if cursor < end {
+            push_restyled(&mut restyled, update.apply_to(gap_base), cursor, end);
         }
 
-        // Add the highlight span
-        new_spans.push(VtSpan {
-            style,
-            begin_pos: begin,
-            end_pos: end,
-        });
+        new_spans.append(&mut restyled);
 
         // Sort spans by begin position to maintain order
         new_spans.sort_by_key(|span| span.begin_pos);
@@ -951,11 +1095,38 @@ impl StyledLine {
         }
     }
 
+    /// Replace the link coverage of `[begin, end)` in place, without touching
+    /// text or styling: existing links are trimmed to the outside of the range
+    /// (one spanning it splits, keeping its outside pieces — the same interval
+    /// rules a splice applies), and `link`, if given, covers the range as one
+    /// new span. `None` bare-strips the range. In-place so a linkify applied
+    /// after a restyle swaps the links vec instead of recloning the line.
+    pub fn relink(&mut self, begin: usize, end: usize, link: Option<StyledLink>) {
+        let begin = floor_char_boundary(&self.text, begin);
+        let end = floor_char_boundary(&self.text, end).max(begin);
+        if begin >= end {
+            return;
+        }
+        // A zero length delta makes the splice remap a pure trim.
+        let mut links = self.remap_links(begin, end, end - begin);
+        if let Some(link) = link {
+            links.push(LinkSpan {
+                begin_pos: begin,
+                end_pos: end,
+                action: link.action,
+                tooltip: link.tooltip,
+                style: link.style,
+            });
+            links.sort_by_key(|link| link.begin_pos);
+        }
+        self.links = links;
+    }
+
     #[must_use]
     pub fn remove(&self, begin: usize, end: usize) -> Self {
         let text = self.text.as_str();
-        let begin = begin.min(text.len());
-        let end = end.min(text.len().max(begin));
+        let begin = floor_char_boundary(text, begin);
+        let end = floor_char_boundary(text, end).max(begin);
 
         let shift = end - begin;
 
@@ -1401,7 +1572,7 @@ mod tests {
     fn test_highlight_at_beginning() {
         let line = create_test_line();
         let highlight_style = create_test_style(AnsiColor::Yellow, true);
-        let result = line.highlight(0, 3, highlight_style);
+        let result = line.highlight(0, 3, highlight_style.into());
 
         assert_eq!(result.text, "Hello World Test");
         assert_eq!(result.spans.len(), 4);
@@ -1420,7 +1591,7 @@ mod tests {
     fn test_highlight_at_end() {
         let line = create_test_line();
         let highlight_style = create_test_style(AnsiColor::Yellow, true);
-        let result = line.highlight(14, 16, highlight_style);
+        let result = line.highlight(14, 16, highlight_style.into());
 
         assert_eq!(result.text, "Hello World Test");
         assert_eq!(result.spans.len(), 4);
@@ -1439,7 +1610,7 @@ mod tests {
     fn test_highlight_spanning_multiple_spans() {
         let line = create_test_line();
         let highlight_style = create_test_style(AnsiColor::Yellow, true);
-        let result = line.highlight(3, 9, highlight_style); // Spans across "Hello" and "World"
+        let result = line.highlight(3, 9, highlight_style.into()); // Spans across "Hello" and "World"
 
         assert_eq!(result.text, "Hello World Test");
         assert_eq!(result.spans.len(), 4);
@@ -1462,7 +1633,7 @@ mod tests {
     fn test_highlight_encompassing_span() {
         let line = create_test_line();
         let highlight_style = create_test_style(AnsiColor::Yellow, true);
-        let result = line.highlight(4, 8, highlight_style); // Encompasses part of "Hello" and space
+        let result = line.highlight(4, 8, highlight_style.into()); // Encompasses part of "Hello" and space
 
         assert_eq!(result.text, "Hello World Test");
         assert_eq!(result.spans.len(), 4);
@@ -1485,7 +1656,7 @@ mod tests {
     fn test_highlight_empty_range() {
         let line = create_test_line();
         let highlight_style = create_test_style(AnsiColor::Yellow, true);
-        let result = line.highlight(5, 5, highlight_style);
+        let result = line.highlight(5, 5, highlight_style.into());
 
         assert_eq!(result.text, "Hello World Test");
         assert_eq!(result.spans.len(), 3); // No change in spans
@@ -1499,7 +1670,7 @@ mod tests {
     fn test_highlight_bounds_checking() {
         let line = create_test_line();
         let highlight_style = create_test_style(AnsiColor::Yellow, true);
-        let result = line.highlight(10, 100, highlight_style);
+        let result = line.highlight(10, 100, highlight_style.into());
 
         assert_eq!(result.text, "Hello World Test");
         assert_eq!(result.spans.len(), 3);
@@ -1508,6 +1679,141 @@ mod tests {
         assert_eq!(result.spans[2].begin_pos, 10);
         assert_eq!(result.spans[2].end_pos, 16);
         assert_eq!(result.spans[2].style, highlight_style);
+    }
+
+    #[test]
+    fn test_highlight_partial_update_keeps_unset_channels_per_span() {
+        let line = create_test_line();
+        let bg = Color::Ansi {
+            color: AnsiColor::Yellow,
+            bold: false,
+        };
+        // Only the background is set: every span keeps its own foreground, so
+        // the range does NOT collapse to one span.
+        let update = StyleUpdate {
+            bg: Some(bg),
+            ..StyleUpdate::UNSET
+        };
+        let result = line.highlight(3, 9, update);
+
+        assert_eq!(result.text, "Hello World Test");
+        assert_eq!(result.spans.len(), 6);
+        // [0,3) red kept, [3,5) red over yellow, [5,6) gap defaults over
+        // yellow, [6,9) green over yellow, [9,11) green kept, [12,16) kept.
+        assert_eq!(
+            result.spans[0].style,
+            create_test_style(AnsiColor::Red, false)
+        );
+        assert_eq!((result.spans[1].begin_pos, result.spans[1].end_pos), (3, 5));
+        assert_eq!(
+            result.spans[1].style,
+            Style {
+                bg,
+                ..create_test_style(AnsiColor::Red, false)
+            }
+        );
+        assert_eq!((result.spans[2].begin_pos, result.spans[2].end_pos), (5, 6));
+        assert_eq!(
+            result.spans[2].style,
+            Style {
+                fg: Color::DefaultForeground { bold: false },
+                bg,
+                ..Style::DEFAULT
+            }
+        );
+        assert_eq!((result.spans[3].begin_pos, result.spans[3].end_pos), (6, 9));
+        assert_eq!(
+            result.spans[3].style,
+            Style {
+                bg,
+                ..create_test_style(AnsiColor::Green, false)
+            }
+        );
+        assert_eq!(
+            (result.spans[4].begin_pos, result.spans[4].end_pos),
+            (9, 11)
+        );
+        assert_eq!(
+            result.spans[4].style,
+            create_test_style(AnsiColor::Green, false)
+        );
+    }
+
+    #[test]
+    fn test_highlight_partial_attributes_merge_per_field() {
+        let mut line = create_test_line();
+        // Give "Hello" italics so a bold-only update must preserve them.
+        line.spans[0].style.attributes.italic = true;
+        let update = StyleUpdate {
+            attributes: TextAttributesUpdate {
+                bold: Some(true),
+                ..TextAttributesUpdate::UNSET
+            },
+            ..StyleUpdate::UNSET
+        };
+        let result = line.highlight(0, 5, update);
+
+        assert!(result.spans[0].style.attributes.bold);
+        assert!(result.spans[0].style.attributes.italic);
+        assert_eq!(
+            result.spans[0].style.fg,
+            Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false
+            }
+        );
+        assert_eq!(result.spans[0].style.bg, Color::DefaultBackground);
+    }
+
+    #[test]
+    fn test_highlight_unset_update_is_a_noop() {
+        let line = create_test_line();
+        let result = line.highlight(0, 16, StyleUpdate::UNSET);
+        assert_eq!(result.spans, line.spans);
+        assert_eq!(result.text, line.text);
+    }
+
+    #[test]
+    fn test_line_edit_offsets_snap_to_char_boundaries() {
+        // "h\u{e9}llo": boundaries at 0, 1, 3, 4, 5, 6 (the e-acute spans
+        // bytes 1..3). Offset 2 splits it and must snap down to 1 everywhere
+        // a script-supplied offset lands, or the first text slice panics.
+        let line = StyledLine::new(
+            "h\u{e9}llo",
+            vec![VtSpan {
+                style: create_test_style(AnsiColor::Red, false),
+                begin_pos: 0,
+                end_pos: 6,
+            }],
+        );
+
+        let highlighted = line.highlight(0, 2, create_test_style(AnsiColor::Yellow, true).into());
+        assert_eq!(
+            (highlighted.spans[0].begin_pos, highlighted.spans[0].end_pos),
+            (0, 1)
+        );
+        for span in &highlighted.spans {
+            assert!(highlighted.text.is_char_boundary(span.begin_pos));
+            assert!(highlighted.text.is_char_boundary(span.end_pos));
+        }
+
+        let mut linked = line.clone();
+        linked.relink(
+            0,
+            2,
+            Some(StyledLink {
+                action: LinkAction::Send(std::sync::Arc::from("x")),
+                tooltip: None,
+                style: None,
+            }),
+        );
+        assert_eq!((linked.links[0].begin_pos, linked.links[0].end_pos), (0, 1));
+
+        // Both offsets snap down, so a mid-char insertion point lands before
+        // the split character, and a range that collapses removes nothing.
+        assert_eq!(line.insert("X", 2, 2, Style::DEFAULT).text, "hX\u{e9}llo");
+        assert_eq!(line.remove(1, 2).text, "h\u{e9}llo");
+        assert_eq!(line.remove(1, 3).text, "hllo");
     }
 
     #[test]
@@ -1815,7 +2121,7 @@ mod tests {
         assert!(gone.links.is_empty());
 
         // A recolor leaves links untouched.
-        let recolored = line.highlight(0, 10, create_test_style(AnsiColor::Red, true));
+        let recolored = line.highlight(0, 10, create_test_style(AnsiColor::Red, true).into());
         assert_eq!(recolored.links, line.links);
 
         // Append shifts the appended line's links.

@@ -3,7 +3,7 @@ use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
 use crate::models::triggers::TriggerDefinition;
 use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
-use crate::session::runtime::line_operation::{LineOperation, SpliceRun};
+use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceRun};
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
@@ -15,8 +15,8 @@ use crate::session::runtime::{
 };
 use crate::session::styled_line::{
     Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkTooltip,
-    LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyledLine, StyledLink,
-    TextAttributes, Underline, sanitize_display_text,
+    LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyleUpdate, StyledLine,
+    StyledLink, TextAttributes, TextAttributesUpdate, Underline, sanitize_display_text,
 };
 use crate::session::{
     SessionId, registry,
@@ -68,6 +68,8 @@ deno_core::extension!(
     op_smudgy_line_replace,
     op_smudgy_splice,
     op_smudgy_line_splice,
+    op_smudgy_highlight_link,
+    op_smudgy_line_highlight_link,
     op_smudgy_line_highlight,
     op_smudgy_line_remove,
     op_smudgy_insert,
@@ -3074,16 +3076,19 @@ impl ColorWire {
     }
 }
 
+/// The wire shape of a run's text attributes: any subset of the fields. A
+/// missing field is an unset channel (it inherits the base the run resolves
+/// against); a present field overrides it.
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TextAttributesWire {
-    bold: bool,
-    faint: bool,
-    italic: bool,
-    underline: UnderlineWire,
-    blink: BlinkWire,
-    crossed_out: bool,
-    reverse: bool,
+    bold: Option<bool>,
+    faint: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<UnderlineWire>,
+    blink: Option<BlinkWire>,
+    crossed_out: Option<bool>,
+    reverse: Option<bool>,
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]
@@ -3102,22 +3107,22 @@ enum BlinkWire {
     Fast,
 }
 
-impl From<TextAttributesWire> for TextAttributes {
+impl From<TextAttributesWire> for TextAttributesUpdate {
     fn from(value: TextAttributesWire) -> Self {
         Self {
             bold: value.bold,
             faint: value.faint,
             italic: value.italic,
-            underline: match value.underline {
+            underline: value.underline.map(|underline| match underline {
                 UnderlineWire::None => Underline::None,
                 UnderlineWire::Single => Underline::Single,
                 UnderlineWire::Double => Underline::Double,
-            },
-            blink: match value.blink {
+            }),
+            blink: value.blink.map(|blink| match blink {
                 BlinkWire::None => Blink::None,
                 BlinkWire::Slow => Blink::Slow,
                 BlinkWire::Fast => Blink::Fast,
-            },
+            }),
             crossed_out: value.crossed_out,
             reverse: value.reverse,
         }
@@ -3162,9 +3167,12 @@ struct StyledRunWire {
 //   2 = ANSI  (bit 3: bold; bits 0-2: black..white index)
 //   3 = role  (0 default, 1 echo, 2 output, 3 warn)
 //
-// attributes u32: 0 = unset (delivery/splice default). Otherwise bit 31 is the
-// presence marker and bits 0..=8 carry bold, faint, italic, two-bit underline,
-// two-bit blink, crossed-out, and reverse. Presence-only is an explicit reset.
+// attributes u32: 0 = fully unset (every attribute inherits the delivery/splice
+// base). Otherwise bit 31 is the presence marker, bits 16..=22 are the per-field
+// set mask (bold, faint, italic, underline, blink, crossed-out, reverse — in
+// that order), and bits 0..=8 carry the values: bold, faint, italic, two-bit
+// underline, two-bit blink, crossed-out, reverse. A field's value bits must be
+// zero when its mask bit is clear; an unset field inherits the base's value.
 //
 // link u32: 0 = none. Else the top 2 bits are a tag over a 30-bit index:
 //   1 = send (index into the send strings), 2 = callback (index into the
@@ -3244,38 +3252,74 @@ fn packed_color(value: u32) -> Result<Option<Color>, StyledTextOpError> {
     }
 }
 
-/// Decode one packed text-attribute set. Zero is inherited/unset; bit 31
-/// distinguishes an explicit all-default reset from that unset value.
-fn packed_attributes(value: u32) -> Result<Option<TextAttributes>, StyledTextOpError> {
+/// Decode one packed partial text-attribute set (layout above). Zero is fully
+/// unset; otherwise bit 31 marks presence, bits 16..=22 say which fields are
+/// set, and bits 0..=8 carry the set fields' values. A value bit whose field
+/// is not in the mask is a malformed payload, not data.
+fn packed_attributes(value: u32) -> Result<TextAttributesUpdate, StyledTextOpError> {
     const PRESENT: u32 = 1 << 31;
-    const KNOWN: u32 = PRESENT | 0x01ff;
+    const MASK_BOLD: u32 = 1 << 16;
+    const MASK_FAINT: u32 = 1 << 17;
+    const MASK_ITALIC: u32 = 1 << 18;
+    const MASK_UNDERLINE: u32 = 1 << 19;
+    const MASK_BLINK: u32 = 1 << 20;
+    const MASK_CROSSED_OUT: u32 = 1 << 21;
+    const MASK_REVERSE: u32 = 1 << 22;
+    const KNOWN: u32 = PRESENT | 0x007f_0000 | 0x01ff;
     if value == 0 {
-        return Ok(None);
+        return Ok(TextAttributesUpdate::UNSET);
     }
     if value & PRESENT == 0 || value & !KNOWN != 0 {
         return Err(packed_invalid("invalid styled text attributes"));
     }
-    let underline = match (value >> 3) & 0x3 {
-        0 => Underline::None,
-        1 => Underline::Single,
-        2 => Underline::Double,
-        _ => return Err(packed_invalid("unknown underline style")),
+    let allowed_value_bits = (if value & MASK_BOLD != 0 { 1 << 0 } else { 0 })
+        | (if value & MASK_FAINT != 0 { 1 << 1 } else { 0 })
+        | (if value & MASK_ITALIC != 0 { 1 << 2 } else { 0 })
+        | (if value & MASK_UNDERLINE != 0 {
+            0x3 << 3
+        } else {
+            0
+        })
+        | (if value & MASK_BLINK != 0 { 0x3 << 5 } else { 0 })
+        | (if value & MASK_CROSSED_OUT != 0 {
+            1 << 7
+        } else {
+            0
+        })
+        | (if value & MASK_REVERSE != 0 { 1 << 8 } else { 0 });
+    if value & 0x01ff & !allowed_value_bits != 0 {
+        return Err(packed_invalid("invalid styled text attributes"));
+    }
+    let underline = if value & MASK_UNDERLINE != 0 {
+        Some(match (value >> 3) & 0x3 {
+            0 => Underline::None,
+            1 => Underline::Single,
+            2 => Underline::Double,
+            _ => return Err(packed_invalid("unknown underline style")),
+        })
+    } else {
+        None
     };
-    let blink = match (value >> 5) & 0x3 {
-        0 => Blink::None,
-        1 => Blink::Slow,
-        2 => Blink::Fast,
-        _ => return Err(packed_invalid("unknown blink style")),
+    let blink = if value & MASK_BLINK != 0 {
+        Some(match (value >> 5) & 0x3 {
+            0 => Blink::None,
+            1 => Blink::Slow,
+            2 => Blink::Fast,
+            _ => return Err(packed_invalid("unknown blink style")),
+        })
+    } else {
+        None
     };
-    Ok(Some(TextAttributes {
-        bold: value & (1 << 0) != 0,
-        faint: value & (1 << 1) != 0,
-        italic: value & (1 << 2) != 0,
+    let flag = |mask: u32, bit: u32| (value & mask != 0).then(|| value & (1 << bit) != 0);
+    Ok(TextAttributesUpdate {
+        bold: flag(MASK_BOLD, 0),
+        faint: flag(MASK_FAINT, 1),
+        italic: flag(MASK_ITALIC, 2),
         underline,
         blink,
-        crossed_out: value & (1 << 7) != 0,
-        reverse: value & (1 << 8) != 0,
-    }))
+        crossed_out: flag(MASK_CROSSED_OUT, 7),
+        reverse: flag(MASK_REVERSE, 8),
+    })
 }
 
 /// One packed link, decoded but not yet resolved against the send/callback tables.
@@ -3489,7 +3533,7 @@ fn packed_echo_lines(
             let style = Style {
                 fg: packed_color(reader.next()?)?.unwrap_or(default_style.fg),
                 bg: packed_color(reader.next()?)?.map_or(default_style.bg, normalize_bg),
-                attributes: packed_attributes(reader.next()?)?.unwrap_or(default_style.attributes),
+                attributes: packed_attributes(reader.next()?)?.apply_to(default_style.attributes),
             };
             let packed_link = packed_link(reader.next()?)?;
             let action = match packed_link {
@@ -3815,7 +3859,9 @@ impl StyledRunWire {
                 .as_ref()
                 .map(|bg| bg.to_color().map(normalize_bg))
                 .transpose()?,
-            attributes: self.attributes.map(Into::into),
+            attributes: self
+                .attributes
+                .map_or(TextAttributesUpdate::UNSET, Into::into),
             link: wire_link_to_styled(self.link.as_ref(), links)?,
             text: match sanitize_display_text(&self.text) {
                 std::borrow::Cow::Borrowed(_) => self.text,
@@ -3900,6 +3946,126 @@ fn op_smudgy_line_splice(
             },
         },
     );
+    Ok(())
+}
+
+/// Resolve a linked highlight's wire link into the [`LinkUpdate`] its
+/// operation carries: `None` strips the range's links, `Some` covers the
+/// range with the link. The wire link is validated BEFORE the callbacks
+/// register, so a rejected payload consumes no registry slots.
+fn highlight_link_update(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    link: Option<LinkWire>,
+    callbacks: v8::Local<v8::Array>,
+) -> Result<LinkUpdate, StyledTextOpError> {
+    if let Some(link) = &link {
+        link.validate(callbacks.length())?;
+    }
+    let context = link_context(scope, state, callbacks)?;
+    Ok(match wire_link_to_styled(link.as_ref(), &context)? {
+        Some(link) => LinkUpdate::Set(link),
+        None => LinkUpdate::Clear,
+    })
+}
+
+/// Build the per-range operations of one linked highlight. `ranges` is flat
+/// `[begin, end, begin, end, ...]` pairs — every occurrence a `highlight()`
+/// matched crosses in ONE op call, so the style parses once and the link's
+/// callbacks register exactly one registry slot however many ranges they
+/// cover. The style parses LOUDLY: silently tolerating a bad color here would
+/// also discard the link half the caller asked for. Empty pairs are dropped,
+/// and a call with no surviving pair registers nothing.
+#[allow(clippy::too_many_arguments)] // The two ops' shared body; arity is the wire's.
+fn linked_highlight_ops<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &OpState,
+    ranges: &[u32],
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
+    link: Option<LinkWire>,
+    callbacks: v8::Local<'s, v8::Array>,
+) -> Result<Vec<LineOperation>, StyledTextOpError> {
+    if !ranges.len().is_multiple_of(2) {
+        return Err(StyledTextOpError::Invalid(
+            "highlight ranges must be begin/end pairs".to_string(),
+        ));
+    }
+    let set = |value: v8::Local<'s, v8::Value>| (!value.is_null_or_undefined()).then_some(value);
+    let style = parse_style_from_js(scope, set(fg_color), set(bg_color), set(attributes))
+        .map_err(|error| StyledTextOpError::Invalid(error.to_string()))?;
+    let pairs: Vec<(usize, usize)> = ranges
+        .chunks_exact(2)
+        .filter(|pair| pair[0] < pair[1])
+        .map(|pair| (pair[0] as usize, pair[1] as usize))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let link = highlight_link_update(scope, state, link, callbacks)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(begin, end)| LineOperation::Highlight {
+            begin,
+            end,
+            style,
+            link: link.clone(),
+        })
+        .collect())
+}
+
+/// [`op_smudgy_highlight`] with a link update: restyle the ranges AND replace
+/// their link coverage — the write path for highlight options that carry
+/// `link` (a link tag, or null to strip). A separate op so the link-free path
+/// keeps its fast-op shape.
+#[op2]
+fn op_smudgy_highlight_link<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    #[buffer] ranges: &[u32],
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
+    #[serde] link: Option<LinkWire>,
+    callbacks: v8::Local<'s, v8::Array>,
+) -> Result<(), StyledTextOpError> {
+    ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
+    let operations = linked_highlight_ops(
+        scope, state, ranges, fg_color, bg_color, attributes, link, callbacks,
+    )?;
+    let pending_ops = state.borrow::<Rc<RefCell<Vec<LineOperation>>>>();
+    pending_ops.borrow_mut().extend(operations);
+    Ok(())
+}
+
+/// [`op_smudgy_highlight_link`] for an already-emitted buffer line.
+#[op2]
+fn op_smudgy_line_highlight_link<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    line_number: u32,
+    #[buffer] ranges: &[u32],
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
+    #[serde] link: Option<LinkWire>,
+    callbacks: v8::Local<'s, v8::Array>,
+) -> Result<(), StyledTextOpError> {
+    ensure(grants(state).change_display, "change-display")?;
+    let operations = linked_highlight_ops(
+        scope, state, ranges, fg_color, bg_color, attributes, link, callbacks,
+    )?;
+    for operation in operations {
+        queue_own_action(
+            state,
+            RuntimeAction::PerformLineOperation {
+                line_number: line_number as usize,
+                operation,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -4680,17 +4846,22 @@ fn parse_color_from_js(
             return Ok(Color::Rgb { r, g, b });
         }
 
-        // Check if it's a palette color with the legacy effective `bold` bit
-        // and, on line-style readback, the lossless raw palette bit.
+        // Check if it's a palette color with the optional `bold` palette-slot
+        // bit and, on line-style readback, the lossless raw palette bit.
         let color_key = v8::String::new(scope, "color").unwrap().into();
         let bold_key = v8::String::new(scope, "bold").unwrap().into();
         let palette_bright_key = v8::String::new(scope, "paletteBright").unwrap().into();
 
-        if let Some(color_val) = obj.get(scope, color_key) {
+        if let Some(color_val) = obj.get(scope, color_key)
+            && !color_val.is_null_or_undefined()
+        {
+            let color_str = color_val.to_rust_string_lossy(scope);
+            // Omitted `bold` means what the bare name means: the bright
+            // variant for an ANSI name, the normal slot for "default".
             let bold = obj
                 .get(scope, bold_key)
-                .is_some_and(|v| v.boolean_value(scope));
-            let color_str = color_val.to_rust_string_lossy(scope);
+                .filter(|value| !value.is_null_or_undefined())
+                .map_or(color_str != "default", |value| value.boolean_value(scope));
             let palette_bright = obj
                 .get(scope, palette_bright_key)
                 .filter(|value| !value.is_null_or_undefined())
@@ -4723,61 +4894,71 @@ fn parse_color_from_js(
     }
 }
 
-fn object_property<'s>(
+/// A named property, with a missing/`null`/`undefined` value flattened to
+/// `None` — an unset attribute leaves the base value untouched.
+fn set_property<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     name: &str,
-) -> Result<v8::Local<'s, v8::Value>, AnyError> {
+) -> Option<v8::Local<'s, v8::Value>> {
     let key = v8::String::new(scope, name).unwrap().into();
     object
         .get(scope, key)
-        .ok_or_else(|| anyhow::anyhow!("missing text attribute {name}"))
+        .filter(|value| !value.is_null_or_undefined())
 }
 
 fn boolean_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     name: &str,
-) -> Result<bool, AnyError> {
-    let value = object_property(scope, object, name)?;
+) -> Result<Option<bool>, AnyError> {
+    let Some(value) = set_property(scope, object, name) else {
+        return Ok(None);
+    };
     if !value.is_boolean() {
         bail!("text attribute {name} must be a boolean");
     }
-    Ok(value.boolean_value(scope))
+    Ok(Some(value.boolean_value(scope)))
 }
 
 fn string_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     name: &str,
-) -> Result<String, AnyError> {
-    let value = object_property(scope, object, name)?;
+) -> Result<Option<String>, AnyError> {
+    let Some(value) = set_property(scope, object, name) else {
+        return Ok(None);
+    };
     if !value.is_string() {
         bail!("text attribute {name} must be a string");
     }
-    Ok(value.to_rust_string_lossy(scope))
+    Ok(Some(value.to_rust_string_lossy(scope)))
 }
 
+/// Parse a script attributes object: any subset of the seven attributes. Set
+/// fields override the style being written over; unset fields leave it alone.
 fn parse_attributes_from_js<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
-) -> Result<TextAttributes, AnyError> {
+) -> Result<TextAttributesUpdate, AnyError> {
     let object = value
         .to_object(scope)
         .ok_or_else(|| anyhow::anyhow!("attributes must be an object"))?;
-    let underline = match string_attribute(scope, object, "underline")?.as_str() {
-        "none" => Underline::None,
-        "single" => Underline::Single,
-        "double" => Underline::Double,
-        other => bail!("unknown underline style: {other}"),
+    let underline = match string_attribute(scope, object, "underline")?.as_deref() {
+        None => None,
+        Some("none") => Some(Underline::None),
+        Some("single") => Some(Underline::Single),
+        Some("double") => Some(Underline::Double),
+        Some(other) => bail!("unknown underline style: {other}"),
     };
-    let blink = match string_attribute(scope, object, "blink")?.as_str() {
-        "none" => Blink::None,
-        "slow" => Blink::Slow,
-        "fast" => Blink::Fast,
-        other => bail!("unknown blink style: {other}"),
+    let blink = match string_attribute(scope, object, "blink")?.as_deref() {
+        None => None,
+        Some("none") => Some(Blink::None),
+        Some("slow") => Some(Blink::Slow),
+        Some("fast") => Some(Blink::Fast),
+        Some(other) => bail!("unknown blink style: {other}"),
     };
-    Ok(TextAttributes {
+    Ok(TextAttributesUpdate {
         bold: boolean_attribute(scope, object, "bold")?,
         faint: boolean_attribute(scope, object, "faint")?,
         italic: boolean_attribute(scope, object, "italic")?,
@@ -4788,29 +4969,32 @@ fn parse_attributes_from_js<'s>(
     })
 }
 
-/// Helper function to create a Style from JavaScript values
+/// Build the [`StyleUpdate`] a line write op carries from its JavaScript
+/// values. Unset channels stay unset: they resolve against the line — a
+/// highlight keeps each span's existing value, an insert inherits the style
+/// at the insertion point.
 fn parse_style_from_js<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     fg_val: Option<v8::Local<'s, v8::Value>>,
     bg_val: Option<v8::Local<'s, v8::Value>>,
     attributes_val: Option<v8::Local<'s, v8::Value>>,
-) -> Result<Style, AnyError> {
+) -> Result<StyleUpdate, AnyError> {
     let fg = match fg_val {
-        Some(val) => parse_color_from_js(scope, val)?,
-        None => Color::DefaultForeground { bold: false },
+        Some(val) => Some(parse_color_from_js(scope, val)?),
+        None => None,
     };
 
     let bg = match bg_val {
-        Some(val) => normalize_bg(parse_color_from_js(scope, val)?),
-        None => Color::DefaultBackground,
+        Some(val) => Some(normalize_bg(parse_color_from_js(scope, val)?)),
+        None => None,
     };
 
     let attributes = match attributes_val {
         Some(value) => parse_attributes_from_js(scope, value)?,
-        None => TextAttributes::DEFAULT,
+        None => TextAttributesUpdate::UNSET,
     };
 
-    Ok(Style { fg, bg, attributes })
+    Ok(StyleUpdate { fg, bg, attributes })
 }
 
 #[op2(fast)]
@@ -4930,6 +5114,7 @@ fn op_smudgy_highlight<'s>(
         begin: begin as usize,
         end: end as usize,
         style,
+        link: LinkUpdate::Keep,
     });
     Ok(())
 }
@@ -7187,6 +7372,7 @@ fn op_smudgy_line_highlight<'s>(
                 begin: begin as usize,
                 end: end as usize,
                 style,
+                link: LinkUpdate::Keep,
             }),
         },
     );
@@ -7282,7 +7468,9 @@ mod tests {
         param_read_allowed, single_line_text,
     };
     use crate::session::runtime::store::ProducerKey;
-    use crate::session::styled_line::{Blink, LinkAction, TextAttributes, Underline};
+    use crate::session::styled_line::{
+        Blink, LinkAction, TextAttributes, TextAttributesUpdate, Underline,
+    };
     use std::sync::Arc;
 
     // ---- Packed styled-echo payload ----------------------------------------------
@@ -7292,6 +7480,7 @@ mod tests {
     const ANSI_RED_BRIGHT: u32 = 0x0200_0009;
     const ROLE_DEFAULT: u32 = 0x0300_0000;
     const ATTR_PRESENT: u32 = 0x8000_0000;
+    const ATTR_MASK_ALL: u32 = 0x007f_0000;
     const LINK_SEND_0: u32 = 0x4000_0000;
     const LINK_CB_0: u32 = 0x8000_0000;
 
@@ -7523,12 +7712,19 @@ mod tests {
 
     #[test]
     fn packed_attributes_distinguish_inheritance_reset_and_all_variants() {
-        assert_eq!(packed_attributes(0).unwrap(), None);
+        assert_eq!(packed_attributes(0).unwrap(), TextAttributesUpdate::UNSET);
+        // Presence with an empty set mask sets nothing.
         assert_eq!(
             packed_attributes(ATTR_PRESENT).unwrap(),
-            Some(TextAttributes::DEFAULT)
+            TextAttributesUpdate::UNSET
+        );
+        // A full mask with all-zero values is an explicit reset of every field.
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT | ATTR_MASK_ALL).unwrap(),
+            TextAttributesUpdate::from(TextAttributes::DEFAULT)
         );
         let all = ATTR_PRESENT
+            | ATTR_MASK_ALL
             | (1 << 0)
             | (1 << 1)
             | (1 << 2)
@@ -7538,7 +7734,7 @@ mod tests {
             | (1 << 8);
         assert_eq!(
             packed_attributes(all).unwrap(),
-            Some(TextAttributes {
+            TextAttributesUpdate::from(TextAttributes {
                 bold: true,
                 faint: true,
                 italic: true,
@@ -7548,8 +7744,26 @@ mod tests {
                 reverse: true,
             })
         );
-        assert!(packed_attributes(ATTR_PRESENT | (3 << 3)).is_err());
-        assert!(packed_attributes(ATTR_PRESENT | (3 << 5)).is_err());
+        // A partial mask sets only its fields.
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT | (1 << 16) | (1 << 0)).unwrap(),
+            TextAttributesUpdate {
+                bold: Some(true),
+                ..TextAttributesUpdate::UNSET
+            }
+        );
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT | (1 << 19) | (1 << 3)).unwrap(),
+            TextAttributesUpdate {
+                underline: Some(Underline::Single),
+                ..TextAttributesUpdate::UNSET
+            }
+        );
+        // A value bit whose field is not in the set mask is malformed.
+        assert!(packed_attributes(ATTR_PRESENT | (1 << 0)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | (2 << 3)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | ATTR_MASK_ALL | (3 << 3)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | ATTR_MASK_ALL | (3 << 5)).is_err());
         assert!(packed_attributes(ATTR_PRESENT | (1 << 9)).is_err());
         assert!(packed_attributes(1).is_err());
     }

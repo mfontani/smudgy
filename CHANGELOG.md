@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Styling from scripts got simpler and sharper.** `line.highlight()` and the `style`
+  chain now take any subset of options: what you set changes, and everything you leave
+  out is left alone — recolor a foreground without touching backgrounds or bold.
+  Text attributes accept any subset the same way, the chain gains one shorthand per
+  attribute (`style.bold.red`, `style.italic.underline`, ...), a chain works directly
+  as a highlight's options (`line.highlight("goblin", style.red.bgWhite)`), and a
+  `link(...)` tag does too — making every match clickable in place while keeping its
+  styling (`link: null` strips links from matches instead). Mistakes are loud: unknown
+  color names and misspelled attribute keys now throw where they are written instead
+  of silently styling nothing.
+
 ### Changed
 
+- A highlight no longer repaints what its options leave unset. Previously
+  `line.highlight("orc", { fg: "red" })` also reset the match's background and text
+  attributes to defaults; now they are preserved. To repaint a range wholesale, pass
+  explicit values for every channel — a read-back `line.styles` span works verbatim.
+- `line.insert()` follows the same rule: text inserted without options (or with
+  partial options) now blends into the style at the insertion point, where it
+  previously always rendered in the terminal defaults.
+- In the `{ color }` foreground/background form, omitting `bold` now means what the
+  bare name means — the bright variant for ANSI names — where it previously selected
+  the dim slot. Scripts that spell `bold` out (anything type-checked against the old
+  contract, which required it) are unaffected.
 - The embedded JavaScript/TypeScript runtime now follows Deno 2.9.5 (V8 150.4), including its
   updated npm/CommonJS compatibility and matching editor declarations.
 - Package manifests gain an `ipc` permission axis for local IPC endpoints. Each row declares a

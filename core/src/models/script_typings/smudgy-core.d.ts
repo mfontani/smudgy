@@ -1502,12 +1502,13 @@ declare module "smudgy:core" {
 
   /**
    * Builds styled text. Use it as a template tag, optionally picking colors
-   * first. Each step is itself a tag, so all of these work:
+   * and attributes first. Each step is itself a tag, so all of these work:
    *
    * ```ts
    * import { echo, style } from "smudgy:core";
    *
    * echo`A ${style.red`red`} word and ${style.blue.bgYellow`a loud one`}.`;
+   * echo`${style.bold.underline`emphasis`} without touching colors.`;
    * echo(style.fg({ r: 255, g: 128, b: 0 })`exact orange`);
    * echo(style({ fg: "cyan", bg: "black" })`both at once`);
    * ```
@@ -1516,11 +1517,22 @@ declare module "smudgy:core" {
    * ANSI names are the bright variant, the theme roles (`default`, `echo`,
    * `output`, `warn`) follow the color scheme, and `fg`/`bg` accept any
    * {@link Color} form, including `{ color, bold: false }` for the dimmer
-   * shade. Text a fragment leaves unstyled behaves like plain text: the usual
-   * echo color when echoed, the surrounding style when spliced into a line.
+   * shade. The attribute shorthands (`bold`, `faint`, `italic`, `underline`,
+   * `doubleUnderline`, `crossedOut`, `reverse`) each set one text attribute —
+   * `bold` is the font-weight attribute (`attributes.bold`), independent of
+   * the `{ color, bold }` palette slot; `blink` and explicit `false` values
+   * stay in the `attributes` options form. Anything a fragment leaves unset
+   * behaves like plain text: the usual echo color when echoed, the
+   * surrounding style when spliced into a line.
+   *
+   * A chain also works directly AS the options of a line write —
+   * `line.highlight("goblin", style.red.bgWhite)` — where it applies exactly
+   * what it set and leaves everything else untouched.
    */
   export interface StyleBuilder extends StyleTag {
-    /** Colors and/or complete text attributes, in the same shape `highlight` takes. */
+    /** Colors and/or text attributes, in the same shape `highlight` takes.
+     *  `attributes` may be any subset: it refines what the chain has set so
+     *  far, and fields no step sets inherit at delivery like unset colors. */
     (options: LineColorOptions): StyleBuilder;
     fg(color: Color): StyleBuilder;
     bg(color: Color): StyleBuilder;
@@ -1544,6 +1556,15 @@ declare module "smudgy:core" {
     readonly bgMagenta: StyleBuilder;
     readonly bgCyan: StyleBuilder;
     readonly bgWhite: StyleBuilder;
+    /** Font-weight bold (`attributes.bold`) — not the palette slot. */
+    readonly bold: StyleBuilder;
+    readonly faint: StyleBuilder;
+    readonly italic: StyleBuilder;
+    /** Single underline; `doubleUnderline` for the double form. */
+    readonly underline: StyleBuilder;
+    readonly doubleUnderline: StyleBuilder;
+    readonly crossedOut: StyleBuilder;
+    readonly reverse: StyleBuilder;
   }
 
   /** Builds {@link StyledText} for `echo` and the line-editing methods (see
@@ -1621,13 +1642,27 @@ declare module "smudgy:core" {
    * script that made it: after a script reload the text remains but clicking it does
    * nothing, and only the most recent function links are kept, so a very old one can
    * expire early. Prefer command links for anything long-lived.
+   *
+   * The tag also works directly as a highlight's options —
+   * `line.highlight("goblin", link("kill goblin"))` makes every match
+   * clickable in place, keeping the text's styling (see {@link Line}'s
+   * `highlight`).
    */
-  export function link(command: string, options?: LinkOptions): StyleTag;
-  export function link(onClick: (click: LinkClick) => void, options?: LinkOptions): StyleTag;
+  export function link(command: string, options?: LinkOptions): LinkTag;
+  export function link(onClick: (click: LinkClick) => void, options?: LinkOptions): LinkTag;
   /** Produces link-styled text with no primary action. A supplied menu opens
    *  from either left or right click by default; pass `{ enabled: false }` to
    *  make that menu right-click-only. */
-  export function link(action: null, options?: LinkOptions): StyleTag;
+  export function link(action: null, options?: LinkOptions): LinkTag;
+
+  /** The template tag {@link link} returns: a {@link StyleTag} whose fragments
+   *  carry the link, also accepted directly as a highlight's options (where it
+   *  covers the matched text with the link). */
+  export interface LinkTag extends StyleTag {
+    /** Marks a tag as carrying a link; the counterpart of
+     *  {@link StyledText}'s brand. */
+    readonly __smudgyLink: true;
+  }
 
   /**
    * Print a line in your session's output window; nothing is sent to the MUD.
@@ -2081,19 +2116,22 @@ declare module "smudgy:core" {
    *   `"magenta"`, `"cyan"`, `"white"`, meaning the bright variant), or a
    *   theme role: `"default"`, `"echo"`, `"output"`, `"warn"`
    * - `{ r, g, b }` with each component 0-255, for an exact color
-   * - `{ color, bold, paletteBright? }`: an ANSI color name or `"default"`
-   *   plus its palette slot (`bold: false` selects the normal, dimmer variant).
-   *   `paletteBright` is normally only needed when re-emitting style readback.
+   * - `{ color, bold?, paletteBright? }`: an ANSI color name or `"default"`
+   *   plus its palette slot. Omitted `bold` means what the bare name means
+   *   (the bright variant for an ANSI name, the normal slot for `"default"`);
+   *   `bold: false` selects the normal, dimmer variant. `paletteBright` is
+   *   normally only needed when re-emitting style readback.
    */
   export type Color =
     | string
     | { r: number; g: number; b: number }
     | {
         color: string;
-        /** On input, selects the palette's bright slot unless `paletteBright`
-         *  is supplied. On ANSI style readback this is the deprecated legacy
+        /** The palette slot: `true` bright, `false` normal. Omitted means what
+         *  the bare name means (ANSI names the bright variant, `"default"` the
+         *  normal slot). On ANSI style readback this is the deprecated legacy
          *  palette-bright-or-font-bold value; use `attributes.bold` for weight. */
-        bold: boolean;
+        bold?: boolean;
         /** An explicit palette-slot override. Style readback supplies this for
          *  ANSI colors so a span round-trips even when legacy `bold` is conflated.
          *  Default foreground readback remains the string `"default"` for
@@ -2102,7 +2140,10 @@ declare module "smudgy:core" {
         paletteBright?: boolean;
       };
 
-  /** The lossless non-color attributes carried by a terminal text run. */
+  /** The lossless non-color attributes carried by a terminal text run.
+   *  Readback ({@link StyleSpan}) always carries every field; the write APIs
+   *  accept any subset (`Partial<TextAttributes>`) and leave the attributes
+   *  they don't mention alone. */
   export interface TextAttributes {
     bold: boolean;
     faint: boolean;
@@ -2128,14 +2169,34 @@ declare module "smudgy:core" {
     foregroundPaletteBright?: boolean;
   }
 
-  /** Foreground, background, and/or complete text attributes for a line write.
-   *  A {@link StyleSpan} is accepted directly, making readback lossless. */
+  /**
+   * Foreground, background, and/or text attributes for a line write. Set only
+   * what you mean to change: anything left unset is left alone — `highlight`
+   * keeps each span's existing value for that channel, and `insert` or a
+   * styled fragment inherits the surrounding (or delivery-default) style.
+   * `attributes` takes any subset of the seven attributes, per-field.
+   *
+   * A {@link StyleSpan} is accepted directly, making readback lossless (its
+   * complete `attributes` object overwrites all seven).
+   */
   export interface LineColorOptions {
     fg?: Color;
     bg?: Color;
-    attributes?: TextAttributes;
+    attributes?: Partial<TextAttributes>;
     /** Lossless raw palette bit for a read-back `fg: "default"` span. */
     foregroundPaletteBright?: boolean;
+  }
+
+  /**
+   * What `highlight`/`highlightAt` accept: colors and attributes (unset ones
+   * left untouched, as everywhere), plus optionally the range's link coverage.
+   * `link` takes the tag {@link link} returns and covers each matched range
+   * with that link — replacing any links it overlaps, while a link reaching
+   * outside the range keeps its outside pieces — or `null` to strip links
+   * from the range. Left unset, existing links are untouched.
+   */
+  export interface HighlightOptions extends LineColorOptions {
+    link?: LinkTag | null;
   }
 
   /**
@@ -2165,26 +2226,41 @@ declare module "smudgy:core" {
    */
   export interface Line {
     /** Insert `text` at byte offset `begin` (replacing up to `end` if given),
-     *  with optional colors. Styled text keeps its own colors and links;
-     *  `options` then supplies the colors its unstyled parts get. */
+     *  with optional colors (plain options or a style chain); whatever
+     *  `options` leaves unset inherits the style at the insertion point.
+     *  Styled text keeps its own colors and links; `options` then supplies
+     *  the colors its unstyled parts get. */
     insert(
       text: string | StyledText,
       begin: number,
       end?: number,
-      options?: LineColorOptions,
+      options?: LineColorOptions | StyleBuilder,
     ): void;
     /** Replace the byte range `[begin, end)` with `text`. Styled text keeps its
      *  own colors and links; its unstyled parts blend into the surrounding style. */
     replaceAt(text: string | StyledText, begin: number, end: number): void;
-    /** Recolor the byte range `[begin, end)`. */
-    highlightAt(begin: number, end: number, options?: LineColorOptions): void;
+    /** Restyle the byte range `[begin, end)`: what `options` sets changes,
+     *  and everything it leaves unset keeps what each span already had — so
+     *  `{ fg: "red" }` recolors without touching backgrounds or bold, and
+     *  `{ attributes: { bold: true } }` emboldens without touching colors.
+     *  A style chain works directly as the options
+     *  (`line.highlightAt(b, e, style.red.bgWhite)`), and so does a link tag,
+     *  linkifying the range in place (see {@link HighlightOptions}). */
+    highlightAt(
+      begin: number,
+      end: number,
+      options?: HighlightOptions | StyleBuilder | LinkTag,
+    ): void;
     /** Remove the byte range `[begin, end)`. */
     removeAt(begin: number, end: number): void;
     /** Replace every occurrence of `oldStr` with `newStr` (plain or styled;
      *  the search side is always plain text). Returns `true` if any was found. */
     replace(oldStr: string, newStr: string | StyledText): boolean;
-    /** Recolor every occurrence of `str`. Returns `true` if any was found. */
-    highlight(str: string, options?: LineColorOptions): boolean;
+    /** Restyle every occurrence of `str` (see {@link Line.highlightAt}: unset
+     *  options are left untouched, and a style chain like `style.red.bold`
+     *  or a link tag like `link("kill goblin")` works directly as the
+     *  options). Returns `true` if any was found. */
+    highlight(str: string, options?: HighlightOptions | StyleBuilder | LinkTag): boolean;
     /** Remove every occurrence of `str`. Returns `true` if any was found. */
     remove(str: string): boolean;
     /** Hide this line: it never reaches the screen. Current-line only (a
