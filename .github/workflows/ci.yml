@@ -55,18 +55,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libwebkit2gtk-4.1-dev
 
+      # rust-cache prunes workspace-member artifacts (the statically-linked
+      # test binaries that dominate target/) before saving; caching target/
+      # wholesale grew past GitHub's 10GB repo cache cap and filled runner
+      # disks mid-job. cache-bin (on by default) covers ~/.cargo/bin, so the
+      # patch-crate install below persists across runs.
       - name: Cache Cargo data
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cargo/bin/cargo-patch-crate*
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-on-failure: true
 
       # The workspace patches dependency sources via patch-crate (see patches/
       # and the workspace manifest): [patch.crates-io] points into target/patch/,
