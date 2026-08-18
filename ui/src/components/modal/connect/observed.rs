@@ -97,6 +97,25 @@ fn game_display_name(observed: &ObservedServer, server_name: &str) -> Option<Str
     Some(safe_prose_display(name, 60))
 }
 
+/// `CONTACT` as an email address, when it is one: a single `@` with a dotted
+/// domain and no whitespace or URL scheme. Becomes a `mailto:` action; every
+/// other non-URL contact stays inert text.
+fn email_contact(observed: &ObservedServer) -> Option<&str> {
+    let contact = scalar(observed, "CONTACT")?.trim();
+    let (local, domain) = contact.split_once('@')?;
+    if local.is_empty()
+        || local.contains(':') // scheme-shaped ("mailto:user") — not a bare address
+        || domain.is_empty()
+        || !domain.contains('.')
+        || domain.contains('@')
+        || contact.chars().any(char::is_whitespace)
+        || link_url_host(contact).is_some()
+    {
+        return None;
+    }
+    Some(contact)
+}
+
 /// `STATUS` worth a badge: anything but the default "Live".
 fn status_text(observed: &ObservedServer) -> Option<String> {
     let status = scalar(observed, "STATUS")?.trim();
@@ -177,11 +196,13 @@ pub(super) fn metadata_band<'a>(
     if let Some(days) = uptime_days(observed, now) {
         lines.push(muted_line(t!("observed-uptime", "days" => days)));
     }
-    // A CONTACT that isn't a URL (usually an email address) is still contact
-    // info worth showing — as inert text, never an action.
+    // A CONTACT that is neither a URL nor an email is still contact info
+    // worth showing — as inert text, never an action. Emails join the chip
+    // row below as `mailto:` actions instead.
     if let Some(contact) = scalar(observed, "CONTACT")
         .map(str::trim)
         .filter(|contact| !contact.is_empty() && link_url_host(contact).is_none())
+        && email_contact(observed).is_none()
     {
         lines.push(muted_line(
             t!("observed-contact", "contact" => safe_prose_display(contact, 80)),
@@ -223,15 +244,48 @@ pub(super) fn metadata_band<'a>(
             has_chips = true;
         }
     }
+    // An email CONTACT is an action too: a `mailto:` through the same trust
+    // gate (no host to grant, so it confirms unless the server has the
+    // blanket grant). Labeled with the address itself — clearer than a
+    // generic "Contact" for where the click lands.
+    if let Some(email) = email_contact(observed) {
+        chips = chips.push(
+            button(text(safe_prose_display(email, 40)).size(12))
+                .style(builtins::button::link)
+                .padding([2, 8])
+                .on_press(Message::OpenObservedLink(
+                    server.name.clone(),
+                    format!("mailto:{email}"),
+                )),
+        );
+        has_chips = true;
+    }
 
     if lines.is_empty() && !has_chips {
         return None;
     }
-    let mut band = Column::with_children(lines).spacing(2);
+    let mut band = Column::with_children(lines).spacing(4);
     if has_chips {
         band = band.push(chips);
     }
-    Some(band.into())
+    // The frame marks the hand-off: everything inside is what the game said
+    // (plus the connect stamp), set off from the user-authored config around
+    // it — same hairline-and-wash vocabulary as the badges.
+    Some(
+        container(band)
+            .padding(10)
+            .width(Length::Fill)
+            .style(|theme: &crate::Theme| container::Style {
+                background: Some(theme.styles.text.normal.scale_alpha(0.03).into()),
+                border: Border {
+                    color: theme.styles.general.border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into(),
+    )
 }
 
 fn muted_line<'a>(line: String) -> Element<'a, Message> {
@@ -472,5 +526,31 @@ mod tests {
             game_display_name(&observed(&[("NAME", "Evil\u{202e}MUD")]), "Arctic"),
             Some("Evil\\u{202E}MUD".to_string())
         );
+    }
+
+    #[test]
+    fn only_a_bare_address_contact_reads_as_email() {
+        assert_eq!(
+            email_contact(&observed(&[("CONTACT", " support@stickmud.com ")])),
+            Some("support@stickmud.com")
+        );
+        // URLs keep their link chip; scheme-shaped and malformed values
+        // never become a `mailto:` target.
+        for contact in [
+            "https://stickmud.com/contact",
+            "mailto:support@stickmud.com",
+            "support@stickmud",
+            "@stickmud.com",
+            "support@",
+            "sup port@stickmud.com",
+            "a@b@stickmud.com",
+            "the wizard on channel gossip",
+        ] {
+            assert_eq!(
+                email_contact(&observed(&[("CONTACT", contact)])),
+                None,
+                "{contact}"
+            );
+        }
     }
 }

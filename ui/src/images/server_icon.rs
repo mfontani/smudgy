@@ -12,8 +12,9 @@
 //!   vetted addresses are pinned for the connection so a rebinding DNS answer
 //!   cannot redirect it ([`vet_addresses`]).
 //! - **Auto-fetch only when no new information flows**: the icon URL's host is
-//!   the game's own host or a parent domain of it (connecting already reveals
-//!   our IP there), or a host covered by the server's link-trust grants
+//!   the game's own host, a parent domain, or a subdomain of it (connecting
+//!   already reveals our IP to that operator; `www.` is the common case), or
+//!   a host covered by the server's link-trust grants
 //!   (`trusted_link_hosts` / `trust_all_links` — icons and links share one
 //!   trust store). Anything else holds at [`IconUrlPolicy::NeedsConsent`]
 //!   until the user grants the host through the link flow.
@@ -55,7 +56,8 @@ const MAX_REDIRECTS: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IconUrlPolicy {
     /// Fetch without asking: https, and the host is the game's own host, a
-    /// parent domain of it, or already covered by the link-trust grants.
+    /// parent domain of it, a subdomain of it, or already covered by the
+    /// link-trust grants.
     AutoFetch(Url),
     /// A well-formed https URL on an unrelated host: fetching would leak the
     /// user's IP somewhere connecting doesn't, so it waits for the same
@@ -91,17 +93,20 @@ pub fn icon_url_policy(raw: &str, game_host: &str, config: &ServerConfig) -> Ico
         Some(Host::Ipv6(address)) => address.to_string(),
         None => return IconUrlPolicy::Refused("ICON URL has no host".to_string()),
     };
-    if host_is_game_or_parent(&host, game_host) || config.allows_server_link(Some(&host)) {
+    if host_is_game_related(&host, game_host) || config.allows_server_link(Some(&host)) {
         IconUrlPolicy::AutoFetch(url)
     } else {
         IconUrlPolicy::NeedsConsent { host }
     }
 }
 
-/// Whether `icon_host` is the dialed game host or a parent domain of it —
-/// the "no new information flows" test. Parent-domain containment applies to
-/// domain names only; IP literals must match exactly.
-fn host_is_game_or_parent(icon_host: &str, game_host: &str) -> bool {
+/// Whether `icon_host` is the dialed game host, a parent domain of it, or a
+/// subdomain of it — the "no new information flows" test: all three name the
+/// operator the user already dialed (games routinely serve their icon from
+/// `www.` while the telnet port lives on the apex). Siblings share no such
+/// containment and stay out. Domain containment applies to domain names
+/// only; IP literals must match exactly.
+fn host_is_game_related(icon_host: &str, game_host: &str) -> bool {
     let Some(game) = canonical_host(game_host) else {
         return false;
     };
@@ -111,8 +116,9 @@ fn host_is_game_or_parent(icon_host: &str, game_host: &str) -> bool {
     if icon_host.parse::<IpAddr>().is_ok() || game.parse::<IpAddr>().is_ok() {
         return false;
     }
-    game.to_ascii_lowercase()
-        .ends_with(&format!(".{}", icon_host.to_ascii_lowercase()))
+    let game = game.to_ascii_lowercase();
+    let icon = icon_host.to_ascii_lowercase();
+    game.ends_with(&format!(".{icon}")) || icon.ends_with(&format!(".{game}"))
 }
 
 /// Canonical form of a configured host (IDNA-lowercased domain, canonical IP
@@ -532,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn the_games_own_host_and_parents_auto_fetch() {
+    fn the_games_own_host_parents_and_subdomains_auto_fetch() {
         let c = config(&[], false);
         // Exact host, case-insensitively.
         assert!(matches!(
@@ -544,14 +550,32 @@ mod tests {
             policy("https://example.com/i.png", "arctic.example.com", &c),
             IconUrlPolicy::AutoFetch(_)
         ));
-        // A sibling is NOT a parent.
+        // A subdomain of the dialed host: same operator, and where the icon
+        // usually lives when the telnet port is on the apex (`www.`).
+        assert!(matches!(
+            policy("https://www.stickmud.com/i.png", "stickmud.com", &c),
+            IconUrlPolicy::AutoFetch(_)
+        ));
+        assert!(matches!(
+            policy(
+                "https://static.Assets.stickmud.com/i.png",
+                "stickmud.com",
+                &c
+            ),
+            IconUrlPolicy::AutoFetch(_)
+        ));
+        // A sibling is neither a parent nor a subdomain.
         assert!(matches!(
             policy("https://cdn.example.com/i.png", "arctic.example.com", &c),
             IconUrlPolicy::NeedsConsent { .. }
         ));
-        // Suffix without a label boundary is not containment.
+        // Suffix without a label boundary is not containment, either way.
         assert!(matches!(
             policy("https://ple.com/i.png", "arctic.example.com", &c),
+            IconUrlPolicy::NeedsConsent { .. }
+        ));
+        assert!(matches!(
+            policy("https://evilstickmud.com/i.png", "stickmud.com", &c),
             IconUrlPolicy::NeedsConsent { .. }
         ));
     }

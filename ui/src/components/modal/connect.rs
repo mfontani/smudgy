@@ -1218,19 +1218,34 @@ fn view_placeholder(state: &State) -> Element<'_, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     let server_pane = view_server_list(state);
 
-    // Determine the content for the main pane based on the state
-    let main_pane_content = if let Some(action) = &state.server_action {
+    // Determine the content for the main pane based on the state. The details
+    // view manages its own overflow (a pinned header/footer around an inner
+    // profile-list scrollable, which an outer scrollable's unbounded height
+    // would collapse); every other pane is a fixed-height form or placeholder
+    // that must scroll rather than clip when the modal shrinks.
+    let (main_pane_content, scrolls_itself) = if let Some(action) = &state.server_action {
         // Show server form if a server action is active
-        view_server_form(state, action)
+        (view_server_form(state, action), false)
     } else if let Some(action) = &state.profile_action {
         // Show profile form if a profile action is active (Create, Edit, or ConfirmDelete)
-        view_profile_form(state, action)
+        (view_profile_form(state, action), false)
     } else if let Some(server_name) = &state.selected_server {
         // Show server details and profiles if a server is selected
-        view_server_details_and_profiles(state, server_name)
+        (view_server_details_and_profiles(state, server_name), true)
     } else {
         // Show placeholder if no server is selected and no form is active
-        view_placeholder(state)
+        (view_placeholder(state), false)
+    };
+    let main_pane_content: Element<'_, Message> = if scrolls_itself {
+        main_pane_content
+    } else {
+        // Right padding keeps form controls clear of the overlaid scrollbar
+        // that appears once the pane overflows.
+        iced::widget::scrollable(
+            container(main_pane_content).padding(iced::Padding::ZERO.right(14)),
+        )
+        .height(Length::Fill)
+        .into()
     };
 
     let main_pane = container(main_pane_content)
