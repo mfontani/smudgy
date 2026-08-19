@@ -245,6 +245,25 @@ server-error-action-missing = 發生非預期錯誤：目前沒有可執行的�
 server-edit-short = 編輯
 server-details-missing = 找不到伺服器詳細資料。
 
+# 連線畫面上觀察到的伺服器中繼資料（MSSP 側車檔）
+observed-players = 上次連線時有 { $players } 位玩家 · { $ago }
+observed-last-connected = 上次連線於 { $ago }
+observed-uptime = 已運行 { $days } 天
+observed-tls-available = 可用 TLS
+observed-contact = 聯絡方式：{ $contact }
+observed-link-discord = Discord
+observed-link-website = 網站
+observed-link-contact = 聯絡
+ago-just-now = 剛剛
+ago-minutes = { $minutes } 分鐘前
+ago-hours = { $hours } 小時前
+ago-days = { $days } 天前
+
+# In-session TLS upgrade offer (a plain connection advertised an encrypted port)
+tls-offer-body = 此伺服器在連接埠 { $port } 上提供加密連線。
+tls-offer-accept = 切換並重新連線
+tls-offer-decline = 此伺服器不需要
+
 profiles-title = 設定檔
 profiles-saved-help = 此伺服器已儲存的登入方式。
 profiles-load-error = 無法載入此伺服器的設定檔。

@@ -1439,7 +1439,7 @@ export function make() { return createEvent('dynamic'); }
     fn platform_event_modules_match_runtime_synthesis() {
         // The platform STATE producers ship typed modules too (a single root handle,
         // synthesized specially — presence is the drift axis, not an export list).
-        for producer in ["gmcp", "msdp"] {
+        for producer in ["gmcp", "msdp", "mssp"] {
             assert!(
                 smudgy_script::platform_state_producer(producer),
                 "{producer} is a platform state producer"
@@ -1449,7 +1449,7 @@ export function make() { return createEvent('dynamic'); }
                 "smudgy:state/{producer} missing from smudgy-core.d.ts"
             );
         }
-        for producer in ["sys", "map", "gmcp", "msdp", "input", "sessions"] {
+        for producer in ["sys", "map", "gmcp", "msdp", "mssp", "input", "sessions"] {
             let catalog = smudgy_script::platform_event_catalog(producer);
             assert!(!catalog.is_empty(), "platform catalog {producer} is empty");
             let header = format!("declare module \"smudgy:events/{producer}\"");

@@ -7,7 +7,7 @@ use iced::widget::{
     space::{horizontal as horizontal_space, vertical as vertical_space},
     text,
 };
-use iced::{Length, Pixels, Task};
+use iced::{Alignment, Length, Pixels, Task};
 use log::warn;
 use validator::Validate;
 
@@ -270,9 +270,24 @@ pub(super) fn view_server_list(state: &State) -> Element<'_, Message> {
             .fold(Column::new().spacing(2), |col, server| {
                 let is_selected = state.selected_server.as_ref() == Some(&server.name);
 
-                let mut server_button = button(text(&server.name))
-                    .width(Length::Fill)
-                    .padding([6, 10]);
+                // The game's advertised icon (the MSSP `ICON` pipeline's
+                // cached artifact) leads the row at text size; a server
+                // without one renders its name exactly as it always has.
+                let label: Element<Message> = if let Some(handle) = state.icons.get(&server.name) {
+                    Row::new()
+                        .push(
+                            iced::widget::image(handle.clone())
+                                .width(Pixels(16.0))
+                                .height(Pixels(16.0)),
+                        )
+                        .push(text(&server.name))
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                } else {
+                    text(&server.name).into()
+                };
+                let mut server_button = button(label).width(Length::Fill).padding([6, 10]);
                 server_button = if is_selected {
                     server_button.style(builtins::button::list_item_selected)
                 } else {

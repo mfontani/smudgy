@@ -17,7 +17,7 @@ use smudgy_core::session::styled_line::{
 };
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
-const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const COMPLETION_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// A module that registers the triggers. Each trigger handler echoes a single sentinel
 /// encoding its pass/fail so the test asserts on the buffer transcript.
@@ -226,15 +226,25 @@ async fn line_buffer_unified_read_styles_writethrough_and_booleans() {
         }
     };
 
-    // Drive the three incoming lines in sequence, each gated on the prior sentinel so the
+    // Drive the four incoming lines in sequence, each gated on the prior sentinel so the
     // triggers are registered and (for BUF) the STYLE line has been emitted into the ring.
-    let mut lines = Vec::new();
+    // The loop ends on a terminal sentinel (or the overall deadline), never on stream
+    // quiescence: a loaded runner can hold the runtime silent far longer than any fixed
+    // quiet period while the isolate is still compiling or dispatching.
+    let mut lines: Vec<String> = Vec::new();
     let mut sent_style = false;
     let mut sent_find = false;
     let mut sent_buf = false;
     let mut sent_check = false;
-    loop {
-        let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await else {
+    let terminal = |line: &String| {
+        line.as_str() == "CHECK_OK"
+            || line.starts_with("CHECK_FAIL")
+            || line.starts_with("FIND_FAIL")
+            || line.starts_with("BUF_FAIL")
+    };
+    let deadline = tokio::time::Instant::now() + COMPLETION_TIMEOUT;
+    while !lines.iter().any(terminal) {
+        let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await else {
             break;
         };
         if let SessionEvent::UpdateBuffer(updates) = event.event {

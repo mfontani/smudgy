@@ -38,6 +38,7 @@ mod session_store;
 pub mod terminal_buffer;
 mod update;
 mod widgets;
+mod win_chrome;
 mod win_rm;
 pub mod workspace;
 
@@ -209,10 +210,11 @@ enum Message {
     /// script reloads, widget wake-ups).
     SessionAction(SessionId, session_store::Message),
     NewSmudgyWindow(window::Id),
-    /// The raw HWND of a freshly opened main window, delivered so the Restart
-    /// Manager shutdown hook can be installed on it (Windows only; the hook is a
-    /// no-op elsewhere).
-    HookWindowForShutdown(u64),
+    /// The raw HWND of a freshly opened main window, delivered so the
+    /// Windows-only native hooks can be installed on it: the Restart Manager
+    /// shutdown watcher (`win_rm`) and the `WM_NCHITTEST` chrome
+    /// (`win_chrome`). Both are no-ops elsewhere.
+    HookNativeWindow(window::Id, u64),
     // Handled in `update()` (opens a window -> `NewSmudgyWindow`), mirroring
     // the other `Create*Window` variants; no sender currently emits it.
     #[allow(dead_code)]
@@ -2236,6 +2238,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 SessionEvent::MapAtlasCreated(atlas_id) => {
                     associate_created_atlas(smudgy, session_id, *atlas_id)
                 }
+                SessionEvent::ObservedServerChanged => {
+                    // A session rewrote its server's observed.json sidecar:
+                    // refresh any open Connect modal's copy so the metadata
+                    // band tracks the file without a reopen.
+                    if let Some(server) = smudgy
+                        .sessions
+                        .get(session_id)
+                        .map(|session| session.server_name.clone())
+                    {
+                        for window in smudgy.smudgy_windows.values_mut() {
+                            window.refresh_connect_observed(&server);
+                        }
+                    }
+                    Task::none()
+                }
                 _ => Task::none(),
             };
             // Pane lifecycle, def-state, and placement events touch both the
@@ -2563,16 +2580,17 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             };
             Task::batch([
                 spike_task,
-                // Install the Restart Manager shutdown hook on this window's
-                // HWND so the installer can close smudgy for an in-place
-                // upgrade.
+                // Install the Windows native hooks on this window's HWND:
+                // the Restart Manager shutdown watcher (installer upgrades
+                // over a running smudgy) and the WM_NCHITTEST chrome
+                // (native move/resize for the borderless frame).
                 window::raw_id::<Message>(id).map(move |raw| {
                     // QA forensics (debug builds only): announce the HWND so
                     // the scripted drag matrix and GetCapture logs can be
                     // correlated to iced window ids.
                     #[cfg(debug_assertions)]
                     log::info!("[pane-drag] window {id:?} hwnd={raw:#x}");
-                    Message::HookWindowForShutdown(raw)
+                    Message::HookNativeWindow(id, raw)
                 }),
                 // Seed the tracker: the window's `Opened` event may have
                 // fired before the daemon subscription was polled (true for
@@ -2606,8 +2624,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 }),
             ])
         }
-        Message::HookWindowForShutdown(raw_id) => {
+        Message::HookNativeWindow(id, raw_id) => {
             win_rm::hook_window(raw_id);
+            win_chrome::hook_window(id, raw_id);
             Task::none()
         }
         Message::AutomationsWindowMessage(id, msg) => {

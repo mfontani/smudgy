@@ -5,10 +5,76 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.4] - 2026-08-18
+
+### Added
+
+- **Styling from scripts got simpler and sharper.** `line.highlight()` and the `style`
+  chain now take any subset of options: what you set changes, and everything you leave
+  out is left alone — recolor a foreground without touching backgrounds or bold.
+  Text attributes accept any subset the same way, the chain gains one shorthand per
+  attribute (`style.bold.red`, `style.italic.underline`, ...), a chain works directly
+  as a highlight's options (`line.highlight("goblin", style.red.bgWhite)`), and a
+  `link(...)` tag does too — making every match clickable in place while keeping its
+  styling (`link: null` strips links from matches instead). Mistakes are loud: unknown
+  color names and misspelled attribute keys now throw where they are written instead
+  of silently styling nothing.
+- **Servers introduce themselves on the Connect screen.** Smudgy now reads MSSP — the
+  status block many MUD servers volunteer on connect — and remembers it per server:
+  the game's own name when it differs from yours, the player count from your last
+  visit shown with its age (a point-in-time number is honest only with one), how long
+  the server has been up, a TLS-available badge, its status when not live, and
+  Discord / website / contact links, which go through the same confirmation as links
+  a server prints in-session. Every server also shows when you last connected,
+  whether or not it speaks MSSP. All of it is optional display data — a server that
+  sends nothing looks exactly as before — and none of it ever changes how smudgy
+  connects. Scripts get a read-only live view: `smudgy:state/mssp` holds the
+  variables as sent (strings, arrays where the server sent several values) and
+  `smudgy:events/mssp` fires `updated` as data arrives.
+- **A guarded offer to encrypt.** When a plain connection advertises a TLS port, an
+  in-session banner offers to switch: accepting flips the server to TLS on that port
+  and reconnects; "Not for this server" is remembered and the offer never returns.
+  The banner appears at most once per connection, and only when the offer holds up —
+  a real port different from the one in use, a server dialed by hostname (a
+  certificate cannot validate against an IP address), and no conflicting `HOSTNAME`
+  claim from the server itself.
+- **Game icons, fetched carefully.** A server advertising an icon URL gets it shown
+  beside its name on the Connect screen. The fetch is https-only and automatic only
+  when the icon lives on the game's own host (or a parent domain of it) or on a host
+  you have already trusted for links — any other host waits for that same per-host
+  approval. Downloads are size-capped, refused for private and internal addresses,
+  and the image is strictly decoded and re-encoded before being cached beside the
+  server's files, refetched only when the advertised value changes.
+- **The welcome screen has a cat.** The no-session screen's lightning-bolt icon is
+  now a small pixel-art cat, drawn in the style of a CRT. It blinks; occasionally it
+  licks. It animates only while that screen is visible and costs nothing once a
+  session is open.
+
+### Fixed
+
+- **Windows: moving and resizing the window can no longer wedge.** On PCs with a
+  touchscreen, pen, or drawing tablet, a single touch or pen press on the titlebar
+  or a window edge could leave the window impossible to move or resize (maximize
+  still worked) until relaunch. Moves and resizes are now handled by Windows
+  itself — which also makes them work by touch and pen, and brings the native
+  comforts along: Aero Snap, double-click to maximize, dragging a maximized window
+  to restore it, and the titlebar's right-click system menu.
+- Double-clicking the titlebar to maximize no longer also begins a window drag from
+  the same click.
 
 ### Changed
 
+- A highlight no longer repaints what its options leave unset. Previously
+  `line.highlight("orc", { fg: "red" })` also reset the match's background and text
+  attributes to defaults; now they are preserved. To repaint a range wholesale, pass
+  explicit values for every channel — a read-back `line.styles` span works verbatim.
+- `line.insert()` follows the same rule: text inserted without options (or with
+  partial options) now blends into the style at the insertion point, where it
+  previously always rendered in the terminal defaults.
+- In the `{ color }` foreground/background form, omitting `bold` now means what the
+  bare name means — the bright variant for ANSI names — where it previously selected
+  the dim slot. Scripts that spell `bold` out (anything type-checked against the old
+  contract, which required it) are unaffected.
 - The embedded JavaScript/TypeScript runtime now follows Deno 2.9.5 (V8 150.4), including its
   updated npm/CommonJS compatibility and matching editor declarations.
 - Package manifests gain an `ipc` permission axis for local IPC endpoints. Each row declares a

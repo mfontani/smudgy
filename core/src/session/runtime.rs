@@ -41,6 +41,7 @@ pub mod input;
 pub mod line_operation;
 mod message_bus;
 mod msdp;
+mod mssp;
 pub mod pane;
 mod remote_interop;
 mod script_action;
@@ -250,6 +251,7 @@ mod runtime_helper_tests {
             isolate: IsolateId::Main,
             instance: 1,
             id: 2,
+            token: Arc::new(crate::session::styled_line::LinkToken::default()),
             state: Arc::clone(&state),
         })
         .expect("open runtime queue");
@@ -622,6 +624,7 @@ impl Runtime {
                 catalogue: catalogue.clone(),
                 gmcp: gmcp::GmcpProducer::new(gmcp_enabled.clone()),
                 msdp: msdp::MsdpProducer::new(),
+                mssp: mssp::MsspProducer::new(),
                 // The spawn-time "Loading session..." append left the main
                 // buffer's tail line open — unless an engine-construction
                 // session notice (emitted directly on ui_tx, each ending in
@@ -695,6 +698,9 @@ impl Runtime {
                 old_gmcp.reset_engine_refs();
                 // The MSDP producer holds no engine facts at all; it survives whole.
                 let old_msdp = std::mem::replace(&mut inner.msdp, msdp::MsdpProducer::new());
+                // The MSSP producer likewise.
+                let old_mssp_producer =
+                    std::mem::replace(&mut inner.mssp, mssp::MsspProducer::new());
                 let mut old_session_runtime_rx =
                     std::mem::replace(&mut inner.session_runtime_rx, {
                         // Create a dummy receiver that will be immediately replaced
@@ -919,6 +925,7 @@ impl Runtime {
                     catalogue: catalogue.clone(), // Samples are session history
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
                     msdp: old_msdp, // Same: server facts, no engine facts
+                    mssp: old_mssp_producer, // Same
                     main_open_line: old_main_open_line
                         && emitted_line_count.get() == count_before_rebuild,
                     replacing_main_open_line: false,
@@ -1133,6 +1140,9 @@ struct Inner<'a> {
     /// `Msdp*` dispatch arms. Session-scoped like the store subtree it writes; it holds
     /// no engine facts, so reloads carry it across whole.
     msdp: msdp::MsdpProducer,
+    /// The host-side MSSP producer, driven by the `MsspVariables` dispatch arm (and reset
+    /// by `Connect`). Session-scoped like the snapshot it writes; no engine facts.
+    mssp: mssp::MsspProducer,
     /// Whether the main buffer's tail line is open (an uncommitted partial). Replaces the
     /// old `pending_buffer_updates.last()` peek — which `AppendTo` entries would confuse —
     /// and, unlike the peek, survives a flush. Drives the echo commit-first rule and

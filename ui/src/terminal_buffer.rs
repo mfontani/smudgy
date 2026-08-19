@@ -3181,7 +3181,7 @@ mod tests {
                 str: Arc::new("prefix ".to_string()),
                 begin: 0,
                 end: 0,
-                style: Style::DEFAULT,
+                style: Style::DEFAULT.into(),
             },
         );
 
@@ -3286,7 +3286,7 @@ mod tests {
                 str: Arc::new("fifteen bytes--".to_string()),
                 begin: 0,
                 end: 0,
-                style: Style::DEFAULT,
+                style: Style::DEFAULT.into(),
             },
         );
 
@@ -3525,7 +3525,7 @@ mod tests {
                 str: Arc::new("edited ".to_string()),
                 begin: 0,
                 end: 0,
-                style: Style::DEFAULT,
+                style: Style::DEFAULT.into(),
             },
         );
         assert!(buffer.link_keys().next().is_none());

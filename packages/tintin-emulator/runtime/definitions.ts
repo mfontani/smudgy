@@ -480,10 +480,23 @@ export function removeGag(pattern: string): number {
 
 // ---- #highlight ------------------------------------------------------------
 
+/** TinTin's #highlight repaints matched text wholesale, so every channel the
+ *  color spec leaves out is pinned to an explicit default — smudgy's highlight
+ *  leaves unset channels untouched, which is not TinTin's contract. */
+const HIGHLIGHT_RESET_ATTRIBUTES = {
+  bold: false, faint: false, italic: false, underline: "none", blink: "none",
+  crossedOut: false, reverse: false,
+} as const;
+
 export function defineHighlight(pattern: string, color: string, quiet = false, cls?: string | null): boolean {
   const compiled = compileDefinitionPattern("highlight", pattern);
   if (!compiled) return false;
-  const options = highlightStyleOptions(color, makeWarnSink());
+  const parsed = highlightStyleOptions(color, makeWarnSink());
+  const options = {
+    fg: parsed.fg ?? "default",
+    bg: parsed.bg ?? "default",
+    attributes: HIGHLIGHT_RESET_ATTRIBUTES,
+  };
   const patterns = compiled.raw ? { rawPatterns: [compiled.source] } : compiled.source;
 
   highlightHandles.get(pattern)?.delete();

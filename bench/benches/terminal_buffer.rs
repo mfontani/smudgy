@@ -45,8 +45,8 @@ use criterion::{
 use smudgy_bench::log_corpora;
 use smudgy_core::session::{
     connection::vt_processor::AnsiColor,
-    runtime::line_operation::LineOperation,
-    styled_line::{Color, Style, StyledLine, VtSpan},
+    runtime::line_operation::{LineOperation, LinkUpdate},
+    styled_line::{Color, Style, StyledLine, VtSpan, floor_char_boundary},
 };
 use smudgy_ui::terminal_buffer::{BufferLine, TerminalBuffer};
 
@@ -141,16 +141,6 @@ fn tile_spans(text: &str, n: usize) -> Vec<VtSpan> {
         begin += frag.len();
     }
     spans
-}
-
-/// Clamps `pos` to `text`'s length and snaps it down to a char boundary, so
-/// the byte offsets handed to `LineOperation`s can never slice mid-codepoint.
-fn floor_char_boundary(text: &str, mut pos: usize) -> usize {
-    pos = pos.min(text.len());
-    while pos > 0 && !text.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
 }
 
 /// Every corpus line as `parts` fragment `StyledLine`s, each carrying a single
@@ -419,7 +409,8 @@ fn terminal_buffer(c: &mut Criterion) {
             LineOperation::Highlight {
                 begin: 0,
                 end: floor_char_boundary(text, 20),
-                style: HIGHLIGHT_STYLE,
+                style: HIGHLIGHT_STYLE.into(),
+                link: LinkUpdate::Keep,
             },
         ));
     }

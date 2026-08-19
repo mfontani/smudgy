@@ -20,7 +20,7 @@ use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 use std::sync::Mutex;
 
-const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const COMPLETION_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// A single-tier local-flavored backend serving areas from memory. Envelope
 /// execution succeeds for a budgeted number of calls, then fails permanently
@@ -186,8 +186,22 @@ fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
     }
 }
 
-async fn run_module(server: &str, session: u32, module: &str, command: &str) -> Vec<String> {
-    run_module_on(BudgetedBackend::new(1), server, session, module, command).await
+async fn run_module(
+    server: &str,
+    session: u32,
+    module: &str,
+    command: &str,
+    sentinel_prefix: &str,
+) -> Vec<String> {
+    run_module_on(
+        BudgetedBackend::new(1),
+        server,
+        session,
+        module,
+        command,
+        sentinel_prefix,
+    )
+    .await
 }
 
 async fn run_module_on(
@@ -196,6 +210,7 @@ async fn run_module_on(
     session: u32,
     module: &str,
     command: &str,
+    sentinel_prefix: &str,
 ) -> Vec<String> {
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -240,7 +255,14 @@ async fn run_module_on(
 
     tx.send(RuntimeAction::Send(Arc::new(command.to_string())))
         .unwrap();
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+    // The alias reports exactly one terminal sentinel; wait for it, never for stream
+    // quiescence — envelope splits round-trip through the backend and can hold the
+    // stream silent longer than any fixed quiet period on a loaded runner.
+    let deadline = tokio::time::Instant::now() + COMPLETION_TIMEOUT;
+    while !lines.iter().any(|line| line.starts_with(sentinel_prefix)) {
+        let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await else {
+            break;
+        };
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             collect(&updates, &mut lines);
         }
@@ -277,7 +299,7 @@ createAlias("^gobatch$", async () => {
     }
 });
 "#;
-    let lines = run_module("MutatePrefixTest", 9401, MODULE, "gobatch").await;
+    let lines = run_module("MutatePrefixTest", 9401, MODULE, "gobatch", "BATCH_").await;
     let transcript = lines.join("\n");
     assert!(
         lines.iter().any(|line| line == "BATCH_ERR committed=1"),
@@ -316,7 +338,7 @@ createAlias("^gostage$", async () => {
     }
 });
 "#;
-    let lines = run_module("MutateStageTest", 9402, MODULE, "gostage").await;
+    let lines = run_module("MutateStageTest", 9402, MODULE, "gostage", "STAGE_").await;
     let transcript = lines.join("\n");
     assert!(
         lines
@@ -361,6 +383,7 @@ createAlias("^gocollide$", async () => {
         9403,
         MODULE,
         "gocollide",
+        "COLLIDE_",
     )
     .await;
     let transcript = lines.join("\n");

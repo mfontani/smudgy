@@ -2,18 +2,31 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::session::styled_line::LinkAction;
-use crate::session::styled_line::{Color, LinkSpan, Style, StyledLine, StyledLink, TextAttributes};
+use crate::session::styled_line::{
+    Color, LinkSpan, Style, StyleUpdate, StyledLine, StyledLink, TextAttributesUpdate,
+};
 
 /// One run of a styled splice: its text, the style channels it SET (an unset channel
-/// inherits the style at the splice point when the operation applies — which is
-/// only knowable then, at the line, not at the op boundary), and an optional link.
+/// — including each individual text attribute — inherits the style at the splice
+/// point when the operation applies, which is only knowable then, at the line, not
+/// at the op boundary), and an optional link.
 #[derive(Debug, Clone)]
 pub struct SpliceRun {
     pub text: String,
     pub fg: Option<Color>,
     pub bg: Option<Color>,
-    pub attributes: Option<TextAttributes>,
+    pub attributes: TextAttributesUpdate,
     pub link: Option<StyledLink>,
+}
+
+/// The link half of a highlight: leave the range's links alone, strip them, or
+/// cover the range with one link (stripping what it overlaps first — a link
+/// spanning the range keeps its outside pieces, like a splice).
+#[derive(Debug, Clone)]
+pub enum LinkUpdate {
+    Keep,
+    Clear,
+    Set(StyledLink),
 }
 
 /// A pure text/style **transform** applied to one line. Suppression and
@@ -22,21 +35,27 @@ pub struct SpliceRun {
 /// sink a line is delivered to, even when the line is gagged from main.
 #[derive(Debug, Clone)]
 pub enum LineOperation {
+    /// Insert `str` over `[begin, end)`. The style channels the write left
+    /// unset inherit the style at the insertion point, like a splice.
     Insert {
         str: Arc<String>,
         begin: usize,
         end: usize,
-        style: Style,
+        style: StyleUpdate,
     },
     Replace {
         str: Arc<String>,
         begin: usize,
         end: usize,
     },
+    /// Restyle `[begin, end)`: the update's set channels apply over each span
+    /// in the range; everything left unset keeps what the span already had.
+    /// `link` optionally replaces the range's link coverage the same way.
     Highlight {
         begin: usize,
         end: usize,
-        style: Style,
+        style: StyleUpdate,
+        link: LinkUpdate,
     },
     Remove {
         begin: usize,
@@ -67,14 +86,7 @@ fn splice_style_at(line: &StyledLine, position: usize) -> Style {
                 .rev()
                 .find(|span| span.begin_pos <= position)
         })
-        .map_or(
-            Style {
-                fg: Color::DefaultForeground { bold: false },
-                bg: Color::DefaultBackground,
-                ..Style::DEFAULT
-            },
-            |span| span.style,
-        )
+        .map_or(Style::DEFAULT, |span| span.style)
 }
 
 impl LineOperation {
@@ -86,12 +98,30 @@ impl LineOperation {
                 begin,
                 end,
                 style,
-            } => Arc::new(line.insert(str.as_str(), *begin, *end, *style)),
+            } => Arc::new(line.insert(
+                str.as_str(),
+                *begin,
+                *end,
+                style.apply_to(splice_style_at(line, *begin)),
+            )),
             LineOperation::Replace { str, begin, end } => {
                 Arc::new(line.insert(str.as_str(), *begin, *end, splice_style_at(line, *begin)))
             }
-            LineOperation::Highlight { begin, end, style } => {
-                Arc::new(line.highlight(*begin, *end, *style))
+            LineOperation::Highlight {
+                begin,
+                end,
+                style,
+                link,
+            } => {
+                // An unset style makes highlight() a plain clone, so a pure
+                // linkify costs one rebuild, not two.
+                let mut restyled = line.highlight(*begin, *end, *style);
+                match link {
+                    LinkUpdate::Keep => {}
+                    LinkUpdate::Clear => restyled.relink(*begin, *end, None),
+                    LinkUpdate::Set(link) => restyled.relink(*begin, *end, Some(link.clone())),
+                }
+                Arc::new(restyled)
             }
             LineOperation::Remove { begin, end } => Arc::new(line.remove(*begin, *end)),
             LineOperation::Splice { runs, begin, end } => {
@@ -118,10 +148,10 @@ impl LineOperation {
                     let style = Style {
                         fg: run.fg.unwrap_or(base_style.fg),
                         bg: run.bg.unwrap_or(base_style.bg),
-                        attributes: run.attributes.unwrap_or(base_style.attributes),
+                        attributes: run.attributes.apply_to(base_style.attributes),
                     };
                     if style != base_style {
-                        result = result.highlight(cursor, run_end, style);
+                        result = result.highlight(cursor, run_end, style.into());
                     }
                     if let Some(link) = &run.link
                         && run_end > cursor
@@ -163,7 +193,7 @@ impl LineOperation {
 mod tests {
     use super::*;
     use crate::session::connection::vt_processor::AnsiColor;
-    use crate::session::styled_line::VtSpan;
+    use crate::session::styled_line::{TextAttributes, VtSpan};
 
     fn bright(color: AnsiColor) -> Color {
         Color::Ansi { color, bold: true }
@@ -229,14 +259,14 @@ mod tests {
                     text: "N".to_string(),
                     fg: None,
                     bg: None,
-                    attributes: None,
+                    attributes: TextAttributesUpdate::UNSET,
                     link: Some(styled_link(link.clone())),
                 },
                 SpliceRun {
                     text: "ORTH".to_string(),
                     fg: Some(bright(AnsiColor::Red)),
                     bg: None,
-                    attributes: None,
+                    attributes: TextAttributesUpdate::UNSET,
                     link: Some(styled_link(link.clone())),
                 },
             ]),
@@ -296,14 +326,14 @@ mod tests {
                     text: "I".to_string(),
                     fg: None,
                     bg: None,
-                    attributes: None,
+                    attributes: TextAttributesUpdate::UNSET,
                     link: None,
                 },
                 SpliceRun {
                     text: "R".to_string(),
                     fg: None,
                     bg: None,
-                    attributes: Some(TextAttributes::DEFAULT),
+                    attributes: TextAttributes::DEFAULT.into(),
                     link: None,
                 },
             ]),
@@ -313,6 +343,55 @@ mod tests {
         let result = op.apply(&line);
         assert_eq!(style_at(&result, 0).attributes, inherited);
         assert_eq!(style_at(&result, 1).attributes, TextAttributes::DEFAULT);
+        assert_tiles(&result);
+    }
+
+    #[test]
+    fn splice_partial_attributes_merge_over_the_splice_point() {
+        use crate::session::styled_line::Underline;
+
+        let inherited = TextAttributes {
+            bold: true,
+            italic: true,
+            ..TextAttributes::DEFAULT
+        };
+        let line = Arc::new(StyledLine::new(
+            "xy",
+            vec![VtSpan {
+                style: Style {
+                    attributes: inherited,
+                    ..base_style()
+                },
+                begin_pos: 0,
+                end_pos: 2,
+            }],
+        ));
+        // The run sets two attribute fields; the splice point's bold survives.
+        let op = LineOperation::Splice {
+            runs: Arc::new(vec![SpliceRun {
+                text: "Z".to_string(),
+                fg: None,
+                bg: None,
+                attributes: TextAttributesUpdate {
+                    italic: Some(false),
+                    underline: Some(Underline::Single),
+                    ..TextAttributesUpdate::UNSET
+                },
+                link: None,
+            }]),
+            begin: 0,
+            end: 2,
+        };
+        let result = op.apply(&line);
+        assert_eq!(
+            style_at(&result, 0).attributes,
+            TextAttributes {
+                bold: true,
+                italic: false,
+                underline: Underline::Single,
+                ..TextAttributes::DEFAULT
+            }
+        );
         assert_tiles(&result);
     }
 
@@ -351,7 +430,7 @@ mod tests {
                 text: "X".to_string(),
                 fg: None,
                 bg: None,
-                attributes: None,
+                attributes: TextAttributesUpdate::UNSET,
                 link: None,
             }]),
             begin: 5,
@@ -444,7 +523,7 @@ mod tests {
                 text: "!".to_string(),
                 fg: None,
                 bg: None,
-                attributes: None,
+                attributes: TextAttributesUpdate::UNSET,
                 link: Some(styled_link(action.clone())),
             }]),
             begin: 8,
@@ -499,7 +578,7 @@ mod tests {
                 text: "south".to_string(),
                 fg: None,
                 bg: None,
-                attributes: None,
+                attributes: TextAttributesUpdate::UNSET,
                 link: None,
             }]),
             begin: 3,
@@ -513,5 +592,102 @@ mod tests {
             "stale link survived: {:?}",
             result.links
         );
+    }
+
+    /// A one-span line with one link span over `[begin, end)`.
+    fn linked_line(text: &str, begin: usize, end: usize, action: LinkAction) -> Arc<StyledLine> {
+        let mut inner = StyledLine::new(
+            text,
+            vec![VtSpan {
+                style: base_style(),
+                begin_pos: 0,
+                end_pos: text.len(),
+            }],
+        );
+        inner.links.push(LinkSpan {
+            begin_pos: begin,
+            end_pos: end,
+            action,
+            tooltip: None,
+            style: None,
+        });
+        Arc::new(inner)
+    }
+
+    #[test]
+    fn highlight_set_link_replaces_overlapped_links_and_keeps_styling() {
+        let old = LinkAction::Send(std::sync::Arc::from("north"));
+        let new = LinkAction::Send(std::sync::Arc::from("south"));
+        let line = linked_line("go north now", 3, 8, old);
+        // A pure linkify: no style channels set, so spans are untouched.
+        let op = LineOperation::Highlight {
+            begin: 3,
+            end: 8,
+            style: StyleUpdate::UNSET,
+            link: LinkUpdate::Set(styled_link(new.clone())),
+        };
+        let result = op.apply(&line);
+        assert_eq!(result.text, "go north now");
+        assert_eq!(result.spans, line.spans, "a linkify must not restyle");
+        assert_eq!(
+            result.links,
+            vec![LinkSpan {
+                begin_pos: 3,
+                end_pos: 8,
+                action: new,
+                tooltip: None,
+                style: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn highlight_clear_link_trims_a_spanning_link_to_its_outside_pieces() {
+        let action = LinkAction::Send(std::sync::Arc::from("go"));
+        let line = linked_line("go north now", 0, 12, action.clone());
+        let op = LineOperation::Highlight {
+            begin: 3,
+            end: 8,
+            style: StyleUpdate::UNSET,
+            link: LinkUpdate::Clear,
+        };
+        let result = op.apply(&line);
+        assert_eq!(
+            result.links,
+            vec![
+                LinkSpan {
+                    begin_pos: 0,
+                    end_pos: 3,
+                    action: action.clone(),
+                    tooltip: None,
+                    style: None,
+                },
+                LinkSpan {
+                    begin_pos: 8,
+                    end_pos: 12,
+                    action,
+                    tooltip: None,
+                    style: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_keep_leaves_links_alone() {
+        let action = LinkAction::Send(std::sync::Arc::from("north"));
+        let line = linked_line("go north now", 3, 8, action);
+        let op = LineOperation::Highlight {
+            begin: 0,
+            end: 12,
+            style: StyleUpdate {
+                fg: Some(bright(AnsiColor::Red)),
+                ..StyleUpdate::UNSET
+            },
+            link: LinkUpdate::Keep,
+        };
+        let result = op.apply(&line);
+        assert_eq!(result.links, line.links);
+        assert_eq!(style_at(&result, 5).fg, bright(AnsiColor::Red));
     }
 }

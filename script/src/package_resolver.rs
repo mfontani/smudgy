@@ -2176,8 +2176,8 @@ pub(crate) struct KindSchemeRef {
 /// shares user handles by ordinary import). Reservation is unconditional, so a package owner
 /// who happens to take one of these nicknames stays unaddressable through the schemes rather
 /// than shadowing the platform.
-const PLATFORM_PRODUCERS: [&str; 8] = [
-    "sys", "map", "gmcp", "msdp", "user", "input", "pane", "sessions",
+const PLATFORM_PRODUCERS: [&str; 9] = [
+    "sys", "map", "gmcp", "msdp", "mssp", "user", "input", "pane", "sessions",
 ];
 
 /// The host event catalog of a platform producer: `(export name, event name)`, where the
@@ -2188,8 +2188,8 @@ const PLATFORM_PRODUCERS: [&str; 8] = [
 /// `sys:receive`, resolved on the export side this time — the kind names what happened,
 /// the export keeps the catalog's bare-verb style).
 /// Mirrored by the `declare module "smudgy:events/sys"` / `"smudgy:events/map"` /
-/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` / `"smudgy:events/input"` /
-/// `"smudgy:events/sessions"` blocks in
+/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` / `"smudgy:events/mssp"` /
+/// `"smudgy:events/input"` / `"smudgy:events/sessions"` blocks in
 /// `smudgy-core.d.ts` (drift-checked by a test in core's `script_typings.rs`).
 #[must_use]
 pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'static str)] {
@@ -2203,6 +2203,9 @@ pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'stat
         ],
         "map" => &[("room", "room")],
         "gmcp" | "msdp" => &[("ready", "ready"), ("closed", "closed")],
+        // MSSP has no negotiation lifecycle scripts can see — the one event is the
+        // snapshot merge (`smudgy:state/mssp` holds the merged variables).
+        "mssp" => &[("updated", "updated")],
         // The observe-only command-input notifications (`docs/input.md`
         // §3.5): subscribing requires the `input` capability, enforced at `on()`.
         "input" => &[("change", "change"), ("focus", "focus")],
@@ -2226,7 +2229,7 @@ pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'stat
 /// default), so `.value` / `.watch` / `.onWrite` / `.bind` cover the whole tree.
 #[must_use]
 pub fn platform_state_producer(producer: &str) -> bool {
-    matches!(producer, "gmcp" | "msdp")
+    matches!(producer, "gmcp" | "msdp" | "mssp")
 }
 
 fn kind_scheme(kind: InteropKind) -> &'static str {

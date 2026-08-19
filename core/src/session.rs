@@ -184,6 +184,26 @@ pub enum SessionEvent {
         suggestions: Arc<Vec<Arc<String>>>,
         blacklist: Arc<std::collections::HashSet<String>>,
     },
+    /// The server's `observed.json` sidecar was rewritten (a successful
+    /// connect stamped `last_connected_at`, or a fresh MSSP payload merged).
+    /// A pure refresh nudge for whatever displays observed server state (the
+    /// Connect screen's metadata band): no payload — the consumer re-reads
+    /// the file, so this message is the only signal and no file watching is
+    /// ever needed.
+    ObservedServerChanged,
+    /// A plain connection's server advertised a usable TLS port and the whole
+    /// upgrade-offer guard set passed (unencrypted transport; a sane port
+    /// distinct from the one dialed; a non-IP-literal dialed host; any
+    /// advertised `HOSTNAME` naming that host; no persisted refusal; first
+    /// offer this connection). The UI shows the in-session offer banner:
+    /// accepting persists `tls` + the port to `server.json` and reconnects,
+    /// declining persists the per-server refusal in `observed.json`.
+    /// Advisory like all MSSP — nothing changes without the user's explicit
+    /// choice, and the offer dies with the connection (a plain dismissal
+    /// persists nothing, so the next connect may re-offer).
+    OfferTlsUpgrade {
+        port: u16,
+    },
     /// The server's telnet ECHO state (RFC 857): `enabled` means the server
     /// has taken over echoing — the classic password-prompt signal — and the
     /// UI should mask the main input (subject to the user's auto-mask

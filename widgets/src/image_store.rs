@@ -731,6 +731,20 @@ pub(crate) mod tests {
         panic!("entry never left Loading");
     }
 
+    /// Wait until the completion generation passes `after`. `wait_ready` observes the
+    /// lock-free state swap, which lands *before* byte accounting inside `complete()`'s
+    /// writer scope; the generation bump is a `Release` increment after both, so once it
+    /// is visible the accounting is too.
+    fn wait_generation(store: &ImageStore, after: u64) {
+        for _ in 0..500 {
+            if store.completion_generation() > after {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("completion generation never advanced past {after}");
+    }
+
     #[test]
     fn ensure_dedups_and_completes() {
         let fetcher = MockFetcher::ok(2, 2);
@@ -753,8 +767,8 @@ pub(crate) mod tests {
             other => panic!("expected Ready, got {other:?}"),
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "in-flight dedup");
+        wait_generation(&store, 0);
         assert_eq!(store.ready_bytes(), 16);
-        assert!(store.completion_generation() > 0);
     }
 
     #[test]
@@ -845,6 +859,14 @@ pub(crate) mod tests {
         drop(dead);
         let cell = store.ensure(&src("w.png"), &server);
         wait_ready(&cell);
-        assert!(rx.has_changed().unwrap(), "completion pokes live wakers");
+        // `poke_all` runs after the writer scope that publishes the state, so the poke
+        // gets the same bounded grace as the state itself.
+        for _ in 0..500 {
+            if rx.has_changed().unwrap() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("completion never poked the live waker");
     }
 }

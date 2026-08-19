@@ -7,9 +7,10 @@
 //  with no build step. Two HARD constraints:
 //    1. Source must be 7-bit ASCII (deno_core's extension load asserts this). Use
 //       \uXXXX escapes for any non-ASCII *runtime* string; keep comments ASCII.
-//    2. The only importable module is "ext:core/ops" (deno's global op module). Any
-//       `import type` is erased at transpile, so it is safe, but we keep this file
-//       self-contained (no cross-file imports) to stay robust.
+//    2. No module imports. Ops are captured from `Deno.core.ops` (see the note at the
+//       capture site below; "ext:core/ops" is frozen into the startup snapshot and
+//       excludes this extension's ops). Any `import type` is erased at transpile, so
+//       it is safe, but we keep this file self-contained (no cross-file imports).
 //
 //  The AUTHOR-FACING contract (what `import ... from "smudgy:core"` resolves to in an
 //  editor) is the hand-authored ambient `script_typings/smudgy-core.d.ts`. This impl is
@@ -23,8 +24,14 @@
 //    - inline alias/trigger bodies: run inside `with (globalThis.__smudgy_user_api) {...}`.
 // =============================================================================
 
-// @ts-ignore - ext:core/ops is a deno virtual module with no type decls
-import * as __smudgy_ops from "ext:core/ops";
+// Ops are captured from `Deno.core.ops` at module-eval time -- NOT imported
+// from "ext:core/ops": that synthetic module's exports are frozen into the V8
+// startup snapshot (which bakes only the deno_runtime base set), so the ops of
+// this extension -- initialized per isolate OUTSIDE the snapshot -- never
+// appear there. `Deno.core.ops` is (re)bound with the full op table at every
+// runtime init, snapshot or not, and extension ESM evaluates after that
+// binding but before bootstrap scrubs `core` off the public `Deno` surface.
+const __smudgy_ops = (globalThis as any).Deno.core.ops;
 
 // Ops are an untyped FFI boundary; treat the table as `any`. Type-checking value lives in
 // the public surface below (Session/Line/the api object), not in the op calls.
@@ -103,6 +110,8 @@ const {
     op_smudgy_splice,
     op_smudgy_line_splice,
     op_smudgy_line_highlight,
+    op_smudgy_highlight_link,
+    op_smudgy_line_highlight_link,
     op_smudgy_line_remove,
     op_smudgy_capture,
     op_smudgy_fallthrough,
@@ -218,11 +227,13 @@ interface Settings {
     palette?: Palette;
 }
 
-/** A foreground/background color in the shape the write color API accepts. */
+/** A foreground/background color in the shape the write color API accepts.
+ *  In the `{ color, bold? }` form an omitted `bold` means what the bare name
+ *  means: the bright variant for an ANSI name, the normal slot for "default". */
 type Color =
     | string
     | { r: number; g: number; b: number }
-    | { color: string; bold: boolean; paletteBright?: boolean };
+    | { color: string; bold?: boolean; paletteBright?: boolean };
 
 interface TextAttributes {
     bold: boolean;
@@ -237,7 +248,9 @@ interface TextAttributes {
 interface ColorOptions {
     fg?: Color;
     bg?: Color;
-    attributes?: TextAttributes;
+    /** Any subset of the attributes; an unset one is left untouched (highlight)
+     *  or inherits the surrounding style (insert / styled fragments). */
+    attributes?: Partial<TextAttributes>;
     /** Lossless raw palette bit for a read-back `fg: "default"` span. */
     foregroundPaletteBright?: boolean;
 }
@@ -295,7 +308,7 @@ interface StyledRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
-    attributes: TextAttributes | null;
+    attributes: Partial<TextAttributes> | null;
     link: LinkSpec | null;
 }
 
@@ -369,9 +382,11 @@ function __styled_check_color(value: Color): Color {
             if (v.paletteBright !== undefined && typeof v.paletteBright !== "boolean") {
                 throw new TypeError("paletteBright must be a boolean");
             }
+            // Omitted `bold` means what the bare name means: the bright variant
+            // for an ANSI name, the normal slot for "default".
             return {
                 color: v.color,
-                bold: Boolean(v.bold),
+                bold: v.bold == null ? v.color !== "default" : Boolean(v.bold),
                 ...(v.paletteBright === undefined ? {} : { paletteBright: v.paletteBright }),
             };
         }
@@ -381,31 +396,66 @@ function __styled_check_color(value: Color): Color {
     );
 }
 
-function __styled_check_attributes(value: TextAttributes): TextAttributes {
+const __STYLED_ATTRIBUTE_NAMES = [
+    "bold",
+    "faint",
+    "italic",
+    "underline",
+    "blink",
+    "crossedOut",
+    "reverse",
+];
+
+/** Validate + canonicalize a partial attributes object: any subset of the seven
+ *  attributes may be set; the result carries ONLY the fields that were set (so
+ *  the wire encoders and spread merges see exactly the author's subset). An
+ *  unknown key throws: with any subset valid, a typo ("blod", "crossedout")
+ *  would otherwise silently style nothing. */
+function __styled_check_attributes(value: Partial<TextAttributes>): Partial<TextAttributes> {
     if (typeof value !== "object" || value === null) {
         throw new TypeError("attributes must be an object");
     }
     const v = value as any;
+    for (const name of Object.keys(v)) {
+        if (__STYLED_ATTRIBUTE_NAMES.indexOf(name) === -1) {
+            throw new TypeError(
+                `unknown attribute "${name}" (expected bold, faint, italic, underline, blink, crossedOut, or reverse)`,
+            );
+        }
+    }
+    const out: any = {};
     for (const name of ["bold", "faint", "italic", "crossedOut", "reverse"]) {
+        if (v[name] == null) continue;
         if (typeof v[name] !== "boolean") {
             throw new TypeError(`attributes.${name} must be a boolean`);
         }
+        out[name] = v[name];
     }
-    if (v.underline !== "none" && v.underline !== "single" && v.underline !== "double") {
-        throw new TypeError('attributes.underline must be "none", "single", or "double"');
+    if (v.underline != null) {
+        if (v.underline !== "none" && v.underline !== "single" && v.underline !== "double") {
+            throw new TypeError('attributes.underline must be "none", "single", or "double"');
+        }
+        out.underline = v.underline;
     }
-    if (v.blink !== "none" && v.blink !== "slow" && v.blink !== "fast") {
-        throw new TypeError('attributes.blink must be "none", "slow", or "fast"');
+    if (v.blink != null) {
+        if (v.blink !== "none" && v.blink !== "slow" && v.blink !== "fast") {
+            throw new TypeError('attributes.blink must be "none", "slow", or "fast"');
+        }
+        out.blink = v.blink;
     }
-    return {
-        bold: v.bold,
-        faint: v.faint,
-        italic: v.italic,
-        underline: v.underline,
-        blink: v.blink,
-        crossedOut: v.crossedOut,
-        reverse: v.reverse,
-    };
+    return out;
+}
+
+/** Merge two partial attribute sets: `patch` fields win, `base` fills the rest.
+ *  Either side may be null (fully unset). Both sides are canonical (only set
+ *  fields as keys), so a plain spread merge is exact. */
+function __styled_merge_attributes(
+    base: Partial<TextAttributes> | null,
+    patch: Partial<TextAttributes> | null,
+): Partial<TextAttributes> | null {
+    if (base === null) return patch;
+    if (patch === null) return base;
+    return { ...base, ...patch };
 }
 
 /** Build a fragment from one tagged-template invocation under the enclosing style
@@ -416,7 +466,7 @@ function __styled_check_attributes(value: TextAttributes): TextAttributes {
 function __styled_from_template(
     fg: Color | null,
     bg: Color | null,
-    attributes: TextAttributes | null,
+    attributes: Partial<TextAttributes> | null,
     link: LinkSpec | null,
     strings: TemplateStringsArray,
     values: unknown[],
@@ -426,7 +476,7 @@ function __styled_from_template(
         text: string,
         runFg: Color | null,
         runBg: Color | null,
-        runAttributes: TextAttributes | null,
+        runAttributes: Partial<TextAttributes> | null,
         runLink: LinkSpec | null,
     ): void => {
         if (text === "") return;
@@ -437,6 +487,24 @@ function __styled_from_template(
             return;
         }
         runs.push({ text, fg: runFg, bg: runBg, attributes: runAttributes, link: runLink });
+    };
+    // An inner run's attributes merge field-by-field over the enclosing tag's
+    // (lexical inheritance, per attribute). Memoize on the inner object so
+    // consecutive runs sharing one attributes object keep one merged identity
+    // and the adjacent-run merge above still fires.
+    let lastInnerAttributes: Partial<TextAttributes> | null = null;
+    let lastMergedAttributes: Partial<TextAttributes> | null = null;
+    const mergeAttributes = (
+        inner: Partial<TextAttributes> | null,
+    ): Partial<TextAttributes> | null => {
+        if (inner === null || attributes === null) {
+            return __styled_merge_attributes(attributes, inner);
+        }
+        if (inner !== lastInnerAttributes) {
+            lastInnerAttributes = inner;
+            lastMergedAttributes = __styled_merge_attributes(attributes, inner);
+        }
+        return lastMergedAttributes;
     };
     for (let i = 0; i < strings.length; i++) {
         // An illegal escape in a tagged template yields an undefined cooked entry
@@ -456,7 +524,7 @@ function __styled_from_template(
                         run.text,
                         run.fg === null ? fg : run.fg,
                         run.bg === null ? bg : run.bg,
-                        run.attributes === null ? attributes : run.attributes,
+                        mergeAttributes(run.attributes),
                         run.link === null ? link : run.link,
                     );
                 }
@@ -495,6 +563,13 @@ interface StyleBuilder {
     readonly bgMagenta: StyleBuilder;
     readonly bgCyan: StyleBuilder;
     readonly bgWhite: StyleBuilder;
+    readonly bold: StyleBuilder;
+    readonly faint: StyleBuilder;
+    readonly italic: StyleBuilder;
+    readonly underline: StyleBuilder;
+    readonly doubleUnderline: StyleBuilder;
+    readonly crossedOut: StyleBuilder;
+    readonly reverse: StyleBuilder;
 }
 
 /** The shorthand property tables, built once: property name -> the color it sets. */
@@ -504,6 +579,125 @@ const __STYLED_BG_PROPS: [string, Color][] = __STYLED_ANSI_NAMES.map((name) => [
     "bg" + name.charAt(0).toUpperCase() + name.slice(1),
     name,
 ]);
+/** Attribute shorthands: property name -> the single-field patch it merges onto
+ *  the chain. `bold` is the font-weight attribute (`attributes.bold`), separate
+ *  from the `{ color, bold }` palette slot. The patches are shared canonical
+ *  partials, frozen because they are reachable through the builder brand (a
+ *  registered symbol): a mutation would poison every later chain step. */
+const __STYLED_ATTRIBUTE_PROPS: [string, Partial<TextAttributes>][] = [
+    ["bold", Object.freeze({ bold: true })],
+    ["faint", Object.freeze({ faint: true })],
+    ["italic", Object.freeze({ italic: true })],
+    ["underline", Object.freeze({ underline: "single" as const })],
+    ["doubleUnderline", Object.freeze({ underline: "double" as const })],
+    ["crossedOut", Object.freeze({ crossedOut: true })],
+    ["reverse", Object.freeze({ reverse: true })],
+];
+
+/** The runtime brand every style builder carries: its `(fg, bg, attributes)`
+ *  state, exposed so a chain can be used directly AS a line write's color
+ *  options (`Symbol.for` for robustness across realm copies, like the styled
+ *  text brand). */
+const __STYLE_BUILDER_BRAND = Symbol.for("smudgy.styleBuilder");
+
+interface StyleBuilderState {
+    fg: Color | null;
+    bg: Color | null;
+    attributes: Partial<TextAttributes> | null;
+}
+
+function __is_style_builder(value: unknown): value is StyleBuilder {
+    return typeof value === "function" && (value as any)[__STYLE_BUILDER_BRAND] !== undefined;
+}
+
+/** The runtime brand every link tag carries: the `LinkSpec` it would give its
+ *  fragments, exposed so a highlight can take the tag directly and cover the
+ *  matched text with the link. */
+const __LINK_TAG_BRAND = Symbol.for("smudgy.linkTag");
+
+/** The contract-facing face of a link tag: what the published `LinkTag` type
+ *  declares. Entry points accept this, then narrow with the runtime brand. */
+interface LinkTagLike {
+    readonly __smudgyLink: true;
+    (text: TemplateStringsArray, ...values: unknown[]): StyledTextImpl;
+}
+
+function __is_link_tag(value: unknown): value is LinkTagLike {
+    return typeof value === "function" && (value as any)[__LINK_TAG_BRAND] !== undefined;
+}
+
+function __link_tag_spec(value: LinkTagLike): LinkSpec {
+    return (value as any)[__LINK_TAG_BRAND] as LinkSpec;
+}
+
+/** The options a highlight takes: colors/attributes plus, optionally, the
+ *  range's link coverage (a link tag, or null to strip links there). */
+interface HighlightOptions extends ColorOptions {
+    link?: LinkTagLike | null;
+}
+
+/** A line write's options argument, normalized: plain options pass through; a
+ *  style chain contributes exactly what it set (everything else stays unset,
+ *  so the write leaves it untouched/inherited like any unset option); on the
+ *  highlight methods (`allowLink`), a bare link tag means `{ link }`. */
+function __line_options(
+    options: HighlightOptions | StyleBuilder | LinkTagLike,
+    allowLink: boolean,
+): HighlightOptions {
+    if (typeof options === "function") {
+        if (__is_style_builder(options)) {
+            const state = (options as any)[__STYLE_BUILDER_BRAND] as StyleBuilderState;
+            return {
+                ...(state.fg === null ? {} : { fg: state.fg }),
+                ...(state.bg === null ? {} : { bg: state.bg }),
+                ...(state.attributes === null ? {} : { attributes: state.attributes }),
+            };
+        }
+        if (allowLink && __is_link_tag(options)) {
+            return { link: options };
+        }
+        throw new TypeError(allowLink
+            ? "expected color options, a style chain (style.red), or a link tag (link(...))"
+            : "expected color options or a style chain (style.red)");
+    }
+    if (__is_styled_text(options)) {
+        throw new TypeError(
+            "expected color options or a style chain (style.red), not styled text (style.red`...`)",
+        );
+    }
+    const link = options.link;
+    if (link !== undefined) {
+        if (!allowLink) {
+            throw new TypeError(
+                "this method does not take a link; use highlight, or interpolate link(...) into styled text",
+            );
+        }
+        if (link !== null && !__is_link_tag(link)) {
+            throw new TypeError("options.link must be a link(...) tag or null");
+        }
+    }
+    if (
+        options.foregroundPaletteBright !== undefined
+        && typeof options.foregroundPaletteBright !== "boolean"
+    ) {
+        throw new TypeError("options.foregroundPaletteBright must be a boolean");
+    }
+    // Canonicalize colors and attributes here so the plain op path throws on
+    // the same mistakes the styled path does (unknown color names, unknown
+    // attribute keys, wrong types) instead of shipping them to a silently-
+    // tolerant native parse.
+    if (options.fg != null || options.bg != null || options.attributes != null) {
+        return {
+            ...options,
+            ...(options.fg != null ? { fg: __styled_check_color(options.fg) } : {}),
+            ...(options.bg != null ? { bg: __styled_check_color(options.bg) } : {}),
+            ...(options.attributes != null
+                ? { attributes: __styled_check_attributes(options.attributes) }
+                : {}),
+        };
+    }
+    return options;
+}
 
 /** Every step of the chain is a fresh immutable builder over `(fg, bg)`; each is both
  *  a template tag and (called with options) a refinement. Shorthand properties are
@@ -512,7 +706,7 @@ const __STYLED_BG_PROPS: [string, Color][] = __STYLED_ANSI_NAMES.map((name) => [
 function __styled_make_builder(
     fg: Color | null,
     bg: Color | null,
-    attributes: TextAttributes | null,
+    attributes: Partial<TextAttributes> | null,
 ): StyleBuilder {
     const builder = ((first: TemplateStringsArray | ColorOptions, ...values: unknown[]): any => {
         if (__is_template_strings(first)) {
@@ -522,10 +716,14 @@ function __styled_make_builder(
             throw new TypeError("style(...) expects { fg?, bg? }, or use it as a template tag");
         }
         // `!= null` so an explicit null means unset, like the plain color options.
+        // Attributes refine field-by-field: the new subset merges over what the
+        // chain has already set.
         return __styled_make_builder(
             first.fg != null ? __styled_check_color(__line_fg(first)!) : fg,
             first.bg != null ? __styled_check_color(first.bg) : bg,
-            first.attributes != null ? __styled_check_attributes(first.attributes) : attributes,
+            first.attributes != null
+                ? __styled_merge_attributes(attributes, __styled_check_attributes(first.attributes))
+                : attributes,
         );
     }) as any;
     builder.fg = (color: Color) =>
@@ -548,6 +746,21 @@ function __styled_make_builder(
     for (const [prop, color] of __STYLED_BG_PROPS) {
         memoize(prop, () => __styled_make_builder(fg, color, attributes));
     }
+    for (const [prop, patch] of __STYLED_ATTRIBUTE_PROPS) {
+        memoize(prop, () =>
+            __styled_make_builder(fg, bg, __styled_merge_attributes(attributes, patch)));
+    }
+    // The whole state is frozen: it is reachable through a REGISTERED symbol,
+    // and every value in it is owned (validation copies incoming objects), so
+    // freezing costs nothing and keeps a mutation from poisoning the chain.
+    const freezeValue = <T>(value: T): T =>
+        typeof value === "object" && value !== null ? Object.freeze(value) : value;
+    const state: StyleBuilderState = Object.freeze({
+        fg: freezeValue(fg),
+        bg: freezeValue(bg),
+        attributes: freezeValue(attributes),
+    });
+    Object.defineProperty(builder, __STYLE_BUILDER_BRAND, { value: state });
     return builder as StyleBuilder;
 }
 
@@ -616,11 +829,12 @@ function __styled_menu(options: LinkOptions | undefined): readonly (LinkMenuItem
 
 /** Makes text clickable: `link("north")` sends the command when clicked (as if
  *  typed); `link(fn)` runs the handler. Returns a template tag, so it composes with
- *  `style` by nesting -- the innermost link wins on overlap. */
+ *  `style` by nesting -- the innermost link wins on overlap. The tag also works
+ *  directly as a highlight's options, linkifying the matched text in place. */
 function link(
     action: string | LinkHandler | null,
     options?: LinkOptions,
-): StyleTag {
+): LinkTagLike {
     const tooltip = __styled_tooltip(options);
     const menu = __styled_menu(options);
     if (options?.enabled !== undefined && typeof options.enabled !== "boolean") {
@@ -649,8 +863,11 @@ function link(
         menu,
         title: options?.title ?? null,
     };
-    return ((strings: TemplateStringsArray, ...values: unknown[]) =>
-        __styled_from_template(null, null, null, spec, strings, values)) as StyleTag;
+    const tag = ((strings: TemplateStringsArray, ...values: unknown[]) =>
+        __styled_from_template(null, null, null, spec, strings, values)) as any;
+    Object.defineProperty(tag, __LINK_TAG_BRAND, { value: spec });
+    Object.defineProperty(tag, "__smudgyLink", { value: true });
+    return tag as LinkTagLike;
 }
 
 /** A run's link in wire form: a command, or an index into the callbacks array the op
@@ -705,7 +922,7 @@ interface WireRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
-    attributes: TextAttributes | null;
+    attributes: Partial<TextAttributes> | null;
     link: WireLink;
 }
 
@@ -781,37 +998,54 @@ function __styled_encode_color(value: Color | null): number {
     return 0x02000000 | (bright ? 8 : 0) | __STYLED_ANSI_NAMES.indexOf(v.color);
 }
 
-/** Encode a complete attribute object. Zero stays reserved for unset/inherit;
- *  bit 31 marks even an explicit all-default object as present. */
-function __styled_encode_attributes(value: TextAttributes | null): number {
+/** One boolean attribute's contribution to the packed bits: its set-mask bit
+ *  plus its value bit. Module-level (not a closure) -- this runs per wire run
+ *  on the styled-echo pack path. Non-boolean garbage returns the reserved
+ *  value bit so Rust rejects the forged run. */
+function __styled_flag_bits(
+    set: boolean | undefined,
+    maskBit: number,
+    valueBit: number,
+): number {
+    if (set === undefined) return 0;
+    if (typeof set !== "boolean") return 0x200;
+    return (1 << maskBit) | (set ? 1 << valueBit : 0);
+}
+
+/** Encode a (canonical -- see `__styled_check_attributes`) partial attribute
+ *  object. Zero stays reserved for fully-unset/inherit; bit 31 marks presence,
+ *  bits 16..=22 say which fields are set (bold, faint, italic, underline,
+ *  blink, crossedOut, reverse), and bits 0..=8 carry the set fields' values --
+ *  the layout comment lives beside the decoder in ops.rs. */
+function __styled_encode_attributes(value: Partial<TextAttributes> | null): number {
     if (value === null) return 0;
-    if (typeof value.bold !== "boolean" || typeof value.faint !== "boolean"
-        || typeof value.italic !== "boolean" || typeof value.crossedOut !== "boolean"
-        || typeof value.reverse !== "boolean") {
-        return 0x80000200; // reserved bit: Rust rejects the forged run
+    let bits = 0x80000000;
+    bits |= __styled_flag_bits(value.bold, 16, 0);
+    bits |= __styled_flag_bits(value.faint, 17, 1);
+    bits |= __styled_flag_bits(value.italic, 18, 2);
+    bits |= __styled_flag_bits(value.crossedOut, 21, 7);
+    bits |= __styled_flag_bits(value.reverse, 22, 8);
+    if (value.underline !== undefined) {
+        const underline = value.underline === "none"
+            ? 0
+            : value.underline === "single"
+            ? 1
+            : value.underline === "double"
+            ? 2
+            : 3; // invalid: Rust rejects the forged run
+        bits |= (1 << 19) | (underline << 3);
     }
-    const underline = value.underline === "none"
-        ? 0
-        : value.underline === "single"
-        ? 1
-        : value.underline === "double"
-        ? 2
-        : 3;
-    const blink = value.blink === "none"
-        ? 0
-        : value.blink === "slow"
-        ? 1
-        : value.blink === "fast"
-        ? 2
-        : 3;
-    return 0x80000000
-        | (value.bold ? 1 << 0 : 0)
-        | (value.faint ? 1 << 1 : 0)
-        | (value.italic ? 1 << 2 : 0)
-        | (underline << 3)
-        | (blink << 5)
-        | (value.crossedOut ? 1 << 7 : 0)
-        | (value.reverse ? 1 << 8 : 0);
+    if (value.blink !== undefined) {
+        const blink = value.blink === "none"
+            ? 0
+            : value.blink === "slow"
+            ? 1
+            : value.blink === "fast"
+            ? 2
+            : 3; // invalid: Rust rejects the forged run
+        bits |= (1 << 20) | (blink << 5);
+    }
+    return bits;
 }
 
 /** A flattened fragment ready for a styled echo op call. `records` is a view of
@@ -954,6 +1188,22 @@ function __styled_splice_args(
     const baseAttributes = options.attributes != null
         ? __styled_check_attributes(options.attributes)
         : null;
+    // Run attributes merge field-by-field over the base subset; memoized on the
+    // run's object so shared attribute objects keep one merged identity.
+    let lastRunAttributes: Partial<TextAttributes> | null = null;
+    let lastMergedAttributes: Partial<TextAttributes> | null = null;
+    const mergeAttributes = (
+        runAttributes: Partial<TextAttributes> | null,
+    ): Partial<TextAttributes> | null => {
+        if (runAttributes === null || baseAttributes === null) {
+            return __styled_merge_attributes(baseAttributes, runAttributes);
+        }
+        if (runAttributes !== lastRunAttributes) {
+            lastRunAttributes = runAttributes;
+            lastMergedAttributes = __styled_merge_attributes(baseAttributes, runAttributes);
+        }
+        return lastMergedAttributes;
+    };
     const runs: WireRun[] = [];
     for (const run of text._runs) {
         if (run.text.indexOf("\n") !== -1) {
@@ -964,7 +1214,7 @@ function __styled_splice_args(
             text: run.text,
             fg: run.fg === null ? baseFg : run.fg,
             bg: run.bg === null ? baseBg : run.bg,
-            attributes: run.attributes === null ? baseAttributes : run.attributes,
+            attributes: mergeAttributes(run.attributes),
             link: wireLink(run.link),
         });
     }
@@ -3039,15 +3289,17 @@ class Line {
         }
     }
 
-    /** Inserts text at the specified position with optional styling. Styled text
-     *  splices with its own colors and links; `options` is then the base its unset
-     *  colors inherit from. */
+    /** Inserts text at the specified position with optional styling (plain
+     *  options or a style chain); whatever `options` leaves unset inherits the
+     *  style at the insertion point. Styled text splices with its own colors
+     *  and links; `options` is then the base its unset colors inherit from. */
     insert(
         text: string | StyledTextLike,
         begin: number,
         end: number = begin,
-        options: ColorOptions = {},
+        options: ColorOptions | StyleBuilder = {},
     ): void {
+        options = __line_options(options, false);
         if (__is_styled_text(text)) {
             this._splice(text, begin, end, options);
             return;
@@ -3058,7 +3310,7 @@ class Line {
                 begin,
                 end,
                 __line_fg(options),
-                options.bg || null,
+                options.bg ?? null,
                 options.attributes ?? null,
             );
         } else {
@@ -3068,7 +3320,7 @@ class Line {
                 begin,
                 end,
                 __line_fg(options),
-                options.bg || null,
+                options.bg ?? null,
                 options.attributes ?? null,
             );
         }
@@ -3088,24 +3340,75 @@ class Line {
         }
     }
 
-    /** Highlights text in the specified byte range with the given colors. */
-    highlightAt(begin: number, end: number, options: ColorOptions = {}): void {
+    /** Restyle the NORMALIZED (see `__line_options`) flat `[begin, end, ...]`
+     *  range pairs with a link update: the wire link is built and its
+     *  callbacks registered ONCE for every range, however many occurrences a
+     *  `highlight()` matched. */
+    _highlightLinked(ranges: Uint32Array, resolved: HighlightOptions): void {
+        const callbacks: Function[] = [];
+        const wire = resolved.link === null || resolved.link === undefined
+            ? null
+            : __styled_make_wire_link(callbacks)(__link_tag_spec(resolved.link));
+        if (this._isCurrent) {
+            op_smudgy_highlight_link(
+                ranges,
+                __line_fg(resolved),
+                resolved.bg ?? null,
+                resolved.attributes ?? null,
+                wire,
+                callbacks,
+            );
+        } else {
+            op_smudgy_line_highlight_link(
+                this._lineNumber,
+                ranges,
+                __line_fg(resolved),
+                resolved.bg ?? null,
+                resolved.attributes ?? null,
+                wire,
+                callbacks,
+            );
+        }
+    }
+
+    /** Restyles the specified byte range: the channels and attributes set in
+     *  `options` (plain options, a style chain, or a link tag) change;
+     *  everything left unset keeps what each span had. `options.link` (or a
+     *  bare link tag) replaces the range's link coverage; `link: null` strips
+     *  it. */
+    highlightAt(
+        begin: number,
+        end: number,
+        options: HighlightOptions | StyleBuilder | LinkTagLike = {},
+    ): void {
+        const resolved = __line_options(options, true);
+        if (resolved.link !== undefined) {
+            this._highlightLinked(Uint32Array.of(begin, end), resolved);
+            return;
+        }
+        this._highlightAtResolved(begin, end, resolved);
+    }
+
+    /** The link-free restyle dispatch over NORMALIZED (see `__line_options`)
+     *  options, so `highlight`'s per-occurrence loop validates once, not once
+     *  per range. */
+    _highlightAtResolved(begin: number, end: number, resolved: HighlightOptions): void {
         if (this._isCurrent) {
             op_smudgy_highlight(
                 begin,
                 end,
-                __line_fg(options),
-                options.bg || null,
-                options.attributes ?? null,
+                __line_fg(resolved),
+                resolved.bg ?? null,
+                resolved.attributes ?? null,
             );
         } else {
             op_smudgy_line_highlight(
                 this._lineNumber,
                 begin,
                 end,
-                __line_fg(options),
-                options.bg || null,
-                options.attributes ?? null,
+                __line_fg(resolved),
+                resolved.bg ?? null,
+                resolved.attributes ?? null,
             );
         }
     }
@@ -3131,13 +3434,28 @@ class Line {
         return ranges.length > 0;
     }
 
-    /** Highlights every occurrence of `str`. Returns whether anything matched. */
-    highlight(str: string, options: ColorOptions = {}): boolean {
+    /** Restyles every occurrence of `str` (plain options, a style chain, or a
+     *  link tag; see `highlightAt`). Returns whether anything matched. */
+    highlight(str: string, options: HighlightOptions | StyleBuilder | LinkTagLike = {}): boolean {
+        const resolved = __line_options(options, true);
         const ranges = __occurrenceByteRanges(this.text, str);
-        for (const range of ranges) {
-            this.highlightAt(range.begin, range.end, options);
+        if (ranges.length === 0) {
+            return false;
         }
-        return ranges.length > 0;
+        if (resolved.link !== undefined) {
+            // All matched ranges cross in one op, so the link registers once.
+            const flat = new Uint32Array(ranges.length * 2);
+            for (let i = 0; i < ranges.length; i++) {
+                flat[i * 2] = ranges[i].begin;
+                flat[i * 2 + 1] = ranges[i].end;
+            }
+            this._highlightLinked(flat, resolved);
+            return true;
+        }
+        for (const range of ranges) {
+            this._highlightAtResolved(range.begin, range.end, resolved);
+        }
+        return true;
     }
 
     /** Removes every occurrence of `str`. Returns whether anything matched. */
@@ -3937,7 +4255,7 @@ function __smudgy_canonical_event(spec: string, name: string): string {
     // Platform producers key their events `producer:name` -- the form the host's
     // `host_emit` registers and emits ("sys:receive", "gmcp:ready", "input:change");
     // package events use the meatball form.
-    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "input" || spec === "pane" || spec === "sessions"
+    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "mssp" || spec === "input" || spec === "pane" || spec === "sessions"
         ? `${spec}:${name}`
         : `${spec}#${name}`;
 }

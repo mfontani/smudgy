@@ -3,7 +3,7 @@ use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
 use crate::models::triggers::TriggerDefinition;
 use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
-use crate::session::runtime::line_operation::{LineOperation, SpliceRun};
+use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceRun};
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
@@ -14,9 +14,9 @@ use crate::session::runtime::{
     SingletonRegistry,
 };
 use crate::session::styled_line::{
-    Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkTooltip,
-    LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyledLine, StyledLink,
-    TextAttributes, Underline, sanitize_display_text,
+    Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkToken, LinkTooltip,
+    LinkTooltipCallback, LinkTooltipState, LinkTooltipText, Style, StyleUpdate, StyledLine,
+    StyledLink, TextAttributes, TextAttributesUpdate, Underline, sanitize_display_text,
 };
 use crate::session::{
     SessionId, registry,
@@ -24,7 +24,7 @@ use crate::session::{
 };
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -68,6 +68,8 @@ deno_core::extension!(
     op_smudgy_line_replace,
     op_smudgy_splice,
     op_smudgy_line_splice,
+    op_smudgy_highlight_link,
+    op_smudgy_line_highlight_link,
     op_smudgy_line_highlight,
     op_smudgy_line_remove,
     op_smudgy_insert,
@@ -343,7 +345,24 @@ deno_core::extension!(
         PendingLinkTooltips::default(),
     )));
   },
+  customizer = |ext: &mut deno_core::Extension| {
+    // deno_core 0.410 records `esm = [...]` sources as absolute build-machine
+    // paths (its snapshot-first design). This extension initializes per isolate
+    // OUTSIDE the startup snapshot (script/build.rs bakes only the deno_runtime
+    // base set), so the source must ship in the binary: swap the path-based
+    // entry for the embedded bytes. The specifier must match `esm_entry_point`.
+    ext.esm_files = std::borrow::Cow::Borrowed(SMUDGY_OPS_EMBEDDED_ESM);
+  },
 );
+
+/// `smudgy.ts` embedded for runtime (non-snapshot) extension init — see the
+/// `customizer` on [`smudgy_ops`]. 7-bit ASCII enforced by the contract drift
+/// test (`ascii_str_include!` requires it).
+static SMUDGY_OPS_EMBEDDED_ESM: &[deno_core::ExtensionFileSource] =
+    &[deno_core::ExtensionFileSource::new(
+        "ext:smudgy_ops/smudgy.ts",
+        deno_core::ascii_str_include!("../js/smudgy.ts"),
+    )];
 
 /// `gmcp.enabled` (`docs/gmcp.md` §3.4): whether GMCP is negotiated on for the live
 /// connection. Gated by `interop:read` like every other read of the `gmcp` producer — the
@@ -2775,40 +2794,180 @@ fn op_smudgy_session_echo(
 
 /// Per-isolate registry of link-callback functions: the `v8::Global` handles stay
 /// HERE, inside their isolate's `OpState` (dropped with the isolate, on the session
-/// thread), and echoed lines carry only a `(token, id)` address — a scrollback line
-/// must never own a v8 handle, or its eventual drop on the UI thread aborts the
-/// process. Ids are monotonic; a capped ring evicts the oldest, so a trigger echoing
-/// callback links on every line cannot grow the registry unboundedly. A click on an
-/// evicted (or reload-stale) id is a defined no-op.
-#[derive(Default)]
-pub struct LinkCallbacks {
-    /// The id of `items[0]`; slot `i` holds id `base + i`. Ids are monotonic and
-    /// `u64` — they cannot wrap within any real session, so a stale id can only
-    /// miss, never alias a newer callback.
-    base: u64,
-    items: std::collections::VecDeque<v8::Global<v8::Function>>,
+/// thread), and echoed lines carry only a `(token, id)` address plus a plain-data
+/// [`LinkToken`] — a scrollback line must never own a v8 handle, or its eventual
+/// drop on the UI thread aborts the process.
+///
+/// Entry lifetime is tied to line reachability: every line carrying a callback
+/// holds an `Arc<LinkToken>` and the registry holds the `Weak`, so entries whose
+/// lines have left every buffer are swept opportunistically (amortized, on
+/// insert past a high-water mark, and at most once per [`Self::SWEEP_FLOOR`]
+/// inserts when the backstop cap keeps the size pinned). Re-registering the
+/// SAME function (by v8 identity) reuses its entry instead of minting a new
+/// one, so a per-line trigger with one handler occupies one entry total. Ids
+/// are monotonic `u64`s and can never alias a DIFFERENT callback: a swept id
+/// misses, and the only reuse is re-arming an id for the same function. A
+/// click on a swept (or reload-stale) id is a defined no-op. A capped
+/// oldest-first eviction remains as a backstop for pathologically many
+/// simultaneously-reachable callbacks.
+///
+/// Generic over the handle type so the bookkeeping (dedup, sweep, backstop) is
+/// unit-testable without a live isolate.
+pub struct LinkCallbacks<F = v8::Global<v8::Function>> {
+    entries: BTreeMap<u64, LinkCallbackEntry<F>>,
+    /// v8 identity hash -> candidate ids (hash collisions are possible; a
+    /// candidate is confirmed by handle equality before reuse).
+    by_identity: HashMap<i32, Vec<u64>>,
+    next_id: u64,
+    /// Sweep when `entries` reaches this size (amortized-O(1) growth trigger).
+    sweep_at: usize,
+    /// Inserts since the last sweep: rations sweeps once the registry sits at
+    /// the cap, where `sweep_at` alone would degrade to a full walk per insert.
+    inserts_since_sweep: usize,
 }
 
-impl LinkCallbacks {
-    /// Generous for real use; tiny next to the heap a script could grow anyway.
-    const CAP: usize = 8192;
+struct LinkCallbackEntry<F> {
+    function: F,
+    token: std::sync::Weak<LinkToken>,
+    identity: i32,
+}
 
-    fn insert(&mut self, function: v8::Global<v8::Function>) -> u64 {
-        if self.items.len() == Self::CAP {
-            self.items.pop_front();
-            self.base += 1;
+impl<F> Default for LinkCallbacks<F> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            by_identity: HashMap::new(),
+            next_id: 0,
+            sweep_at: Self::SWEEP_FLOOR,
+            inserts_since_sweep: 0,
         }
-        self.items.push_back(function);
-        self.base + (self.items.len() as u64 - 1)
+    }
+}
+
+impl<F> LinkCallbacks<F> {
+    /// Backstop only: sweeping bounds the live population by what retained
+    /// lines actually reference, and this sits far above any realistic
+    /// reachable count (a full 10k-line scrollback of per-line closures is
+    /// ~10k). Only a pathological line set (thousands of distinct callbacks
+    /// per line) can hit it, at which point the oldest evict first.
+    const CAP: usize = 65_536;
+    /// Never sweep below this size — small registries aren't worth the walk —
+    /// and, at the cap, sweep at most once per this many inserts.
+    const SWEEP_FLOOR: usize = 64;
+
+    /// Register `function` under `identity`, deduplicating against existing
+    /// entries via `is_same` (v8 handle equality in real use). A hit returns
+    /// the existing id — re-arming its liveness token if every prior line
+    /// already dropped (safe: a dead token means no line can click the id, and
+    /// the function is the same one regardless).
+    fn insert_raw(
+        &mut self,
+        identity: i32,
+        function: F,
+        mut is_same: impl FnMut(&F) -> bool,
+    ) -> (u64, Arc<LinkToken>) {
+        let found = self.by_identity.get(&identity).and_then(|candidates| {
+            candidates.iter().copied().find(|id| {
+                self.entries
+                    .get(id)
+                    .is_some_and(|entry| is_same(&entry.function))
+            })
+        });
+        if let Some(id) = found {
+            let entry = self.entries.get_mut(&id).expect("candidate ids are live");
+            if let Some(token) = entry.token.upgrade() {
+                return (id, token);
+            }
+            // Re-arming a dead entry is safe: the id addresses the SAME
+            // function, so the only possible holder of the old id — a click
+            // already in flight from a just-dropped line — invokes exactly
+            // what that click always meant.
+            let token = Arc::new(LinkToken::default());
+            entry.token = Arc::downgrade(&token);
+            return (id, token);
+        }
+
+        // Sweep on growth past the high-water mark and — once the backstop
+        // cap pins the size — at most once per SWEEP_FLOOR inserts, so a
+        // saturated registry pays an amortized fraction of a walk per insert
+        // instead of a full futile walk on every one.
+        self.inserts_since_sweep += 1;
+        if self.entries.len() >= self.sweep_at
+            || (self.entries.len() >= Self::CAP && self.inserts_since_sweep >= Self::SWEEP_FLOOR)
+        {
+            self.sweep();
+        }
+        if self.entries.len() >= Self::CAP {
+            let oldest = self.entries.keys().next().copied();
+            if let Some(oldest) = oldest {
+                self.remove(oldest);
+            }
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let token = Arc::new(LinkToken::default());
+        self.entries.insert(
+            id,
+            LinkCallbackEntry {
+                function,
+                token: Arc::downgrade(&token),
+                identity,
+            },
+        );
+        self.by_identity.entry(identity).or_default().push(id);
+        (id, token)
+    }
+
+    /// Drop every entry whose token has no strong holders left — no line in
+    /// any buffer references it, so no click can ever arrive for its id.
+    fn sweep(&mut self) {
+        self.entries
+            .retain(|_, entry| entry.token.strong_count() > 0);
+        self.by_identity.clear();
+        for (id, entry) in &self.entries {
+            self.by_identity
+                .entry(entry.identity)
+                .or_default()
+                .push(*id);
+        }
+        // Deliberately uncapped: at the backstop cap the size cannot grow to
+        // meet a doubled mark, so the once-per-SWEEP_FLOOR-inserts trigger in
+        // `insert_raw` takes over instead of a per-insert futile walk.
+        self.sweep_at = (self.entries.len() * 2).max(Self::SWEEP_FLOOR);
+        self.inserts_since_sweep = 0;
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some(entry) = self.entries.remove(&id)
+            && let Some(candidates) = self.by_identity.get_mut(&entry.identity)
+        {
+            candidates.retain(|candidate| *candidate != id);
+            if candidates.is_empty() {
+                self.by_identity.remove(&entry.identity);
+            }
+        }
     }
 
     #[must_use]
-    pub fn get(&self, id: u64) -> Option<&v8::Global<v8::Function>> {
-        // An evicted id (`id < base`) wraps to a huge offset and misses.
-        let offset = id.wrapping_sub(self.base);
-        usize::try_from(offset)
-            .ok()
-            .and_then(|offset| self.items.get(offset))
+    pub fn get(&self, id: u64) -> Option<&F> {
+        self.entries.get(&id).map(|entry| &entry.function)
+    }
+}
+
+impl LinkCallbacks {
+    /// Register a link-callback function, deduplicated by v8 identity: the
+    /// identity hash narrows to candidates, strict equality confirms.
+    fn insert(
+        &mut self,
+        scope: &mut v8::PinScope,
+        function: v8::Local<v8::Function>,
+    ) -> (u64, Arc<LinkToken>) {
+        let identity = function.get_identity_hash().get();
+        let global = v8::Global::new(scope, function);
+        self.insert_raw(identity, global, |existing| {
+            v8::Local::new(scope, existing).strict_equals(function.into())
+        })
     }
 }
 
@@ -2896,13 +3055,22 @@ enum TooltipWire {
 /// refcount instead of copying the string.
 pub struct LinkIsolateToken(pub Arc<str>);
 
-/// Everything needed to turn wire links into [`LinkAction`]s: the callback ids the
+/// One registered callback as payload consumers index it: the registry slot
+/// plus the liveness anchor every line carrying it must hold. Pairing them in
+/// one value makes an id/token mismatch unrepresentable.
+#[derive(Clone)]
+struct CallbackRef {
+    id: u64,
+    token: Arc<LinkToken>,
+}
+
+/// Everything needed to turn wire links into [`LinkAction`]s: the callbacks the
 /// op registered from the payload's function array, plus the address a click routes
 /// back to (this session + this isolate instantiation).
 struct LinkContext {
     session: SessionId,
     isolate_token: Arc<str>,
-    callback_ids: Vec<u64>,
+    callbacks: Vec<CallbackRef>,
     tooltip_states: Vec<Arc<LinkTooltipState>>,
 }
 
@@ -2920,28 +3088,35 @@ fn link_context(
     callbacks: v8::Local<v8::Array>,
 ) -> Result<LinkContext, StyledTextOpError> {
     let len = callbacks.length();
-    let mut callback_ids = Vec::with_capacity(len as usize);
-    if len > 0 {
+    // Validate the whole array BEFORE registering anything, so a rejected
+    // payload consumes no registry entries.
+    let mut functions = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let function: v8::Local<v8::Function> = callbacks
+            .get_index(scope, i)
+            .and_then(|value| value.try_into().ok())
+            .ok_or_else(|| {
+                StyledTextOpError::Invalid("link callback must be a function".to_string())
+            })?;
+        functions.push(function);
+    }
+    let mut refs = Vec::with_capacity(functions.len());
+    if !functions.is_empty() {
         let registry = state.borrow::<SharedLinkCallbacks>().clone();
         let mut registry = registry.borrow_mut();
-        for i in 0..len {
-            let function: v8::Local<v8::Function> = callbacks
-                .get_index(scope, i)
-                .and_then(|value| value.try_into().ok())
-                .ok_or_else(|| {
-                    StyledTextOpError::Invalid("link callback must be a function".to_string())
-                })?;
-            callback_ids.push(registry.insert(v8::Global::new(scope, function)));
+        for function in functions {
+            let (id, token) = registry.insert(scope, function);
+            refs.push(CallbackRef { id, token });
         }
     }
     Ok(LinkContext {
         session: *state.borrow::<SessionId>(),
         isolate_token: state.borrow::<LinkIsolateToken>().0.clone(),
-        tooltip_states: callback_ids
+        tooltip_states: refs
             .iter()
             .map(|_| Arc::new(LinkTooltipState::default()))
             .collect(),
-        callback_ids,
+        callbacks: refs,
     })
 }
 
@@ -2973,7 +3148,7 @@ impl LinkContext {
             Some(ResolvedTooltip::Text(text)) => Ok(Some(LinkTooltip::styled_text(text, target))),
             Some(ResolvedTooltip::Callback(index)) => {
                 let index = index as usize;
-                let id = self.callback_ids.get(index).copied().ok_or_else(|| {
+                let callback = self.callbacks.get(index).cloned().ok_or_else(|| {
                     StyledTextOpError::Invalid(
                         "link tooltip callback index out of range".to_string(),
                     )
@@ -2987,7 +3162,8 @@ impl LinkContext {
                     LinkTooltipCallback {
                         session: self.session,
                         isolate_token: self.isolate_token.clone(),
-                        id,
+                        id: callback.id,
+                        token: callback.token,
                         state,
                     },
                     target,
@@ -3074,16 +3250,19 @@ impl ColorWire {
     }
 }
 
+/// The wire shape of a run's text attributes: any subset of the fields. A
+/// missing field is an unset channel (it inherits the base the run resolves
+/// against); a present field overrides it.
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TextAttributesWire {
-    bold: bool,
-    faint: bool,
-    italic: bool,
-    underline: UnderlineWire,
-    blink: BlinkWire,
-    crossed_out: bool,
-    reverse: bool,
+    bold: Option<bool>,
+    faint: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<UnderlineWire>,
+    blink: Option<BlinkWire>,
+    crossed_out: Option<bool>,
+    reverse: Option<bool>,
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]
@@ -3102,22 +3281,22 @@ enum BlinkWire {
     Fast,
 }
 
-impl From<TextAttributesWire> for TextAttributes {
+impl From<TextAttributesWire> for TextAttributesUpdate {
     fn from(value: TextAttributesWire) -> Self {
         Self {
             bold: value.bold,
             faint: value.faint,
             italic: value.italic,
-            underline: match value.underline {
+            underline: value.underline.map(|underline| match underline {
                 UnderlineWire::None => Underline::None,
                 UnderlineWire::Single => Underline::Single,
                 UnderlineWire::Double => Underline::Double,
-            },
-            blink: match value.blink {
+            }),
+            blink: value.blink.map(|blink| match blink {
                 BlinkWire::None => Blink::None,
                 BlinkWire::Slow => Blink::Slow,
                 BlinkWire::Fast => Blink::Fast,
-            },
+            }),
             crossed_out: value.crossed_out,
             reverse: value.reverse,
         }
@@ -3162,9 +3341,12 @@ struct StyledRunWire {
 //   2 = ANSI  (bit 3: bold; bits 0-2: black..white index)
 //   3 = role  (0 default, 1 echo, 2 output, 3 warn)
 //
-// attributes u32: 0 = unset (delivery/splice default). Otherwise bit 31 is the
-// presence marker and bits 0..=8 carry bold, faint, italic, two-bit underline,
-// two-bit blink, crossed-out, and reverse. Presence-only is an explicit reset.
+// attributes u32: 0 = fully unset (every attribute inherits the delivery/splice
+// base). Otherwise bit 31 is the presence marker, bits 16..=22 are the per-field
+// set mask (bold, faint, italic, underline, blink, crossed-out, reverse — in
+// that order), and bits 0..=8 carry the values: bold, faint, italic, two-bit
+// underline, two-bit blink, crossed-out, reverse. A field's value bits must be
+// zero when its mask bit is clear; an unset field inherits the base's value.
 //
 // link u32: 0 = none. Else the top 2 bits are a tag over a 30-bit index:
 //   1 = send (index into the send strings), 2 = callback (index into the
@@ -3244,38 +3426,74 @@ fn packed_color(value: u32) -> Result<Option<Color>, StyledTextOpError> {
     }
 }
 
-/// Decode one packed text-attribute set. Zero is inherited/unset; bit 31
-/// distinguishes an explicit all-default reset from that unset value.
-fn packed_attributes(value: u32) -> Result<Option<TextAttributes>, StyledTextOpError> {
+/// Decode one packed partial text-attribute set (layout above). Zero is fully
+/// unset; otherwise bit 31 marks presence, bits 16..=22 say which fields are
+/// set, and bits 0..=8 carry the set fields' values. A value bit whose field
+/// is not in the mask is a malformed payload, not data.
+fn packed_attributes(value: u32) -> Result<TextAttributesUpdate, StyledTextOpError> {
     const PRESENT: u32 = 1 << 31;
-    const KNOWN: u32 = PRESENT | 0x01ff;
+    const MASK_BOLD: u32 = 1 << 16;
+    const MASK_FAINT: u32 = 1 << 17;
+    const MASK_ITALIC: u32 = 1 << 18;
+    const MASK_UNDERLINE: u32 = 1 << 19;
+    const MASK_BLINK: u32 = 1 << 20;
+    const MASK_CROSSED_OUT: u32 = 1 << 21;
+    const MASK_REVERSE: u32 = 1 << 22;
+    const KNOWN: u32 = PRESENT | 0x007f_0000 | 0x01ff;
     if value == 0 {
-        return Ok(None);
+        return Ok(TextAttributesUpdate::UNSET);
     }
     if value & PRESENT == 0 || value & !KNOWN != 0 {
         return Err(packed_invalid("invalid styled text attributes"));
     }
-    let underline = match (value >> 3) & 0x3 {
-        0 => Underline::None,
-        1 => Underline::Single,
-        2 => Underline::Double,
-        _ => return Err(packed_invalid("unknown underline style")),
+    let allowed_value_bits = (if value & MASK_BOLD != 0 { 1 << 0 } else { 0 })
+        | (if value & MASK_FAINT != 0 { 1 << 1 } else { 0 })
+        | (if value & MASK_ITALIC != 0 { 1 << 2 } else { 0 })
+        | (if value & MASK_UNDERLINE != 0 {
+            0x3 << 3
+        } else {
+            0
+        })
+        | (if value & MASK_BLINK != 0 { 0x3 << 5 } else { 0 })
+        | (if value & MASK_CROSSED_OUT != 0 {
+            1 << 7
+        } else {
+            0
+        })
+        | (if value & MASK_REVERSE != 0 { 1 << 8 } else { 0 });
+    if value & 0x01ff & !allowed_value_bits != 0 {
+        return Err(packed_invalid("invalid styled text attributes"));
+    }
+    let underline = if value & MASK_UNDERLINE != 0 {
+        Some(match (value >> 3) & 0x3 {
+            0 => Underline::None,
+            1 => Underline::Single,
+            2 => Underline::Double,
+            _ => return Err(packed_invalid("unknown underline style")),
+        })
+    } else {
+        None
     };
-    let blink = match (value >> 5) & 0x3 {
-        0 => Blink::None,
-        1 => Blink::Slow,
-        2 => Blink::Fast,
-        _ => return Err(packed_invalid("unknown blink style")),
+    let blink = if value & MASK_BLINK != 0 {
+        Some(match (value >> 5) & 0x3 {
+            0 => Blink::None,
+            1 => Blink::Slow,
+            2 => Blink::Fast,
+            _ => return Err(packed_invalid("unknown blink style")),
+        })
+    } else {
+        None
     };
-    Ok(Some(TextAttributes {
-        bold: value & (1 << 0) != 0,
-        faint: value & (1 << 1) != 0,
-        italic: value & (1 << 2) != 0,
+    let flag = |mask: u32, bit: u32| (value & mask != 0).then(|| value & (1 << bit) != 0);
+    Ok(TextAttributesUpdate {
+        bold: flag(MASK_BOLD, 0),
+        faint: flag(MASK_FAINT, 1),
+        italic: flag(MASK_ITALIC, 2),
         underline,
         blink,
-        crossed_out: value & (1 << 7) != 0,
-        reverse: value & (1 << 8) != 0,
-    }))
+        crossed_out: flag(MASK_CROSSED_OUT, 7),
+        reverse: flag(MASK_REVERSE, 8),
+    })
 }
 
 /// One packed link, decoded but not yet resolved against the send/callback tables.
@@ -3489,7 +3707,7 @@ fn packed_echo_lines(
             let style = Style {
                 fg: packed_color(reader.next()?)?.unwrap_or(default_style.fg),
                 bg: packed_color(reader.next()?)?.map_or(default_style.bg, normalize_bg),
-                attributes: packed_attributes(reader.next()?)?.unwrap_or(default_style.attributes),
+                attributes: packed_attributes(reader.next()?)?.apply_to(default_style.attributes),
             };
             let packed_link = packed_link(reader.next()?)?;
             let action = match packed_link {
@@ -3500,15 +3718,16 @@ fn packed_echo_lines(
                     )?))
                 }
                 PackedLink::Callback(index) => {
-                    let id = link_context
-                        .callback_ids
+                    let callback = link_context
+                        .callbacks
                         .get(index)
-                        .copied()
+                        .cloned()
                         .ok_or_else(|| packed_invalid("link callback index out of range"))?;
                     Some(LinkAction::Callback {
                         session: link_context.session,
                         isolate_token: link_context.isolate_token.clone(),
-                        id,
+                        id: callback.id,
+                        token: callback.token,
                     })
                 }
             };
@@ -3690,17 +3909,14 @@ fn resolve_script_link_action(
     match action {
         ScriptLinkActionWire::Send { send } => Ok(LinkAction::Send(Arc::from(send.as_str()))),
         ScriptLinkActionWire::Callback { cb } => {
-            let id = links
-                .callback_ids
-                .get(*cb as usize)
-                .copied()
-                .ok_or_else(|| {
-                    StyledTextOpError::Invalid("link callback index out of range".to_string())
-                })?;
+            let callback = links.callbacks.get(*cb as usize).cloned().ok_or_else(|| {
+                StyledTextOpError::Invalid("link callback index out of range".to_string())
+            })?;
             Ok(LinkAction::Callback {
                 session: links.session,
                 isolate_token: links.isolate_token.clone(),
-                id,
+                id: callback.id,
+                token: callback.token,
             })
         }
     }
@@ -3815,7 +4031,9 @@ impl StyledRunWire {
                 .as_ref()
                 .map(|bg| bg.to_color().map(normalize_bg))
                 .transpose()?,
-            attributes: self.attributes.map(Into::into),
+            attributes: self
+                .attributes
+                .map_or(TextAttributesUpdate::UNSET, Into::into),
             link: wire_link_to_styled(self.link.as_ref(), links)?,
             text: match sanitize_display_text(&self.text) {
                 std::borrow::Cow::Borrowed(_) => self.text,
@@ -3900,6 +4118,126 @@ fn op_smudgy_line_splice(
             },
         },
     );
+    Ok(())
+}
+
+/// Resolve a linked highlight's wire link into the [`LinkUpdate`] its
+/// operation carries: `None` strips the range's links, `Some` covers the
+/// range with the link. The wire link is validated BEFORE the callbacks
+/// register, so a rejected payload consumes no registry slots.
+fn highlight_link_update(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    link: Option<LinkWire>,
+    callbacks: v8::Local<v8::Array>,
+) -> Result<LinkUpdate, StyledTextOpError> {
+    if let Some(link) = &link {
+        link.validate(callbacks.length())?;
+    }
+    let context = link_context(scope, state, callbacks)?;
+    Ok(match wire_link_to_styled(link.as_ref(), &context)? {
+        Some(link) => LinkUpdate::Set(link),
+        None => LinkUpdate::Clear,
+    })
+}
+
+/// Build the per-range operations of one linked highlight. `ranges` is flat
+/// `[begin, end, begin, end, ...]` pairs — every occurrence a `highlight()`
+/// matched crosses in ONE op call, so the style parses once and the link's
+/// callbacks register exactly one registry slot however many ranges they
+/// cover. The style parses LOUDLY: silently tolerating a bad color here would
+/// also discard the link half the caller asked for. Empty pairs are dropped,
+/// and a call with no surviving pair registers nothing.
+#[allow(clippy::too_many_arguments)] // The two ops' shared body; arity is the wire's.
+fn linked_highlight_ops<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &OpState,
+    ranges: &[u32],
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
+    link: Option<LinkWire>,
+    callbacks: v8::Local<'s, v8::Array>,
+) -> Result<Vec<LineOperation>, StyledTextOpError> {
+    if !ranges.len().is_multiple_of(2) {
+        return Err(StyledTextOpError::Invalid(
+            "highlight ranges must be begin/end pairs".to_string(),
+        ));
+    }
+    let set = |value: v8::Local<'s, v8::Value>| (!value.is_null_or_undefined()).then_some(value);
+    let style = parse_style_from_js(scope, set(fg_color), set(bg_color), set(attributes))
+        .map_err(|error| StyledTextOpError::Invalid(error.to_string()))?;
+    let pairs: Vec<(usize, usize)> = ranges
+        .chunks_exact(2)
+        .filter(|pair| pair[0] < pair[1])
+        .map(|pair| (pair[0] as usize, pair[1] as usize))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let link = highlight_link_update(scope, state, link, callbacks)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(begin, end)| LineOperation::Highlight {
+            begin,
+            end,
+            style,
+            link: link.clone(),
+        })
+        .collect())
+}
+
+/// [`op_smudgy_highlight`] with a link update: restyle the ranges AND replace
+/// their link coverage — the write path for highlight options that carry
+/// `link` (a link tag, or null to strip). A separate op so the link-free path
+/// keeps its fast-op shape.
+#[op2]
+fn op_smudgy_highlight_link<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    #[buffer] ranges: &[u32],
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
+    #[serde] link: Option<LinkWire>,
+    callbacks: v8::Local<'s, v8::Array>,
+) -> Result<(), StyledTextOpError> {
+    ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
+    let operations = linked_highlight_ops(
+        scope, state, ranges, fg_color, bg_color, attributes, link, callbacks,
+    )?;
+    let pending_ops = state.borrow::<Rc<RefCell<Vec<LineOperation>>>>();
+    pending_ops.borrow_mut().extend(operations);
+    Ok(())
+}
+
+/// [`op_smudgy_highlight_link`] for an already-emitted buffer line.
+#[op2]
+fn op_smudgy_line_highlight_link<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    line_number: u32,
+    #[buffer] ranges: &[u32],
+    fg_color: v8::Local<'s, v8::Value>,
+    bg_color: v8::Local<'s, v8::Value>,
+    attributes: v8::Local<'s, v8::Value>,
+    #[serde] link: Option<LinkWire>,
+    callbacks: v8::Local<'s, v8::Array>,
+) -> Result<(), StyledTextOpError> {
+    ensure(grants(state).change_display, "change-display")?;
+    let operations = linked_highlight_ops(
+        scope, state, ranges, fg_color, bg_color, attributes, link, callbacks,
+    )?;
+    for operation in operations {
+        queue_own_action(
+            state,
+            RuntimeAction::PerformLineOperation {
+                line_number: line_number as usize,
+                operation,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -4680,17 +5018,22 @@ fn parse_color_from_js(
             return Ok(Color::Rgb { r, g, b });
         }
 
-        // Check if it's a palette color with the legacy effective `bold` bit
-        // and, on line-style readback, the lossless raw palette bit.
+        // Check if it's a palette color with the optional `bold` palette-slot
+        // bit and, on line-style readback, the lossless raw palette bit.
         let color_key = v8::String::new(scope, "color").unwrap().into();
         let bold_key = v8::String::new(scope, "bold").unwrap().into();
         let palette_bright_key = v8::String::new(scope, "paletteBright").unwrap().into();
 
-        if let Some(color_val) = obj.get(scope, color_key) {
+        if let Some(color_val) = obj.get(scope, color_key)
+            && !color_val.is_null_or_undefined()
+        {
+            let color_str = color_val.to_rust_string_lossy(scope);
+            // Omitted `bold` means what the bare name means: the bright
+            // variant for an ANSI name, the normal slot for "default".
             let bold = obj
                 .get(scope, bold_key)
-                .is_some_and(|v| v.boolean_value(scope));
-            let color_str = color_val.to_rust_string_lossy(scope);
+                .filter(|value| !value.is_null_or_undefined())
+                .map_or(color_str != "default", |value| value.boolean_value(scope));
             let palette_bright = obj
                 .get(scope, palette_bright_key)
                 .filter(|value| !value.is_null_or_undefined())
@@ -4723,61 +5066,71 @@ fn parse_color_from_js(
     }
 }
 
-fn object_property<'s>(
+/// A named property, with a missing/`null`/`undefined` value flattened to
+/// `None` — an unset attribute leaves the base value untouched.
+fn set_property<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     name: &str,
-) -> Result<v8::Local<'s, v8::Value>, AnyError> {
+) -> Option<v8::Local<'s, v8::Value>> {
     let key = v8::String::new(scope, name).unwrap().into();
     object
         .get(scope, key)
-        .ok_or_else(|| anyhow::anyhow!("missing text attribute {name}"))
+        .filter(|value| !value.is_null_or_undefined())
 }
 
 fn boolean_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     name: &str,
-) -> Result<bool, AnyError> {
-    let value = object_property(scope, object, name)?;
+) -> Result<Option<bool>, AnyError> {
+    let Some(value) = set_property(scope, object, name) else {
+        return Ok(None);
+    };
     if !value.is_boolean() {
         bail!("text attribute {name} must be a boolean");
     }
-    Ok(value.boolean_value(scope))
+    Ok(Some(value.boolean_value(scope)))
 }
 
 fn string_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     name: &str,
-) -> Result<String, AnyError> {
-    let value = object_property(scope, object, name)?;
+) -> Result<Option<String>, AnyError> {
+    let Some(value) = set_property(scope, object, name) else {
+        return Ok(None);
+    };
     if !value.is_string() {
         bail!("text attribute {name} must be a string");
     }
-    Ok(value.to_rust_string_lossy(scope))
+    Ok(Some(value.to_rust_string_lossy(scope)))
 }
 
+/// Parse a script attributes object: any subset of the seven attributes. Set
+/// fields override the style being written over; unset fields leave it alone.
 fn parse_attributes_from_js<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
-) -> Result<TextAttributes, AnyError> {
+) -> Result<TextAttributesUpdate, AnyError> {
     let object = value
         .to_object(scope)
         .ok_or_else(|| anyhow::anyhow!("attributes must be an object"))?;
-    let underline = match string_attribute(scope, object, "underline")?.as_str() {
-        "none" => Underline::None,
-        "single" => Underline::Single,
-        "double" => Underline::Double,
-        other => bail!("unknown underline style: {other}"),
+    let underline = match string_attribute(scope, object, "underline")?.as_deref() {
+        None => None,
+        Some("none") => Some(Underline::None),
+        Some("single") => Some(Underline::Single),
+        Some("double") => Some(Underline::Double),
+        Some(other) => bail!("unknown underline style: {other}"),
     };
-    let blink = match string_attribute(scope, object, "blink")?.as_str() {
-        "none" => Blink::None,
-        "slow" => Blink::Slow,
-        "fast" => Blink::Fast,
-        other => bail!("unknown blink style: {other}"),
+    let blink = match string_attribute(scope, object, "blink")?.as_deref() {
+        None => None,
+        Some("none") => Some(Blink::None),
+        Some("slow") => Some(Blink::Slow),
+        Some("fast") => Some(Blink::Fast),
+        Some(other) => bail!("unknown blink style: {other}"),
     };
-    Ok(TextAttributes {
+    Ok(TextAttributesUpdate {
         bold: boolean_attribute(scope, object, "bold")?,
         faint: boolean_attribute(scope, object, "faint")?,
         italic: boolean_attribute(scope, object, "italic")?,
@@ -4788,29 +5141,32 @@ fn parse_attributes_from_js<'s>(
     })
 }
 
-/// Helper function to create a Style from JavaScript values
+/// Build the [`StyleUpdate`] a line write op carries from its JavaScript
+/// values. Unset channels stay unset: they resolve against the line — a
+/// highlight keeps each span's existing value, an insert inherits the style
+/// at the insertion point.
 fn parse_style_from_js<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     fg_val: Option<v8::Local<'s, v8::Value>>,
     bg_val: Option<v8::Local<'s, v8::Value>>,
     attributes_val: Option<v8::Local<'s, v8::Value>>,
-) -> Result<Style, AnyError> {
+) -> Result<StyleUpdate, AnyError> {
     let fg = match fg_val {
-        Some(val) => parse_color_from_js(scope, val)?,
-        None => Color::DefaultForeground { bold: false },
+        Some(val) => Some(parse_color_from_js(scope, val)?),
+        None => None,
     };
 
     let bg = match bg_val {
-        Some(val) => normalize_bg(parse_color_from_js(scope, val)?),
-        None => Color::DefaultBackground,
+        Some(val) => Some(normalize_bg(parse_color_from_js(scope, val)?)),
+        None => None,
     };
 
     let attributes = match attributes_val {
         Some(value) => parse_attributes_from_js(scope, value)?,
-        None => TextAttributes::DEFAULT,
+        None => TextAttributesUpdate::UNSET,
     };
 
-    Ok(Style { fg, bg, attributes })
+    Ok(StyleUpdate { fg, bg, attributes })
 }
 
 #[op2(fast)]
@@ -4930,6 +5286,7 @@ fn op_smudgy_highlight<'s>(
         begin: begin as usize,
         end: end as usize,
         style,
+        link: LinkUpdate::Keep,
     });
     Ok(())
 }
@@ -7187,6 +7544,7 @@ fn op_smudgy_line_highlight<'s>(
                 begin: begin as usize,
                 end: end as usize,
                 style,
+                link: LinkUpdate::Keep,
             }),
         },
     );
@@ -7282,7 +7640,9 @@ mod tests {
         param_read_allowed, single_line_text,
     };
     use crate::session::runtime::store::ProducerKey;
-    use crate::session::styled_line::{Blink, LinkAction, TextAttributes, Underline};
+    use crate::session::styled_line::{
+        Blink, LinkAction, LinkToken, TextAttributes, TextAttributesUpdate, Underline,
+    };
     use std::sync::Arc;
 
     // ---- Packed styled-echo payload ----------------------------------------------
@@ -7292,6 +7652,7 @@ mod tests {
     const ANSI_RED_BRIGHT: u32 = 0x0200_0009;
     const ROLE_DEFAULT: u32 = 0x0300_0000;
     const ATTR_PRESENT: u32 = 0x8000_0000;
+    const ATTR_MASK_ALL: u32 = 0x007f_0000;
     const LINK_SEND_0: u32 = 0x4000_0000;
     const LINK_CB_0: u32 = 0x8000_0000;
 
@@ -7303,8 +7664,79 @@ mod tests {
                 .iter()
                 .map(|_| Arc::new(super::LinkTooltipState::default()))
                 .collect(),
-            callback_ids,
+            callbacks: callback_ids
+                .into_iter()
+                .map(|id| super::CallbackRef {
+                    id,
+                    token: Arc::new(LinkToken::default()),
+                })
+                .collect(),
         }
+    }
+
+    // ---- Link-callback registry --------------------------------------------
+
+    #[test]
+    fn link_callbacks_dedupe_by_identity_and_sweep_dead_entries() {
+        // `u32` stands in for the v8 global; the i32 plays the identity hash.
+        let mut registry = super::LinkCallbacks::<u32>::default();
+        let (id_a, token_a) = registry.insert_raw(1, 100, |f| *f == 100);
+        let (id_b, token_b) = registry.insert_raw(1, 100, |f| *f == 100);
+        assert_eq!(id_a, id_b, "the same function reuses its entry");
+        assert!(Arc::ptr_eq(&token_a, &token_b), "and its liveness token");
+
+        // An identity-hash collision with a DIFFERENT function is confirmed
+        // away by handle equality and gets its own entry.
+        let (id_c, token_c) = registry.insert_raw(1, 200, |f| *f == 200);
+        assert_ne!(id_a, id_c);
+        assert_eq!(registry.get(id_a), Some(&100));
+        assert_eq!(registry.get(id_c), Some(&200));
+
+        // Dropping every line's token makes the entry sweepable; a reachable
+        // entry survives the sweep.
+        drop(token_a);
+        drop(token_b);
+        registry.sweep();
+        assert_eq!(registry.get(id_a), None, "unreachable entry swept");
+        assert_eq!(registry.get(id_c), Some(&200), "reachable entry kept");
+
+        // Ids are monotonic: a swept id misses forever, never aliases.
+        drop(token_c);
+        let (id_d, _token_d) = registry.insert_raw(1, 100, |f| *f == 100);
+        assert!(id_d > id_c);
+        assert_eq!(registry.get(id_a), None);
+    }
+
+    #[test]
+    fn link_callbacks_rearm_a_dead_entry_for_the_same_function() {
+        let mut registry = super::LinkCallbacks::<u32>::default();
+        let (id_a, token_a) = registry.insert_raw(7, 100, |f| *f == 100);
+        drop(token_a);
+        // No sweep ran, so the dead entry is still present. Re-registering the
+        // same function revives it under the SAME id — safe, because a dead
+        // token means no line still holds the old id to click.
+        let (id_b, token_b) = registry.insert_raw(7, 100, |f| *f == 100);
+        assert_eq!(id_a, id_b);
+        assert_eq!(registry.get(id_b), Some(&100));
+        drop(token_b);
+    }
+
+    #[test]
+    fn link_callbacks_cap_evicts_oldest_reachable_entry_as_backstop() {
+        let mut registry = super::LinkCallbacks::<u32>::default();
+        let cap = u32::try_from(super::LinkCallbacks::<u32>::CAP).expect("cap fits");
+        // Fill to the cap with distinct, still-reachable callbacks.
+        let tokens: Vec<_> = (0..cap)
+            .map(|i| {
+                registry
+                    .insert_raw(i32::try_from(i).expect("hash"), i, |f| *f == i)
+                    .1
+            })
+            .collect();
+        let (id_new, _token_new) = registry.insert_raw(-1, 999_999, |f| *f == 999_999);
+        assert_eq!(registry.get(0), None, "the oldest entry evicts at the cap");
+        assert_eq!(registry.get(id_new), Some(&999_999));
+        drop(tokens);
     }
 
     #[test]
@@ -7523,12 +7955,19 @@ mod tests {
 
     #[test]
     fn packed_attributes_distinguish_inheritance_reset_and_all_variants() {
-        assert_eq!(packed_attributes(0).unwrap(), None);
+        assert_eq!(packed_attributes(0).unwrap(), TextAttributesUpdate::UNSET);
+        // Presence with an empty set mask sets nothing.
         assert_eq!(
             packed_attributes(ATTR_PRESENT).unwrap(),
-            Some(TextAttributes::DEFAULT)
+            TextAttributesUpdate::UNSET
+        );
+        // A full mask with all-zero values is an explicit reset of every field.
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT | ATTR_MASK_ALL).unwrap(),
+            TextAttributesUpdate::from(TextAttributes::DEFAULT)
         );
         let all = ATTR_PRESENT
+            | ATTR_MASK_ALL
             | (1 << 0)
             | (1 << 1)
             | (1 << 2)
@@ -7538,7 +7977,7 @@ mod tests {
             | (1 << 8);
         assert_eq!(
             packed_attributes(all).unwrap(),
-            Some(TextAttributes {
+            TextAttributesUpdate::from(TextAttributes {
                 bold: true,
                 faint: true,
                 italic: true,
@@ -7548,8 +7987,26 @@ mod tests {
                 reverse: true,
             })
         );
-        assert!(packed_attributes(ATTR_PRESENT | (3 << 3)).is_err());
-        assert!(packed_attributes(ATTR_PRESENT | (3 << 5)).is_err());
+        // A partial mask sets only its fields.
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT | (1 << 16) | (1 << 0)).unwrap(),
+            TextAttributesUpdate {
+                bold: Some(true),
+                ..TextAttributesUpdate::UNSET
+            }
+        );
+        assert_eq!(
+            packed_attributes(ATTR_PRESENT | (1 << 19) | (1 << 3)).unwrap(),
+            TextAttributesUpdate {
+                underline: Some(Underline::Single),
+                ..TextAttributesUpdate::UNSET
+            }
+        );
+        // A value bit whose field is not in the set mask is malformed.
+        assert!(packed_attributes(ATTR_PRESENT | (1 << 0)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | (2 << 3)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | ATTR_MASK_ALL | (3 << 3)).is_err());
+        assert!(packed_attributes(ATTR_PRESENT | ATTR_MASK_ALL | (3 << 5)).is_err());
         assert!(packed_attributes(ATTR_PRESENT | (1 << 9)).is_err());
         assert!(packed_attributes(1).is_err());
     }

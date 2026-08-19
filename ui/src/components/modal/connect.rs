@@ -7,12 +7,15 @@ use crate::theme::Element;
 use crate::theme::builtins;
 
 // Keep core model imports
+use smudgy_core::models::observed::{ObservedServer, ObservedValue};
 use smudgy_core::models::profile::{
     clear_profile_password, contains_password_token, has_profile_password, set_profile_password,
 };
+use smudgy_core::models::server::{link_url_host, load_server, update_server};
 use smudgy_core::models::{profile::Profile, server::Server};
 use std::collections::HashMap;
 
+mod observed;
 mod profile;
 mod server;
 
@@ -125,6 +128,17 @@ pub enum Message {
     ProfileCreated(Result<smudgy_core::models::profile::Profile, String>),
     ProfileUpdated(Result<smudgy_core::models::profile::Profile, String>),
     ProfileDeleted(Result<(ServerName, ProfileName), String>), // Need both names for state update
+    // --- Observed-metadata band (server-supplied URLs; same trust gate as
+    // --- server OSC 8 links, persisting into the same `server.json` grants) ---
+    /// An MSSP `ICON` fetch settled: `Some` carries the display handle of the
+    /// freshly cached artifact, `None` a refusal/failure (any cached icon
+    /// keeps rendering).
+    ServerIconFetched(ServerName, Option<iced::widget::image::Handle>),
+    OpenObservedLink(ServerName, String),
+    ObservedLinkGrantHost(bool),
+    ObservedLinkGrantServer(bool),
+    ObservedLinkProceed,
+    ObservedLinkCancel,
 }
 
 /// Fields in the server create/edit form.
@@ -198,9 +212,40 @@ pub enum ProfileCrudAction {
     ConfirmDelete(ProfileName), // Confirmation step before deleting
 }
 
+/// One observed-metadata link (MSSP `DISCORD`/`WEBSITE`/`CONTACT`) held at
+/// the trust gate, with the confirm dialog's checkbox state. The mirror of
+/// the session view's pending link confirm, keyed by server since the modal
+/// is not session-bound.
+#[derive(Debug, Clone)]
+struct ObservedLinkConfirm {
+    /// The server whose metadata supplied the URL (and whose grants apply).
+    server: ServerName,
+    /// The gated URL, opened verbatim on Proceed.
+    url: String,
+    /// Safe, middle-elided display copy (invisible characters escaped).
+    display: String,
+    /// The URL's host (the per-host grant key).
+    host: Option<String>,
+    grant_host: bool,
+    grant_server: bool,
+}
+
 // State managed by this modal
 pub struct State {
     servers: Vec<Server>,
+    /// Per-server observed sidecar (`observed.json`) — the metadata band's
+    /// source. Absent entry = nothing observed yet; that server renders
+    /// exactly as it did before the feature existed. Loaded with the server
+    /// list and refreshed by the daemon's `ObservedServerChanged` nudge.
+    observed: HashMap<ServerName, ObservedServer>,
+    /// A metadata-band link held at the trust gate — the same per-server
+    /// gate server OSC 8 links pass, sharing its `server.json` grant store.
+    link_confirm: Option<ObservedLinkConfirm>,
+    /// Per-server display handles for the MSSP `ICON` cache (`icon.png` in the
+    /// server's directory). Loaded with the server list; a fetch task replaces
+    /// an entry when the observed `ICON` value changes. Absent entry = the
+    /// title renders iconless, exactly as it did before the feature existed.
+    icons: HashMap<ServerName, iced::widget::image::Handle>,
     profiles: HashMap<ServerName, Vec<Profile>>,
     /// Per probed server: the profile names of its last-session snapshot in
     /// slot order, or `None` when no usable snapshot exists. Absent until a
@@ -285,8 +330,83 @@ impl State {
                 .insert(name.clone(), load_last_session_profiles(&name));
             state.profiles.insert(name, profiles);
         }
+        // The observed sidecars are the same class of small local read; a
+        // server without one simply has no entry (and no metadata band).
+        state.observed = servers
+            .iter()
+            .filter_map(|server| {
+                smudgy_core::models::observed::load_observed(&server.name)
+                    .map(|observed| (server.name.clone(), observed))
+            })
+            .collect();
+        // Cached icons likewise (small PNGs of the icon pipeline's own
+        // re-encode); fetches for changed `ICON` values are spawned by
+        // `icon_refresh_task` once the modal is up.
+        state.icons = servers
+            .iter()
+            .filter_map(|server| {
+                crate::images::server_icon::load_cached_icon(&server.name)
+                    .map(|handle| (server.name.clone(), handle))
+            })
+            .collect();
         state.servers = servers;
         state
+    }
+
+    /// Fetch tasks for every server whose observed `ICON` value the cache
+    /// wasn't built from — run when the modal opens, and again after a
+    /// link-trust grant (which may have just unlocked a held icon). The
+    /// pre-checks here only avoid spawning tasks that would refuse; the fetch
+    /// re-applies the full policy itself.
+    pub(crate) fn icon_refresh_task(&self) -> Task<Message> {
+        use crate::images::server_icon;
+        let mut tasks = Vec::new();
+        for server in &self.servers {
+            let Some(icon_value) = self
+                .observed
+                .get(&server.name)
+                .and_then(|observed| match observed.mssp.get("ICON") {
+                    Some(ObservedValue::Text(value)) => Some(value.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !server_icon::needs_refetch(&server.name, &icon_value) {
+                continue;
+            }
+            if !matches!(
+                server_icon::icon_url_policy(&icon_value, &server.config.host, &server.config),
+                server_icon::IconUrlPolicy::AutoFetch(_)
+            ) {
+                continue;
+            }
+            tasks.push(Task::perform(
+                server_icon::fetch_and_cache(
+                    server.name.clone(),
+                    server.config.host.clone(),
+                    server.config.clone(),
+                    icon_value,
+                ),
+                |(name, handle)| Message::ServerIconFetched(name, handle),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Re-read one server's observed sidecar — the daemon calls this on
+    /// `SessionEvent::ObservedServerChanged`, so an open modal's metadata
+    /// band tracks a live session's writes without file watching.
+    pub fn refresh_observed(&mut self, server: &str) {
+        match smudgy_core::models::observed::load_observed(server) {
+            Some(observed) => {
+                self.observed.insert(server.to_string(), observed);
+            }
+            None => {
+                self.observed.remove(server);
+            }
+        }
     }
 }
 
@@ -304,6 +424,9 @@ impl Default for State {
     fn default() -> Self {
         State {
             servers: Vec::new(),
+            observed: HashMap::new(),
+            link_confirm: None,
+            icons: HashMap::new(),
             profiles: HashMap::new(),
             last_sessions: HashMap::new(),
             selected_server: None,
@@ -335,6 +458,15 @@ async fn load_image_cache_usage(server: ServerName) -> (ServerName, u64) {
 async fn clear_image_cache_async(server: ServerName) -> ServerName {
     crate::images::clear_server_image_cache(&server);
     server
+}
+
+/// Open a URL in the system browser, detached; a failure is logged, never
+/// fatal. (The session view keeps its own copy — both are one-line wrappers
+/// around the same crate call.)
+fn open_url_in_browser(url: &str) {
+    if let Err(e) = open::that_detached(url) {
+        log::error!("Failed to open {url} in the browser: {e}");
+    }
 }
 
 // --- Auto-login password helpers ---
@@ -674,8 +806,12 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     state.servers.retain(|s| s.name != deleted_name);
                     // Remove from profiles map
                     state.profiles.remove(&deleted_name);
-                    // Its probed last-session offer retires with it.
+                    // Its probed last-session offer, observed sidecar copy,
+                    // and icon retire with it (the on-disk files went with the
+                    // server's directory).
                     state.last_sessions.remove(&deleted_name);
+                    state.observed.remove(&deleted_name);
+                    state.icons.remove(&deleted_name);
 
                     // If the deleted server was selected, select the first one or none
                     if state.selected_server.as_ref() == Some(&deleted_name) {
@@ -927,6 +1063,95 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 }
             }
         }
+        Message::ServerIconFetched(server_name, handle) => {
+            // `None` (refusal or failure) keeps whatever was cached before.
+            if let Some(handle) = handle {
+                state.icons.insert(server_name, handle);
+            }
+        }
+        Message::OpenObservedLink(server_name, url) => {
+            // The same per-server gate a server OSC 8 link passes: a granted
+            // host (or a blanket grant) opens directly, anything else is held
+            // for the user's verdict. The URL is server-supplied input.
+            let host = link_url_host(&url);
+            let allowed = state
+                .servers
+                .iter()
+                .find(|s| s.name == server_name)
+                .is_some_and(|s| s.config.allows_server_link(host.as_deref()));
+            if allowed {
+                open_url_in_browser(&url);
+            } else {
+                state.link_confirm = Some(ObservedLinkConfirm {
+                    display: observed::safe_url_display(&url),
+                    server: server_name,
+                    url,
+                    host,
+                    grant_host: false,
+                    grant_server: false,
+                });
+            }
+        }
+        Message::ObservedLinkGrantHost(value) => {
+            if let Some(pending) = state.link_confirm.as_mut() {
+                pending.grant_host = value;
+            }
+        }
+        Message::ObservedLinkGrantServer(value) => {
+            if let Some(pending) = state.link_confirm.as_mut() {
+                pending.grant_server = value;
+            }
+        }
+        Message::ObservedLinkCancel => {
+            state.link_confirm = None;
+        }
+        Message::ObservedLinkProceed => {
+            if let Some(pending) = state.link_confirm.take() {
+                if pending.grant_host || pending.grant_server {
+                    // Persist by re-reading the on-disk config and applying
+                    // only this grant, so a concurrent session's grant isn't
+                    // clobbered by a stale whole-config snapshot; fall back
+                    // to the modal's copy if the load fails. The in-memory
+                    // copy adopts the result so the gate reflects it now.
+                    let config =
+                        load_server(&pending.server)
+                            .map(|s| s.config)
+                            .ok()
+                            .or_else(|| {
+                                state
+                                    .servers
+                                    .iter()
+                                    .find(|s| s.name == pending.server)
+                                    .map(|s| s.config.clone())
+                            });
+                    if let Some(mut config) = config {
+                        if pending.grant_server {
+                            config.trust_all_links = true;
+                        }
+                        if pending.grant_host
+                            && let Some(host) = &pending.host
+                        {
+                            config.grant_link_host(host);
+                        }
+                        if let Err(e) = update_server(&pending.server, config.clone()) {
+                            warn!(
+                                "Failed to persist link-trust grants for '{}': {e}",
+                                pending.server
+                            );
+                        }
+                        if let Some(server) =
+                            state.servers.iter_mut().find(|s| s.name == pending.server)
+                        {
+                            server.config = config;
+                        }
+                        // A fresh grant may have unlocked an icon held at the
+                        // same trust gate (icons and links share the store).
+                        task = state.icon_refresh_task();
+                    }
+                }
+                open_url_in_browser(&pending.url);
+            }
+        }
         Message::ProfileDeleted(result) => {
             match result {
                 Ok((server_name, deleted_profile_name)) => {
@@ -993,19 +1218,34 @@ fn view_placeholder(state: &State) -> Element<'_, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     let server_pane = view_server_list(state);
 
-    // Determine the content for the main pane based on the state
-    let main_pane_content = if let Some(action) = &state.server_action {
+    // Determine the content for the main pane based on the state. The details
+    // view manages its own overflow (a pinned header/footer around an inner
+    // profile-list scrollable, which an outer scrollable's unbounded height
+    // would collapse); every other pane is a fixed-height form or placeholder
+    // that must scroll rather than clip when the modal shrinks.
+    let (main_pane_content, scrolls_itself) = if let Some(action) = &state.server_action {
         // Show server form if a server action is active
-        view_server_form(state, action)
+        (view_server_form(state, action), false)
     } else if let Some(action) = &state.profile_action {
         // Show profile form if a profile action is active (Create, Edit, or ConfirmDelete)
-        view_profile_form(state, action)
+        (view_profile_form(state, action), false)
     } else if let Some(server_name) = &state.selected_server {
         // Show server details and profiles if a server is selected
-        view_server_details_and_profiles(state, server_name)
+        (view_server_details_and_profiles(state, server_name), true)
     } else {
         // Show placeholder if no server is selected and no form is active
-        view_placeholder(state)
+        (view_placeholder(state), false)
+    };
+    let main_pane_content: Element<'_, Message> = if scrolls_itself {
+        main_pane_content
+    } else {
+        // Right padding keeps form controls clear of the overlaid scrollbar
+        // that appears once the pane overflows.
+        iced::widget::scrollable(
+            container(main_pane_content).padding(iced::Padding::ZERO.right(14)),
+        )
+        .height(Length::Fill)
+        .into()
     };
 
     let main_pane = container(main_pane_content)
@@ -1014,5 +1254,12 @@ pub fn view(state: &State) -> Element<'_, Message> {
         .into();
 
     // Combine panes into the modal body
-    Row::with_children(vec![server_pane, main_pane]).into()
+    let body: Element<'_, Message> = Row::with_children(vec![server_pane, main_pane]).into();
+
+    // A metadata link held at the trust gate renders its confirm dialog over
+    // the whole modal body, exactly like the session view's link dialog.
+    match &state.link_confirm {
+        Some(pending) => iced::widget::stack![body, observed::link_confirm_dialog(pending)].into(),
+        None => body,
+    }
 }

@@ -139,6 +139,10 @@ pub enum Message {
     DismissUpgrade,
     /// "Dismiss for this version" on the soft upgrade popup (persisted).
     DismissUpgradeForVersion,
+    /// A frame tick while the no-session empty state is showing; carries the
+    /// frame timestamp so the CRT-cat shader's clock advances. Only emitted
+    /// while there is no pane grid (see `subscription`).
+    EmptyStateTick(std::time::Instant),
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +499,10 @@ pub struct SmudgyWindow {
     /// this window adopts, exact profile first, then lowest ordinal.
     /// Runtime-only — snapshots never carry vacancies.
     vacancies: Vec<SessionVacancy>,
+    /// Animation clock for the empty state's CRT-cat shader. Ticked by
+    /// `EmptyStateTick` frames, which only flow while the empty state shows;
+    /// it restarts after a gap so the cat re-enters with its opening pose.
+    cat_clock: widgets::crt_cat::Clock,
 }
 
 /// The pane_grid axis (and whether the new pane is the first child) for a
@@ -673,6 +681,7 @@ impl SmudgyWindow {
             strip_scroll: std::cell::RefCell::new(FxHashMap::default()),
             pending_panes: std::collections::HashMap::new(),
             vacancies: Vec::new(),
+            cat_clock: widgets::crt_cat::Clock::default(),
         }
     }
 
@@ -735,6 +744,7 @@ impl SmudgyWindow {
     /// first frames don't draw the floating frame chrome.
     pub(crate) fn seed_maximized(&mut self, maximized: bool) {
         self.maximized = maximized;
+        crate::win_chrome::set_maximized(self.window_id, maximized);
     }
 
     /// Whether the window is in native fullscreen (as mirrored from resize
@@ -1675,6 +1685,14 @@ impl SmudgyWindow {
         // resizes, to keep the maximize/restore button and the resize grips
         // honest.
         subscriptions.push(window::resize_events().map(|(id, _size)| Message::WindowResized(id)));
+
+        // Drive the empty state's animated cat. `window::frames()` requests a
+        // redraw every frame, so it's gated on the no-grid state (the same
+        // condition that selects the empty state in `view`) to stop burning
+        // the GPU once a session is up.
+        if self.grid.is_none() {
+            subscriptions.push(window::frames().map(Message::EmptyStateTick));
+        }
 
         Subscription::batch(subscriptions)
     }
@@ -2688,6 +2706,16 @@ impl SmudgyWindow {
         }
     }
 
+    /// Refresh an open Connect modal's observed-state copy for `server` — the
+    /// daemon's response to `SessionEvent::ObservedServerChanged` (a session
+    /// rewrote that server's `observed.json`). A no-op when no Connect modal
+    /// is up.
+    pub fn refresh_connect_observed(&mut self, server: &str) {
+        if let Some(modal::Modal::Connect(state)) = &mut self.modal {
+            state.refresh_observed(server);
+        }
+    }
+
     pub fn update(
         &mut self,
         message: Message,
@@ -2953,10 +2981,12 @@ impl SmudgyWindow {
             }
             Message::SetMaximized(maximized) => {
                 self.maximized = maximized;
+                crate::win_chrome::set_maximized(self.window_id, maximized);
                 Update::none()
             }
             Message::SetFullscreen(fullscreen) => {
                 self.fullscreen = fullscreen;
+                crate::win_chrome::set_fullscreen(self.window_id, fullscreen);
                 Update::none()
             }
             Message::SetActiveSession(session_id) => {
@@ -3281,6 +3311,10 @@ impl SmudgyWindow {
             Message::DismissUpgradeForVersion => {
                 Update::with_event(Event::DismissUpgradeForVersion)
             }
+            Message::EmptyStateTick(now) => {
+                self.cat_clock.tick(now);
+                Update::none()
+            }
         }
     }
 
@@ -3296,6 +3330,7 @@ impl SmudgyWindow {
     ) -> ThemedElement<'a, Message> {
         let session_context = self.create_session_context(sessions);
         let toolbar_element = toolbar::view(
+            self.window_id,
             self.toolbar_expanded,
             self.maximized,
             self.fullscreen,
@@ -3603,24 +3638,17 @@ impl SmudgyWindow {
             })
             .into()
         } else {
-            // Empty session: an actionable empty state — icon chip, heading,
-            // one-line subtext, and a single primary action that opens the Connect
-            // modal (so first-run users don't have to discover the menu bar).
-            let chip = container(
-                text(assets::bootstrap_icons::LIGHTNING)
-                    .font(assets::fonts::BOOTSTRAP_ICONS)
-                    .size(28)
-                    .style(theme::builtins::text::muted),
-            )
-            .width(Length::Fixed(64.0))
-            .height(Length::Fixed(64.0))
-            .align_x(Horizontal::Center)
-            .align_y(Vertical::Center)
-            .style(theme::builtins::container::icon_chip);
+            // Empty session: an actionable empty state — animated CRT cat,
+            // heading, one-line subtext, and a single primary action that opens
+            // the Connect modal (so first-run users don't have to discover the
+            // menu bar). The cat is a custom wgpu shader primitive; under the
+            // software (tiny-skia) renderer it is a no-op and its slot is
+            // simply blank.
+            let cat = widgets::crt_cat::view(self.cat_clock.seconds());
 
             let empty_state: ThemedElement<'_, Message> = container(
                 column![
-                    chip,
+                    cat,
                     text(crate::i18n::t!("shell-no-sessions")).size(22),
                     text(crate::i18n::t!("shell-connect-help")).style(theme::builtins::text::muted),
                     iced::widget::button(
@@ -3769,12 +3797,19 @@ impl SmudgyWindow {
             main_layout
         };
 
-        if cfg!(target_os = "macos") || self.maximized || self.fullscreen {
+        if cfg!(any(target_os = "macos", target_os = "windows"))
+            || self.maximized
+            || self.fullscreen
+        {
             // No resize grips while maximized; the OS rejects resizing anyway
             // and the strips would steal clicks at the screen edges. macOS
             // never gets grips: the window keeps its native frame there, so
             // edge resizing is the system's (and winit's `drag_resize` is
-            // unsupported on macOS regardless).
+            // unsupported on macOS regardless). Windows resizes through the
+            // `WM_NCHITTEST` border zones (`win_chrome`), whose geometry
+            // mirrors these strips — client-side grips would both shadow
+            // them and re-enter winit's latch-prone `drag_resize` path. The
+            // grips are the Linux borderless frame's path.
             main_layout
         } else {
             stack(vec![

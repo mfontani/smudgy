@@ -50,6 +50,9 @@ impl std::error::Error for EncodeError {}
 /// Per-connection transcoding state, owned by the connect task like the telnet parser.
 pub struct Transcode {
     encoding: &'static Encoding,
+    /// The encoding this connection was constructed with (the per-server setting),
+    /// unchanged by any mid-stream CHARSET switch — see [`Self::configured_encoding`].
+    configured: &'static Encoding,
     /// `None` on the UTF-8 pass-through (no decoder is ever constructed for it).
     decoder: Option<Decoder>,
     /// Reused inbound UTF-8 output.
@@ -81,6 +84,7 @@ impl Transcode {
         let convert = encoding != UTF_8;
         Self {
             encoding,
+            configured: encoding,
             decoder: convert.then(|| encoding.new_decoder()),
             in_buf: String::new(),
             scratch: Vec::new(),
@@ -100,11 +104,22 @@ impl Transcode {
         self.encoding
     }
 
+    /// The encoding the per-server setting seeded this connection with, regardless of
+    /// any later CHARSET switch. Subnegotiation payloads that can predate that
+    /// negotiation (MSSP) decode against this label — never through the streaming
+    /// decoder, whose partial-sequence state belongs to application text.
+    #[must_use]
+    pub fn configured_encoding(&self) -> &'static Encoding {
+        self.configured
+    }
+
     /// Switch encodings mid-connection (a CHARSET `ACCEPTED`). Fresh coders: the switch
     /// happens at a subnegotiation boundary, so no partial sequence is legitimately in
     /// flight; any carried decoder state belonged to the old encoding anyway.
     pub fn switch_to(&mut self, encoding: &'static Encoding) {
+        let configured = self.configured;
         *self = Self::new(encoding);
+        self.configured = configured;
     }
 
     /// Decode one run of inbound application bytes to UTF-8, carrying partial multibyte
@@ -298,5 +313,13 @@ mod tests {
         t.switch_to(WINDOWS_1252);
         // The pending Big5 lead byte is gone; Latin-1 decodes cleanly.
         assert_eq!(t.decode(&[0xE9]), "\u{e9}");
+    }
+
+    #[test]
+    fn configured_encoding_survives_a_charset_switch() {
+        let mut t = Transcode::new(WINDOWS_1252);
+        t.switch_to(BIG5);
+        assert_eq!(t.encoding(), BIG5);
+        assert_eq!(t.configured_encoding(), WINDOWS_1252);
     }
 }

@@ -50,10 +50,13 @@ const CELLS: &[(&str, u32, &str)] = &[
     ("empty", 9501, ""),
     ("gag", 9502, "line.gag();"),
     ("read_echo", 9503, r#"echo("ZZECHOED " + line.text);"#),
+    // NB: hex strings were never a valid Color; with call-site validation the
+    // old "#ff0000" would now throw per line and the cell would measure the
+    // exception path instead of the highlight.
     (
         "highlight",
         9504,
-        r##"line.highlight("fountain", { fg: "#ff0000" });"##,
+        r##"line.highlight("fountain", { fg: { r: 255, g: 0, b: 0 } });"##,
     ),
 ];
 

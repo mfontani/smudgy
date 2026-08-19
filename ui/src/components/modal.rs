@@ -102,8 +102,9 @@ impl Modal {
         match self {
             // The connect modal loads its servers + first-server profiles
             // synchronously in `connect::State::opening`, so it opens fully
-            // populated and needs no initial async task.
-            Modal::Connect(_) => Task::none(),
+            // populated; the only start-up async work is fetching icons whose
+            // observed `ICON` value the cache wasn't built from.
+            Modal::Connect(state) => state.icon_refresh_task().map(Message::Connect),
             // The layouts modal lists its store synchronously too.
             Modal::Layouts(_) => Task::none(),
         }
