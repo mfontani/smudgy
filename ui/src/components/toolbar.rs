@@ -1,5 +1,5 @@
 use iced::alignment::Vertical;
-use iced::widget::{Row, Space, button, mouse_area, svg, text};
+use iced::widget::{Row, button, svg, text};
 // The `row!` macro only builds the custom window controls, which macOS
 // (native traffic lights) never renders.
 #[cfg(not(target_os = "macos"))]
@@ -7,8 +7,12 @@ use iced::widget::row;
 use iced::{Color, Length};
 use smudgy_theme::builtins;
 
+use iced::window;
+
 use crate::assets;
 use crate::theme::Element;
+#[cfg(not(target_os = "windows"))]
+use crate::widgets::titlebar_press::TitlebarPress;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message {
@@ -19,7 +23,9 @@ pub enum Message {
     LayoutsPressed,
     ToggleExpand,
     // Window controls: the toolbar doubles as the titlebar of the borderless
-    // main window.
+    // main window. On Windows moves go through the `WM_NCHITTEST` chrome
+    // instead, so nothing constructs `DragWindow` there.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     DragWindow,
     MinimizePressed,
     ToggleMaximizePressed,
@@ -77,11 +83,30 @@ fn window_control_button(
 
 /// The empty stretch of toolbar between the app buttons and the window
 /// controls: dragging it moves the window, double-clicking toggles maximize.
-fn drag_area() -> Element<'static, Message> {
-    mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-        .on_press(Message::DragWindow)
-        .on_double_click(Message::ToggleMaximizePressed)
+///
+/// On Windows the strip is inert to iced — it only mirrors its bounds to the
+/// `WM_NCHITTEST` chrome (`win_chrome`), which answers `HTCAPTION` there so
+/// DefWindowProc runs moves, double-click maximize, drag-to-restore, and
+/// touch/pen drags natively. Elsewhere the press surface arms on press and
+/// hands off to the OS drag only past the deadband, so a double-click's
+/// second press toggles maximize without also firing a drag (see
+/// `titlebar_press`).
+fn drag_area(window: window::Id) -> Element<'static, Message> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::widgets::bounds_probe::BoundsProbe::new(
+            iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+            move |bounds| crate::win_chrome::set_caption_bounds(window, bounds),
+        )
         .into()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        TitlebarPress::new(Message::DragWindow, Message::ToggleMaximizePressed).into()
+    }
 }
 
 /// Quiet text button used for the toolbar's menu items.
@@ -132,13 +157,13 @@ fn window_controls(maximized: bool) -> Element<'static, Message> {
 /// behavior as the rest of the titlebar.
 #[cfg(target_os = "macos")]
 fn traffic_light_inset() -> Element<'static, Message> {
-    mouse_area(Space::new().width(TRAFFIC_LIGHT_INSET).height(Length::Fill))
-        .on_press(Message::DragWindow)
-        .on_double_click(Message::ToggleMaximizePressed)
+    TitlebarPress::new(Message::DragWindow, Message::ToggleMaximizePressed)
+        .width(TRAFFIC_LIGHT_INSET)
         .into()
 }
 
 pub fn view(
+    window: window::Id,
     expanded: bool,
     maximized: bool,
     fullscreen: bool,
@@ -187,7 +212,7 @@ pub fn view(
             Message::SettingsPressed,
         ));
 
-        buttons.push(drag_area());
+        buttons.push(drag_area(window));
         #[cfg(not(target_os = "macos"))]
         buttons.push(window_controls(maximized));
 
@@ -213,7 +238,7 @@ pub fn view(
         }
         items.push(menu_button());
         items.push(title.into());
-        items.push(drag_area());
+        items.push(drag_area(window));
         #[cfg(not(target_os = "macos"))]
         items.push(window_controls(maximized));
 

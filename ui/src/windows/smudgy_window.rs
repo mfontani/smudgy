@@ -744,6 +744,7 @@ impl SmudgyWindow {
     /// first frames don't draw the floating frame chrome.
     pub(crate) fn seed_maximized(&mut self, maximized: bool) {
         self.maximized = maximized;
+        crate::win_chrome::set_maximized(self.window_id, maximized);
     }
 
     /// Whether the window is in native fullscreen (as mirrored from resize
@@ -2980,10 +2981,12 @@ impl SmudgyWindow {
             }
             Message::SetMaximized(maximized) => {
                 self.maximized = maximized;
+                crate::win_chrome::set_maximized(self.window_id, maximized);
                 Update::none()
             }
             Message::SetFullscreen(fullscreen) => {
                 self.fullscreen = fullscreen;
+                crate::win_chrome::set_fullscreen(self.window_id, fullscreen);
                 Update::none()
             }
             Message::SetActiveSession(session_id) => {
@@ -3327,6 +3330,7 @@ impl SmudgyWindow {
     ) -> ThemedElement<'a, Message> {
         let session_context = self.create_session_context(sessions);
         let toolbar_element = toolbar::view(
+            self.window_id,
             self.toolbar_expanded,
             self.maximized,
             self.fullscreen,
@@ -3793,12 +3797,19 @@ impl SmudgyWindow {
             main_layout
         };
 
-        if cfg!(target_os = "macos") || self.maximized || self.fullscreen {
+        if cfg!(any(target_os = "macos", target_os = "windows"))
+            || self.maximized
+            || self.fullscreen
+        {
             // No resize grips while maximized; the OS rejects resizing anyway
             // and the strips would steal clicks at the screen edges. macOS
             // never gets grips: the window keeps its native frame there, so
             // edge resizing is the system's (and winit's `drag_resize` is
-            // unsupported on macOS regardless).
+            // unsupported on macOS regardless). Windows resizes through the
+            // `WM_NCHITTEST` border zones (`win_chrome`), whose geometry
+            // mirrors these strips — client-side grips would both shadow
+            // them and re-enter winit's latch-prone `drag_resize` path. The
+            // grips are the Linux borderless frame's path.
             main_layout
         } else {
             stack(vec![

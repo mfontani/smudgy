@@ -12,10 +12,12 @@ use iced::{Length, mouse::Interaction};
 
 use crate::theme::Element;
 
-/// Thickness of the edge strips, in logical pixels.
-const GRIP: f32 = 6.0;
+/// Thickness of the edge strips, in logical pixels. Shared with the Windows
+/// `WM_NCHITTEST` chrome (`win_chrome`) so both platforms' resize zones have
+/// identical geometry.
+pub(crate) const GRIP: f32 = 6.0;
 /// How far corner zones extend along each edge.
-const CORNER: f32 = 16.0;
+pub(crate) const CORNER: f32 = 16.0;
 
 fn interaction_for(direction: Direction) -> Interaction {
     match direction {
