@@ -282,19 +282,39 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     ))
     .unwrap();
 
+    // The engine commits Room.Info through separate mutateArea gestures with host
+    // round-trips between them, so the mapper queue is momentarily idle between the
+    // rooms gesture and the topology gesture; a drain alone can return inside that gap
+    // and leak Room.Info's exits envelope into the Room.Map window below. Completion
+    // is therefore Room.Info's LAST effect: its topology reaching the backend log.
+    let exit_committed = |direction: ExitDirection| {
+        local
+            .mutation_log()
+            .iter()
+            .flat_map(|envelope| envelope.payload.iter())
+            .any(|op| {
+                matches!(
+                    op,
+                    AreaMutation::CreateExit { body, .. } if body.from_direction == direction
+                )
+            })
+    };
     wait_until(
         &mut events,
         &mut lines,
-        "Room.Info to provision the center room and both exit neighbors",
+        "Room.Info to provision the neighborhood and commit its exit topology",
         |_| {
             room_exists(&mapper, "5539")
                 && room_exists(&mapper, "5540")
                 && room_exists(&mapper, "5541")
+                && exit_committed(ExitDirection::North)
+                && exit_committed(ExitDirection::East)
         },
     )
     .await;
     // Drain before the snapshot so the log index below is a CAUSAL boundary:
-    // every envelope recorded past it was caused by Room.Map alone.
+    // every envelope recorded past it was caused by Room.Map alone. (The atlas
+    // publishes only after enqueue, so anything atlas-visible above is flushed here.)
     drain_mutation_queue(&mapper).await;
     let mutations_before_room_map = local.mutation_log().len();
 
