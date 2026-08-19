@@ -31,6 +31,8 @@ iced_runtime = { workspace = true }
 iced_graphics = "0.14"
 log = { workspace = true }
 smudgy_widgets = { workspace = true }
+# Zero-copy upload of the CRT-cat shader's uniform block (see widgets/crt_cat.rs).
+bytemuck = { version = "1", features = ["derive"] }
 # Inline-capacity tab lists in the pane-group layout model (same version the
 # rest of the tree already resolves to).
 smallvec = "1"

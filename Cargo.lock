@@ -10714,6 +10714,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.22.1",
+ "bytemuck",
  "chrono",
  "cosmic-text",
  "discord-rich-presence",

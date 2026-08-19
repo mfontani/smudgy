@@ -1,4 +1,5 @@
 pub mod bounds_probe;
+pub mod crt_cat;
 pub mod drag_overlay;
 pub mod hotkey_input;
 pub mod hotkey_matching_input;
