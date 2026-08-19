@@ -5,7 +5,7 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.4] - 2026-08-18
 
 ### Added
 
@@ -45,6 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   approval. Downloads are size-capped, refused for private and internal addresses,
   and the image is strictly decoded and re-encoded before being cached beside the
   server's files, refetched only when the advertised value changes.
+- **The welcome screen has a cat.** The no-session screen's lightning-bolt icon is
+  now a small pixel-art cat, drawn in the style of a CRT. It blinks; occasionally it
+  licks. It animates only while that screen is visible and costs nothing once a
+  session is open.
+
+### Fixed
+
+- **Windows: moving and resizing the window can no longer wedge.** On PCs with a
+  touchscreen, pen, or drawing tablet, a single touch or pen press on the titlebar
+  or a window edge could leave the window impossible to move or resize (maximize
+  still worked) until relaunch. Moves and resizes are now handled by Windows
+  itself — which also makes them work by touch and pen, and brings the native
+  comforts along: Aero Snap, double-click to maximize, dragging a maximized window
+  to restore it, and the titlebar's right-click system menu.
+- Double-clicking the titlebar to maximize no longer also begins a window drag from
+  the same click.
 
 ### Changed
 
