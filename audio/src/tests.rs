@@ -18,6 +18,19 @@ use super::*;
 
 const TEST_RATE: u32 = 48_000;
 
+#[test]
+fn mixer_frame_owns_stereo_samples_and_maps_to_the_backend() {
+    let frames = [MixerFrame::new(0.25, -0.5), MixerFrame::from_mono(0.75)];
+    assert!((frames[0].left() - 0.25).abs() < f32::EPSILON);
+    assert!((frames[0].right() + 0.5).abs() < f32::EPSILON);
+    assert_eq!(MixerFrame::ZERO, MixerFrame::new(0.0, 0.0));
+
+    let mut backend = [KiraFrame::ZERO; 2];
+    copy_mixer_frames(&mut backend, &frames);
+    assert_eq!(backend[0], KiraFrame::new(0.25, -0.5));
+    assert_eq!(backend[1], KiraFrame::from_mono(0.75));
+}
+
 #[derive(Clone, Default)]
 struct RenderProbe {
     renderer: Arc<Mutex<Option<Renderer>>>,
@@ -118,13 +131,13 @@ fn settings(probe: RenderProbe) -> TestBackendSettings {
 }
 
 struct ConstantInput {
-    frame: Frame,
+    frame: MixerFrame,
     calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
 }
 
 impl MixerInput for ConstantInput {
-    fn render(&mut self, output: &mut [Frame]) -> MixerInputStatus {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
         self.calls.fetch_add(1, Ordering::Relaxed);
         output.fill(self.frame);
         MixerInputStatus::Active
@@ -142,7 +155,7 @@ fn constant(value: f32) -> (Box<dyn MixerInput>, Arc<AtomicUsize>, Arc<AtomicUsi
     let drops = Arc::new(AtomicUsize::new(0));
     (
         Box::new(ConstantInput {
-            frame: Frame::from_mono(value),
+            frame: MixerFrame::from_mono(value),
             calls: calls.clone(),
             drops: drops.clone(),
         }),
@@ -445,10 +458,10 @@ struct BlockingInput {
 }
 
 impl MixerInput for BlockingInput {
-    fn render(&mut self, output: &mut [Frame]) -> MixerInputStatus {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
         self.entered.send(thread::current().id()).unwrap();
         self.release.wait();
-        output.fill(Frame::from_mono(0.25));
+        output.fill(MixerFrame::from_mono(0.25));
         MixerInputStatus::Active
     }
 }
@@ -617,8 +630,8 @@ struct ReentrantDestructor {
 }
 
 impl MixerInput for ReentrantDestructor {
-    fn render(&mut self, output: &mut [Frame]) -> MixerInputStatus {
-        output.fill(Frame::ZERO);
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        output.fill(MixerFrame::ZERO);
         MixerInputStatus::Active
     }
 }
@@ -658,7 +671,7 @@ struct PanickingInput {
 }
 
 impl MixerInput for PanickingInput {
-    fn render(&mut self, _output: &mut [Frame]) -> MixerInputStatus {
+    fn render(&mut self, _output: &mut [MixerFrame]) -> MixerInputStatus {
         panic!("hostile input")
     }
 }
@@ -698,8 +711,8 @@ fn render_panic_fails_closed_and_is_destroyed_only_off_render() {
 struct PanickingDestructor;
 
 impl MixerInput for PanickingDestructor {
-    fn render(&mut self, output: &mut [Frame]) -> MixerInputStatus {
-        output.fill(Frame::ZERO);
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        output.fill(MixerFrame::ZERO);
         MixerInputStatus::Active
     }
 }
@@ -808,7 +821,7 @@ fn standalone_running(
         slot.install(
             generation,
             Box::new(ConstantInput {
-                frame: Frame::ZERO,
+                frame: MixerFrame::ZERO,
                 calls: Arc::new(AtomicUsize::new(0)),
                 drops,
             }),
@@ -901,7 +914,7 @@ fn cleanup_queue_full_retains_callback_without_owner_thread_drop() {
         slot.install(
             generation,
             Box::new(ConstantInput {
-                frame: Frame::ZERO,
+                frame: MixerFrame::ZERO,
                 calls: Arc::new(AtomicUsize::new(0)),
                 drops: drops.clone(),
             }),
@@ -1051,8 +1064,8 @@ fn close_is_absorbing_even_after_finished_callback() {
     struct OneShot(Arc<AtomicBool>);
 
     impl MixerInput for OneShot {
-        fn render(&mut self, output: &mut [Frame]) -> MixerInputStatus {
-            output.fill(Frame::from_mono(0.5));
+        fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+            output.fill(MixerFrame::from_mono(0.5));
             self.0.store(true, Ordering::Release);
             MixerInputStatus::Finished
         }

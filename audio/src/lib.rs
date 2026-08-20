@@ -27,7 +27,7 @@ use std::{
 
 use futures::channel::oneshot;
 use kira::{
-    AudioManager, AudioManagerSettings, Capacities, Decibels, Frame, Tween,
+    AudioManager, AudioManagerSettings, Capacities, Decibels, Frame as KiraFrame, Tween,
     backend::{Backend, Renderer},
     sound::{Sound, SoundData},
     track::{MainTrackBuilder, TrackBuilder, TrackHandle},
@@ -95,6 +95,45 @@ impl MixerFormat {
     }
 }
 
+/// One stereo sample exchanged with a [`MixerInput`].
+///
+/// This value belongs to `smudgy_audio`; mixer inputs do not depend on the
+/// physical mixer's internal frame representation.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct MixerFrame {
+    left: f32,
+    right: f32,
+}
+
+impl MixerFrame {
+    /// A silent stereo frame.
+    pub const ZERO: Self = Self::new(0.0, 0.0);
+
+    /// Creates a frame from separate left and right samples.
+    #[must_use]
+    pub const fn new(left: f32, right: f32) -> Self {
+        Self { left, right }
+    }
+
+    /// Creates a frame with the same sample in both channels.
+    #[must_use]
+    pub const fn from_mono(sample: f32) -> Self {
+        Self::new(sample, sample)
+    }
+
+    /// Returns the left-channel sample.
+    #[must_use]
+    pub const fn left(self) -> f32 {
+        self.left
+    }
+
+    /// Returns the right-channel sample.
+    #[must_use]
+    pub const fn right(self) -> f32 {
+        self.right
+    }
+}
+
 /// Whether an input has more audio to produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixerInputStatus {
@@ -111,7 +150,7 @@ pub enum MixerInputStatus {
 /// fails closed so it cannot cross the backend callback boundary.
 pub trait MixerInput: Send + 'static {
     /// Render the next stereo quantum.
-    fn render(&mut self, output: &mut [Frame]) -> MixerInputStatus;
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus;
 }
 
 const PHASE_MASK: u64 = 0x0f;
@@ -639,8 +678,8 @@ impl SoundData for SlotSoundData {
 }
 
 impl Sound for SlotSound {
-    fn process(&mut self, output: &mut [Frame], _dt: f64, _info: &kira::info::Info) {
-        output.fill(Frame::ZERO);
+    fn process(&mut self, output: &mut [KiraFrame], _dt: f64, _info: &kira::info::Info) {
+        output.fill(KiraFrame::ZERO);
         let Some(slot) = self.slot.upgrade() else {
             return;
         };
@@ -655,13 +694,20 @@ impl Sound for SlotSound {
             let _ = slot.close(generation, true);
             return;
         };
-        match catch_unwind(AssertUnwindSafe(|| source.render(output))) {
-            Ok(MixerInputStatus::Active) => {}
+        let mut rendered = [MixerFrame::ZERO; INTERNAL_BUFFER_FRAMES];
+        let Some(rendered) = rendered.get_mut(..output.len()) else {
+            let _ = slot.close(generation, true);
+            return;
+        };
+        match catch_unwind(AssertUnwindSafe(|| source.render(rendered))) {
+            Ok(MixerInputStatus::Active) => {
+                copy_mixer_frames(output, rendered);
+            }
             Ok(MixerInputStatus::Finished) => {
+                copy_mixer_frames(output, rendered);
                 let _ = slot.close(generation, false);
             }
             Err(payload) => {
-                output.fill(Frame::ZERO);
                 let _ = slot.close(generation, true);
                 std::mem::forget(payload);
             }
@@ -670,6 +716,15 @@ impl Sound for SlotSound {
 
     fn finished(&self) -> bool {
         false
+    }
+}
+
+fn copy_mixer_frames(output: &mut [KiraFrame], rendered: &[MixerFrame]) {
+    for (output, rendered) in output.iter_mut().zip(rendered) {
+        *output = KiraFrame {
+            left: rendered.left,
+            right: rendered.right,
+        };
     }
 }
 
