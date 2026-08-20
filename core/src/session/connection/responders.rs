@@ -776,7 +776,8 @@ mod tests {
     fn charset_request_matches_configured_by_encoding_not_spelling() {
         use super::charset;
         let mut replies = Vec::new();
-        let enc = charset::answer_request(b";UTF-8;cp1252", encoding_rs::WINDOWS_1252, &mut replies);
+        let enc =
+            charset::answer_request(b";UTF-8;cp1252", encoding_rs::WINDOWS_1252, &mut replies);
         assert_eq!(enc, Some(encoding_rs::WINDOWS_1252));
         let (_, payload) = unframe(&replies);
         assert_eq!(
@@ -837,7 +838,8 @@ mod tests {
     fn charset_request_with_a_ttable_and_no_usable_label_is_rejected() {
         use super::charset;
         let mut replies = Vec::new();
-        let enc = charset::answer_request(b"[TTABLE]\x01;KLINGON", encoding_rs::UTF_8, &mut replies);
+        let enc =
+            charset::answer_request(b"[TTABLE]\x01;KLINGON", encoding_rs::UTF_8, &mut replies);
         assert_eq!(enc, None);
         let (_, reply) = unframe(&replies);
         assert_eq!(reply, vec![charset::REJECTED]);
