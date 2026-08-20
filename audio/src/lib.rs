@@ -12,6 +12,15 @@
 //! dependency. It owns the bounded physical-mixer topology that those layers
 //! use through explicit adapters.
 
+#[cfg(feature = "physical-output")]
+mod system;
+
+#[cfg(feature = "physical-output")]
+pub use system::{
+    SystemMixerService, SystemMixerStartError, SystemOutputError, SystemOutputErrorKind,
+    SystemOutputOperation,
+};
+
 use std::{
     cell::UnsafeCell,
     collections::HashMap,

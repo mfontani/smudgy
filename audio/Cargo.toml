@@ -6,10 +6,13 @@ edition = "2024"
 [features]
 # Unstable, nondefault cross-crate test ABI. Never enable in production builds.
 test-support = []
+# Direct proof-bearing system output. Kira's detached CPAL backend stays disabled.
+physical-output = ["dep:cpal"]
 
 [dependencies]
 futures = { workspace = true }
 kira = { workspace = true }
+cpal = { workspace = true, optional = true }
 
 [dev-dependencies]
 assert_no_alloc = "1.1.2"
