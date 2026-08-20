@@ -10982,6 +10982,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "smudgy_audio_web"
+version = "0.1.0"
+dependencies = [
+ "assert_no_alloc",
+ "deno_audio",
+ "futures",
+ "kira",
+ "smudgy_audio",
+ "web-audio-api",
+]
+
+[[package]]
 name = "smudgy_bench"
 version = "0.5.5-rc2"
 dependencies = [

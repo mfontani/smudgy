@@ -1,6 +1,7 @@
 [workspace]
-members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector", "audio"]
-# Everything except `inspector` and `scriptref`. This leaves exactly one bin target (ui's
+members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector", "audio", "audio_web"]
+# Everything except `inspector`, `scriptref`, and the internal `audio_web` integration crate.
+# This leaves exactly one bin target (ui's
 # `smudgy`) in the default set, so a bare `cargo run` / `cargo build` / `cargo
 # test` resolves to the app without needing `-p` or `--bin`. `inspector` is a
 # standalone dev/sidecar helper with its own bin (`smudgy_inspector`); a second

@@ -1,0 +1,18 @@
+[package]
+name = "smudgy_audio_web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+deno_audio = { workspace = true }
+smudgy_audio = { workspace = true }
+
+[dev-dependencies]
+assert_no_alloc = "1.1.2"
+futures = { workspace = true }
+kira = { workspace = true }
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "06bcc862de63edb8de6f6b8a38b04f8b5249cf1a", default-features = false }
+
+[lints]
+workspace = true
