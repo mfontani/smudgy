@@ -167,6 +167,63 @@ impl Drop for TestBackend {
     }
 }
 
+struct UnjoinedBackend {
+    probe: RenderProbe,
+    panic_close: bool,
+}
+
+struct UnjoinedSettings {
+    probe: RenderProbe,
+    panic_close: bool,
+}
+
+impl JoinedOutputDriver for UnjoinedBackend {
+    type Settings = UnjoinedSettings;
+    type Error = TestBackendError;
+
+    fn setup(
+        settings: Self::Settings,
+        _internal_buffer_size: usize,
+        failures: DriverFailureSignal,
+    ) -> Result<(Self, PhysicalOutputFormat), Self::Error> {
+        *settings
+            .probe
+            .failure
+            .lock()
+            .expect("failure lock poisoned") = Some(failures);
+        Ok((
+            Self {
+                probe: settings.probe,
+                panic_close: settings.panic_close,
+            },
+            PhysicalOutputFormat {
+                sample_rate: TEST_RATE,
+                channels: 2,
+                sample_format: PhysicalSampleFormat::F32,
+                buffer_frames_hint: Some(INTERNAL_BUFFER_FRAMES),
+            },
+        ))
+    }
+
+    fn start(&mut self, renderer: JoinedRenderer) -> Result<(), Self::Error> {
+        self.probe
+            .renderer
+            .lock()
+            .expect("renderer lock poisoned")
+            .replace(renderer);
+        Ok(())
+    }
+
+    fn play(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn close_and_join(&mut self) -> bool {
+        assert!(!self.panic_close, "injected unjoined close panic");
+        false
+    }
+}
+
 fn settings(probe: RenderProbe) -> TestBackendSettings {
     TestBackendSettings {
         probe,
@@ -236,6 +293,28 @@ fn eventually(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !condition() {
         assert!(Instant::now() < deadline, "condition did not become true");
+        thread::yield_now();
+    }
+}
+
+fn drive_session_retirement(
+    probe: &RenderProbe,
+    retirement: &mut MixerSessionRetirement,
+) -> Result<(), MixerSessionRetirementError> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let wake_probe = Arc::new(WakeProbe::default());
+    let waker = Waker::from(wake_probe);
+    let mut context = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(result) = Pin::new(&mut *retirement).poll(&mut context) {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session retirement did not become ready"
+        );
+        let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+        probe.render(&mut output);
         thread::yield_now();
     }
 }
@@ -321,15 +400,18 @@ fn test_control(
 ) -> Arc<ControlInner> {
     let driver_status = Arc::new(DriverStatus::new());
     assert!(driver_status.mark_live());
+    let (session_retirements, _session_retirement_receiver) = mpsc::sync_channel(1);
     Arc::new(ControlInner {
         gate: Mutex::new(GateState {
-            sealed: false,
-            accepting_retirements: true,
+            production_sealed: false,
+            accepting_input_retirements: true,
+            accepting_session_retirements: true,
             start_admissions: 0,
         }),
         gate_drained: Condvar::new(),
         commands,
         retirements,
+        session_retirements,
         format: MixerFormat {
             sample_rate: TEST_RATE,
         },
@@ -342,12 +424,21 @@ fn join_authority_is_not_send_but_scoped_bus_handles_are_send() {
     trait AmbiguousIfSend<Marker> {
         fn assert_not_send() {}
     }
+    trait AmbiguousIfClone<Marker> {
+        fn assert_not_clone() {}
+    }
     fn assert_send<T: Send>() {}
 
     impl<T: ?Sized> AmbiguousIfSend<()> for T {}
     impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
     let _ = <MixerService as AmbiguousIfSend<_>>::assert_not_send;
+    let _ = <MixerSessionOwner as AmbiguousIfClone<_>>::assert_not_clone;
+    assert_send::<MixerSessionOwner>();
     assert_send::<MixerScriptBusHandle>();
+    assert_send::<MixerNativeBusHandle>();
+    assert_send::<MixerSpeechBusHandle>();
 }
 
 #[test]
@@ -497,6 +588,644 @@ fn exact_capacity_rejects_without_mutation_and_reuses_after_retirement() {
 }
 
 #[test]
+fn exact_session_retirement_waits_for_render_ack_and_readds_same_id_safely() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(20)).unwrap();
+    let stale_bus = session.script_bus();
+    let mut retirement = session.retire();
+
+    assert_eq!(
+        stale_bus.try_reserve_input().unwrap_err(),
+        MixerControlError::UnknownSession
+    );
+    assert_eq!(
+        stale_bus.set_gain(0.5),
+        Err(MixerControlError::UnknownSession)
+    );
+    assert!(matches!(
+        service.add_session(AudioSessionId(20)),
+        Err(MixerControlError::SessionRetirementPending)
+    ));
+    assert!(matches!(
+        service.add_session(AudioSessionId(200)),
+        Err(MixerControlError::SessionRetirementPending)
+    ));
+    eventually(|| stale_bus.0.session.tracks_dropped.load(Ordering::Acquire));
+    let safe_waker = Waker::from(Arc::new(WakeProbe::default()));
+    let mut context = Context::from_waker(&safe_waker);
+    assert!(matches!(
+        Pin::new(&mut retirement).poll(&mut context),
+        Poll::Pending
+    ));
+
+    drive_session_retirement(&probe, &mut retirement).unwrap();
+    let replacement = service.add_session(AudioSessionId(20)).unwrap();
+    let reservation = replacement.script_bus().try_reserve_input().unwrap();
+    assert!(block_on(reservation.abort()).unwrap().is_clean());
+    assert_eq!(
+        stale_bus.try_reserve_input().unwrap_err(),
+        MixerControlError::UnknownSession
+    );
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn session_close_waits_a_preclose_start_admission_without_blocking_the_receipt() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(26)).unwrap();
+    let stale_bus = session.script_bus();
+    let (source, _, drops) = constant(0.25);
+    let installed = stale_bus
+        .try_reserve_input()
+        .unwrap()
+        .install_preboxed(source)
+        .unwrap();
+
+    let mut retirement = session.retire();
+    let safe_waker = Waker::from(Arc::new(WakeProbe::default()));
+    let mut context = Context::from_waker(&safe_waker);
+    assert!(matches!(
+        Pin::new(&mut retirement).poll(&mut context),
+        Poll::Pending
+    ));
+    assert_eq!(
+        stale_bus.try_reserve_input().unwrap_err(),
+        MixerControlError::UnknownSession
+    );
+
+    let running = installed
+        .open()
+        .expect("a start admitted before close must finish publication");
+    drive_session_retirement(&probe, &mut retirement).unwrap();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    let replacement = service.add_session(AudioSessionId(31)).unwrap();
+    let (replacement_source, _, _) = constant(0.5);
+    let replacement_input = start_reserved(
+        replacement.script_bus().try_reserve_input().unwrap(),
+        replacement_source,
+    );
+    assert!(!running.suspend());
+    assert!(!running.resume());
+    assert!(block_on(running.shutdown()).unwrap().is_clean());
+    let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+    probe.render(&mut output);
+    assert_samples(&output, 0.5);
+    assert!(block_on(replacement_input.shutdown()).unwrap().is_clean());
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn cleanup_already_in_flight_terminalizes_when_session_close_wins() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(27)).unwrap();
+    let stale_bus = session.script_bus();
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let running = start_reserved(
+        stale_bus.try_reserve_input().unwrap(),
+        Box::new(BlockingDestructor {
+            entered: entered_sender,
+            release: Arc::clone(&release),
+            drops: Arc::clone(&drops),
+        }),
+    );
+    let shutdown = running.shutdown();
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("cleanup worker did not enter the source destructor");
+
+    let mut retirement = session.retire();
+    assert_eq!(
+        stale_bus.try_reserve_input().unwrap_err(),
+        MixerControlError::UnknownSession
+    );
+    let safe_waker = Waker::from(Arc::new(WakeProbe::default()));
+    let mut context = Context::from_waker(&safe_waker);
+    assert!(matches!(
+        Pin::new(&mut retirement).poll(&mut context),
+        Poll::Pending
+    ));
+    let (released, ready) = &*release;
+    *lock_recover(released) = true;
+    ready.notify_all();
+
+    assert!(block_on(shutdown).unwrap().is_clean());
+    drive_session_retirement(&probe, &mut retirement).unwrap();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert!(service.add_session(AudioSessionId(27)).is_ok());
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn accepted_input_shutdown_is_correlated_before_session_forced_cleanup() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(32)).unwrap();
+    let (source, _, drops) = constant(0.25);
+    let running = start_reserved(session.script_bus().try_reserve_input().unwrap(), source);
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.retirement_scan_hook) =
+        Some(Arc::new(RetirementScanHook {
+            entered: entered_sender,
+            release: Arc::clone(&release),
+            armed: AtomicBool::new(true),
+        }));
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner did not pause after its first input-retirement scan");
+
+    let input_retirement = running.shutdown();
+    let mut session_retirement = session.retire();
+    release.wait();
+    assert!(block_on(input_retirement).unwrap().is_clean());
+    drive_session_retirement(&probe, &mut session_retirement).unwrap();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+
+    let replacement = service.add_session(AudioSessionId(32)).unwrap();
+    drop(replacement);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn cleanup_finish_does_not_deadlock_a_racing_session_reserve() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(38)).unwrap();
+    let bus = session.script_bus();
+    let (source, _, _) = constant(0.25);
+    let running = start_reserved(bus.try_reserve_input().unwrap(), source);
+    let first_slot = Arc::as_ptr(&running.slot);
+    let first_generation = running.generation;
+
+    let session_control = Arc::clone(session.session.as_ref().unwrap());
+    let (cleanup_entered, cleanup_entered_receiver) = mpsc::sync_channel(1);
+    let cleanup_release = Arc::new(Barrier::new(2));
+    *lock_recover(&session_control.cleanup_finish_hook) = Some(Arc::new(RetirementScanHook {
+        entered: cleanup_entered,
+        release: Arc::clone(&cleanup_release),
+        armed: AtomicBool::new(true),
+    }));
+
+    let first_shutdown = running.shutdown();
+    cleanup_entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner did not pause after receiving the cleanup result");
+
+    let (request_entered, request_entered_receiver) = mpsc::sync_channel(1);
+    let request_release = Arc::new(Barrier::new(2));
+    *lock_recover(&session_control.request_enqueued_hook) = Some(Arc::new(RetirementScanHook {
+        entered: request_entered,
+        release: Arc::clone(&request_release),
+        armed: AtomicBool::new(true),
+    }));
+    let (reserved_sender, reserved_receiver) = mpsc::sync_channel(1);
+    let reserve = thread::spawn(move || {
+        let _ = reserved_sender.send(bus.try_reserve_input());
+    });
+    request_entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("racing reserve was not enqueued");
+
+    request_release.wait();
+    cleanup_release.wait();
+    let reservation = reserved_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("racing reserve deadlocked cleanup finalization")
+        .expect("cleaned slot was not recycled");
+    reserve.join().unwrap();
+    assert_eq!(Arc::as_ptr(&reservation.slot), first_slot);
+    assert!(reservation.generation > first_generation);
+    assert!(block_on(first_shutdown).unwrap().is_clean());
+
+    let mut session_retirement = session.retire();
+    let replacement_shutdown = reservation.abort();
+    assert!(block_on(replacement_shutdown).unwrap().is_clean());
+    drive_session_retirement(&probe, &mut session_retirement).unwrap();
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn pending_active_input_receipt_cannot_be_stolen_by_session_forced_cleanup() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(33)).unwrap();
+    let (render_entered, render_entered_receiver) = mpsc::sync_channel(1);
+    let render_release = Arc::new(Barrier::new(2));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let running = start_reserved(
+        session.script_bus().try_reserve_input().unwrap(),
+        Box::new(BlockingInput {
+            entered: render_entered,
+            release: Arc::clone(&render_release),
+            drops: Arc::clone(&drops),
+        }),
+    );
+    let render_probe = probe.clone();
+    let render = thread::spawn(move || {
+        let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+        render_probe.render(&mut output);
+    });
+    render_entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("render did not acquire ACTIVE");
+
+    let (first_entered, first_entered_receiver) = mpsc::sync_channel(1);
+    let first_release = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.retirement_scan_hook) =
+        Some(Arc::new(RetirementScanHook {
+            entered: first_entered,
+            release: Arc::clone(&first_release),
+            armed: AtomicBool::new(true),
+        }));
+    let (forced_entered, forced_entered_receiver) = mpsc::sync_channel(1);
+    let forced_release = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.session_forced_hook) =
+        Some(Arc::new(RetirementScanHook {
+            entered: forced_entered,
+            release: Arc::clone(&forced_release),
+            armed: AtomicBool::new(true),
+        }));
+    first_entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner did not pause after its first input scan");
+
+    let input_retirement = running.shutdown();
+    let mut session_retirement = session.retire();
+    first_release.wait();
+    forced_entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner did not pause before forced session cleanup");
+    render_release.wait();
+    render.join().unwrap();
+    forced_release.wait();
+
+    assert!(block_on(input_retirement).unwrap().is_clean());
+    drive_session_retirement(&probe, &mut session_retirement).unwrap();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    let replacement = service.add_session(AudioSessionId(33)).unwrap();
+    drop(replacement);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn retiring_one_session_terminalizes_inputs_without_disturbing_a_sibling() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        2,
+        1,
+    )
+    .unwrap();
+    let retiring = service.add_session(AudioSessionId(21)).unwrap();
+    let sibling = service.add_session(AudioSessionId(22)).unwrap();
+    let (retiring_source, _, retiring_drops) = constant(0.25);
+    let retiring_input = start_reserved(
+        retiring.script_bus().try_reserve_input().unwrap(),
+        retiring_source,
+    );
+    let sibling_bus = sibling.script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let sibling_observer = Arc::new(FailureObserverProbe {
+        bus: sibling_bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: false,
+    });
+    let sibling_input = start_reserved(
+        sibling_bus.try_reserve_input().unwrap(),
+        Box::new(ObservedInput {
+            observer: Arc::clone(&sibling_observer),
+        }),
+    );
+    sibling_bus.set_gain(0.5).unwrap();
+
+    let mut retirement = retiring.retire();
+    assert!(!retiring_input.resume());
+    drive_session_retirement(&probe, &mut retirement).unwrap();
+    assert_eq!(retiring_drops.load(Ordering::Acquire), 1);
+    let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+    probe.render(&mut output);
+    assert_samples(&output, 0.125);
+
+    assert!(probe.fail_output());
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::BackendFailure
+    );
+    assert_eq!(sibling_observer.calls.load(Ordering::Acquire), 1);
+
+    drop(retiring_input);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let sibling_retirement = block_on(sibling_input.shutdown()).unwrap();
+    assert!(sibling_retirement.failed_before_retirement);
+    assert_eq!(sibling_observer.calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn session_retirement_waits_for_an_active_render_before_source_and_tracks() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(31)).unwrap();
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let running = start_reserved(
+        session.script_bus().try_reserve_input().unwrap(),
+        Box::new(BlockingInput {
+            entered: entered_sender,
+            release: Arc::clone(&release),
+            drops: Arc::clone(&drops),
+        }),
+    );
+    let render_probe = probe.clone();
+    let render = thread::spawn(move || {
+        let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+        render_probe.render(&mut output);
+    });
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("render did not enter the exact session slot");
+
+    let mut retirement = session.retire();
+    let safe_waker = Waker::from(Arc::new(WakeProbe::default()));
+    let mut context = Context::from_waker(&safe_waker);
+    assert!(matches!(
+        Pin::new(&mut retirement).poll(&mut context),
+        Poll::Pending
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    release.wait();
+    render.join().unwrap();
+    eventually(|| {
+        !matches!(
+            slot_phase(running.slot.word.load(Ordering::Acquire)),
+            SlotPhase::Running
+        )
+    });
+
+    drive_session_retirement(&probe, &mut retirement).unwrap();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    drop(running);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn preclose_reservation_cannot_start_and_session_drop_is_autonomous() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(23)).unwrap();
+    let stale_bus = session.script_bus();
+    let reservation = stale_bus.try_reserve_input().unwrap();
+    drop(session);
+
+    let (source, _, drops) = constant(0.125);
+    let MixerInputStartFailure::Rejected(failure) = reservation.start_preboxed(source).unwrap_err()
+    else {
+        panic!("session close must reject before installation");
+    };
+    assert_eq!(failure.error(), MixerControlError::UnknownSession);
+    let (_, reservation, source) = failure.into_parts();
+    drop(source);
+    drop(reservation.abort());
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        stale_bus.try_reserve_input().unwrap_err(),
+        MixerControlError::UnknownSession
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let replacement = loop {
+        let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+        probe.render(&mut output);
+        match service.add_session(AudioSessionId(23)) {
+            Ok(session) => break session,
+            Err(MixerControlError::SessionRetirementPending) => {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            Err(error) => panic!("unexpected replacement error: {error:?}"),
+        }
+    };
+    drop(replacement);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn accepted_session_retirement_survives_dropped_receipt_and_service_seal() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(24)).unwrap();
+    drop(session.retire());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let replacement = loop {
+        let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+        probe.render(&mut output);
+        match service.add_session(AudioSessionId(24)) {
+            Ok(session) => break session,
+            Err(MixerControlError::SessionRetirementPending) => {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            Err(error) => panic!("unexpected replacement error: {error:?}"),
+        }
+    };
+    let retirement = replacement.retire();
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(block_on(retirement), Ok(()));
+}
+
+#[test]
+fn accepted_session_retirement_settles_after_device_failure_cleanup() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(29)).unwrap();
+    let retirement = session.retire();
+    assert!(probe.fail_output());
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    assert_eq!(block_on(retirement), Ok(()));
+}
+
+#[test]
+fn unproven_backend_join_never_false_acks_session_retirement() {
+    for panic_close in [false, true] {
+        let service = MixerService::start_with_driver_and_limits::<UnjoinedBackend>(
+            UnjoinedSettings {
+                probe: RenderProbe::default(),
+                panic_close,
+            },
+            MixerFormat {
+                sample_rate: TEST_RATE,
+            },
+            1,
+            1,
+        )
+        .unwrap();
+        let session = service.add_session(AudioSessionId(34)).unwrap();
+        let retirement = session.retire();
+        let shutdown = service.shutdown();
+        assert!(!shutdown.clean);
+        assert_eq!(
+            block_on(retirement),
+            Err(MixerSessionRetirementError::OwnerUncertain)
+        );
+    }
+}
+
+#[test]
+fn session_retirement_contains_hostile_waker_and_survives_owner_panic() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(30)).unwrap();
+    let mut retirement = session.retire();
+    let panic_waker = Waker::from(Arc::new(PanicWake));
+    let mut context = Context::from_waker(&panic_waker);
+    assert!(matches!(
+        Pin::new(&mut retirement).poll(&mut context),
+        Poll::Pending
+    ));
+    service
+        .driver_status
+        .panic_owner
+        .store(true, Ordering::Release);
+    eventually(|| service.driver_status.failure() == Some(MixerOutputFailure::OwnerPanicked));
+
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::OwnerPanicked));
+    assert_eq!(block_on(retirement), Ok(()));
+}
+
+#[test]
+fn hostile_source_cleanup_reports_unclean_only_after_track_removal() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(25)).unwrap();
+    let running = start_reserved(
+        session.script_bus().try_reserve_input().unwrap(),
+        Box::new(PanickingDestructor),
+    );
+    let mut retirement = session.retire();
+    assert_eq!(
+        drive_session_retirement(&probe, &mut retirement),
+        Err(MixerSessionRetirementError::CleanupFailed)
+    );
+    drop(running);
+    let replacement = service.add_session(AudioSessionId(25)).unwrap();
+    drop(replacement);
+    assert!(!service.shutdown().clean);
+}
+
+#[test]
 fn dropped_shutdown_observer_does_not_cancel_cleanup_or_reuse() {
     let probe = RenderProbe::default();
     let service = MixerService::start_with_driver_and_limits::<TestBackend>(
@@ -531,17 +1260,76 @@ fn bounded_control_full_and_disconnect_are_typed_without_mutation() {
     let (full_commands, full_receiver) = mpsc::sync_channel(0);
     let (full_retirements, _full_retirement_receiver) = mpsc::sync_channel(1);
     let full_control = test_control(full_commands, full_retirements);
+    let session = Arc::new(SessionControl::new(SessionKey {
+        id: AudioSessionId(30),
+        generation: 1,
+    }));
     let handle = MixerBusHandle {
         control: Arc::downgrade(&full_control),
-        session: SessionKey {
-            id: AudioSessionId(30),
-            generation: 1,
-        },
+        session,
         bus: SessionBus::Script,
     };
     assert_eq!(handle.set_gain(0.5), Err(MixerControlError::Saturated));
     drop(full_receiver);
     assert_eq!(handle.set_gain(0.5), Err(MixerControlError::OwnerStopped));
+}
+
+#[test]
+fn session_retirement_queue_failure_is_typed_and_leaves_old_clones_inert() {
+    for disconnected in [false, true] {
+        let (commands, _command_receiver) = mpsc::sync_channel(1);
+        let (retirements, _retirement_receiver) = mpsc::sync_channel(1);
+        let (session_retirements, session_retirement_receiver) = mpsc::sync_channel(0);
+        if disconnected {
+            drop(session_retirement_receiver);
+        }
+        let driver_status = Arc::new(DriverStatus::new());
+        assert!(driver_status.mark_live());
+        let control = Arc::new(ControlInner {
+            gate: Mutex::new(GateState {
+                production_sealed: false,
+                accepting_input_retirements: true,
+                accepting_session_retirements: true,
+                start_admissions: 0,
+            }),
+            gate_drained: Condvar::new(),
+            commands,
+            retirements,
+            session_retirements,
+            format: MixerFormat {
+                sample_rate: TEST_RATE,
+            },
+            driver_status,
+        });
+        let session = Arc::new(SessionControl::new(SessionKey {
+            id: AudioSessionId(28),
+            generation: 1,
+        }));
+        let stale_bus = MixerScriptBusHandle(MixerBusHandle {
+            control: Arc::downgrade(&control),
+            session: Arc::clone(&session),
+            bus: SessionBus::Script,
+        });
+        let owner = MixerSessionOwner {
+            control: Arc::downgrade(&control),
+            session: Some(session),
+        };
+        let mut retirement = owner.retire();
+        let safe_waker = Waker::from(Arc::new(WakeProbe::default()));
+        let mut context = Context::from_waker(&safe_waker);
+        assert_eq!(
+            Pin::new(&mut retirement).poll(&mut context),
+            Poll::Ready(Err(if disconnected {
+                MixerSessionRetirementError::OwnerUncertain
+            } else {
+                MixerSessionRetirementError::QueueInvariant
+            }))
+        );
+        assert_eq!(
+            stale_bus.try_reserve_input().unwrap_err(),
+            MixerControlError::UnknownSession
+        );
+    }
 }
 
 #[test]
@@ -562,7 +1350,7 @@ fn dropped_reserve_response_restores_the_same_physical_capacity() {
     control
         .commands
         .send(OwnerCommand::Reserve(
-            session.key,
+            session.session.as_ref().unwrap().key,
             SessionBus::Script,
             response,
         ))
@@ -982,6 +1770,33 @@ impl Drop for PanickingDestructor {
     }
 }
 
+struct BlockingDestructor {
+    entered: mpsc::SyncSender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl MixerInput for BlockingDestructor {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        output.fill(MixerFrame::ZERO);
+        MixerInputStatus::Active
+    }
+}
+
+impl Drop for BlockingDestructor {
+    fn drop(&mut self) {
+        let _ = self.entered.send(());
+        let (released, ready) = &*self.release;
+        let mut released = lock_recover(released);
+        while !*released {
+            released = ready
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        self.drops.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[test]
 fn hostile_destructor_is_contained_and_quarantines_capacity() {
     let probe = RenderProbe::default();
@@ -1037,10 +1852,8 @@ fn early_driver_death_seals_control_notifies_each_live_input_once_and_joins() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(901))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(901)).unwrap();
+    let bus = session.script_bus();
     let (notifications, received) = mpsc::sync_channel(2);
     let first_observer = Arc::new(FailureObserverProbe {
         bus: bus.clone(),
@@ -1117,10 +1930,8 @@ fn output_death_between_install_and_open_preserves_exact_cause_and_observer() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(908))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(908)).unwrap();
+    let bus = session.script_bus();
     let (notifications, received) = mpsc::sync_channel(1);
     let observer = Arc::new(FailureObserverProbe {
         bus: bus.clone(),
@@ -1159,10 +1970,8 @@ fn output_death_after_live_open_snapshot_preserves_exact_broadcast_cause() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(910))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(910)).unwrap();
+    let bus = session.script_bus();
     let (notifications, received) = mpsc::sync_channel(1);
     let observer = Arc::new(FailureObserverProbe {
         bus: bus.clone(),
@@ -1218,10 +2027,8 @@ fn reservations_acquired_before_output_death_abort_or_drop_without_leaking() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(909))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(909)).unwrap();
+    let bus = session.script_bus();
     let aborted = bus.try_reserve_input().unwrap();
     let dropped = bus.try_reserve_input().unwrap();
     let aborted_slot = Arc::downgrade(&aborted.slot);
@@ -1245,10 +2052,8 @@ fn observer_panic_before_publication_cannot_erase_failure_or_cleanup_proof() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(904))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(904)).unwrap();
+    let bus = session.script_bus();
     let (notifications, received) = mpsc::sync_channel(1);
     let observer = Arc::new(FailureObserverProbe {
         bus: bus.clone(),
@@ -1287,10 +2092,8 @@ fn owner_panic_is_first_writer_failure_and_cleanup_remains_autonomous() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(902))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(902)).unwrap();
+    let bus = session.script_bus();
     let (notifications, received) = mpsc::sync_channel(1);
     let observer = Arc::new(FailureObserverProbe {
         bus: bus.clone(),
@@ -1328,10 +2131,8 @@ fn logical_close_that_wins_before_late_output_death_stays_normal() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
-    let bus = service
-        .add_session(AudioSessionId(903))
-        .unwrap()
-        .script_bus();
+    let session = service.add_session(AudioSessionId(903)).unwrap();
+    let bus = session.script_bus();
     let (notifications, received) = mpsc::sync_channel(1);
     let observer = Arc::new(FailureObserverProbe {
         bus: bus.clone(),
@@ -1426,6 +2227,7 @@ fn standalone_running(
             slot: ManuallyDrop::new(Arc::clone(&slot)),
             generation,
             control: Arc::downgrade(control),
+            session: Arc::new(SessionControl::new(slot.address.session)),
         },
         slot,
         generation,
@@ -1560,8 +2362,8 @@ fn failure_notification_full_or_disconnect_retains_all_authority() {
             1,
         )
         .unwrap();
-        let key = mixer.add_session(AudioSessionId(905)).unwrap();
-        let record = mixer.reserve(key, SessionBus::Script).unwrap();
+        let session = mixer.add_session(AudioSessionId(905)).unwrap();
+        let record = mixer.reserve(session.key, SessionBus::Script).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let observer_drops = Arc::new(AtomicUsize::new(0));
         let source_drops = Arc::new(AtomicUsize::new(0));
@@ -1601,6 +2403,51 @@ fn failure_notification_full_or_disconnect_retains_all_authority() {
         assert_eq!(observer_drops.load(Ordering::Acquire), 0);
         assert_eq!(source_drops.load(Ordering::Acquire), 0);
     }
+}
+
+#[test]
+fn impossible_kira_track_undercount_terminalizes_with_structural_session_error() {
+    let status = Arc::new(DriverStatus::new());
+    let probe = RenderProbe::default();
+    let mut backend_settings = settings(probe);
+    backend_settings.enforce_owner_thread = false;
+    let (mut mixer, _) = MixerCore::<TestBackend>::with_limits(
+        backend_settings,
+        Arc::clone(&status),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        2,
+        1,
+    )
+    .unwrap();
+    let retiring = mixer.add_session(AudioSessionId(950)).unwrap();
+    let _sibling = mixer.add_session(AudioSessionId(951)).unwrap();
+    retiring.begin_close().unwrap();
+    let (completion, completed) = oneshot::channel();
+    assert!(
+        mixer
+            .begin_session_retirement(SessionRetirementRequest {
+                key: retiring.key,
+                completion,
+            })
+            .is_ok()
+    );
+    mixer.reported_sub_track_count = Some(0);
+    let (cleanup_sender, _cleanup_receiver) = mpsc::sync_channel(1);
+
+    assert!(!progress_session_retirements(
+        &mut mixer,
+        &cleanup_sender,
+        &[]
+    ));
+    assert!(!mixer.cleanup_clean);
+    assert!(retire_backend(&mut mixer));
+    mixer.finish_session_retirements_after_backend(true);
+    assert_eq!(
+        block_on(completed).unwrap(),
+        Err(MixerSessionRetirementError::Structural)
+    );
 }
 
 #[test]

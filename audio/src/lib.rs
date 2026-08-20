@@ -63,6 +63,7 @@ pub const CONTROL_QUEUE_CAPACITY: usize = 128;
 
 const SESSION_BUS_COUNT: usize = 3;
 const RETIREMENT_QUEUE_CAPACITY: usize = MAX_SESSIONS * SESSION_BUS_COUNT * INPUTS_PER_BUS;
+const SESSION_RETIREMENT_QUEUE_CAPACITY: usize = MAX_SESSIONS;
 const RETIREMENT_SCAN_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A stable session identity within one process mixer.
@@ -720,19 +721,24 @@ impl InputSlot {
         result
     }
 
-    fn prepare_forced_after_backend(&self) -> Option<(u64, PreparedRetirement)> {
+    fn prepare_forced_terminal(
+        &self,
+        quarantine_active: bool,
+    ) -> Option<(u64, PreparedRetirement)> {
         let word = self.word.load(Ordering::Acquire);
         let generation = slot_generation(word);
         match slot_phase(word) {
             SlotPhase::Free | SlotPhase::ForcedClean | SlotPhase::Retiring => return None,
             SlotPhase::Reserved | SlotPhase::Installed | SlotPhase::Running => {
                 self.force_close_current();
-                return self.prepare_forced_after_backend();
+                return self.prepare_forced_terminal(quarantine_active);
             }
             SlotPhase::Closing | SlotPhase::Quarantined => {}
         }
         if word & ACTIVE != 0 {
-            self.force_quarantine();
+            if quarantine_active {
+                self.force_quarantine();
+            }
             return None;
         }
         if self
@@ -749,10 +755,10 @@ impl InputSlot {
             )
             .is_err()
         {
-            return self.prepare_forced_after_backend();
+            return self.prepare_forced_terminal(quarantine_active);
         }
-        // SAFETY: the backend is gone, ACTIVE is clear, and Retiring excludes
-        // all future render entry and payload mutation.
+        // SAFETY: Closing prevents future entry, ACTIVE is clear, and Retiring
+        // excludes all future render entry and payload mutation.
         let source = unsafe { (**self.payload.get()).take() };
         let expected_payload = word & HAS_PAYLOAD != 0;
         let result = if slot_phase(word) == SlotPhase::Quarantined {
@@ -775,6 +781,13 @@ impl InputSlot {
                 result,
             },
         ))
+    }
+
+    fn is_terminal_for_session(&self) -> bool {
+        matches!(
+            slot_phase(self.word.load(Ordering::Acquire)),
+            SlotPhase::Free | SlotPhase::ForcedClean | SlotPhase::Quarantined
+        )
     }
 
     fn fail_live(&self, failure: MixerOutputFailure) -> Option<Arc<dyn MixerFailureObserver>> {
@@ -1040,6 +1053,10 @@ struct DriverStatus {
     panic_owner: AtomicBool,
     #[cfg(test)]
     open_snapshot_hook: Mutex<Option<Arc<OpenSnapshotHook>>>,
+    #[cfg(test)]
+    retirement_scan_hook: Mutex<Option<Arc<RetirementScanHook>>>,
+    #[cfg(test)]
+    session_forced_hook: Mutex<Option<Arc<RetirementScanHook>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1055,6 +1072,13 @@ struct OpenSnapshotHook {
     armed: AtomicBool,
 }
 
+#[cfg(test)]
+struct RetirementScanHook {
+    entered: SyncSender<()>,
+    release: Arc<std::sync::Barrier>,
+    armed: AtomicBool,
+}
+
 impl DriverStatus {
     fn new() -> Self {
         Self {
@@ -1063,6 +1087,10 @@ impl DriverStatus {
             panic_owner: AtomicBool::new(false),
             #[cfg(test)]
             open_snapshot_hook: Mutex::new(None),
+            #[cfg(test)]
+            retirement_scan_hook: Mutex::new(None),
+            #[cfg(test)]
+            session_forced_hook: Mutex::new(None),
         }
     }
 
@@ -1168,6 +1196,28 @@ impl DriverStatus {
     #[cfg(test)]
     fn pause_after_open_snapshot(&self) {
         let hook = lock_recover(&self.open_snapshot_hook).clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            let _ = hook.entered.send(());
+            hook.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_input_retirement_scan(&self) {
+        let hook = lock_recover(&self.retirement_scan_hook).clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            let _ = hook.entered.send(());
+            hook.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_session_forced_cleanup(&self) {
+        let hook = lock_recover(&self.session_forced_hook).clone();
         if let Some(hook) = hook
             && hook.armed.swap(false, Ordering::AcqRel)
         {
@@ -1373,16 +1423,34 @@ impl SlotPool {
     }
 }
 
-struct SessionTracks {
+struct SessionTrackHandles {
     _root: TrackHandle,
     tracks: [TrackHandle; SESSION_BUS_COUNT],
+}
+
+struct SessionRetirementState {
+    completion: oneshot::Sender<Result<(), MixerSessionRetirementError>>,
+    clean: bool,
+    failure: Option<MixerSessionRetirementError>,
+    inputs_closed: bool,
+    tracks_dropped: bool,
+}
+
+struct SessionTracks {
+    handles: Option<SessionTrackHandles>,
     pools: [SlotPool; SESSION_BUS_COUNT],
     key: SessionKey,
+    control: Arc<SessionControl>,
+    retirement: Option<SessionRetirementState>,
 }
 
 impl SessionTracks {
     fn track_mut(&mut self, bus: SessionBus) -> &mut TrackHandle {
-        &mut self.tracks[bus.ordinal()]
+        &mut self
+            .handles
+            .as_mut()
+            .expect("active session lost its track handles")
+            .tracks[bus.ordinal()]
     }
     fn pool_mut(&mut self, bus: SessionBus) -> &mut SlotPool {
         &mut self.pools[bus.ordinal()]
@@ -1396,6 +1464,8 @@ struct MixerCore<D: JoinedOutputDriver> {
     inputs_per_bus: usize,
     next_session_generation: u64,
     cleanup_clean: bool,
+    #[cfg(test)]
+    reported_sub_track_count: Option<usize>,
 }
 
 impl<D: JoinedOutputDriver> MixerCore<D> {
@@ -1453,23 +1523,45 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 inputs_per_bus,
                 next_session_generation: 1,
                 cleanup_clean: true,
+                #[cfg(test)]
+                reported_sub_track_count: None,
             },
             negotiated,
         ))
     }
 
-    fn add_session(&mut self, id: AudioSessionId) -> Result<SessionKey, MixerMutationError> {
-        if self.sessions.contains_key(&id) {
-            return Err(MixerMutationError::DuplicateSession);
+    fn add_session(
+        &mut self,
+        id: AudioSessionId,
+    ) -> Result<Arc<SessionControl>, MixerMutationError> {
+        if let Some(session) = self.sessions.get(&id) {
+            return Err(
+                if session.retirement.is_some() || session.control.is_closing() {
+                    MixerMutationError::SessionRetirementPending
+                } else {
+                    MixerMutationError::DuplicateSession
+                },
+            );
         }
         if self.sessions.len() == self.max_sessions {
-            return Err(MixerMutationError::SessionCapacity);
+            return Err(
+                if self
+                    .sessions
+                    .values()
+                    .any(|session| session.retirement.is_some() || session.control.is_closing())
+                {
+                    MixerMutationError::SessionRetirementPending
+                } else {
+                    MixerMutationError::SessionCapacity
+                },
+            );
         }
         let generation = self.next_session_generation;
         self.next_session_generation = generation
             .checked_add(1)
             .ok_or(MixerMutationError::GenerationExhausted)?;
         let key = SessionKey { id, generation };
+        let session_control = Arc::new(SessionControl::new(key));
         let manager = self
             .manager
             .as_mut()
@@ -1516,13 +1608,17 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         self.sessions.insert(
             id,
             SessionTracks {
-                _root: root,
-                tracks: [script, native, speech],
+                handles: Some(SessionTrackHandles {
+                    _root: root,
+                    tracks: [script, native, speech],
+                }),
                 pools: [script_pool, native_pool, speech_pool],
                 key,
+                control: Arc::clone(&session_control),
+                retirement: None,
             },
         );
-        Ok(key)
+        Ok(session_control)
     }
 
     fn reserve(
@@ -1532,7 +1628,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
     ) -> Result<ReservedRecord, MixerMutationError> {
         self.sessions
             .get_mut(&key.id)
-            .filter(|session| session.key == key)
+            .filter(|session| session.key == key && session.retirement.is_none())
             .ok_or(MixerMutationError::UnknownSession)?
             .pool_mut(bus)
             .reserve()
@@ -1580,7 +1676,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         let session = self
             .sessions
             .get_mut(&key.id)
-            .filter(|session| session.key == key)
+            .filter(|session| session.key == key && session.retirement.is_none())
             .ok_or(MixerMutationError::UnknownSession)?;
         let decibels = if linear == 0.0 {
             Decibels::SILENCE
@@ -1601,10 +1697,233 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         self.for_each_slot(|slot| slot.force_close_current());
     }
 
+    fn begin_session_retirement(
+        &mut self,
+        request: SessionRetirementRequest,
+    ) -> Result<(), SessionRetirementRequest> {
+        let Some(session) = self
+            .sessions
+            .get_mut(&request.key.id)
+            .filter(|session| session.key == request.key)
+        else {
+            return Err(request);
+        };
+        if session.retirement.is_some() {
+            return Err(request);
+        }
+        session.retirement = Some(SessionRetirementState {
+            completion: request.completion,
+            clean: session.control.cleanup_clean.load(Ordering::Acquire),
+            failure: None,
+            inputs_closed: false,
+            tracks_dropped: false,
+        });
+        Ok(())
+    }
+
+    fn session_control(&self, key: SessionKey) -> Option<Arc<SessionControl>> {
+        self.sessions
+            .get(&key.id)
+            .filter(|session| session.key == key)
+            .map(|session| Arc::clone(&session.control))
+    }
+
+    fn mark_session_cleanup_failed(&mut self, key: SessionKey) {
+        let Some(session) = self
+            .sessions
+            .get_mut(&key.id)
+            .filter(|session| session.key == key)
+        else {
+            return;
+        };
+        session
+            .control
+            .cleanup_clean
+            .store(false, Ordering::Release);
+        if let Some(retirement) = session.retirement.as_mut() {
+            retirement.clean = false;
+        }
+    }
+
+    fn close_drained_session_inputs(&mut self) {
+        for session in self.sessions.values_mut() {
+            let Some(retirement) = session.retirement.as_mut() else {
+                continue;
+            };
+            if retirement.inputs_closed || !session.control.starts_drained() {
+                continue;
+            }
+            for pool in &session.pools {
+                for slot in &pool.inventory {
+                    if let Some(slot) = slot.upgrade() {
+                        slot.force_close_current();
+                    }
+                }
+            }
+            retirement.inputs_closed = true;
+        }
+    }
+
+    fn prepare_session_forced_jobs(&self, pending: &[RetirementRequest]) -> Vec<CleanupJob> {
+        let mut jobs = Vec::new();
+        for session in self.sessions.values().filter(|session| {
+            session
+                .retirement
+                .as_ref()
+                .is_some_and(|retirement| retirement.inputs_closed)
+        }) {
+            for pool in &session.pools {
+                for slot in &pool.inventory {
+                    let Some(slot) = slot.upgrade() else {
+                        continue;
+                    };
+                    if slot.is_terminal_for_session() {
+                        continue;
+                    }
+                    if pending.iter().any(|request| {
+                        request.record.generation
+                            == slot_generation(slot.word.load(Ordering::Acquire))
+                            && Arc::ptr_eq(&request.record.slot, &slot)
+                    }) {
+                        continue;
+                    }
+                    if let Some((generation, prepared)) = slot.prepare_forced_terminal(false) {
+                        jobs.push(CleanupJob {
+                            record: ReservedRecord { slot, generation },
+                            prepared,
+                            completion: None,
+                            terminal: true,
+                        });
+                    }
+                }
+            }
+        }
+        jobs
+    }
+
+    fn drop_ready_session_tracks(&mut self) {
+        for session in self
+            .sessions
+            .values_mut()
+            .filter(|session| session.retirement.is_some())
+        {
+            if !session
+                .retirement
+                .as_ref()
+                .is_some_and(|retirement| retirement.inputs_closed)
+            {
+                continue;
+            }
+            let inputs_terminal = session.pools.iter().all(|pool| {
+                pool.inventory.iter().all(|slot| {
+                    slot.upgrade()
+                        .is_none_or(|slot| slot.is_terminal_for_session())
+                })
+            });
+            if !inputs_terminal {
+                continue;
+            }
+            let Some(handles) = session.handles.take() else {
+                continue;
+            };
+            drop(handles);
+            #[cfg(test)]
+            session
+                .control
+                .tracks_dropped
+                .store(true, Ordering::Release);
+            session
+                .retirement
+                .as_mut()
+                .expect("filtered retiring session")
+                .tracks_dropped = true;
+        }
+    }
+
+    fn complete_rendered_session_retirements(&mut self) -> bool {
+        let active_track_count = self
+            .sessions
+            .values()
+            .filter(|session| session.handles.is_some())
+            .count();
+        let Some(manager) = self.manager.as_ref() else {
+            return false;
+        };
+        #[cfg(test)]
+        let reported_track_count = self
+            .reported_sub_track_count
+            .unwrap_or_else(|| manager.num_sub_tracks());
+        #[cfg(not(test))]
+        let reported_track_count = manager.num_sub_tracks();
+        if reported_track_count > active_track_count {
+            return true;
+        }
+        if reported_track_count < active_track_count {
+            self.cleanup_clean = false;
+            for retirement in self
+                .sessions
+                .values_mut()
+                .filter_map(|session| session.retirement.as_mut())
+            {
+                retirement.clean = false;
+                retirement.failure = Some(MixerSessionRetirementError::Structural);
+            }
+            return false;
+        }
+        let retired = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                session
+                    .retirement
+                    .as_ref()
+                    .is_some_and(|retirement| retirement.tracks_dropped)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in retired {
+            let Some(mut session) = self.sessions.remove(&id) else {
+                continue;
+            };
+            let retirement = session
+                .retirement
+                .take()
+                .expect("retired session lost completion authority");
+            let result = if let Some(error) = retirement.failure {
+                Err(error)
+            } else if retirement.clean {
+                Ok(())
+            } else {
+                Err(MixerSessionRetirementError::CleanupFailed)
+            };
+            send_session_completion(retirement.completion, result);
+        }
+        true
+    }
+
+    fn finish_session_retirements_after_backend(&mut self, backend_clean: bool) {
+        let sessions = std::mem::take(&mut self.sessions);
+        for (_, mut session) in sessions {
+            let Some(retirement) = session.retirement.take() else {
+                continue;
+            };
+            let result = if let Some(error) = retirement.failure {
+                Err(error)
+            } else if backend_clean && retirement.clean {
+                Ok(())
+            } else if backend_clean {
+                Err(MixerSessionRetirementError::CleanupFailed)
+            } else {
+                Err(MixerSessionRetirementError::OwnerUncertain)
+            };
+            send_session_completion(retirement.completion, result);
+        }
+    }
+
     fn prepare_forced_jobs(&self) -> Vec<CleanupJob> {
         let mut jobs = Vec::new();
         self.for_each_slot(|slot| {
-            if let Some((generation, prepared)) = slot.prepare_forced_after_backend() {
+            if let Some((generation, prepared)) = slot.prepare_forced_terminal(true) {
                 jobs.push(CleanupJob {
                     record: ReservedRecord {
                         slot: Arc::clone(slot),
@@ -1641,6 +1960,7 @@ enum MixerMutationError {
     DriverStopped,
     DuplicateSession,
     SessionCapacity,
+    SessionRetirementPending,
     UnknownSession,
     InputCapacity,
     GenerationExhausted,
@@ -1655,6 +1975,11 @@ struct ReservedRecord {
 struct RetirementRequest {
     record: ReservedRecord,
     completion: oneshot::Sender<Result<MixerInputRetirement, MixerRetirementError>>,
+}
+
+struct SessionRetirementRequest {
+    key: SessionKey,
+    completion: oneshot::Sender<Result<(), MixerSessionRetirementError>>,
 }
 
 struct CleanupJob {
@@ -1684,7 +2009,7 @@ enum CleanupTask {
 enum OwnerCommand {
     AddSession(
         AudioSessionId,
-        SyncSender<Result<SessionKey, MixerMutationError>>,
+        SyncSender<Result<Arc<SessionControl>, MixerMutationError>>,
     ),
     Reserve(
         SessionKey,
@@ -1701,9 +2026,88 @@ enum OwnerCommand {
 }
 
 struct GateState {
-    sealed: bool,
-    accepting_retirements: bool,
+    production_sealed: bool,
+    accepting_input_retirements: bool,
+    accepting_session_retirements: bool,
     start_admissions: usize,
+}
+
+struct SessionGateState {
+    start_admissions: usize,
+}
+
+struct SessionControl {
+    key: SessionKey,
+    gate: Mutex<SessionGateState>,
+    closing: AtomicBool,
+    drained: Condvar,
+    cleanup_clean: AtomicBool,
+    #[cfg(test)]
+    tracks_dropped: AtomicBool,
+    #[cfg(test)]
+    cleanup_finish_hook: Mutex<Option<Arc<RetirementScanHook>>>,
+    #[cfg(test)]
+    request_enqueued_hook: Mutex<Option<Arc<RetirementScanHook>>>,
+}
+
+impl SessionControl {
+    fn new(key: SessionKey) -> Self {
+        Self {
+            key,
+            gate: Mutex::new(SessionGateState {
+                start_admissions: 0,
+            }),
+            closing: AtomicBool::new(false),
+            drained: Condvar::new(),
+            cleanup_clean: AtomicBool::new(true),
+            #[cfg(test)]
+            tracks_dropped: AtomicBool::new(false),
+            #[cfg(test)]
+            cleanup_finish_hook: Mutex::new(None),
+            #[cfg(test)]
+            request_enqueued_hook: Mutex::new(None),
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn begin_close(&self) -> Result<(), MixerSessionRetirementError> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| MixerSessionRetirementError::OwnerUncertain)?;
+        self.closing.store(true, Ordering::Release);
+        drop(gate);
+        Ok(())
+    }
+
+    fn starts_drained(&self) -> bool {
+        lock_recover(&self.gate).start_admissions == 0
+    }
+
+    #[cfg(test)]
+    fn pause_before_cleanup_finish(&self) {
+        let hook = lock_recover(&self.cleanup_finish_hook).clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            let _ = hook.entered.send(());
+            hook.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_request_enqueued(&self) {
+        let hook = lock_recover(&self.request_enqueued_hook).clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            let _ = hook.entered.send(());
+            hook.release.wait();
+        }
+    }
 }
 
 struct ControlInner {
@@ -1711,26 +2115,45 @@ struct ControlInner {
     gate_drained: Condvar,
     commands: SyncSender<OwnerCommand>,
     retirements: SyncSender<RetirementRequest>,
+    session_retirements: SyncSender<SessionRetirementRequest>,
     format: MixerFormat,
     driver_status: Arc<DriverStatus>,
 }
 
 impl ControlInner {
-    fn admit_start(self: &Arc<Self>) -> Result<StartAdmission, MixerControlError> {
+    fn admit_start(
+        self: &Arc<Self>,
+        session: &Arc<SessionControl>,
+    ) -> Result<StartAdmission, MixerControlError> {
+        let mut session_gate = session
+            .gate
+            .lock()
+            .map_err(|_| MixerControlError::OwnerStopped)?;
+        if session.is_closing() {
+            return Err(MixerControlError::UnknownSession);
+        }
         let mut gate = self
             .gate
             .lock()
             .map_err(|_| MixerControlError::OwnerStopped)?;
-        if gate.sealed || !self.driver_status.is_live() {
+        if gate.production_sealed || !self.driver_status.is_live() {
             return Err(MixerControlError::OwnerStopped);
         }
-        gate.start_admissions = gate
+        let next_global_admissions = gate
             .start_admissions
             .checked_add(1)
             .ok_or(MixerControlError::InternalInvariant)?;
+        let next_session_admissions = session_gate
+            .start_admissions
+            .checked_add(1)
+            .ok_or(MixerControlError::InternalInvariant)?;
+        gate.start_admissions = next_global_admissions;
+        session_gate.start_admissions = next_session_admissions;
         drop(gate);
+        drop(session_gate);
         Ok(StartAdmission {
             control: Arc::clone(self),
+            session: Arc::clone(session),
         })
     }
 
@@ -1741,7 +2164,7 @@ impl ControlInner {
         let Ok(gate) = self.gate.lock() else {
             return Err((MixerRetirementError::OwnerUncertain, request));
         };
-        if !gate.accepting_retirements {
+        if !gate.accepting_input_retirements {
             return Err((MixerRetirementError::OwnerUncertain, request));
         }
         let result = match self.retirements.try_send(request) {
@@ -1757,13 +2180,35 @@ impl ControlInner {
         result
     }
 
-    fn seal(&self) -> Result<(), MixerControlError> {
+    fn submit_session_retirement(
+        &self,
+        request: SessionRetirementRequest,
+    ) -> Result<(), (MixerSessionRetirementError, SessionRetirementRequest)> {
+        let Ok(gate) = self.gate.lock() else {
+            return Err((MixerSessionRetirementError::OwnerUncertain, request));
+        };
+        if !gate.accepting_session_retirements {
+            return Err((MixerSessionRetirementError::OwnerUncertain, request));
+        }
+        let result = match self.session_retirements.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(request)) => {
+                Err((MixerSessionRetirementError::QueueInvariant, request))
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                Err((MixerSessionRetirementError::OwnerUncertain, request))
+            }
+        };
+        drop(gate);
+        result
+    }
+
+    fn seal_production(&self) -> Result<(), MixerControlError> {
         let mut gate = self
             .gate
             .lock()
             .map_err(|_| MixerControlError::OwnerStopped)?;
-        gate.sealed = true;
-        gate.accepting_retirements = false;
+        gate.production_sealed = true;
         while gate.start_admissions != 0 {
             gate = self
                 .gate_drained
@@ -1772,10 +2217,17 @@ impl ControlInner {
         }
         Ok(())
     }
+
+    fn stop_retirement_acceptance(&self) {
+        let mut gate = lock_recover(&self.gate);
+        gate.accepting_input_retirements = false;
+        gate.accepting_session_retirements = false;
+    }
 }
 
 struct StartAdmission {
     control: Arc<ControlInner>,
+    session: Arc<SessionControl>,
 }
 
 impl Drop for StartAdmission {
@@ -1785,6 +2237,13 @@ impl Drop for StartAdmission {
         gate.start_admissions = gate.start_admissions.saturating_sub(1);
         if gate.start_admissions == 0 {
             self.control.gate_drained.notify_all();
+        }
+        drop(gate);
+        let mut session_gate = lock_recover(&self.session.gate);
+        debug_assert!(session_gate.start_admissions > 0);
+        session_gate.start_admissions = session_gate.start_admissions.saturating_sub(1);
+        if session_gate.start_admissions == 0 {
+            self.session.drained.notify_all();
         }
     }
 }
@@ -1814,6 +2273,10 @@ pub enum MixerControlError {
     DuplicateSession,
     /// The fixed session capacity has been reached.
     SessionCapacity,
+    /// A session is closing and Kira has not yet acknowledged track removal.
+    ///
+    /// Retry after awaiting the exact [`MixerSessionRetirement`] receipt.
+    SessionRetirementPending,
     /// The requested session does not exist.
     UnknownSession,
     /// The selected bus has reached its fixed input capacity.
@@ -1832,12 +2295,26 @@ impl From<MixerMutationError> for MixerControlError {
             MixerMutationError::DuplicateSession => Self::DuplicateSession,
             MixerMutationError::DriverStopped => Self::OwnerStopped,
             MixerMutationError::SessionCapacity => Self::SessionCapacity,
+            MixerMutationError::SessionRetirementPending => Self::SessionRetirementPending,
             MixerMutationError::UnknownSession => Self::UnknownSession,
             MixerMutationError::InputCapacity => Self::InputCapacity,
             MixerMutationError::GenerationExhausted => Self::GenerationExhausted,
             MixerMutationError::InternalInvariant => Self::InternalInvariant,
         }
     }
+}
+
+/// Failure to prove exact retirement of one mixer session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixerSessionRetirementError {
+    /// The owner or retirement channel disappeared before accepting the work.
+    OwnerUncertain,
+    /// A queue invariant failed; the exact session remains sealed fail-closed.
+    QueueInvariant,
+    /// Logical inputs were made permanently non-enterable, but cleanup was unclean.
+    CleanupFailed,
+    /// The exact session generation was no longer owned by the mixer.
+    Structural,
 }
 
 /// Primary driver or format cause of a mixer startup failure.
@@ -2044,8 +2521,17 @@ fn submit_shutdown(
     slot: Arc<InputSlot>,
     generation: u64,
     control: &Weak<ControlInner>,
+    session: &Arc<SessionControl>,
 ) -> MixerInputShutdown {
     let live_control = control.upgrade();
+    let Ok(session_gate) = session.gate.lock() else {
+        return MixerInputShutdown {
+            state: ShutdownState::RetainedError {
+                _slot: ManuallyDrop::new(slot),
+                error: MixerRetirementError::OwnerUncertain,
+            },
+        };
+    };
     let initial = slot.word.load(Ordering::Acquire);
     if slot_generation(initial) == generation
         && matches!(
@@ -2075,6 +2561,15 @@ fn submit_shutdown(
             },
         };
     }
+    if session.is_closing() {
+        drop(session_gate);
+        return MixerInputShutdown {
+            state: ShutdownState::Forced {
+                slot: ManuallyDrop::new(slot),
+                generation,
+            },
+        };
+    }
     let word = slot.word.load(Ordering::Acquire);
     if slot_generation(word) != generation || slot_phase(word) != SlotPhase::Closing {
         return MixerInputShutdown {
@@ -2085,6 +2580,7 @@ fn submit_shutdown(
         };
     }
     let Some(control) = live_control else {
+        drop(session_gate);
         return MixerInputShutdown {
             state: ShutdownState::Forced {
                 slot: ManuallyDrop::new(slot),
@@ -2097,7 +2593,9 @@ fn submit_shutdown(
         record: ReservedRecord { slot, generation },
         completion,
     };
-    match control.submit_retirement(request) {
+    let submitted = control.submit_retirement(request);
+    drop(session_gate);
+    match submitted {
         Ok(()) => MixerInputShutdown {
             state: ShutdownState::Accepted(receiver),
         },
@@ -2121,6 +2619,7 @@ pub struct MixerInputReservation {
     slot: ManuallyDrop<Arc<InputSlot>>,
     generation: u64,
     control: Weak<ControlInner>,
+    session: Arc<SessionControl>,
 }
 
 impl fmt::Debug for MixerInputReservation {
@@ -2140,8 +2639,9 @@ impl MixerInputReservation {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let generation = self.generation;
         let control = self.control.clone();
+        let session = Arc::clone(&self.session);
         std::mem::forget(self);
-        submit_shutdown(slot, generation, &control)
+        submit_shutdown(slot, generation, &control, &session)
     }
 
     /// Install a preallocated input while holding exact start admission.
@@ -2161,7 +2661,7 @@ impl MixerInputReservation {
                 source,
             ));
         };
-        let admission = match control.admit_start() {
+        let admission = match control.admit_start(&self.session) {
             Ok(admission) => admission,
             Err(error) => return Err(MixerInputInstallFailure::new(error, self, source)),
         };
@@ -2177,11 +2677,13 @@ impl MixerInputReservation {
         let slot = unsafe { ManuallyDrop::take(&mut this.slot) };
         let generation = this.generation;
         let control = this.control.clone();
+        let session = Arc::clone(&this.session);
         std::mem::forget(this);
         Ok(InstalledMixerInput {
             slot: ManuallyDrop::new(slot),
             generation,
             control,
+            session,
             admission: Some(admission),
         })
     }
@@ -2211,7 +2713,7 @@ impl Drop for MixerInputReservation {
     fn drop(&mut self) {
         // SAFETY: the field is initialized on every ordinary Drop path.
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
-        let shutdown = submit_shutdown(slot, self.generation, &self.control);
+        let shutdown = submit_shutdown(slot, self.generation, &self.control, &self.session);
         drop(shutdown);
     }
 }
@@ -2290,6 +2792,7 @@ struct InstalledMixerInput {
     slot: ManuallyDrop<Arc<InputSlot>>,
     generation: u64,
     control: Weak<ControlInner>,
+    session: Arc<SessionControl>,
     admission: Option<StartAdmission>,
 }
 
@@ -2315,6 +2818,7 @@ impl InstalledMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let generation = self.generation;
         let control = self.control.clone();
+        let session = Arc::clone(&self.session);
         let live_control = control.upgrade();
         let driver_snapshot = live_control
             .as_ref()
@@ -2346,6 +2850,7 @@ impl InstalledMixerInput {
                     slot: ManuallyDrop::new(slot),
                     generation,
                     control,
+                    session,
                 },
             });
         }
@@ -2356,6 +2861,7 @@ impl InstalledMixerInput {
             slot: ManuallyDrop::new(slot),
             generation,
             control,
+            session,
         })
     }
 }
@@ -2366,7 +2872,7 @@ impl Drop for InstalledMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let _ = slot.close(self.generation, false);
         self.admission.take();
-        let shutdown = submit_shutdown(slot, self.generation, &self.control);
+        let shutdown = submit_shutdown(slot, self.generation, &self.control, &self.session);
         drop(shutdown);
     }
 }
@@ -2389,6 +2895,7 @@ pub struct RunningMixerInput {
     slot: ManuallyDrop<Arc<InputSlot>>,
     generation: u64,
     control: Weak<ControlInner>,
+    session: Arc<SessionControl>,
 }
 
 impl fmt::Debug for RunningMixerInput {
@@ -2404,17 +2911,27 @@ impl RunningMixerInput {
     /// Silence this logical input from the next render entry onward.
     #[must_use]
     pub fn suspend(&self) -> bool {
-        self.control
-            .upgrade()
-            .is_some_and(|control| control.driver_status.is_live())
+        let Ok(_session_gate) = self.session.gate.lock() else {
+            return false;
+        };
+        !self.session.is_closing()
+            && self
+                .control
+                .upgrade()
+                .is_some_and(|control| control.driver_status.is_live())
             && self.slot.set_suspended(self.generation, true)
     }
     /// Reopen a suspended logical input from the next render entry onward.
     #[must_use]
     pub fn resume(&self) -> bool {
-        self.control
-            .upgrade()
-            .is_some_and(|control| control.driver_status.is_live())
+        let Ok(_session_gate) = self.session.gate.lock() else {
+            return false;
+        };
+        !self.session.is_closing()
+            && self
+                .control
+                .upgrade()
+                .is_some_and(|control| control.driver_status.is_live())
             && self.slot.set_suspended(self.generation, false)
     }
     /// Absorbingly close and commit off-render retirement.
@@ -2424,8 +2941,9 @@ impl RunningMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let generation = self.generation;
         let control = self.control.clone();
+        let session = Arc::clone(&self.session);
         std::mem::forget(self);
-        submit_shutdown(slot, generation, &control)
+        submit_shutdown(slot, generation, &control, &session)
     }
     /// Whether rendering or the installed callback failed closed.
     #[must_use]
@@ -2453,7 +2971,7 @@ impl Drop for RunningMixerInput {
     fn drop(&mut self) {
         // SAFETY: initialized on every ordinary Drop path.
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
-        let shutdown = submit_shutdown(slot, self.generation, &self.control);
+        let shutdown = submit_shutdown(slot, self.generation, &self.control, &self.session);
         drop(shutdown);
     }
 }
@@ -2461,7 +2979,7 @@ impl Drop for RunningMixerInput {
 #[derive(Clone)]
 struct MixerBusHandle {
     control: Weak<ControlInner>,
-    session: SessionKey,
+    session: Arc<SessionControl>,
     bus: SessionBus,
 }
 
@@ -2471,14 +2989,15 @@ impl MixerBusHandle {
             .control
             .upgrade()
             .ok_or(MixerControlError::OwnerStopped)?;
-        let record = send_request(&control, |response| {
-            OwnerCommand::Reserve(self.session, self.bus, response)
+        let record = send_session_request(&control, &self.session, |response| {
+            OwnerCommand::Reserve(self.session.key, self.bus, response)
         })?
         .map_err(MixerControlError::from)?;
         Ok(MixerInputReservation {
             slot: ManuallyDrop::new(record.slot),
             generation: record.generation,
             control: self.control.clone(),
+            session: Arc::clone(&self.session),
         })
     }
 
@@ -2490,8 +3009,8 @@ impl MixerBusHandle {
             .control
             .upgrade()
             .ok_or(MixerControlError::OwnerStopped)?;
-        send_request(&control, |response| {
-            OwnerCommand::SetGain(self.session, self.bus, linear, response)
+        send_session_request(&control, &self.session, |response| {
+            OwnerCommand::SetGain(self.session.key, self.bus, linear, response)
         })?
         .map_err(Into::into)
     }
@@ -2501,11 +3020,19 @@ impl MixerBusHandle {
             .control
             .upgrade()
             .ok_or(MixerControlError::OwnerStopped)?;
+        let _session_gate = self
+            .session
+            .gate
+            .lock()
+            .map_err(|_| MixerControlError::OwnerStopped)?;
+        if self.session.is_closing() {
+            return Err(MixerControlError::UnknownSession);
+        }
         let gate = control
             .gate
             .lock()
             .map_err(|_| MixerControlError::OwnerStopped)?;
-        if gate.sealed || !control.driver_status.is_live() {
+        if gate.production_sealed || !control.driver_status.is_live() {
             Err(MixerControlError::OwnerStopped)
         } else {
             Ok(control.format)
@@ -2548,7 +3075,9 @@ macro_rules! typed_bus_handle {
             ///
             /// # Errors
             ///
-            /// Returns [`MixerControlError::OwnerStopped`] after owner teardown.
+            /// Returns [`MixerControlError::UnknownSession`] after exact session
+            /// retirement begins, or [`MixerControlError::OwnerStopped`] after
+            /// service teardown.
             pub fn format(&self) -> Result<MixerFormat, MixerControlError> {
                 self.0.format()
             }
@@ -2560,27 +3089,123 @@ typed_bus_handle!(MixerScriptBusHandle);
 typed_bus_handle!(MixerNativeBusHandle);
 typed_bus_handle!(MixerSpeechBusHandle);
 
-/// Scoped handle for one fixed session subtree.
-#[derive(Clone)]
-pub struct MixerSessionHandle {
-    control: Weak<ControlInner>,
-    key: SessionKey,
+enum SessionRetirementReceiptState {
+    Accepted(oneshot::Receiver<Result<(), MixerSessionRetirementError>>),
+    RetainedError {
+        _request: SessionRetirementRequest,
+        error: MixerSessionRetirementError,
+    },
+    Ready(Option<Result<(), MixerSessionRetirementError>>),
+    Finished,
 }
 
-impl fmt::Debug for MixerSessionHandle {
+/// Cancellation-independent, waking proof of exact session retirement.
+pub struct MixerSessionRetirement {
+    state: SessionRetirementReceiptState,
+}
+
+impl fmt::Debug for MixerSessionRetirement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("MixerSessionHandle")
-            .field("id", &self.key.id)
+            .debug_struct("MixerSessionRetirement")
             .finish_non_exhaustive()
     }
 }
 
-impl MixerSessionHandle {
+impl Future for MixerSessionRetirement {
+    type Output = Result<(), MixerSessionRetirementError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            SessionRetirementReceiptState::Accepted(receiver) => {
+                match Pin::new(receiver).poll(cx) {
+                    Poll::Ready(Ok(result)) => {
+                        self.state = SessionRetirementReceiptState::Finished;
+                        Poll::Ready(result)
+                    }
+                    Poll::Ready(Err(_)) => {
+                        self.state = SessionRetirementReceiptState::Finished;
+                        Poll::Ready(Err(MixerSessionRetirementError::OwnerUncertain))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            SessionRetirementReceiptState::RetainedError { error, .. } => Poll::Ready(Err(*error)),
+            SessionRetirementReceiptState::Ready(result) => Poll::Ready(
+                result
+                    .take()
+                    .unwrap_or(Err(MixerSessionRetirementError::Structural)),
+            ),
+            SessionRetirementReceiptState::Finished => {
+                Poll::Ready(Err(MixerSessionRetirementError::Structural))
+            }
+        }
+    }
+}
+
+fn submit_session_retirement(
+    session: &Arc<SessionControl>,
+    control: &Weak<ControlInner>,
+) -> MixerSessionRetirement {
+    if let Err(error) = session.begin_close() {
+        return MixerSessionRetirement {
+            state: SessionRetirementReceiptState::Ready(Some(Err(error))),
+        };
+    }
+    let (completion, receiver) = oneshot::channel();
+    let request = SessionRetirementRequest {
+        key: session.key,
+        completion,
+    };
+    let Some(control) = control.upgrade() else {
+        return MixerSessionRetirement {
+            state: SessionRetirementReceiptState::RetainedError {
+                _request: request,
+                error: MixerSessionRetirementError::OwnerUncertain,
+            },
+        };
+    };
+    match control.submit_session_retirement(request) {
+        Ok(()) => MixerSessionRetirement {
+            state: SessionRetirementReceiptState::Accepted(receiver),
+        },
+        Err((error, request)) => MixerSessionRetirement {
+            state: SessionRetirementReceiptState::RetainedError {
+                _request: request,
+                error,
+            },
+        },
+    }
+}
+
+/// Sole logical owner of one fixed session subtree.
+///
+/// This owner is deliberately not cloneable. Cloneable bus handles remain
+/// scoped to this exact non-wrapping session generation and become inert as
+/// soon as retirement begins.
+pub struct MixerSessionOwner {
+    control: Weak<ControlInner>,
+    session: Option<Arc<SessionControl>>,
+}
+
+impl fmt::Debug for MixerSessionOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MixerSessionOwner")
+            .field("id", &self.session.as_ref().map(|session| session.key.id))
+            .finish_non_exhaustive()
+    }
+}
+
+impl MixerSessionOwner {
     fn bus(&self, bus: SessionBus) -> MixerBusHandle {
         MixerBusHandle {
             control: self.control.clone(),
-            session: self.key,
+            session: Arc::clone(
+                self.session
+                    .as_ref()
+                    .expect("retired session owner was used again"),
+            ),
             bus,
         }
     }
@@ -2599,7 +3224,31 @@ impl MixerSessionHandle {
     pub fn speech_bus(&self) -> MixerSpeechBusHandle {
         MixerSpeechBusHandle(self.bus(SessionBus::Speech))
     }
+
+    /// Close this exact generation and return its proof-bearing retirement receipt.
+    #[must_use = "session retirement is complete only after awaiting this receipt"]
+    pub fn retire(mut self) -> MixerSessionRetirement {
+        let Some(session) = self.session.take() else {
+            return MixerSessionRetirement {
+                state: SessionRetirementReceiptState::Ready(Some(Err(
+                    MixerSessionRetirementError::Structural,
+                ))),
+            };
+        };
+        submit_session_retirement(&session, &self.control)
+    }
 }
+
+impl Drop for MixerSessionOwner {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            drop(submit_session_retirement(&session, &self.control));
+        }
+    }
+}
+
+/// Compatibility name for the now-unique session owner.
+pub type MixerSessionHandle = MixerSessionOwner;
 
 /// Bounded control plus unique joined ownership of one process mixer.
 ///
@@ -2660,16 +3309,20 @@ impl MixerService {
     {
         let (commands, command_receiver) = mpsc::sync_channel(CONTROL_QUEUE_CAPACITY);
         let (retirements, retirement_receiver) = mpsc::sync_channel(RETIREMENT_QUEUE_CAPACITY);
+        let (session_retirements, session_retirement_receiver) =
+            mpsc::sync_channel(SESSION_RETIREMENT_QUEUE_CAPACITY.max(max_sessions));
         let driver_status = Arc::new(DriverStatus::new());
         let control = Arc::new(ControlInner {
             gate: Mutex::new(GateState {
-                sealed: false,
-                accepting_retirements: true,
+                production_sealed: false,
+                accepting_input_retirements: true,
+                accepting_session_retirements: true,
                 start_admissions: 0,
             }),
             gate_drained: Condvar::new(),
             commands,
             retirements,
+            session_retirements,
             format,
             driver_status: Arc::clone(&driver_status),
         });
@@ -2689,6 +3342,7 @@ impl MixerService {
                         inputs_per_bus,
                         &command_receiver,
                         &retirement_receiver,
+                        &session_retirement_receiver,
                         &started_sender,
                         &control_weak,
                         &owner_status_thread,
@@ -2698,7 +3352,7 @@ impl MixerService {
                 if outcome.is_err() {
                     driver_status_thread.fail(MixerOutputFailure::OwnerPanicked);
                     if let Some(control) = control_weak.upgrade() {
-                        let _ = control.seal();
+                        let _ = control.seal_production();
                     }
                     owner_status_thread.clean.store(false, Ordering::Release);
                     owner_status_thread.retired.store(true, Ordering::Release);
@@ -2747,16 +3401,16 @@ impl MixerService {
     ///
     /// Returns a bounded control or topology error. No handle is published
     /// until every permanent slot sound has been accepted.
-    pub fn add_session(&self, id: AudioSessionId) -> Result<MixerSessionHandle, MixerControlError> {
+    pub fn add_session(&self, id: AudioSessionId) -> Result<MixerSessionOwner, MixerControlError> {
         let control = self
             .control
             .as_ref()
             .ok_or(MixerControlError::OwnerStopped)?;
-        let key = send_request(control, |response| OwnerCommand::AddSession(id, response))?
+        let session = send_request(control, |response| OwnerCommand::AddSession(id, response))?
             .map_err(MixerControlError::from)?;
-        Ok(MixerSessionHandle {
+        Ok(MixerSessionOwner {
             control: Arc::downgrade(control),
-            key,
+            session: Some(session),
         })
     }
 
@@ -2765,7 +3419,7 @@ impl MixerService {
     pub fn shutdown(mut self) -> MixerShutdown {
         self.driver_status.begin_close();
         if let Some(control) = self.control.as_ref()
-            && control.seal().is_ok()
+            && control.seal_production().is_ok()
         {
             let _ = control.commands.send(OwnerCommand::Shutdown);
         }
@@ -2785,7 +3439,7 @@ impl Drop for MixerService {
     fn drop(&mut self) {
         self.driver_status.begin_close();
         if let Some(control) = self.control.take() {
-            let _ = control.seal();
+            let _ = control.seal_production();
             let _ = control.commands.try_send(OwnerCommand::Shutdown);
         }
         // Explicit shutdown is the proof-bearing joined path. Dropping the last
@@ -2794,15 +3448,15 @@ impl Drop for MixerService {
     }
 }
 
-fn send_request<T>(
+fn enqueue_request<T>(
     control: &Arc<ControlInner>,
     command: impl FnOnce(SyncSender<T>) -> OwnerCommand,
-) -> Result<T, MixerControlError> {
+) -> Result<Receiver<T>, MixerControlError> {
     let gate = control
         .gate
         .lock()
         .map_err(|_| MixerControlError::OwnerStopped)?;
-    if gate.sealed || !control.driver_status.is_live() {
+    if gate.production_sealed || !control.driver_status.is_live() {
         return Err(MixerControlError::OwnerStopped);
     }
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
@@ -2812,9 +3466,38 @@ fn send_request<T>(
         Err(TrySendError::Disconnected(_)) => return Err(MixerControlError::OwnerStopped),
     }
     drop(gate);
-    response_receiver
+    Ok(response_receiver)
+}
+
+fn send_request<T>(
+    control: &Arc<ControlInner>,
+    command: impl FnOnce(SyncSender<T>) -> OwnerCommand,
+) -> Result<T, MixerControlError> {
+    enqueue_request(control, command)?
         .recv()
         .map_err(|_| MixerControlError::OwnerStopped)
+}
+
+fn send_session_request<T>(
+    control: &Arc<ControlInner>,
+    session: &Arc<SessionControl>,
+    command: impl FnOnce(SyncSender<T>) -> OwnerCommand,
+) -> Result<T, MixerControlError> {
+    let session_gate = session
+        .gate
+        .lock()
+        .map_err(|_| MixerControlError::OwnerStopped)?;
+    if session.is_closing() {
+        return Err(MixerControlError::UnknownSession);
+    }
+    let response_receiver = enqueue_request(control, command)?;
+    #[cfg(test)]
+    session.pause_after_request_enqueued();
+    let result = response_receiver
+        .recv()
+        .map_err(|_| MixerControlError::OwnerStopped);
+    drop(session_gate);
+    result
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2825,6 +3508,7 @@ fn run_owner<D>(
     inputs_per_bus: usize,
     commands: &Receiver<OwnerCommand>,
     retirements: &Receiver<RetirementRequest>,
+    session_retirements: &Receiver<SessionRetirementRequest>,
     started: &SyncSender<Result<PhysicalOutputFormat, MixerStartError<D::Error>>>,
     control: &Weak<ControlInner>,
     status: &OwnerStatus,
@@ -2887,6 +3571,7 @@ fn run_owner<D>(
                 &mut mixer,
                 commands,
                 retirements,
+                session_retirements,
                 &cleanup_sender,
                 &cleanup_result_receiver,
                 control,
@@ -2902,6 +3587,7 @@ fn run_owner<D>(
     let clean = terminal_owner_cleanup(
         &mut mixer,
         retirements,
+        session_retirements,
         control,
         &mut pending,
         cleanup_sender,
@@ -2918,6 +3604,7 @@ fn run_active_owner<D: JoinedOutputDriver>(
     mixer: &mut MixerCore<D>,
     commands: &Receiver<OwnerCommand>,
     retirements: &Receiver<RetirementRequest>,
+    session_retirements: &Receiver<SessionRetirementRequest>,
     cleanup_sender: &SyncSender<CleanupTask>,
     cleanup_results: &Receiver<CleanupResult>,
     control: &Weak<ControlInner>,
@@ -2933,7 +3620,7 @@ fn run_active_owner<D: JoinedOutputDriver>(
         drain_cleanup_results(mixer, cleanup_results);
         if let Some(failure) = driver_status.failure() {
             if let Some(control) = control.upgrade()
-                && control.seal().is_err()
+                && control.seal_production().is_err()
             {
                 mixer.cleanup_clean = false;
             }
@@ -2942,6 +3629,20 @@ fn run_active_owner<D: JoinedOutputDriver>(
         }
         drain_retirements(retirements, pending);
         scan_retirements(mixer, pending, cleanup_sender);
+        #[cfg(test)]
+        driver_status.pause_after_input_retirement_scan();
+        drain_session_retirements(mixer, session_retirements);
+        // A per-input shutdown admitted before a session close publishes to
+        // `retirements` before that session request can be submitted under the
+        // same session gate. Re-draining after observing session work therefore
+        // captures every exact completion authority before forced cleanup.
+        drain_retirements(retirements, pending);
+        scan_retirements(mixer, pending, cleanup_sender);
+        #[cfg(test)]
+        driver_status.pause_before_session_forced_cleanup();
+        if !progress_session_retirements(mixer, cleanup_sender, pending) {
+            break;
+        }
         let mut shutting_down = false;
         match commands.recv_timeout(RETIREMENT_SCAN_INTERVAL) {
             Ok(OwnerCommand::AddSession(id, response)) => {
@@ -3003,6 +3704,7 @@ fn run_active_owner<D: JoinedOutputDriver>(
 fn terminal_owner_cleanup<D: JoinedOutputDriver>(
     mixer: &mut MixerCore<D>,
     retirements: &Receiver<RetirementRequest>,
+    session_retirements: &Receiver<SessionRetirementRequest>,
     control: &Weak<ControlInner>,
     pending: &mut Vec<RetirementRequest>,
     cleanup_sender: SyncSender<CleanupTask>,
@@ -3010,12 +3712,14 @@ fn terminal_owner_cleanup<D: JoinedOutputDriver>(
     cleanup_owner: JoinHandle<()>,
     driver_status: &DriverStatus,
 ) -> bool {
-    if control
-        .upgrade()
-        .is_some_and(|control| control.seal().is_err())
-    {
-        mixer.cleanup_clean = false;
+    if let Some(control) = control.upgrade() {
+        if control.seal_production().is_err() {
+            mixer.cleanup_clean = false;
+        }
+        control.stop_retirement_acceptance();
     }
+    drain_retirements(retirements, pending);
+    drain_session_retirements(mixer, session_retirements);
     drain_retirements(retirements, pending);
     if let Some(failure) = driver_status.failure() {
         notify_failed_inputs(mixer, failure, &cleanup_sender);
@@ -3034,10 +3738,13 @@ fn terminal_owner_cleanup<D: JoinedOutputDriver>(
         }
         let mut forced_jobs = mixer.prepare_forced_jobs().into_iter();
         while let Some(job) = forced_jobs.next() {
+            let session_key = job.record.slot.address.session;
             if let Err(error) = cleanup_sender.send(CleanupTask::Retire(job)) {
                 mixer.cleanup_clean = false;
+                mixer.mark_session_cleanup_failed(session_key);
                 retain_failed_cleanup_task(error.0);
                 for job in forced_jobs {
+                    mixer.mark_session_cleanup_failed(job.record.slot.address.session);
                     retain_failed_cleanup_job(job);
                 }
                 break;
@@ -3059,6 +3766,7 @@ fn terminal_owner_cleanup<D: JoinedOutputDriver>(
         finish_cleanup_result(mixer, result);
     }
     let cleanup_joined = cleanup_owner.join().is_ok();
+    mixer.finish_session_retirements_after_backend(backend_clean && cleanup_joined);
     backend_clean && cleanup_joined && mixer.cleanup_clean
 }
 
@@ -3067,6 +3775,42 @@ fn drain_retirements(
     pending: &mut Vec<RetirementRequest>,
 ) {
     pending.extend(retirements.try_iter());
+}
+
+fn drain_session_retirements<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
+    retirements: &Receiver<SessionRetirementRequest>,
+) {
+    for request in retirements.try_iter() {
+        if let Err(request) = mixer.begin_session_retirement(request) {
+            mixer.cleanup_clean = false;
+            send_session_completion(
+                request.completion,
+                Err(MixerSessionRetirementError::Structural),
+            );
+        }
+    }
+}
+
+fn progress_session_retirements<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
+    cleanup_sender: &SyncSender<CleanupTask>,
+    pending: &[RetirementRequest],
+) -> bool {
+    mixer.close_drained_session_inputs();
+    let jobs = mixer.prepare_session_forced_jobs(pending);
+    for job in jobs {
+        let key = job.record.slot.address.session;
+        if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
+            cleanup_sender.try_send(CleanupTask::Retire(job))
+        {
+            mixer.cleanup_clean = false;
+            mixer.mark_session_cleanup_failed(key);
+            retain_failed_cleanup_task(task);
+        }
+    }
+    mixer.drop_ready_session_tracks();
+    mixer.complete_rendered_session_retirements()
 }
 
 fn scan_retirements<D: JoinedOutputDriver>(
@@ -3104,10 +3848,12 @@ fn scan_retirements<D: JoinedOutputDriver>(
             completion: Some(request.completion),
             terminal: false,
         };
+        let session_key = job.record.slot.address.session;
         if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) =
             cleanup_sender.try_send(CleanupTask::Retire(job))
         {
             mixer.cleanup_clean = false;
+            mixer.mark_session_cleanup_failed(session_key);
             retain_failed_cleanup_task(job);
         }
     }
@@ -3152,6 +3898,7 @@ fn notify_failed_inputs<D: JoinedOutputDriver>(
     cleanup_sender: &SyncSender<CleanupTask>,
 ) {
     let mut notification_transport_clean = true;
+    let mut failed_sessions = Vec::new();
     mixer.for_each_slot(|slot| {
         let Some(observer) = slot.fail_live(failure) else {
             return;
@@ -3161,9 +3908,13 @@ fn notify_failed_inputs<D: JoinedOutputDriver>(
             cleanup_sender.try_send(task)
         {
             notification_transport_clean = false;
+            failed_sessions.push(slot.address.session);
             retain_failed_cleanup_task(task);
         }
     });
+    for key in failed_sessions {
+        mixer.mark_session_cleanup_failed(key);
+    }
     mixer.cleanup_clean &= notification_transport_clean;
 }
 
@@ -3205,6 +3956,16 @@ fn finish_cleanup_result<D: JoinedOutputDriver>(mixer: &mut MixerCore<D>, result
         terminal,
     } = result;
     let generation = record.generation;
+    let session_key = record.slot.address.session;
+    let session_control = mixer.session_control(session_key);
+    #[cfg(test)]
+    if let Some(session) = session_control.as_ref() {
+        session.pause_before_cleanup_finish();
+    }
+    let terminal = terminal
+        || session_control
+            .as_ref()
+            .is_none_or(|session| session.is_closing());
     let result = if terminal {
         record.slot.finish_terminal(generation, result)
     } else {
@@ -3216,9 +3977,21 @@ fn finish_cleanup_result<D: JoinedOutputDriver>(mixer: &mut MixerCore<D>, result
         }
     };
     mixer.cleanup_clean &= result.is_ok();
+    if result.is_err() {
+        mixer.mark_session_cleanup_failed(session_key);
+    }
     if let Some(completion) = completion {
         send_completion(completion, result);
     }
+}
+
+fn send_session_completion(
+    completion: oneshot::Sender<Result<(), MixerSessionRetirementError>>,
+    result: Result<(), MixerSessionRetirementError>,
+) {
+    forget_panic(catch_unwind(AssertUnwindSafe(|| {
+        let _ = completion.send(result);
+    })));
 }
 
 fn send_completion(

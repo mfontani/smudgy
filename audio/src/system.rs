@@ -24,7 +24,7 @@ use cpal::{
 use super::{
     AudioSessionId, DriverFailureSignal, JoinedOutputDriver, JoinedRenderer,
     MAX_PHYSICAL_CALLBACK_FRAMES, MixerControlError, MixerFormat, MixerOutputFailure, MixerService,
-    MixerSessionHandle, MixerShutdown, MixerStartError, PhysicalOutputFormat, PhysicalSampleFormat,
+    MixerSessionOwner, MixerShutdown, MixerStartError, PhysicalOutputFormat, PhysicalSampleFormat,
 };
 
 const PHYSICAL_CHANNELS: usize = 2;
@@ -221,7 +221,7 @@ impl SystemMixerService {
     /// # Errors
     ///
     /// Returns a bounded control or topology error.
-    pub fn add_session(&self, id: AudioSessionId) -> Result<MixerSessionHandle, MixerControlError> {
+    pub fn add_session(&self, id: AudioSessionId) -> Result<MixerSessionOwner, MixerControlError> {
         self.0.add_session(id)
     }
 
