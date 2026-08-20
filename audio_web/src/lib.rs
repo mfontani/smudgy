@@ -1,10 +1,12 @@
 //! Hosted Web Audio output adapter for Smudgy's shared script mixer bus.
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Barrier, mpsc};
 #[cfg(test)]
 use std::thread::{self, ThreadId};
 
@@ -15,9 +17,9 @@ use deno_audio::{
     PreparedAudioOutput, RunningAudioOutput,
 };
 use smudgy_audio::{
-    MixerControlError, MixerFrame, MixerInput, MixerInputReservation, MixerInputShutdown,
-    MixerInputStartFailure, MixerInputStatus, MixerRetirementError, MixerScriptBusHandle,
-    RunningMixerInput,
+    MixerControlError, MixerFailureObserver, MixerFrame, MixerInput, MixerInputReservation,
+    MixerInputShutdown, MixerInputStartFailure, MixerInputStatus, MixerOutputFailure,
+    MixerRetirementError, MixerScriptBusHandle, RunningMixerInput,
 };
 
 const CHANNELS: usize = 2;
@@ -279,7 +281,7 @@ impl PreparedAudioOutput for ScriptBusPreparedOutput {
 
 struct CallbackMixerInput {
     callback: Option<AudioRenderCallback>,
-    events: Option<AudioOutputEventSink>,
+    events: Arc<OutputFailureReporter>,
     scratch: [f32; INTERLEAVED_SAMPLES],
     #[cfg(test)]
     render_hook: Option<Arc<TestRenderHook>>,
@@ -287,10 +289,10 @@ struct CallbackMixerInput {
 
 impl CallbackMixerInput {
     #[cfg(not(test))]
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             callback: None,
-            events: None,
+            events: Arc::new(OutputFailureReporter::new()),
             scratch: [0.0; INTERLEAVED_SAMPLES],
             #[cfg(test)]
             render_hook: None,
@@ -301,7 +303,7 @@ impl CallbackMixerInput {
     fn with_render_hook(render_hook: Option<Arc<TestRenderHook>>) -> Self {
         Self {
             callback: None,
-            events: None,
+            events: Arc::new(OutputFailureReporter::new()),
             scratch: [0.0; INTERLEAVED_SAMPLES],
             render_hook,
         }
@@ -309,24 +311,63 @@ impl CallbackMixerInput {
 
     fn install(&mut self, callback: AudioRenderCallback, events: AudioOutputEventSink) {
         debug_assert!(self.callback.is_none());
-        debug_assert!(self.events.is_none());
         self.callback = Some(callback);
-        self.events = Some(events);
+        self.events.install(events);
+    }
+}
+
+struct OutputFailureReporter {
+    events: OnceLock<AudioOutputEventSink>,
+    reported: AtomicBool,
+}
+
+impl OutputFailureReporter {
+    const fn new() -> Self {
+        Self {
+            events: OnceLock::new(),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    fn install(&self, events: AudioOutputEventSink) {
+        assert!(
+            self.events.set(events).is_ok(),
+            "output event reporter is installed exactly once"
+        );
+    }
+
+    fn report(&self, reason: AudioOutputDeathReason) {
+        if let Some(events) = self.events.get()
+            && !self.reported.swap(true, Ordering::AcqRel)
+        {
+            let _ = events.report_endpoint_death(reason);
+        }
+    }
+}
+
+impl MixerFailureObserver for OutputFailureReporter {
+    fn output_failed(&self, _failure: MixerOutputFailure) {
+        self.report(AudioOutputDeathReason::BackendFailure);
     }
 }
 
 impl MixerInput for CallbackMixerInput {
+    fn output_failure_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        Some(Arc::clone(&self.events) as Arc<dyn MixerFailureObserver>)
+    }
+
     fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
-        let (Some(callback), Some(events)) = (&mut self.callback, &self.events) else {
+        let Some(callback) = &mut self.callback else {
             output.fill(MixerFrame::ZERO);
             return MixerInputStatus::Finished;
         };
+        let events = &self.events;
         let status = render_fixed(
             output,
             &mut self.scratch,
             |scratch| callback.render_interleaved_f32(scratch),
             |reason| {
-                let _ = events.report_endpoint_death(reason);
+                events.report(reason);
             },
         );
         #[cfg(test)]
@@ -454,6 +495,11 @@ fn transition(input: Option<&RunningMixerInput>, suspended: bool) -> Result<(), 
     };
     if applied {
         Ok(())
+    } else if input.output_failure().is_some() {
+        // The exact process-output cause is delivered by the preinstalled
+        // failure observer. A close-time suspend after that global death is a
+        // no-op, not a loss of callback-retirement proof.
+        Ok(())
     } else if input.is_failed() {
         Err(output_error(
             AudioOutputErrorKind::CallbackDied,
@@ -537,15 +583,22 @@ fn retirement_result(
     result: Result<smudgy_audio::MixerInputRetirement, MixerRetirementError>,
 ) -> Result<(), AudioOutputError> {
     match result {
-        Ok(retirement) if retirement.is_clean() => Ok(()),
         Ok(retirement) if retirement.source_destructor_panicked => Err(output_error(
             AudioOutputErrorKind::Shutdown,
             "the Web Audio mixer callback destructor panicked",
         )),
-        Ok(_) => Err(output_error(
-            AudioOutputErrorKind::CallbackDied,
-            "the Web Audio mixer callback failed before retirement",
-        )),
+        Ok(retirement)
+            if retirement.failed_before_retirement && retirement.output_failure.is_none() =>
+        {
+            Err(output_error(
+                AudioOutputErrorKind::CallbackDied,
+                "the Web Audio mixer callback failed before retirement",
+            ))
+        }
+        // A global output cause was separately published through the exact
+        // input's event sink. Proven off-render destruction confirms cleanup;
+        // the operational failure remains in the context report.
+        Ok(_) => Ok(()),
         Err(error) => Err(retirement_error(error)),
     }
 }

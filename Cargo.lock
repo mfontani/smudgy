@@ -10988,7 +10988,6 @@ dependencies = [
  "assert_no_alloc",
  "deno_audio",
  "futures",
- "kira",
  "smudgy_audio",
  "web-audio-api",
 ]

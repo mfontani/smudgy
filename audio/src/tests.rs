@@ -11,10 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::executor::block_on;
-use kira::backend::Renderer;
-
 use super::*;
+use futures::executor::block_on;
 
 const TEST_RATE: u32 = 48_000;
 
@@ -33,15 +31,15 @@ fn mixer_frame_owns_stereo_samples_and_maps_to_the_backend() {
 
 #[derive(Clone, Default)]
 struct RenderProbe {
-    renderer: Arc<Mutex<Option<Renderer>>>,
+    renderer: Arc<Mutex<Option<JoinedRenderer>>>,
+    failure: Arc<Mutex<Option<DriverFailureSignal>>>,
 }
 
 impl RenderProbe {
     fn render(&self, output: &mut [f32]) {
         let mut renderer = self.renderer.lock().expect("renderer lock poisoned");
         let renderer = renderer.as_mut().expect("renderer is not live");
-        renderer.on_start_processing();
-        renderer.process(output, 2);
+        renderer.render(output, 2).expect("valid fake render");
     }
 
     fn is_live(&self) -> bool {
@@ -49,6 +47,14 @@ impl RenderProbe {
             .lock()
             .expect("renderer lock poisoned")
             .is_some()
+    }
+
+    fn fail_output(&self) -> bool {
+        self.failure
+            .lock()
+            .expect("failure lock poisoned")
+            .as_ref()
+            .is_some_and(|signal| signal.report(MixerOutputFailure::BackendFailure))
     }
 }
 
@@ -64,37 +70,66 @@ struct TestBackendSettings {
     actual_rate: u32,
     fail_setup: bool,
     fail_start: bool,
+    backend_closes: Arc<AtomicUsize>,
     backend_drops: Arc<AtomicUsize>,
+    lifecycle_threads: Arc<Mutex<Vec<thread::ThreadId>>>,
+    enforce_owner_thread: bool,
 }
 
 struct TestBackend {
     probe: RenderProbe,
     fail_start: bool,
+    backend_closes: Arc<AtomicUsize>,
     backend_drops: Arc<AtomicUsize>,
+    lifecycle_threads: Arc<Mutex<Vec<thread::ThreadId>>>,
+    enforce_owner_thread: bool,
 }
 
-impl Backend for TestBackend {
+fn record_backend_owner(threads: &Mutex<Vec<thread::ThreadId>>, enforce_owner_thread: bool) {
+    if enforce_owner_thread {
+        assert_eq!(thread::current().name(), Some("smudgy-audio-owner"));
+    }
+    lock_recover(threads).push(thread::current().id());
+}
+
+impl JoinedOutputDriver for TestBackend {
     type Settings = TestBackendSettings;
     type Error = TestBackendError;
 
     fn setup(
         settings: Self::Settings,
         _internal_buffer_size: usize,
-    ) -> Result<(Self, u32), Self::Error> {
+        failures: DriverFailureSignal,
+    ) -> Result<(Self, PhysicalOutputFormat), Self::Error> {
+        record_backend_owner(&settings.lifecycle_threads, settings.enforce_owner_thread);
         if settings.fail_setup {
             return Err(TestBackendError::Setup);
         }
+        *settings
+            .probe
+            .failure
+            .lock()
+            .expect("failure lock poisoned") = Some(failures);
         Ok((
             Self {
                 probe: settings.probe,
                 fail_start: settings.fail_start,
+                backend_closes: settings.backend_closes,
                 backend_drops: settings.backend_drops,
+                lifecycle_threads: settings.lifecycle_threads,
+                enforce_owner_thread: settings.enforce_owner_thread,
             },
-            settings.actual_rate,
+            PhysicalOutputFormat {
+                sample_rate: settings.actual_rate,
+                channels: 2,
+                sample_format: PhysicalSampleFormat::F32,
+                buffer_frames_hint: Some(INTERNAL_BUFFER_FRAMES),
+            },
         ))
     }
 
-    fn start(&mut self, renderer: Renderer) -> Result<(), Self::Error> {
+    fn start(&mut self, renderer: JoinedRenderer) -> Result<(), Self::Error> {
+        record_backend_owner(&self.lifecycle_threads, self.enforce_owner_thread);
         if self.fail_start {
             return Err(TestBackendError::Start);
         }
@@ -107,15 +142,27 @@ impl Backend for TestBackend {
         assert!(replaced.is_none());
         Ok(())
     }
-}
 
-impl Drop for TestBackend {
-    fn drop(&mut self) {
+    fn play(&mut self) -> Result<(), Self::Error> {
+        record_backend_owner(&self.lifecycle_threads, self.enforce_owner_thread);
+        Ok(())
+    }
+
+    fn close_and_join(&mut self) -> bool {
+        record_backend_owner(&self.lifecycle_threads, self.enforce_owner_thread);
+        self.backend_closes.fetch_add(1, Ordering::Relaxed);
         self.probe
             .renderer
             .lock()
             .expect("renderer lock poisoned")
             .take();
+        true
+    }
+}
+
+impl Drop for TestBackend {
+    fn drop(&mut self) {
+        record_backend_owner(&self.lifecycle_threads, self.enforce_owner_thread);
         self.backend_drops.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -126,7 +173,10 @@ fn settings(probe: RenderProbe) -> TestBackendSettings {
         actual_rate: TEST_RATE,
         fail_setup: false,
         fail_start: false,
+        backend_closes: Arc::new(AtomicUsize::new(0)),
         backend_drops: Arc::new(AtomicUsize::new(0)),
+        lifecycle_threads: Arc::new(Mutex::new(Vec::new())),
+        enforce_owner_thread: true,
     }
 }
 
@@ -190,10 +240,87 @@ fn eventually(mut condition: impl FnMut() -> bool) {
     }
 }
 
+struct FailureObserverProbe {
+    bus: MixerScriptBusHandle,
+    notifications: mpsc::SyncSender<MixerOutputFailure>,
+    calls: AtomicUsize,
+    panic_before_publish: bool,
+    panic_after_publish: bool,
+}
+
+impl MixerFailureObserver for FailureObserverProbe {
+    fn output_failed(&self, failure: MixerOutputFailure) {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(self.bus.set_gain(0.5), Err(MixerControlError::OwnerStopped));
+        assert!(
+            !self.panic_before_publish,
+            "injected pre-publication failure-observer panic"
+        );
+        let _ = self.notifications.try_send(failure);
+        assert!(!self.panic_after_publish, "injected failure-observer panic");
+    }
+}
+
+struct ObservedInput {
+    observer: Arc<FailureObserverProbe>,
+}
+
+impl MixerInput for ObservedInput {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        output.fill(MixerFrame::from_mono(0.25));
+        MixerInputStatus::Active
+    }
+
+    fn output_failure_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        Some(Arc::clone(&self.observer) as Arc<dyn MixerFailureObserver>)
+    }
+}
+
+struct RetainedFailureObserver {
+    calls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl MixerFailureObserver for RetainedFailureObserver {
+    fn output_failed(&self, _failure: MixerOutputFailure) {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for RetainedFailureObserver {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct RetainedObservedInput {
+    observer: Arc<RetainedFailureObserver>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl MixerInput for RetainedObservedInput {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        output.fill(MixerFrame::ZERO);
+        MixerInputStatus::Active
+    }
+
+    fn output_failure_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        Some(Arc::clone(&self.observer) as Arc<dyn MixerFailureObserver>)
+    }
+}
+
+impl Drop for RetainedObservedInput {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 fn test_control(
     commands: SyncSender<OwnerCommand>,
     retirements: SyncSender<RetirementRequest>,
 ) -> Arc<ControlInner> {
+    let driver_status = Arc::new(DriverStatus::new());
+    assert!(driver_status.mark_live());
     Arc::new(ControlInner {
         gate: Mutex::new(GateState {
             sealed: false,
@@ -206,6 +333,7 @@ fn test_control(
         format: MixerFormat {
             sample_rate: TEST_RATE,
         },
+        driver_status,
     })
 }
 
@@ -218,7 +346,7 @@ fn join_authority_is_not_send_but_scoped_bus_handles_are_send() {
 
     impl<T: ?Sized> AmbiguousIfSend<()> for T {}
     impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
-    let _ = <MixerService<TestBackend> as AmbiguousIfSend<_>>::assert_not_send;
+    let _ = <MixerService as AmbiguousIfSend<_>>::assert_not_send;
     assert_send::<MixerScriptBusHandle>();
 }
 
@@ -226,7 +354,7 @@ fn join_authority_is_not_send_but_scoped_bus_handles_are_send() {
 fn service_publishes_exact_format_and_joins_backend() {
     let probe = RenderProbe::default();
     let backend_drops = Arc::new(AtomicUsize::new(0));
-    let service = MixerService::<TestBackend>::start(
+    let service = MixerService::start_with_driver::<TestBackend>(
         TestBackendSettings {
             backend_drops: backend_drops.clone(),
             ..settings(probe.clone())
@@ -242,15 +370,32 @@ fn service_publishes_exact_format_and_joins_backend() {
     );
     assert!(probe.is_live());
 
-    assert!(service.shutdown().clean);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, None);
     assert!(!probe.is_live());
     assert_eq!(backend_drops.load(Ordering::Relaxed), 1);
 }
 
 #[test]
+fn driver_lifecycle_stays_on_the_single_joined_owner_thread() {
+    let probe = RenderProbe::default();
+    let settings = settings(probe);
+    let lifecycle_threads = Arc::clone(&settings.lifecycle_threads);
+    let service = MixerService::start_with_driver::<TestBackend>(settings, TEST_RATE).unwrap();
+    assert!(service.shutdown().clean);
+
+    let threads = lock_recover(&lifecycle_threads);
+    assert_eq!(threads.len(), 5);
+    assert!(threads.iter().all(|thread| *thread == threads[0]));
+    assert_ne!(threads[0], thread::current().id());
+}
+
+#[test]
 fn permanent_slots_mix_two_script_inputs_and_native_with_independent_gains() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(7)).unwrap();
     let script = session.script_bus();
     let native = session.native_bus();
@@ -283,13 +428,16 @@ fn permanent_slots_mix_two_script_inputs_and_native_with_independent_gains() {
     assert_samples(&output, 0.1875);
     assert!(block_on(first.shutdown()).unwrap().is_clean());
     assert!(block_on(tone.shutdown()).unwrap().is_clean());
-    assert!(service.shutdown().clean);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, None);
 }
 
 #[test]
 fn reservation_is_real_prestart_silence_and_render_allocates_nothing() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(9)).unwrap();
     let reservation = session.script_bus().try_reserve_input().unwrap();
 
@@ -307,13 +455,15 @@ fn reservation_is_real_prestart_silence_and_render_allocates_nothing() {
 
     assert!(block_on(running.shutdown()).unwrap().is_clean());
     assert_eq!(drops.load(Ordering::Relaxed), 1);
-    assert!(service.shutdown().clean);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, None);
 }
 
 #[test]
 fn exact_capacity_rejects_without_mutation_and_reuses_after_retirement() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start_with_limits(
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
         settings(probe),
         MixerFormat {
             sample_rate: TEST_RATE,
@@ -341,13 +491,15 @@ fn exact_capacity_rejects_without_mutation_and_reuses_after_retirement() {
 
     let reused = session.script_bus().try_reserve_input().unwrap();
     assert!(block_on(reused.abort()).unwrap().is_clean());
-    assert!(service.shutdown().clean);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, None);
 }
 
 #[test]
 fn dropped_shutdown_observer_does_not_cancel_cleanup_or_reuse() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start_with_limits(
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
         settings(probe),
         MixerFormat {
             sample_rate: TEST_RATE,
@@ -395,7 +547,7 @@ fn bounded_control_full_and_disconnect_are_typed_without_mutation() {
 #[test]
 fn dropped_reserve_response_restores_the_same_physical_capacity() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start_with_limits(
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
         settings(probe),
         MixerFormat {
             sample_rate: TEST_RATE,
@@ -426,7 +578,7 @@ fn dropped_reserve_response_restores_the_same_physical_capacity() {
 #[test]
 fn stale_generation_cannot_control_a_reused_slot() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start_with_limits(
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
         settings(probe),
         MixerFormat {
             sample_rate: TEST_RATE,
@@ -455,6 +607,29 @@ struct BlockingInput {
     entered: mpsc::SyncSender<thread::ThreadId>,
     release: Arc<Barrier>,
     drops: Arc<AtomicUsize>,
+}
+
+struct OrderedBlockingInput {
+    entered: mpsc::SyncSender<thread::ThreadId>,
+    release: Arc<Barrier>,
+    dropped: mpsc::SyncSender<thread::ThreadId>,
+    backend_drops: Arc<AtomicUsize>,
+}
+
+impl MixerInput for OrderedBlockingInput {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        self.entered.send(thread::current().id()).unwrap();
+        self.release.wait();
+        output.fill(MixerFrame::from_mono(0.25));
+        MixerInputStatus::Active
+    }
+}
+
+impl Drop for OrderedBlockingInput {
+    fn drop(&mut self) {
+        assert_eq!(self.backend_drops.load(Ordering::Acquire), 1);
+        let _ = self.dropped.send(thread::current().id());
+    }
 }
 
 impl MixerInput for BlockingInput {
@@ -502,7 +677,8 @@ impl Wake for PanicWake {
 #[test]
 fn active_render_keeps_shutdown_pending_then_owner_wakes_and_retires_off_render() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(3)).unwrap();
     let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
     let release = Arc::new(Barrier::new(2));
@@ -549,7 +725,8 @@ fn active_render_keeps_shutdown_pending_then_owner_wakes_and_retires_off_render(
 #[test]
 fn hostile_completion_waker_cannot_kill_the_owner() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(35)).unwrap();
     let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
     let release = Arc::new(Barrier::new(2));
@@ -587,7 +764,8 @@ fn hostile_completion_waker_cannot_kill_the_owner() {
 #[test]
 fn service_shutdown_waits_for_active_render_then_forced_cleanup() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(33)).unwrap();
     let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
     let release = Arc::new(Barrier::new(2));
@@ -624,6 +802,85 @@ fn service_shutdown_waits_for_active_render_then_forced_cleanup() {
     assert!(block_on(running.shutdown()).unwrap().is_clean());
 }
 
+#[test]
+fn output_death_waits_for_active_callback_then_joins_before_source_cleanup() {
+    let probe = RenderProbe::default();
+    let settings = settings(probe.clone());
+    let backend_closes = Arc::clone(&settings.backend_closes);
+    let backend_drops = Arc::clone(&settings.backend_drops);
+    let service = MixerService::start_with_driver::<TestBackend>(settings, TEST_RATE).unwrap();
+    let session = service.add_session(AudioSessionId(906)).unwrap();
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (dropped_sender, dropped_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    let running = start_reserved(
+        session.script_bus().try_reserve_input().unwrap(),
+        Box::new(OrderedBlockingInput {
+            entered: entered_sender,
+            release: Arc::clone(&release),
+            dropped: dropped_sender,
+            backend_drops: Arc::clone(&backend_drops),
+        }),
+    );
+
+    let render_probe = probe.clone();
+    let render = thread::spawn(move || {
+        let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+        render_probe.render(&mut output);
+    });
+    let render_thread = entered_receiver.recv().unwrap();
+    assert!(probe.fail_output());
+
+    let release_for_thread = Arc::clone(&release);
+    let drops_for_thread = Arc::clone(&backend_drops);
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(drops_for_thread.load(Ordering::Acquire), 0);
+        release_for_thread.wait();
+    });
+    let started = Instant::now();
+    let shutdown = service.shutdown();
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    releaser.join().unwrap();
+    render.join().unwrap();
+    assert_eq!(backend_closes.load(Ordering::Acquire), 1);
+    assert_eq!(backend_drops.load(Ordering::Acquire), 1);
+    let cleanup_thread = dropped_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_ne!(cleanup_thread, render_thread);
+    assert_ne!(cleanup_thread, thread::current().id());
+    let retirement = block_on(running.shutdown()).unwrap();
+    assert!(retirement.failed_before_retirement);
+    assert_eq!(
+        retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+}
+
+#[test]
+fn dropping_service_after_output_death_still_retires_backend_and_source() {
+    let probe = RenderProbe::default();
+    let settings = settings(probe.clone());
+    let backend_closes = Arc::clone(&settings.backend_closes);
+    let backend_drops = Arc::clone(&settings.backend_drops);
+    let service = MixerService::start_with_driver::<TestBackend>(settings, TEST_RATE).unwrap();
+    let session = service.add_session(AudioSessionId(907)).unwrap();
+    let (source, _, source_drops) = constant(0.25);
+    let running = start_reserved(session.script_bus().try_reserve_input().unwrap(), source);
+
+    assert!(probe.fail_output());
+    drop(service);
+    drop(running);
+    eventually(|| {
+        backend_closes.load(Ordering::Acquire) == 1
+            && backend_drops.load(Ordering::Acquire) == 1
+            && source_drops.load(Ordering::Acquire) == 1
+    });
+}
+
 struct ReentrantDestructor {
     bus: MixerScriptBusHandle,
     result: mpsc::SyncSender<Result<(), MixerControlError>>,
@@ -645,7 +902,8 @@ impl Drop for ReentrantDestructor {
 #[test]
 fn callback_destructor_can_reenter_control_without_deadlocking_owner() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(34)).unwrap();
     let bus = session.script_bus();
     let (result_sender, result_receiver) = mpsc::sync_channel(1);
@@ -685,7 +943,8 @@ impl Drop for PanickingInput {
 #[test]
 fn render_panic_fails_closed_and_is_destroyed_only_off_render() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(4)).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
     let running = start_reserved(
@@ -726,7 +985,7 @@ impl Drop for PanickingDestructor {
 #[test]
 fn hostile_destructor_is_contained_and_quarantines_capacity() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start_with_limits(
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
         settings(probe),
         MixerFormat {
             sample_rate: TEST_RATE,
@@ -758,7 +1017,8 @@ fn hostile_destructor_is_contained_and_quarantines_capacity() {
 #[test]
 fn forced_hostile_destructor_makes_service_shutdown_unclean_and_wakes_owner() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(36)).unwrap();
     let running = start_reserved(
         session.script_bus().try_reserve_input().unwrap(),
@@ -773,9 +1033,341 @@ fn forced_hostile_destructor_makes_service_shutdown_unclean_and_wakes_owner() {
 }
 
 #[test]
+fn early_driver_death_seals_control_notifies_each_live_input_once_and_joins() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(901))
+        .unwrap()
+        .script_bus();
+    let (notifications, received) = mpsc::sync_channel(2);
+    let first_observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications: notifications.clone(),
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: false,
+    });
+    let second_observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: true,
+    });
+    let first = bus
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(ObservedInput {
+            observer: Arc::clone(&first_observer),
+        }))
+        .unwrap();
+    let second = bus
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(ObservedInput {
+            observer: Arc::clone(&second_observer),
+        }))
+        .unwrap();
+    let mut output = [0.0; 16];
+    probe.render(&mut output);
+    assert!(probe.fail_output());
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(MixerControlError::OwnerStopped)
+    ));
+    assert_eq!(bus.set_gain(0.75), Err(MixerControlError::OwnerStopped));
+    let first_shutdown = first.shutdown();
+    assert!(!second.suspend());
+
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::BackendFailure
+    );
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::BackendFailure
+    );
+    eventually(|| bus.format() == Err(MixerControlError::OwnerStopped));
+    assert_eq!(first_observer.calls.load(Ordering::Acquire), 1);
+    assert_eq!(second_observer.calls.load(Ordering::Acquire), 1);
+
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let first_retirement = block_on(first_shutdown).unwrap();
+    let second_retirement = block_on(second.shutdown()).unwrap();
+    assert!(first_retirement.failed_before_retirement);
+    assert!(second_retirement.failed_before_retirement);
+    assert_eq!(
+        first_retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+    assert_eq!(
+        second_retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+    assert_eq!(first_observer.calls.load(Ordering::Acquire), 1);
+    assert_eq!(second_observer.calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn output_death_between_install_and_open_preserves_exact_cause_and_observer() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(908))
+        .unwrap()
+        .script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: false,
+    });
+    let reservation = bus.try_reserve_input().unwrap();
+    let Ok(installed) = reservation.install_preboxed(Box::new(ObservedInput {
+        observer: Arc::clone(&observer),
+    })) else {
+        panic!("live reservation must install");
+    };
+
+    assert!(probe.fail_output());
+    let open_failure = installed.open().expect_err("dead output cannot open input");
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::BackendFailure
+    );
+    assert_eq!(observer.calls.load(Ordering::Acquire), 1);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let retirement = block_on(open_failure.shutdown()).unwrap();
+    assert!(retirement.failed_before_retirement);
+    assert_eq!(
+        retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+}
+
+#[test]
+fn output_death_after_live_open_snapshot_preserves_exact_broadcast_cause() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(910))
+        .unwrap()
+        .script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: false,
+    });
+    let reservation = bus.try_reserve_input().unwrap();
+    let Ok(installed) = reservation.install_preboxed(Box::new(ObservedInput {
+        observer: Arc::clone(&observer),
+    })) else {
+        panic!("live reservation must install");
+    };
+    let (entered, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.open_snapshot_hook) = Some(Arc::new(OpenSnapshotHook {
+        entered,
+        release: Arc::clone(&release),
+        armed: AtomicBool::new(true),
+    }));
+
+    let opening = thread::spawn(move || installed.open());
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(probe.fail_output());
+    release.wait();
+    let running = opening
+        .join()
+        .unwrap()
+        .expect("start linearized by the coherent live snapshot");
+
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::BackendFailure
+    );
+    assert_eq!(observer.calls.load(Ordering::Acquire), 1);
+    eventually(|| running.is_failed());
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let retirement = block_on(running.shutdown()).unwrap();
+    assert!(retirement.failed_before_retirement);
+    assert_eq!(
+        retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+}
+
+#[test]
+fn reservations_acquired_before_output_death_abort_or_drop_without_leaking() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(909))
+        .unwrap()
+        .script_bus();
+    let aborted = bus.try_reserve_input().unwrap();
+    let dropped = bus.try_reserve_input().unwrap();
+    let aborted_slot = Arc::downgrade(&aborted.slot);
+    let dropped_slot = Arc::downgrade(&dropped.slot);
+
+    assert!(probe.fail_output());
+    let retirement = block_on(aborted.abort()).unwrap();
+    assert!(retirement.is_clean());
+    assert_eq!(retirement.output_failure, None);
+    drop(dropped);
+
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    eventually(|| aborted_slot.upgrade().is_none());
+    eventually(|| dropped_slot.upgrade().is_none());
+}
+
+#[test]
+fn observer_panic_before_publication_cannot_erase_failure_or_cleanup_proof() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(904))
+        .unwrap()
+        .script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: true,
+        panic_after_publish: false,
+    });
+    let running = bus
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(ObservedInput {
+            observer: Arc::clone(&observer),
+        }))
+        .unwrap();
+
+    assert!(probe.fail_output());
+    eventually(|| observer.calls.load(Ordering::Acquire) == 1);
+    assert!(matches!(
+        received.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let retirement = block_on(running.shutdown()).unwrap();
+    assert!(retirement.failed_before_retirement);
+    assert_eq!(
+        retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+}
+
+#[test]
+fn owner_panic_is_first_writer_failure_and_cleanup_remains_autonomous() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(902))
+        .unwrap()
+        .script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: false,
+    });
+    let running = bus
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(ObservedInput {
+            observer: Arc::clone(&observer),
+        }))
+        .unwrap();
+    service
+        .driver_status
+        .panic_owner
+        .store(true, Ordering::Release);
+
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::OwnerPanicked
+    );
+    assert_eq!(observer.calls.load(Ordering::Acquire), 1);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::OwnerPanicked));
+    let retirement = block_on(running.shutdown()).unwrap();
+    assert!(retirement.failed_before_retirement);
+}
+
+#[test]
+fn logical_close_that_wins_before_late_output_death_stays_normal() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let bus = service
+        .add_session(AudioSessionId(903))
+        .unwrap()
+        .script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let observer = Arc::new(FailureObserverProbe {
+        bus: bus.clone(),
+        notifications,
+        calls: AtomicUsize::new(0),
+        panic_before_publish: false,
+        panic_after_publish: false,
+    });
+    let running = bus
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(ObservedInput {
+            observer: Arc::clone(&observer),
+        }))
+        .unwrap();
+
+    let retirement = running.shutdown();
+    assert!(probe.fail_output());
+    let retirement = block_on(retirement).unwrap();
+    assert!(retirement.is_clean());
+    assert_eq!(retirement.output_failure, None);
+    assert_eq!(observer.calls.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        received.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+}
+
+#[test]
 fn missing_required_payload_is_structural_and_never_recycled_cleanly() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start_with_limits(
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
         settings(probe),
         MixerFormat {
             sample_rate: TEST_RATE,
@@ -952,9 +1544,85 @@ fn cleanup_queue_full_retains_callback_without_owner_thread_drop() {
 }
 
 #[test]
+fn failure_notification_full_or_disconnect_retains_all_authority() {
+    for disconnected in [false, true] {
+        let status = Arc::new(DriverStatus::new());
+        let probe = RenderProbe::default();
+        let mut backend_settings = settings(probe);
+        backend_settings.enforce_owner_thread = false;
+        let (mut mixer, _) = MixerCore::<TestBackend>::with_limits(
+            backend_settings,
+            Arc::clone(&status),
+            MixerFormat {
+                sample_rate: TEST_RATE,
+            },
+            1,
+            1,
+        )
+        .unwrap();
+        let key = mixer.add_session(AudioSessionId(905)).unwrap();
+        let record = mixer.reserve(key, SessionBus::Script).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observer_drops = Arc::new(AtomicUsize::new(0));
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new(RetainedFailureObserver {
+            calls: Arc::clone(&calls),
+            drops: Arc::clone(&observer_drops),
+        });
+        assert!(
+            record
+                .slot
+                .install(
+                    record.generation,
+                    Box::new(RetainedObservedInput {
+                        observer: Arc::clone(&observer),
+                        drops: Arc::clone(&source_drops),
+                    }),
+                )
+                .is_ok()
+        );
+        assert!(record.slot.open(record.generation));
+        drop(observer);
+
+        let (cleanup, receiver) = mpsc::sync_channel(0);
+        if disconnected {
+            drop(receiver);
+        }
+        notify_failed_inputs(&mut mixer, MixerOutputFailure::BackendFailure, &cleanup);
+        assert!(!mixer.cleanup_clean);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(observer_drops.load(Ordering::Acquire), 0);
+        assert_eq!(source_drops.load(Ordering::Acquire), 0);
+
+        assert!(retire_backend(&mut mixer));
+        mixer.force_quarantine_all();
+        drop(record);
+        drop(mixer);
+        assert_eq!(observer_drops.load(Ordering::Acquire), 0);
+        assert_eq!(source_drops.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
+fn observer_authority_is_fail_closed_on_arbitrary_stack_unwind() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let observer = Arc::new(RetainedFailureObserver {
+        calls,
+        drops: Arc::clone(&drops),
+    });
+    {
+        let mut authority = ObserverAuthority::new();
+        authority.replace(Some(observer));
+    }
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn service_shutdown_force_cleans_live_endpoints_and_future_is_ready() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(6)).unwrap();
     let (source, _, drops) = constant(0.25);
     let running = start_reserved(session.script_bus().try_reserve_input().unwrap(), source);
@@ -968,7 +1636,8 @@ fn service_shutdown_force_cleans_live_endpoints_and_future_is_ready() {
 #[test]
 fn sealed_owner_returns_source_and_reservation_for_honest_cleanup() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(8)).unwrap();
     let reservation = session.script_bus().try_reserve_input().unwrap();
     assert!(service.shutdown().clean);
@@ -990,7 +1659,7 @@ fn sealed_owner_returns_source_and_reservation_for_honest_cleanup() {
 #[test]
 fn backend_failures_and_rate_mismatch_are_typed_and_joined() {
     let setup_probe = RenderProbe::default();
-    let setup_error = MixerService::<TestBackend>::start(
+    let setup_error = MixerService::start_with_driver::<TestBackend>(
         TestBackendSettings {
             fail_setup: true,
             ..settings(setup_probe.clone())
@@ -1005,10 +1674,12 @@ fn backend_failures_and_rate_mismatch_are_typed_and_joined() {
     assert!(!setup_probe.is_live());
 
     let start_probe = RenderProbe::default();
+    let start_closes = Arc::new(AtomicUsize::new(0));
     let start_drops = Arc::new(AtomicUsize::new(0));
-    let start_error = MixerService::<TestBackend>::start(
+    let start_error = MixerService::start_with_driver::<TestBackend>(
         TestBackendSettings {
             fail_start: true,
+            backend_closes: start_closes.clone(),
             backend_drops: start_drops.clone(),
             ..settings(start_probe.clone())
         },
@@ -1020,13 +1691,16 @@ fn backend_failures_and_rate_mismatch_are_typed_and_joined() {
         MixerStartError::Backend(TestBackendError::Start)
     ));
     assert!(!start_probe.is_live());
+    assert_eq!(start_closes.load(Ordering::Relaxed), 1);
     assert_eq!(start_drops.load(Ordering::Relaxed), 1);
 
     let rate_probe = RenderProbe::default();
+    let rate_closes = Arc::new(AtomicUsize::new(0));
     let rate_drops = Arc::new(AtomicUsize::new(0));
-    let rate_error = MixerService::<TestBackend>::start(
+    let rate_error = MixerService::start_with_driver::<TestBackend>(
         TestBackendSettings {
             actual_rate: 44_100,
+            backend_closes: rate_closes.clone(),
             backend_drops: rate_drops.clone(),
             ..settings(rate_probe.clone())
         },
@@ -1041,13 +1715,15 @@ fn backend_failures_and_rate_mismatch_are_typed_and_joined() {
         }
     ));
     assert!(!rate_probe.is_live());
+    assert_eq!(rate_closes.load(Ordering::Relaxed), 1);
     assert_eq!(rate_drops.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn invalid_gain_is_rejected_before_owner_mutation() {
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(11)).unwrap();
     let bus = session.script_bus();
     assert_eq!(bus.set_gain(-0.1), Err(MixerControlError::InvalidGain));
@@ -1072,7 +1748,8 @@ fn close_is_absorbing_even_after_finished_callback() {
     }
 
     let probe = RenderProbe::default();
-    let service = MixerService::<TestBackend>::start(settings(probe.clone()), TEST_RATE).unwrap();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
     let session = service.add_session(AudioSessionId(12)).unwrap();
     let rendered = Arc::new(AtomicBool::new(false));
     let running = start_reserved(

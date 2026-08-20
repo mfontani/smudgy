@@ -3,6 +3,10 @@ name = "smudgy_audio"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Unstable, nondefault cross-crate test ABI. Never enable in production builds.
+test-support = []
+
 [dependencies]
 futures = { workspace = true }
 kira = { workspace = true }

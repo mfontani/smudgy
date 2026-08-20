@@ -2,15 +2,15 @@ use std::future::Future;
 use std::panic::panic_any;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::executor::block_on;
-use kira::backend::{Backend, Renderer};
 use smudgy_audio::{
     AudioSessionId, MixerControlError, MixerFrame, MixerInput, MixerInputStatus, MixerService,
+    test_support::{TestDriverConfig, TestDriverProbe, start_test_mixer},
 };
 use web_audio_api::context::{
     AudioContext, AudioContextOptions, AudioContextShutdownOutcome, AudioContextState,
@@ -33,90 +33,39 @@ impl Drop for HostilePayload {
 }
 
 #[derive(Clone, Default)]
-struct RenderProbe {
-    renderer: Arc<Mutex<Option<Renderer>>>,
-}
+struct RenderProbe(Option<TestDriverProbe>);
 
 impl RenderProbe {
     fn render(&self) -> [f32; INTERLEAVED_SAMPLES] {
         let mut output = [0.0; INTERLEAVED_SAMPLES];
-        let mut renderer = self.renderer.lock().expect("renderer lock poisoned");
-        let renderer = renderer.as_mut().expect("renderer is live");
-        renderer.on_start_processing();
-        renderer.process(&mut output, 2);
+        self.0
+            .as_ref()
+            .expect("renderer is live")
+            .render(&mut output, 2)
+            .expect("valid fake physical render");
         output
     }
-}
 
-#[derive(Debug)]
-struct ProbeBackendError;
-
-#[derive(Clone)]
-struct ProbeBackendSettings {
-    probe: RenderProbe,
-}
-
-struct ProbeBackend {
-    probe: RenderProbe,
-}
-
-impl Backend for ProbeBackend {
-    type Settings = ProbeBackendSettings;
-    type Error = ProbeBackendError;
-
-    fn setup(
-        settings: Self::Settings,
-        _internal_buffer_size: usize,
-    ) -> Result<(Self, u32), Self::Error> {
-        Ok((
-            Self {
-                probe: settings.probe,
-            },
-            TEST_RATE,
-        ))
+    fn fail_output(&self) -> bool {
+        self.0.as_ref().expect("renderer is live").fail_output()
     }
 
-    fn start(&mut self, renderer: Renderer) -> Result<(), Self::Error> {
-        let replaced = self
-            .probe
-            .renderer
-            .lock()
-            .expect("renderer lock poisoned")
-            .replace(renderer);
-        assert!(replaced.is_none());
-        Ok(())
+    fn physical_start_count(&self) -> usize {
+        self.0.as_ref().expect("renderer is live").start_count()
+    }
+
+    fn physical_play_count(&self) -> usize {
+        self.0.as_ref().expect("renderer is live").play_count()
     }
 }
 
-impl Drop for ProbeBackend {
-    fn drop(&mut self) {
-        self.probe
-            .renderer
-            .lock()
-            .expect("renderer lock poisoned")
-            .take();
-    }
-}
-
-fn service(
-    session_id: u64,
-) -> (
-    MixerService<ProbeBackend>,
-    smudgy_audio::MixerSessionHandle,
-    RenderProbe,
-) {
-    let probe = RenderProbe::default();
-    let service = MixerService::<ProbeBackend>::start(
-        ProbeBackendSettings {
-            probe: probe.clone(),
-        },
-        TEST_RATE,
-    )
-    .expect("probe mixer starts");
+fn service(session_id: u64) -> (MixerService, smudgy_audio::MixerSessionHandle, RenderProbe) {
+    let (service, probe) =
+        start_test_mixer(TEST_RATE, TestDriverConfig::default()).expect("probe mixer starts");
     let session = service
         .add_session(AudioSessionId(session_id))
         .expect("test session is admitted");
-    (service, session, probe)
+    (service, session, RenderProbe(Some(probe)))
 }
 
 fn assert_samples(output: &[f32], expected: f32) {
@@ -549,6 +498,8 @@ fn two_hosted_contexts_and_native_sibling_mix_with_independent_lifecycle() {
     let script = session.script_bus();
     let native = session.native_bus();
     let factory = ScriptBusAudioOutputFactory::new(script.clone());
+    assert_eq!(probe.physical_start_count(), 1);
+    assert_eq!(probe.physical_play_count(), 1);
 
     script.set_gain(0.5).unwrap();
     native.set_gain(0.25).unwrap();
@@ -830,6 +781,53 @@ fn live_mixer_shutdown_reports_the_callback_drop_classification() {
         Some(AudioOutputDeathReason::CallbackRetiredUnexpectedly)
     );
     assert_eq!(context.state(), AudioContextState::Closed);
+}
+
+#[test]
+fn physical_output_death_seals_bus_and_settles_each_hosted_context_once() {
+    let (service, session, probe) = service(903);
+    let script = session.script_bus();
+    let factory = ScriptBusAudioOutputFactory::new(script.clone());
+    let first = hosted_context(&factory);
+    let second = hosted_context(&factory);
+    let _first_graph = attach_constant(&first, 0.125, 1.0);
+    let _second_graph = attach_constant(&second, 0.25, 1.0);
+    render_until(&probe, 0.375);
+
+    assert!(probe.fail_output());
+    let first_close = first
+        .request_close()
+        .expect("post-death immediate close retains endpoint cleanup proof");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match script.set_gain(0.75) {
+            Err(MixerControlError::OwnerStopped) => break,
+            Ok(()) | Err(MixerControlError::Saturated) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "device death did not seal bus control"
+                );
+                thread::yield_now();
+            }
+            Err(error) => panic!("unexpected post-death bus result: {error:?}"),
+        }
+    }
+    assert!(service.shutdown().clean);
+
+    let second_close = second
+        .request_close()
+        .expect("device death retains endpoint cleanup proof");
+    for (context, close) in [(&first, first_close), (&second, second_close)] {
+        let outcome = close.wait();
+        let AudioContextShutdownOutcome::Confirmed(report) = outcome else {
+            panic!("device-death cleanup was not confirmed: {outcome:?}");
+        };
+        assert_eq!(
+            report.endpoint_death(),
+            Some(AudioOutputDeathReason::BackendFailure)
+        );
+        assert_eq!(context.state(), AudioContextState::Closed);
+    }
 }
 
 #[test]

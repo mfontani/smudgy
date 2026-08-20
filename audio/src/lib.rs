@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        dead_code,
+        reason = "S2a lands the private driver seam before S2b adds its production constructor"
+    )
+)]
+
 //! Process-level audio mixing primitives for Smudgy.
 //!
 //! This crate deliberately has no Deno, V8, UI, package, or session-runtime
@@ -35,6 +43,8 @@ use kira::{
 
 /// The fixed number of frames in one internal mixer quantum.
 pub const INTERNAL_BUFFER_FRAMES: usize = 128;
+/// Hard maximum accepted from one physical output callback.
+pub const MAX_PHYSICAL_CALLBACK_FRAMES: usize = 8192;
 /// Maximum number of simultaneous sessions in the first mixer profile.
 pub const MAX_SESSIONS: usize = 32;
 /// Maximum number of simultaneous inputs on each session bus.
@@ -88,10 +98,61 @@ impl MixerFormat {
     pub const fn number_of_channels(self) -> usize {
         2
     }
-    /// Maximum frames in one logical input invocation.
+    /// Maximum frames in one bounded logical render chunk.
+    ///
+    /// One physical callback can contain multiple chunks, up to
+    /// [`MAX_PHYSICAL_CALLBACK_FRAMES`] in total.
     #[must_use]
     pub const fn max_frames_per_callback(self) -> usize {
         INTERNAL_BUFFER_FRAMES
+    }
+}
+
+/// Sample encoding selected for the physical output stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalSampleFormat {
+    /// Native 32-bit floating-point samples.
+    F32,
+    /// Native signed 16-bit integer samples.
+    I16,
+    /// Native unsigned 16-bit integer samples.
+    U16,
+}
+
+/// Exact format negotiated for one physical output stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalOutputFormat {
+    sample_rate: u32,
+    channels: usize,
+    sample_format: PhysicalSampleFormat,
+    buffer_frames_hint: Option<usize>,
+}
+
+impl PhysicalOutputFormat {
+    /// Negotiated physical sample rate.
+    #[must_use]
+    pub const fn sample_rate(self) -> u32 {
+        self.sample_rate
+    }
+    /// Negotiated physical channel count.
+    #[must_use]
+    pub const fn number_of_channels(self) -> usize {
+        self.channels
+    }
+    /// Negotiated physical sample encoding.
+    #[must_use]
+    pub const fn sample_format(self) -> PhysicalSampleFormat {
+        self.sample_format
+    }
+    /// Driver-requested buffer-size hint, when the driver has one.
+    #[must_use]
+    pub const fn buffer_frames_hint(self) -> Option<usize> {
+        self.buffer_frames_hint
+    }
+    /// Maximum callback size accepted by the bounded conversion/render path.
+    #[must_use]
+    pub const fn max_frames_per_callback(self) -> usize {
+        MAX_PHYSICAL_CALLBACK_FRAMES
     }
 }
 
@@ -151,6 +212,43 @@ pub enum MixerInputStatus {
 pub trait MixerInput: Send + 'static {
     /// Render the next stereo quantum.
     fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus;
+
+    /// Returns an off-render observer for process-output failure.
+    ///
+    /// The default is no observer. Implementations that return one must
+    /// prebuild it before reserving mixer capacity. Smudgy invokes it at most
+    /// once on the cleanup worker, never on the physical callback or command
+    /// owner, and contains any unwind.
+    fn output_failure_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        None
+    }
+}
+
+/// Stable operational failure of the shared process output.
+///
+/// This notification is deliberately separate from proof-bearing logical
+/// input retirement: an endpoint can learn why output died before its cleanup
+/// future proves whether callback ownership was retired safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixerOutputFailure {
+    /// The physical driver stopped or reported a device/backend error.
+    BackendFailure,
+    /// The physical callback supplied invalid channel or buffer geometry.
+    InvalidCallbackGeometry,
+    /// The Kira render boundary unwound and was silenced.
+    RendererPanicked,
+    /// The sole mixer command owner unwound.
+    OwnerPanicked,
+}
+
+/// Receives one off-render process-output failure notification for an input.
+pub trait MixerFailureObserver: Send + Sync + 'static {
+    /// Publish the first operational failure to the hosted endpoint.
+    ///
+    /// Implementations must finish in bounded time and must not block. Calls
+    /// share the sole cleanup worker with proof-bearing source destruction;
+    /// Smudgy contains unwinds but cannot recover a worker blocked by user code.
+    fn output_failed(&self, failure: MixerOutputFailure);
 }
 
 const PHASE_MASK: u64 = 0x0f;
@@ -158,7 +256,9 @@ const ACTIVE: u64 = 1 << 4;
 const SUSPENDED: u64 = 1 << 5;
 const FAILED: u64 = 1 << 6;
 const HAS_PAYLOAD: u64 = 1 << 7;
-const GENERATION_SHIFT: u32 = 8;
+const SLOT_CAUSE_SHIFT: u32 = 8;
+const SLOT_CAUSE_MASK: u64 = 0x07 << SLOT_CAUSE_SHIFT;
+const GENERATION_SHIFT: u32 = 11;
 const MAX_GENERATION: u64 = u64::MAX >> GENERATION_SHIFT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +295,26 @@ fn slot_phase(word: u64) -> SlotPhase {
     }
 }
 
+const fn slot_failure_cause(failure: MixerOutputFailure) -> u64 {
+    let cause = match failure {
+        MixerOutputFailure::BackendFailure => 1,
+        MixerOutputFailure::InvalidCallbackGeometry => 2,
+        MixerOutputFailure::RendererPanicked => 3,
+        MixerOutputFailure::OwnerPanicked => 4,
+    };
+    cause << SLOT_CAUSE_SHIFT
+}
+
+fn decode_slot_failure(word: u64) -> Option<MixerOutputFailure> {
+    match (word & SLOT_CAUSE_MASK) >> SLOT_CAUSE_SHIFT {
+        1 => Some(MixerOutputFailure::BackendFailure),
+        2 => Some(MixerOutputFailure::InvalidCallbackGeometry),
+        3 => Some(MixerOutputFailure::RendererPanicked),
+        4 => Some(MixerOutputFailure::OwnerPanicked),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SessionKey {
     id: AudioSessionId,
@@ -212,17 +332,44 @@ struct ForcedWaiter {
     generation: u64,
     result: Option<Result<MixerInputRetirement, MixerRetirementError>>,
     waker: Option<Waker>,
+    retained: Option<ManuallyDrop<Arc<InputSlot>>>,
 }
 
 struct PreparedRetirement {
     source: Option<Box<dyn MixerInput>>,
+    observer: ManuallyDrop<Option<Arc<dyn MixerFailureObserver>>>,
     result: Result<MixerInputRetirement, MixerRetirementError>,
+}
+
+struct ObserverAuthority(ManuallyDrop<Option<Arc<dyn MixerFailureObserver>>>);
+
+impl ObserverAuthority {
+    const fn new() -> Self {
+        Self(ManuallyDrop::new(None))
+    }
+
+    fn replace(&mut self, observer: Option<Arc<dyn MixerFailureObserver>>) {
+        if let Some(existing) = self.0.take() {
+            std::mem::forget(existing);
+        }
+        *self.0 = observer;
+    }
+
+    fn clone_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        self.0.as_ref().map(Arc::clone)
+    }
+
+    fn take(&mut self) -> Option<Arc<dyn MixerFailureObserver>> {
+        self.0.take()
+    }
 }
 
 struct InputSlot {
     address: SlotAddress,
     word: AtomicU64,
     payload: UnsafeCell<ManuallyDrop<Option<Box<dyn MixerInput>>>>,
+    failure_observer: Mutex<ObserverAuthority>,
+    failure_notified: AtomicBool,
     forced: Mutex<ForcedWaiter>,
 }
 
@@ -237,10 +384,13 @@ impl InputSlot {
             address,
             word: AtomicU64::new(slot_word(1, SlotPhase::Free, 0)),
             payload: UnsafeCell::new(ManuallyDrop::new(None)),
+            failure_observer: Mutex::new(ObserverAuthority::new()),
+            failure_notified: AtomicBool::new(false),
             forced: Mutex::new(ForcedWaiter {
                 generation: 1,
                 result: None,
                 waker: None,
+                retained: None,
             }),
         }
     }
@@ -270,6 +420,8 @@ impl InputSlot {
                 forced.generation = generation;
                 forced.result = None;
                 forced.waker = None;
+                debug_assert!(forced.retained.is_none());
+                self.failure_notified.store(false, Ordering::Release);
                 return Ok(generation);
             }
         }
@@ -284,6 +436,13 @@ impl InputSlot {
         if self.word.load(Ordering::Acquire) != expected {
             return Err(source);
         }
+        let observer = match catch_unwind(AssertUnwindSafe(|| source.output_failure_observer())) {
+            Ok(observer) => observer,
+            Err(payload) => {
+                std::mem::forget(payload);
+                return Err(source);
+            }
+        };
         // SAFETY: Reserved cannot enter rendering. Start admission excludes the
         // service seal/forced-cleanup path until Installed is opened or dropped.
         let payload = unsafe { &mut **self.payload.get() };
@@ -292,6 +451,7 @@ impl InputSlot {
             return Err(source);
         }
         *payload = Some(source);
+        lock_recover(&self.failure_observer).replace(observer);
         if self
             .word
             .compare_exchange(
@@ -302,6 +462,8 @@ impl InputSlot {
             )
             .is_err()
         {
+            let observer = lock_recover(&self.failure_observer).take();
+            forget_observer_panic(observer);
             return Err(payload.take().expect("installed payload disappeared"));
         }
         Ok(())
@@ -356,13 +518,43 @@ impl InputSlot {
                 | SlotPhase::Quarantined => return true,
                 SlotPhase::Free => return false,
             }
-            let flags = (word & (ACTIVE | HAS_PAYLOAD))
+            let flags = (word & (ACTIVE | HAS_PAYLOAD | SLOT_CAUSE_MASK))
                 | if failed || word & FAILED != 0 {
                     FAILED
                 } else {
                     0
                 };
             let next = slot_word(generation, SlotPhase::Closing, flags);
+            if self
+                .word
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn close_after_output_failure(&self, generation: u64, failure: MixerOutputFailure) -> bool {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if slot_generation(word) != generation {
+                return false;
+            }
+            match slot_phase(word) {
+                SlotPhase::Reserved => return self.close(generation, false),
+                SlotPhase::Installed | SlotPhase::Running => {}
+                SlotPhase::Closing
+                | SlotPhase::Retiring
+                | SlotPhase::ForcedClean
+                | SlotPhase::Quarantined => return true,
+                SlotPhase::Free => return false,
+            }
+            let next = slot_word(
+                generation,
+                SlotPhase::Closing,
+                (word & (ACTIVE | HAS_PAYLOAD)) | FAILED | slot_failure_cause(failure),
+            );
             if self
                 .word
                 .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
@@ -419,7 +611,7 @@ impl InputSlot {
                 slot_word(
                     generation,
                     SlotPhase::Retiring,
-                    word & (FAILED | HAS_PAYLOAD),
+                    word & (FAILED | HAS_PAYLOAD | SLOT_CAUSE_MASK),
                 ),
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -436,11 +628,17 @@ impl InputSlot {
             Ok(MixerInputRetirement {
                 failed_before_retirement: word & FAILED != 0,
                 source_destructor_panicked: false,
+                output_failure: decode_slot_failure(word),
             })
         } else {
             Err(MixerRetirementError::Structural)
         };
-        Ok(PreparedRetirement { source, result })
+        let observer = self.take_failure_observer();
+        Ok(PreparedRetirement {
+            source,
+            observer: ManuallyDrop::new(observer),
+            result,
+        })
     }
 
     fn finish_reusable(
@@ -535,7 +733,7 @@ impl InputSlot {
                 slot_word(
                     generation,
                     SlotPhase::Retiring,
-                    word & (FAILED | HAS_PAYLOAD),
+                    word & (FAILED | HAS_PAYLOAD | SLOT_CAUSE_MASK),
                 ),
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -554,11 +752,57 @@ impl InputSlot {
             Ok(MixerInputRetirement {
                 failed_before_retirement: word & FAILED != 0,
                 source_destructor_panicked: false,
+                output_failure: decode_slot_failure(word),
             })
         } else {
             Err(MixerRetirementError::Structural)
         };
-        Some((generation, PreparedRetirement { source, result }))
+        let observer = self.take_failure_observer();
+        Some((
+            generation,
+            PreparedRetirement {
+                source,
+                observer: ManuallyDrop::new(observer),
+                result,
+            },
+        ))
+    }
+
+    fn fail_live(&self, failure: MixerOutputFailure) -> Option<Arc<dyn MixerFailureObserver>> {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if slot_phase(word) == SlotPhase::Closing {
+                if word & FAILED == 0 || decode_slot_failure(word) != Some(failure) {
+                    return None;
+                }
+                if self.failure_notified.swap(true, Ordering::AcqRel) {
+                    return None;
+                }
+                return lock_recover(&self.failure_observer).clone_observer();
+            }
+            if !matches!(slot_phase(word), SlotPhase::Installed | SlotPhase::Running) {
+                return None;
+            }
+            let next = slot_word(
+                slot_generation(word),
+                SlotPhase::Closing,
+                (word & (ACTIVE | HAS_PAYLOAD)) | FAILED | slot_failure_cause(failure),
+            );
+            if self
+                .word
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if self.failure_notified.swap(true, Ordering::AcqRel) {
+                    return None;
+                }
+                return lock_recover(&self.failure_observer).clone_observer();
+            }
+        }
+    }
+
+    fn take_failure_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        lock_recover(&self.failure_observer).take()
     }
 
     fn force_close_current(&self) {
@@ -575,7 +819,7 @@ impl InputSlot {
             let next = slot_word(
                 slot_generation(word),
                 SlotPhase::Closing,
-                word & (ACTIVE | FAILED | HAS_PAYLOAD),
+                word & (ACTIVE | FAILED | HAS_PAYLOAD | SLOT_CAUSE_MASK),
             );
             if self
                 .word
@@ -591,6 +835,9 @@ impl InputSlot {
         let word = self.word.load(Ordering::Acquire);
         let generation = slot_generation(word);
         self.quarantine_word(word);
+        if let Some(observer) = self.take_failure_observer() {
+            std::mem::forget(observer);
+        }
         self.finish_forced(generation, Err(MixerRetirementError::OwnerUncertain));
     }
 
@@ -599,16 +846,21 @@ impl InputSlot {
         generation: u64,
         result: Result<MixerInputRetirement, MixerRetirementError>,
     ) {
-        let waker = {
+        let (waker, retained) = {
             let mut forced = lock_recover(&self.forced);
             if forced.generation != generation {
                 return;
             }
             forced.result = Some(result);
-            forced.waker.take()
+            (forced.waker.take(), forced.retained.take())
         };
         if let Some(waker) = waker {
             forget_panic(catch_unwind(AssertUnwindSafe(|| waker.wake())));
+        }
+        if let Some(mut retained) = retained {
+            // SAFETY: terminal cleanup has resolved the slot, and the caller
+            // still owns a temporary strong Arc while this method executes.
+            unsafe { ManuallyDrop::drop(&mut retained) };
         }
     }
 
@@ -728,37 +980,355 @@ fn copy_mixer_frames(output: &mut [KiraFrame], rendered: &[MixerFrame]) {
     }
 }
 
-struct CheckedBackend<B>(B);
-struct CheckedBackendSettings<S> {
-    inner: S,
-    expected_sample_rate: u32,
-}
-enum CheckedBackendError<E> {
-    Backend(E),
-    SampleRateMismatch { expected: u32, actual: u32 },
+const DRIVER_PHASE_MASK: u64 = 0x0f;
+const DRIVER_CAUSE_SHIFT: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+enum DriverPhase {
+    Provisional = 0,
+    Live = 1,
+    Closing = 2,
+    Failed = 3,
+    Retired = 4,
+    Uncertain = 5,
 }
 
-impl<B: Backend> Backend for CheckedBackend<B> {
-    type Settings = CheckedBackendSettings<B::Settings>;
-    type Error = CheckedBackendError<B::Error>;
+const fn driver_cause(failure: MixerOutputFailure) -> u64 {
+    let cause = match failure {
+        MixerOutputFailure::BackendFailure => 1,
+        MixerOutputFailure::InvalidCallbackGeometry => 2,
+        MixerOutputFailure::RendererPanicked => 3,
+        MixerOutputFailure::OwnerPanicked => 4,
+    };
+    cause << DRIVER_CAUSE_SHIFT
+}
+
+fn decode_driver_phase(word: u64) -> DriverPhase {
+    match word & DRIVER_PHASE_MASK {
+        0 => DriverPhase::Provisional,
+        1 => DriverPhase::Live,
+        2 => DriverPhase::Closing,
+        3 => DriverPhase::Failed,
+        4 => DriverPhase::Retired,
+        _ => DriverPhase::Uncertain,
+    }
+}
+
+fn decode_driver_cause(word: u64) -> Option<MixerOutputFailure> {
+    match word >> DRIVER_CAUSE_SHIFT {
+        1 => Some(MixerOutputFailure::BackendFailure),
+        2 => Some(MixerOutputFailure::InvalidCallbackGeometry),
+        3 => Some(MixerOutputFailure::RendererPanicked),
+        4 => Some(MixerOutputFailure::OwnerPanicked),
+        _ => None,
+    }
+}
+
+struct DriverStatus {
+    word: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    panic_owner: AtomicBool,
+    #[cfg(test)]
+    open_snapshot_hook: Mutex<Option<Arc<OpenSnapshotHook>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriverSnapshot {
+    phase: DriverPhase,
+    failure: Option<MixerOutputFailure>,
+}
+
+#[cfg(test)]
+struct OpenSnapshotHook {
+    entered: SyncSender<()>,
+    release: Arc<std::sync::Barrier>,
+    armed: AtomicBool,
+}
+
+impl DriverStatus {
+    fn new() -> Self {
+        Self {
+            word: AtomicU64::new(DriverPhase::Provisional as u64),
+            #[cfg(any(test, feature = "test-support"))]
+            panic_owner: AtomicBool::new(false),
+            #[cfg(test)]
+            open_snapshot_hook: Mutex::new(None),
+        }
+    }
+
+    fn snapshot(&self) -> DriverSnapshot {
+        let word = self.word.load(Ordering::Acquire);
+        DriverSnapshot {
+            phase: decode_driver_phase(word),
+            failure: decode_driver_cause(word),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.snapshot().phase == DriverPhase::Live
+    }
+
+    fn mark_live(&self) -> bool {
+        self.word
+            .compare_exchange(
+                DriverPhase::Provisional as u64,
+                DriverPhase::Live as u64,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn fail(&self, failure: MixerOutputFailure) -> bool {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if !matches!(
+                decode_driver_phase(word),
+                DriverPhase::Provisional | DriverPhase::Live
+            ) {
+                return false;
+            }
+            let next = DriverPhase::Failed as u64 | driver_cause(failure);
+            if self
+                .word
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn begin_close(&self) -> bool {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            if !matches!(
+                decode_driver_phase(word),
+                DriverPhase::Provisional | DriverPhase::Live
+            ) {
+                return false;
+            }
+            if self
+                .word
+                .compare_exchange_weak(
+                    word,
+                    DriverPhase::Closing as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn finish_retirement(&self, joined: bool) {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            let phase = decode_driver_phase(word);
+            if matches!(phase, DriverPhase::Retired | DriverPhase::Uncertain) {
+                return;
+            }
+            let next = if joined {
+                DriverPhase::Retired as u64 | (word & !DRIVER_PHASE_MASK)
+            } else {
+                DriverPhase::Uncertain as u64 | (word & !DRIVER_PHASE_MASK)
+            };
+            if self
+                .word
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn failure(&self) -> Option<MixerOutputFailure> {
+        let snapshot = self.snapshot();
+        matches!(
+            snapshot.phase,
+            DriverPhase::Failed | DriverPhase::Retired | DriverPhase::Uncertain
+        )
+        .then_some(snapshot.failure)
+        .flatten()
+    }
+
+    #[cfg(test)]
+    fn pause_after_open_snapshot(&self) {
+        let hook = lock_recover(&self.open_snapshot_hook).clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            let _ = hook.entered.send(());
+            hook.release.wait();
+        }
+    }
+
+    fn is_joined_retired(&self) -> bool {
+        decode_driver_phase(self.word.load(Ordering::Acquire)) == DriverPhase::Retired
+    }
+
+    fn is_uncertain(&self) -> bool {
+        decode_driver_phase(self.word.load(Ordering::Acquire)) == DriverPhase::Uncertain
+    }
+}
+
+#[derive(Clone)]
+struct DriverFailureSignal(Weak<DriverStatus>);
+
+impl DriverFailureSignal {
+    fn report(&self, failure: MixerOutputFailure) -> bool {
+        self.0.upgrade().is_some_and(|status| status.fail(failure))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverRenderError {
+    InvalidGeometry,
+    RendererPanicked,
+}
+
+struct JoinedRenderer {
+    renderer: Renderer,
+    status: Arc<DriverStatus>,
+}
+
+impl JoinedRenderer {
+    fn render(&mut self, output: &mut [f32], channels: usize) -> Result<(), DriverRenderError> {
+        output.fill(0.0);
+        if !self.status.is_live() {
+            return Ok(());
+        }
+        let frames = output.len().checked_div(channels).unwrap_or(0);
+        if channels != 2
+            || output.is_empty()
+            || !output.len().is_multiple_of(channels)
+            || frames > MAX_PHYSICAL_CALLBACK_FRAMES
+        {
+            self.status
+                .fail(MixerOutputFailure::InvalidCallbackGeometry);
+            return Err(DriverRenderError::InvalidGeometry);
+        }
+        let rendered = catch_unwind(AssertUnwindSafe(|| {
+            self.renderer.on_start_processing();
+            self.renderer.process(output, 2);
+        }));
+        match rendered {
+            Ok(()) => Ok(()),
+            Err(payload) => {
+                output.fill(0.0);
+                self.status.fail(MixerOutputFailure::RendererPanicked);
+                std::mem::forget(payload);
+                Err(DriverRenderError::RendererPanicked)
+            }
+        }
+    }
+}
+
+trait JoinedOutputDriver: Sized {
+    type Settings;
+    type Error;
+
+    fn setup(
+        settings: Self::Settings,
+        internal_buffer_size: usize,
+        failures: DriverFailureSignal,
+    ) -> Result<(Self, PhysicalOutputFormat), Self::Error>;
+    fn start(&mut self, renderer: JoinedRenderer) -> Result<(), Self::Error>;
+    fn play(&mut self) -> Result<(), Self::Error>;
+    fn close_and_join(&mut self) -> bool;
+}
+
+struct MonitoredBackend<D: JoinedOutputDriver> {
+    driver: ManuallyDrop<D>,
+    status: Arc<DriverStatus>,
+}
+
+struct MonitoredBackendSettings<S> {
+    inner: S,
+    expected_sample_rate: u32,
+    status: Arc<DriverStatus>,
+    negotiated: Arc<Mutex<Option<PhysicalOutputFormat>>>,
+}
+enum MonitoredBackendError<E> {
+    Backend(E),
+    SampleRateMismatch { expected: u32, actual: u32 },
+    UnsupportedFormat(PhysicalOutputFormat),
+    FailedDuringStart(MixerOutputFailure),
+}
+
+impl<D: JoinedOutputDriver> Backend for MonitoredBackend<D> {
+    type Settings = MonitoredBackendSettings<D::Settings>;
+    type Error = MonitoredBackendError<D::Error>;
 
     fn setup(
         settings: Self::Settings,
         internal_buffer_size: usize,
     ) -> Result<(Self, u32), Self::Error> {
-        let (backend, actual) =
-            B::setup(settings.inner, internal_buffer_size).map_err(CheckedBackendError::Backend)?;
-        if actual != settings.expected_sample_rate {
-            return Err(CheckedBackendError::SampleRateMismatch {
+        let failures = DriverFailureSignal(Arc::downgrade(&settings.status));
+        let (driver, format) = D::setup(settings.inner, internal_buffer_size, failures)
+            .map_err(MonitoredBackendError::Backend)?;
+        let backend = Self {
+            driver: ManuallyDrop::new(driver),
+            status: settings.status,
+        };
+        if format.sample_rate != settings.expected_sample_rate {
+            return Err(MonitoredBackendError::SampleRateMismatch {
                 expected: settings.expected_sample_rate,
-                actual,
+                actual: format.sample_rate,
             });
         }
-        Ok((Self(backend), actual))
+        if format.channels != 2 {
+            return Err(MonitoredBackendError::UnsupportedFormat(format));
+        }
+        *lock_recover(&settings.negotiated) = Some(format);
+        Ok((backend, format.sample_rate))
     }
 
     fn start(&mut self, renderer: Renderer) -> Result<(), Self::Error> {
-        self.0.start(renderer).map_err(CheckedBackendError::Backend)
+        self.driver
+            .start(JoinedRenderer {
+                renderer,
+                status: Arc::clone(&self.status),
+            })
+            .map_err(MonitoredBackendError::Backend)?;
+        self.driver.play().map_err(|error| {
+            self.status.fail(MixerOutputFailure::BackendFailure);
+            MonitoredBackendError::Backend(error)
+        })?;
+        if self.status.mark_live() {
+            Ok(())
+        } else {
+            Err(MonitoredBackendError::FailedDuringStart(
+                self.status
+                    .failure()
+                    .unwrap_or(MixerOutputFailure::BackendFailure),
+            ))
+        }
+    }
+}
+
+impl<D: JoinedOutputDriver> Drop for MonitoredBackend<D> {
+    fn drop(&mut self) {
+        self.status.begin_close();
+        let joined = forget_panic(catch_unwind(AssertUnwindSafe(|| {
+            self.driver.close_and_join()
+        }))) == Some(true);
+        if !joined {
+            // Lost callback-retirement proof: retaining the entire driver is
+            // the only safe alternative to destroying its renderer/stream
+            // authority while a physical callback may still exist.
+            self.status.finish_retirement(false);
+            return;
+        }
+        let dropped = forget_panic(catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut self.driver);
+        })))
+        .is_some();
+        self.status.finish_retirement(dropped);
     }
 }
 
@@ -810,8 +1380,8 @@ impl SessionTracks {
     }
 }
 
-struct MixerCore<B: Backend> {
-    manager: Option<AudioManager<CheckedBackend<B>>>,
+struct MixerCore<D: JoinedOutputDriver> {
+    manager: Option<AudioManager<MonitoredBackend<D>>>,
     sessions: HashMap<AudioSessionId, SessionTracks>,
     max_sessions: usize,
     inputs_per_bus: usize,
@@ -819,13 +1389,16 @@ struct MixerCore<B: Backend> {
     cleanup_clean: bool,
 }
 
-impl<B: Backend> MixerCore<B> {
+impl<D: JoinedOutputDriver> MixerCore<D> {
     fn with_limits(
-        backend_settings: B::Settings,
+        backend_settings: D::Settings,
+        driver_status: Arc<DriverStatus>,
         format: MixerFormat,
         max_sessions: usize,
         inputs_per_bus: usize,
-    ) -> Result<Self, MixerStartError<B::Error>> {
+    ) -> Result<(Self, PhysicalOutputFormat), MixerStartError<D::Error>> {
+        let negotiated = Arc::new(Mutex::new(None));
+        let retirement_status = Arc::clone(&driver_status);
         let manager = AudioManager::new(AudioManagerSettings {
             capacities: Capacities {
                 sub_track_capacity: max_sessions,
@@ -836,25 +1409,44 @@ impl<B: Backend> MixerCore<B> {
             },
             main_track_builder: MainTrackBuilder::new().sound_capacity(0),
             internal_buffer_size: INTERNAL_BUFFER_FRAMES,
-            backend_settings: CheckedBackendSettings {
+            backend_settings: MonitoredBackendSettings {
                 inner: backend_settings,
                 expected_sample_rate: format.sample_rate,
+                status: driver_status,
+                negotiated: Arc::clone(&negotiated),
             },
         })
-        .map_err(|error| match error {
-            CheckedBackendError::Backend(error) => MixerStartError::Backend(error),
-            CheckedBackendError::SampleRateMismatch { expected, actual } => {
-                MixerStartError::SampleRateMismatch { expected, actual }
-            }
+        .map_err(|error| {
+            let cause = match error {
+                MonitoredBackendError::Backend(error) => MixerStartupFailure::Backend(error),
+                MonitoredBackendError::SampleRateMismatch { expected, actual } => {
+                    MixerStartupFailure::SampleRateMismatch { expected, actual }
+                }
+                MonitoredBackendError::UnsupportedFormat(format) => {
+                    MixerStartupFailure::UnsupportedPhysicalFormat(format)
+                }
+                MonitoredBackendError::FailedDuringStart(failure) => {
+                    MixerStartupFailure::DriverFailed(failure)
+                }
+            };
+            startup_error(cause, retirement_status.is_uncertain())
         })?;
-        Ok(Self {
-            manager: Some(manager),
-            sessions: HashMap::with_capacity(max_sessions),
-            max_sessions,
-            inputs_per_bus,
-            next_session_generation: 1,
-            cleanup_clean: true,
-        })
+        let negotiated = lock_recover(&negotiated)
+            .take()
+            .ok_or(MixerStartError::DriverFailed(
+                MixerOutputFailure::BackendFailure,
+            ))?;
+        Ok((
+            Self {
+                manager: Some(manager),
+                sessions: HashMap::with_capacity(max_sessions),
+                max_sessions,
+                inputs_per_bus,
+                next_session_generation: 1,
+                cleanup_clean: true,
+            },
+            negotiated,
+        ))
     }
 
     fn add_session(&mut self, id: AudioSessionId) -> Result<SessionKey, MixerMutationError> {
@@ -1037,6 +1629,7 @@ impl<B: Backend> MixerCore<B> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MixerMutationError {
+    DriverStopped,
     DuplicateSession,
     SessionCapacity,
     UnknownSession,
@@ -1067,6 +1660,16 @@ struct CleanupResult {
     result: Result<MixerInputRetirement, MixerRetirementError>,
     completion: Option<oneshot::Sender<Result<MixerInputRetirement, MixerRetirementError>>>,
     terminal: bool,
+}
+
+struct FailureNotification {
+    observer: Arc<dyn MixerFailureObserver>,
+    failure: MixerOutputFailure,
+}
+
+enum CleanupTask {
+    Retire(CleanupJob),
+    Notify(FailureNotification),
 }
 
 enum OwnerCommand {
@@ -1100,6 +1703,7 @@ struct ControlInner {
     commands: SyncSender<OwnerCommand>,
     retirements: SyncSender<RetirementRequest>,
     format: MixerFormat,
+    driver_status: Arc<DriverStatus>,
 }
 
 impl ControlInner {
@@ -1108,7 +1712,7 @@ impl ControlInner {
             .gate
             .lock()
             .map_err(|_| MixerControlError::OwnerStopped)?;
-        if gate.sealed {
+        if gate.sealed || !self.driver_status.is_live() {
             return Err(MixerControlError::OwnerStopped);
         }
         gate.start_admissions = gate
@@ -1217,12 +1821,47 @@ impl From<MixerMutationError> for MixerControlError {
     fn from(value: MixerMutationError) -> Self {
         match value {
             MixerMutationError::DuplicateSession => Self::DuplicateSession,
+            MixerMutationError::DriverStopped => Self::OwnerStopped,
             MixerMutationError::SessionCapacity => Self::SessionCapacity,
             MixerMutationError::UnknownSession => Self::UnknownSession,
             MixerMutationError::InputCapacity => Self::InputCapacity,
             MixerMutationError::GenerationExhausted => Self::GenerationExhausted,
             MixerMutationError::InternalInvariant => Self::InternalInvariant,
         }
+    }
+}
+
+/// Primary driver or format cause of a mixer startup failure.
+#[derive(Debug)]
+pub enum MixerStartupFailure<E> {
+    /// The selected physical output driver could not be created or started.
+    Backend(E),
+    /// The physical output's actual sample rate did not match the fixed contract.
+    SampleRateMismatch {
+        /// Requested and published rate.
+        expected: u32,
+        /// Rate returned by physical-driver setup.
+        actual: u32,
+    },
+    /// The negotiated physical format cannot carry the fixed stereo mixer.
+    UnsupportedPhysicalFormat(PhysicalOutputFormat),
+    /// The physical output failed during provisional startup.
+    DriverFailed(MixerOutputFailure),
+}
+
+fn startup_error<E>(cause: MixerStartupFailure<E>, cleanup_uncertain: bool) -> MixerStartError<E> {
+    if cleanup_uncertain {
+        return MixerStartError::CleanupUncertain(cause);
+    }
+    match cause {
+        MixerStartupFailure::Backend(error) => MixerStartError::Backend(error),
+        MixerStartupFailure::SampleRateMismatch { expected, actual } => {
+            MixerStartError::SampleRateMismatch { expected, actual }
+        }
+        MixerStartupFailure::UnsupportedPhysicalFormat(format) => {
+            MixerStartError::UnsupportedPhysicalFormat(format)
+        }
+        MixerStartupFailure::DriverFailed(failure) => MixerStartError::DriverFailed(failure),
     }
 }
 
@@ -1233,15 +1872,21 @@ pub enum MixerStartError<E> {
     InvalidSampleRate,
     /// The owner thread could not be created.
     Thread(std::io::Error),
-    /// The selected Kira backend could not be created or started.
+    /// The selected physical output driver could not be created or started.
     Backend(E),
-    /// The backend's actual sample rate did not match the fixed contract.
+    /// The physical output's actual sample rate did not match the fixed contract.
     SampleRateMismatch {
         /// Requested and published rate.
         expected: u32,
-        /// Rate returned by `Backend::setup`.
+        /// Rate returned by physical-driver setup.
         actual: u32,
     },
+    /// The negotiated physical format cannot carry the fixed stereo mixer.
+    UnsupportedPhysicalFormat(PhysicalOutputFormat),
+    /// The physical output failed during provisional startup.
+    DriverFailed(MixerOutputFailure),
+    /// Startup failed and callback/driver retirement could not be proven.
+    CleanupUncertain(MixerStartupFailure<E>),
     /// The owner terminated before reporting its startup result.
     OwnerStopped,
 }
@@ -1249,8 +1894,10 @@ pub enum MixerStartError<E> {
 /// Result of explicitly joining the mixer owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MixerShutdown {
-    /// Whether Kira/backend retirement and forced input cleanup were proven.
+    /// Whether physical-driver retirement and forced input cleanup were proven.
     pub clean: bool,
+    /// First operational output failure, independent of cleanup proof.
+    pub failure: Option<MixerOutputFailure>,
 }
 
 /// Result of an off-render mixer-input retirement.
@@ -1260,6 +1907,8 @@ pub struct MixerInputRetirement {
     pub failed_before_retirement: bool,
     /// Whether the contained source's destructor panicked.
     pub source_destructor_panicked: bool,
+    /// Global output cause published to this exact input, if any.
+    pub output_failure: Option<MixerOutputFailure>,
 }
 
 impl MixerInputRetirement {
@@ -1302,6 +1951,38 @@ enum ShutdownState {
 #[must_use = "mixer input retirement must be polled to observe its outcome"]
 pub struct MixerInputShutdown {
     state: ShutdownState,
+}
+
+impl Drop for MixerInputShutdown {
+    fn drop(&mut self) {
+        let state = std::mem::replace(&mut self.state, ShutdownState::Finished);
+        let ShutdownState::Forced {
+            mut slot,
+            generation,
+        } = state
+        else {
+            return;
+        };
+        // SAFETY: replacing the state transfers this exact strong authority.
+        let slot = unsafe { ManuallyDrop::take(&mut slot) };
+        let mut forced = lock_recover(&slot.forced);
+        let mut duplicate = false;
+        if forced.generation == generation && forced.result.is_none() {
+            if forced.retained.is_none() {
+                forced.retained = Some(ManuallyDrop::new(Arc::clone(&slot)));
+            } else {
+                // An impossible duplicate forced owner is retained rather than
+                // risking premature slot destruction.
+                duplicate = true;
+            }
+        }
+        drop(forced);
+        if duplicate {
+            std::mem::forget(slot);
+            return;
+        }
+        drop(slot);
+    }
 }
 
 impl fmt::Debug for MixerInputShutdown {
@@ -1355,13 +2036,13 @@ fn submit_shutdown(
     generation: u64,
     control: &Weak<ControlInner>,
 ) -> MixerInputShutdown {
+    let live_control = control.upgrade();
     let initial = slot.word.load(Ordering::Acquire);
     if slot_generation(initial) == generation
         && matches!(
             slot_phase(initial),
             SlotPhase::Retiring | SlotPhase::ForcedClean | SlotPhase::Quarantined
         )
-        && control.upgrade().is_none()
     {
         return MixerInputShutdown {
             state: ShutdownState::Forced {
@@ -1370,7 +2051,14 @@ fn submit_shutdown(
             },
         };
     }
-    if !slot.close(generation, false) {
+    let failure = live_control
+        .as_ref()
+        .and_then(|control| control.driver_status.failure());
+    let closed = failure.map_or_else(
+        || slot.close(generation, false),
+        |failure| slot.close_after_output_failure(generation, failure),
+    );
+    if !closed {
         return MixerInputShutdown {
             state: ShutdownState::RetainedError {
                 _slot: ManuallyDrop::new(slot),
@@ -1387,7 +2075,7 @@ fn submit_shutdown(
             },
         };
     }
-    let Some(control) = control.upgrade() else {
+    let Some(control) = live_control else {
         return MixerInputShutdown {
             state: ShutdownState::Forced {
                 slot: ManuallyDrop::new(slot),
@@ -1618,8 +2306,30 @@ impl InstalledMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let generation = self.generation;
         let control = self.control.clone();
-        if !slot.open(generation) {
-            let _ = slot.close(generation, true);
+        let live_control = control.upgrade();
+        let driver_snapshot = live_control
+            .as_ref()
+            .map(|control| control.driver_status.snapshot());
+        #[cfg(test)]
+        if let Some(control) = live_control.as_ref() {
+            control.driver_status.pause_after_open_snapshot();
+        }
+        let driver_live = driver_snapshot.is_some_and(|snapshot| {
+            snapshot.phase == DriverPhase::Live && snapshot.failure.is_none()
+        });
+        if !driver_live || !slot.open(generation) {
+            let output_failure = driver_snapshot
+                .and_then(|snapshot| snapshot.failure)
+                .or_else(|| {
+                    live_control
+                        .as_ref()
+                        .and_then(|control| control.driver_status.failure())
+                });
+            if let Some(failure) = output_failure {
+                let _ = slot.close_after_output_failure(generation, failure);
+            } else {
+                let _ = slot.close(generation, true);
+            }
             self.admission.take();
             std::mem::forget(self);
             return Err(MixerInputOpenFailure {
@@ -1685,12 +2395,18 @@ impl RunningMixerInput {
     /// Silence this logical input from the next render entry onward.
     #[must_use]
     pub fn suspend(&self) -> bool {
-        self.slot.set_suspended(self.generation, true)
+        self.control
+            .upgrade()
+            .is_some_and(|control| control.driver_status.is_live())
+            && self.slot.set_suspended(self.generation, true)
     }
     /// Reopen a suspended logical input from the next render entry onward.
     #[must_use]
     pub fn resume(&self) -> bool {
-        self.slot.set_suspended(self.generation, false)
+        self.control
+            .upgrade()
+            .is_some_and(|control| control.driver_status.is_live())
+            && self.slot.set_suspended(self.generation, false)
     }
     /// Absorbingly close and commit off-render retirement.
     #[must_use = "logical shutdown returns the proof-bearing cleanup future"]
@@ -1707,6 +2423,20 @@ impl RunningMixerInput {
     pub fn is_failed(&self) -> bool {
         let word = self.slot.word.load(Ordering::Acquire);
         slot_generation(word) == self.generation && word & FAILED != 0
+    }
+
+    /// Global output cause observed by this exact running generation.
+    #[must_use]
+    pub fn output_failure(&self) -> Option<MixerOutputFailure> {
+        let word = self.slot.word.load(Ordering::Acquire);
+        let attached = (slot_generation(word) == self.generation && word & FAILED != 0)
+            .then(|| decode_slot_failure(word))
+            .flatten();
+        attached.or_else(|| {
+            self.control
+                .upgrade()
+                .and_then(|control| control.driver_status.failure())
+        })
     }
 }
 
@@ -1758,10 +2488,19 @@ impl MixerBusHandle {
     }
 
     fn format(&self) -> Result<MixerFormat, MixerControlError> {
-        self.control
+        let control = self
+            .control
             .upgrade()
-            .map(|control| control.format)
-            .ok_or(MixerControlError::OwnerStopped)
+            .ok_or(MixerControlError::OwnerStopped)?;
+        let gate = control
+            .gate
+            .lock()
+            .map_err(|_| MixerControlError::OwnerStopped)?;
+        if gate.sealed || !control.driver_status.is_live() {
+            Err(MixerControlError::OwnerStopped)
+        } else {
+            Ok(control.format)
+        }
     }
 }
 
@@ -1859,16 +2598,17 @@ impl MixerSessionHandle {
 /// Cloneable scoped bus handles carry cross-thread control. Keeping the service
 /// thread-affine also prevents a [`MixerInput`] destructor from owning and
 /// synchronously joining the owner that is waiting for that destructor.
-pub struct MixerService<B: Backend> {
+pub struct MixerService {
     control: Option<Arc<ControlInner>>,
     owner: Option<JoinHandle<()>>,
     owner_status: Arc<OwnerStatus>,
+    driver_status: Arc<DriverStatus>,
     format: MixerFormat,
-    _backend: PhantomData<fn() -> B>,
+    physical_format: PhysicalOutputFormat,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
-impl<B: Backend> fmt::Debug for MixerService<B> {
+impl fmt::Debug for MixerService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MixerService")
@@ -1877,26 +2617,20 @@ impl<B: Backend> fmt::Debug for MixerService<B> {
     }
 }
 
-impl<B> MixerService<B>
-where
-    B: Backend + 'static,
-    B::Settings: Send + 'static,
-    B::Error: Send + 'static,
-{
-    /// Create and verify the backend and mixer topology on a dedicated owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed spawn/backend/rate/owner failure. A startup failure is
-    /// joined before this function returns.
-    pub fn start(
-        backend_settings: B::Settings,
+impl MixerService {
+    fn start_with_driver<D>(
+        backend_settings: D::Settings,
         sample_rate: u32,
-    ) -> Result<Self, MixerStartError<B::Error>> {
+    ) -> Result<Self, MixerStartError<D::Error>>
+    where
+        D: JoinedOutputDriver + 'static,
+        D::Settings: Send + 'static,
+        D::Error: Send + 'static,
+    {
         if sample_rate == 0 {
             return Err(MixerStartError::InvalidSampleRate);
         }
-        Self::start_with_limits(
+        Self::start_with_driver_and_limits::<D>(
             backend_settings,
             MixerFormat { sample_rate },
             MAX_SESSIONS,
@@ -1904,14 +2638,20 @@ where
         )
     }
 
-    fn start_with_limits(
-        backend_settings: B::Settings,
+    fn start_with_driver_and_limits<D>(
+        backend_settings: D::Settings,
         format: MixerFormat,
         max_sessions: usize,
         inputs_per_bus: usize,
-    ) -> Result<Self, MixerStartError<B::Error>> {
+    ) -> Result<Self, MixerStartError<D::Error>>
+    where
+        D: JoinedOutputDriver + 'static,
+        D::Settings: Send + 'static,
+        D::Error: Send + 'static,
+    {
         let (commands, command_receiver) = mpsc::sync_channel(CONTROL_QUEUE_CAPACITY);
         let (retirements, retirement_receiver) = mpsc::sync_channel(RETIREMENT_QUEUE_CAPACITY);
+        let driver_status = Arc::new(DriverStatus::new());
         let control = Arc::new(ControlInner {
             gate: Mutex::new(GateState {
                 sealed: false,
@@ -1922,16 +2662,18 @@ where
             commands,
             retirements,
             format,
+            driver_status: Arc::clone(&driver_status),
         });
         let owner_status = Arc::new(OwnerStatus::new());
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
         let control_weak = Arc::downgrade(&control);
         let owner_status_thread = Arc::clone(&owner_status);
+        let driver_status_thread = Arc::clone(&driver_status);
         let owner = thread::Builder::new()
             .name("smudgy-audio-owner".into())
             .spawn(move || {
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    run_owner::<B>(
+                    run_owner::<D>(
                         backend_settings,
                         format,
                         max_sessions,
@@ -1941,9 +2683,11 @@ where
                         &started_sender,
                         &control_weak,
                         &owner_status_thread,
+                        &driver_status_thread,
                     );
                 }));
                 if outcome.is_err() {
+                    driver_status_thread.fail(MixerOutputFailure::OwnerPanicked);
                     if let Some(control) = control_weak.upgrade() {
                         let _ = control.seal();
                     }
@@ -1954,12 +2698,13 @@ where
             })
             .map_err(MixerStartError::Thread)?;
         match started_receiver.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(physical_format)) => Ok(Self {
                 control: Some(control),
                 owner: Some(owner),
                 owner_status,
+                driver_status,
                 format,
-                _backend: PhantomData,
+                physical_format,
                 _thread_affinity: PhantomData,
             }),
             Ok(Err(error)) => {
@@ -1981,6 +2726,12 @@ where
         self.format
     }
 
+    /// Exact format accepted from the physical output driver at startup.
+    #[must_use]
+    pub fn physical_output_format(&self) -> PhysicalOutputFormat {
+        self.physical_format
+    }
+
     /// Add and fully preinstall the fixed Script/Native/Speech subtree.
     ///
     /// # Errors
@@ -2000,27 +2751,30 @@ where
         })
     }
 
-    /// Seal production, join the backend owner, and force-resolve live slots.
+    /// Seal production, join the physical output owner, and force-resolve live slots.
     #[must_use]
     pub fn shutdown(mut self) -> MixerShutdown {
-        let mut requested = false;
+        self.driver_status.begin_close();
         if let Some(control) = self.control.as_ref()
             && control.seal().is_ok()
         {
-            requested = control.commands.send(OwnerCommand::Shutdown).is_ok();
+            let _ = control.commands.send(OwnerCommand::Shutdown);
         }
         self.control.take();
         let joined = self.owner.take().is_some_and(|owner| owner.join().is_ok());
-        let clean = requested
-            && joined
+        let clean = joined
             && self.owner_status.retired.load(Ordering::Acquire)
             && self.owner_status.clean.load(Ordering::Acquire);
-        MixerShutdown { clean }
+        MixerShutdown {
+            clean,
+            failure: self.driver_status.failure(),
+        }
     }
 }
 
-impl<B: Backend> Drop for MixerService<B> {
+impl Drop for MixerService {
     fn drop(&mut self) {
+        self.driver_status.begin_close();
         if let Some(control) = self.control.take() {
             let _ = control.seal();
             let _ = control.commands.try_send(OwnerCommand::Shutdown);
@@ -2039,7 +2793,7 @@ fn send_request<T>(
         .gate
         .lock()
         .map_err(|_| MixerControlError::OwnerStopped)?;
-    if gate.sealed {
+    if gate.sealed || !control.driver_status.is_live() {
         return Err(MixerControlError::OwnerStopped);
     }
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
@@ -2055,18 +2809,19 @@ fn send_request<T>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn run_owner<B>(
-    backend_settings: B::Settings,
+fn run_owner<D>(
+    backend_settings: D::Settings,
     format: MixerFormat,
     max_sessions: usize,
     inputs_per_bus: usize,
     commands: &Receiver<OwnerCommand>,
     retirements: &Receiver<RetirementRequest>,
-    started: &SyncSender<Result<(), MixerStartError<B::Error>>>,
+    started: &SyncSender<Result<PhysicalOutputFormat, MixerStartError<D::Error>>>,
     control: &Weak<ControlInner>,
     status: &OwnerStatus,
+    driver_status: &Arc<DriverStatus>,
 ) where
-    B: Backend,
+    D: JoinedOutputDriver,
 {
     let cleanup_capacity = max_sessions
         .saturating_mul(SESSION_BUS_COUNT)
@@ -2085,18 +2840,37 @@ fn run_owner<B>(
             return;
         }
     };
-    let mut mixer =
-        match MixerCore::<B>::with_limits(backend_settings, format, max_sessions, inputs_per_bus) {
-            Ok(mixer) => mixer,
-            Err(error) => {
-                let _ = started.send(Err(error));
-                drop(cleanup_sender);
-                let _ = cleanup_owner.join();
-                status.retired.store(true, Ordering::Release);
-                return;
-            }
-        };
-    let published = started.send(Ok(())).is_ok();
+    let constructed = catch_unwind(AssertUnwindSafe(|| {
+        MixerCore::<D>::with_limits(
+            backend_settings,
+            Arc::clone(driver_status),
+            format,
+            max_sessions,
+            inputs_per_bus,
+        )
+    }));
+    let (mut mixer, physical_format) = match constructed {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let _ = started.send(Err(error));
+            drop(cleanup_sender);
+            let _ = cleanup_owner.join();
+            status.retired.store(true, Ordering::Release);
+            return;
+        }
+        Err(payload) => {
+            driver_status.fail(MixerOutputFailure::BackendFailure);
+            std::mem::forget(payload);
+            let _ = started.send(Err(MixerStartError::DriverFailed(
+                MixerOutputFailure::BackendFailure,
+            )));
+            drop(cleanup_sender);
+            let _ = cleanup_owner.join();
+            status.retired.store(true, Ordering::Release);
+            return;
+        }
+    };
+    let published = started.send(Ok(physical_format)).is_ok();
     let mut pending = Vec::new();
     if published {
         let active = catch_unwind(AssertUnwindSafe(|| {
@@ -2108,10 +2882,11 @@ fn run_owner<B>(
                 &cleanup_result_receiver,
                 control,
                 &mut pending,
+                driver_status,
             );
         }));
         if active.is_err() {
-            mixer.cleanup_clean = false;
+            driver_status.fail(MixerOutputFailure::OwnerPanicked);
         }
         forget_panic(active);
     }
@@ -2123,29 +2898,49 @@ fn run_owner<B>(
         cleanup_sender,
         &cleanup_result_receiver,
         cleanup_owner,
+        driver_status,
     );
     status.clean.store(clean, Ordering::Release);
     status.retired.store(true, Ordering::Release);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_active_owner<B: Backend>(
-    mixer: &mut MixerCore<B>,
+fn run_active_owner<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
     commands: &Receiver<OwnerCommand>,
     retirements: &Receiver<RetirementRequest>,
-    cleanup_sender: &SyncSender<CleanupJob>,
+    cleanup_sender: &SyncSender<CleanupTask>,
     cleanup_results: &Receiver<CleanupResult>,
     control: &Weak<ControlInner>,
     pending: &mut Vec<RetirementRequest>,
+    driver_status: &DriverStatus,
 ) {
     loop {
+        #[cfg(any(test, feature = "test-support"))]
+        assert!(
+            !driver_status.panic_owner.swap(false, Ordering::AcqRel),
+            "injected mixer owner panic"
+        );
         drain_cleanup_results(mixer, cleanup_results);
+        if let Some(failure) = driver_status.failure() {
+            if let Some(control) = control.upgrade()
+                && control.seal().is_err()
+            {
+                mixer.cleanup_clean = false;
+            }
+            notify_failed_inputs(mixer, failure, cleanup_sender);
+            break;
+        }
         drain_retirements(retirements, pending);
         scan_retirements(mixer, pending, cleanup_sender);
         let mut shutting_down = false;
         match commands.recv_timeout(RETIREMENT_SCAN_INTERVAL) {
             Ok(OwnerCommand::AddSession(id, response)) => {
-                let result = mixer.add_session(id);
+                let result = if driver_status.is_live() {
+                    mixer.add_session(id)
+                } else {
+                    Err(MixerMutationError::DriverStopped)
+                };
                 let fatal = matches!(result, Err(MixerMutationError::InternalInvariant));
                 mixer.cleanup_clean &= !fatal;
                 if let Err(send_error) = response.send(result)
@@ -2156,7 +2951,11 @@ fn run_active_owner<B: Backend>(
                 shutting_down |= fatal;
             }
             Ok(OwnerCommand::Reserve(key, bus, response)) => {
-                let result = mixer.reserve(key, bus);
+                let result = if driver_status.is_live() {
+                    mixer.reserve(key, bus)
+                } else {
+                    Err(MixerMutationError::DriverStopped)
+                };
                 if matches!(
                     result,
                     Err(MixerMutationError::InternalInvariant
@@ -2173,7 +2972,12 @@ fn run_active_owner<B: Backend>(
                 }
             }
             Ok(OwnerCommand::SetGain(key, bus, linear, response)) => {
-                let _ = response.send(mixer.set_gain(key, bus, linear));
+                let result = if driver_status.is_live() {
+                    mixer.set_gain(key, bus, linear)
+                } else {
+                    Err(MixerMutationError::DriverStopped)
+                };
+                let _ = response.send(result);
             }
             Ok(OwnerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 shutting_down = true;
@@ -2187,14 +2991,15 @@ fn run_active_owner<B: Backend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn terminal_owner_cleanup<B: Backend>(
-    mixer: &mut MixerCore<B>,
+fn terminal_owner_cleanup<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
     retirements: &Receiver<RetirementRequest>,
     control: &Weak<ControlInner>,
     pending: &mut Vec<RetirementRequest>,
-    cleanup_sender: SyncSender<CleanupJob>,
+    cleanup_sender: SyncSender<CleanupTask>,
     cleanup_results: &Receiver<CleanupResult>,
     cleanup_owner: JoinHandle<()>,
+    driver_status: &DriverStatus,
 ) -> bool {
     if control
         .upgrade()
@@ -2203,8 +3008,13 @@ fn terminal_owner_cleanup<B: Backend>(
         mixer.cleanup_clean = false;
     }
     drain_retirements(retirements, pending);
+    if let Some(failure) = driver_status.failure() {
+        notify_failed_inputs(mixer, failure, &cleanup_sender);
+    } else {
+        driver_status.begin_close();
+    }
     mixer.close_all_slots();
-    let backend_clean = retire_backend(mixer);
+    let backend_clean = retire_backend(mixer) && driver_status.is_joined_retired();
     if backend_clean {
         scan_retirements(mixer, pending, &cleanup_sender);
         for request in pending.drain(..) {
@@ -2215,9 +3025,9 @@ fn terminal_owner_cleanup<B: Backend>(
         }
         let mut forced_jobs = mixer.prepare_forced_jobs().into_iter();
         while let Some(job) = forced_jobs.next() {
-            if let Err(error) = cleanup_sender.send(job) {
+            if let Err(error) = cleanup_sender.send(CleanupTask::Retire(job)) {
                 mixer.cleanup_clean = false;
-                retain_failed_cleanup_job(error.0);
+                retain_failed_cleanup_task(error.0);
                 for job in forced_jobs {
                     retain_failed_cleanup_job(job);
                 }
@@ -2250,10 +3060,10 @@ fn drain_retirements(
     pending.extend(retirements.try_iter());
 }
 
-fn scan_retirements<B: Backend>(
-    mixer: &mut MixerCore<B>,
+fn scan_retirements<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
     pending: &mut Vec<RetirementRequest>,
-    cleanup_sender: &SyncSender<CleanupJob>,
+    cleanup_sender: &SyncSender<CleanupTask>,
 ) {
     let mut index = 0;
     while index < pending.len() {
@@ -2286,38 +3096,74 @@ fn scan_retirements<B: Backend>(
             terminal: false,
         };
         if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) =
-            cleanup_sender.try_send(job)
+            cleanup_sender.try_send(CleanupTask::Retire(job))
         {
             mixer.cleanup_clean = false;
-            retain_failed_cleanup_job(job);
+            retain_failed_cleanup_task(job);
         }
     }
 }
 
-fn run_cleanup_worker(jobs: &Receiver<CleanupJob>, results: &SyncSender<CleanupResult>) {
-    while let Ok(mut job) = jobs.recv() {
-        if let Some(source) = job.prepared.source.take()
-            && forget_panic(catch_unwind(AssertUnwindSafe(|| drop(source)))).is_none()
-        {
-            job.prepared.result = Err(MixerRetirementError::SourceDestructorPanicked);
-        }
-        if results
-            .send(CleanupResult {
-                record: job.record,
-                result: job.prepared.result,
-                completion: job.completion,
-                terminal: job.terminal,
-            })
-            .is_err()
-        {
-            break;
+fn run_cleanup_worker(jobs: &Receiver<CleanupTask>, results: &SyncSender<CleanupResult>) {
+    while let Ok(task) = jobs.recv() {
+        match task {
+            CleanupTask::Retire(mut job) => {
+                if let Some(source) = job.prepared.source.take()
+                    && forget_panic(catch_unwind(AssertUnwindSafe(|| drop(source)))).is_none()
+                {
+                    job.prepared.result = Err(MixerRetirementError::SourceDestructorPanicked);
+                }
+                forget_observer_panic(job.prepared.observer.take());
+                if results
+                    .send(CleanupResult {
+                        record: job.record,
+                        result: job.prepared.result,
+                        completion: job.completion,
+                        terminal: job.terminal,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            CleanupTask::Notify(notification) => {
+                let FailureNotification { observer, failure } = notification;
+                forget_panic(catch_unwind(AssertUnwindSafe(|| {
+                    observer.output_failed(failure);
+                })));
+                forget_observer_panic(Some(observer));
+            }
         }
     }
+}
+
+fn notify_failed_inputs<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
+    failure: MixerOutputFailure,
+    cleanup_sender: &SyncSender<CleanupTask>,
+) {
+    let mut notification_transport_clean = true;
+    mixer.for_each_slot(|slot| {
+        let Some(observer) = slot.fail_live(failure) else {
+            return;
+        };
+        let task = CleanupTask::Notify(FailureNotification { observer, failure });
+        if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
+            cleanup_sender.try_send(task)
+        {
+            notification_transport_clean = false;
+            retain_failed_cleanup_task(task);
+        }
+    });
+    mixer.cleanup_clean &= notification_transport_clean;
 }
 
 fn retain_failed_cleanup_job(mut job: CleanupJob) {
     if let Some(source) = job.prepared.source.take() {
         std::mem::forget(source);
+    }
+    if let Some(observer) = job.prepared.observer.take() {
+        std::mem::forget(observer);
     }
     job.record.slot.force_quarantine();
     if let Some(completion) = job.completion.take() {
@@ -2326,13 +3172,23 @@ fn retain_failed_cleanup_job(mut job: CleanupJob) {
     std::mem::forget(job);
 }
 
-fn drain_cleanup_results<B: Backend>(mixer: &mut MixerCore<B>, results: &Receiver<CleanupResult>) {
+fn retain_failed_cleanup_task(task: CleanupTask) {
+    match task {
+        CleanupTask::Retire(job) => retain_failed_cleanup_job(job),
+        CleanupTask::Notify(notification) => std::mem::forget(notification),
+    }
+}
+
+fn drain_cleanup_results<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
+    results: &Receiver<CleanupResult>,
+) {
     for result in results.try_iter() {
         finish_cleanup_result(mixer, result);
     }
 }
 
-fn finish_cleanup_result<B: Backend>(mixer: &mut MixerCore<B>, result: CleanupResult) {
+fn finish_cleanup_result<D: JoinedOutputDriver>(mixer: &mut MixerCore<D>, result: CleanupResult) {
     let CleanupResult {
         record,
         result,
@@ -2365,11 +3221,17 @@ fn send_completion(
     })));
 }
 
-fn retire_backend<B: Backend>(mixer: &mut MixerCore<B>) -> bool {
+fn retire_backend<D: JoinedOutputDriver>(mixer: &mut MixerCore<D>) -> bool {
     let Some(manager) = mixer.manager.take() else {
         return false;
     };
     forget_panic(catch_unwind(AssertUnwindSafe(|| drop(manager)))).is_some()
+}
+
+fn forget_observer_panic(observer: Option<Arc<dyn MixerFailureObserver>>) {
+    if let Some(observer) = observer {
+        forget_panic(catch_unwind(AssertUnwindSafe(|| drop(observer))));
+    }
 }
 
 fn forget_panic<T>(result: std::thread::Result<T>) -> Option<T> {
@@ -2390,3 +3252,7 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
