@@ -125,6 +125,271 @@ fn retire_reservations(reservations: Vec<smudgy_audio::MixerInputReservation>) {
 fn public_factory_and_dependency_boundary_compile() {
     fn assert_factory<T: AudioOutputFactory + Clone + Send + Sync>() {}
     assert_factory::<ScriptBusAudioOutputFactory>();
+    assert_factory::<SessionAudioOutputFactory>();
+}
+
+fn composite_context(
+    factory: &SessionAudioOutputFactory,
+    sink_id: &str,
+    sample_rate: f32,
+    number_of_channels: usize,
+) -> Result<AudioContext, web_audio_api::context::AudioContextBuildError> {
+    let output: Arc<dyn AudioOutputFactory> = Arc::new(factory.clone());
+    AudioContext::builder(output)
+        .options(AudioContextOptions {
+            sample_rate: Some(sample_rate),
+            sink_id: sink_id.into(),
+            ..AudioContextOptions::default()
+        })
+        .number_of_channels(number_of_channels)
+        .build()
+}
+
+#[test]
+fn composite_none_is_slot_free_while_default_owns_the_only_available_slot() {
+    let (service, session, probe) = service(114);
+    let bus = session.script_bus();
+    let factory = SessionAudioOutputFactory::new(bus.clone());
+    // Leave one usable Script slot, then prove the default route consumes it.
+    let held: Vec<_> = (0..INPUT_CAPACITY - 1)
+        .map(|_| bus.try_reserve_input().unwrap())
+        .collect();
+    let default = composite_context(&factory, "", TEST_RATE_F32, CHANNELS)
+        .expect("the default sink routes to the session Script bus");
+    assert_eq!(default.sink_id(), "");
+    assert!((default.sample_rate() - TEST_RATE_F32).abs() < f32::EPSILON);
+    assert_eq!(default.destination().channel_count(), CHANNELS);
+    assert!((default.output_latency() - 128.0 / f64::from(TEST_RATE)).abs() < f64::EPSILON);
+    let _default_graph = attach_constant(&default, 0.25, 1.0);
+    render_until(&probe, 0.25);
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(MixerControlError::InputCapacity)
+    ));
+    let full_error = composite_context(&factory, "", TEST_RATE_F32, CHANNELS)
+        .expect_err("a second default context observes Script capacity");
+    assert_eq!(
+        full_error.output_error().map(AudioOutputError::kind),
+        Some(AudioOutputErrorKind::DeviceUnavailable)
+    );
+
+    // Hosted contexts do not migrate between delegates. Construct separate
+    // contexts to exercise each exact sink route.
+    let first_none = composite_context(&factory, "none", 44_100.0, 1)
+        .expect("none remains available while the Script bus is full");
+    let second_none = composite_context(&factory, "none", TEST_RATE_F32, CHANNELS)
+        .expect("independent none contexts do not consume mixer inputs");
+    assert_eq!(first_none.sink_id(), "none");
+    assert!((first_none.sample_rate() - 44_100.0).abs() < f32::EPSILON);
+    assert_eq!(first_none.destination().channel_count(), 1);
+    assert!(first_none.output_latency().abs() < f64::EPSILON);
+    assert_eq!(second_none.sink_id(), "none");
+    assert!((second_none.sample_rate() - TEST_RATE_F32).abs() < f32::EPSILON);
+    assert_eq!(second_none.destination().channel_count(), CHANNELS);
+    assert!(second_none.output_latency().abs() < f64::EPSILON);
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(MixerControlError::InputCapacity)
+    ));
+
+    for context in [&first_none, &second_none] {
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(context.state(), AudioContextState::Closed);
+    }
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(MixerControlError::InputCapacity)
+    ));
+
+    control_while_rendering(&probe, &default, AudioContext::close_sync);
+    render_until(&probe, 0.0);
+    let replacement = bus
+        .try_reserve_input()
+        .expect("closing the default context returns its exact Script slot");
+    assert!(block_on(replacement.abort()).unwrap().is_clean());
+    retire_reservations(held);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn composite_unsupported_sink_is_stable_and_does_not_mutate_mixer_capacity() {
+    let (service, session, _probe) = service(115);
+    let bus = session.script_bus();
+    let factory = SessionAudioOutputFactory::new(bus.clone());
+    let error = composite_context(&factory, "named-device", TEST_RATE_F32, CHANNELS)
+        .expect_err("a named device must not bypass the process mixer");
+    assert_eq!(
+        error.kind(),
+        web_audio_api::context::AudioContextBuildErrorKind::OutputRejected
+    );
+    let output_error = error.output_error().expect("factory rejection is retained");
+    assert_eq!(output_error.kind(), AudioOutputErrorKind::NotSupported);
+    assert_eq!(
+        output_error.message(),
+        "Smudgy Web Audio supports only the default and none output sinks"
+    );
+    assert!(error.cleanup_receipt().is_none());
+
+    let reservations = reserve_all(&bus);
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(MixerControlError::InputCapacity)
+    ));
+    retire_reservations(reservations);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn composite_routes_before_touching_a_retired_script_bus() {
+    let (service, session, probe) = service(116);
+    let bus = session.script_bus();
+    let factory = SessionAudioOutputFactory::new(bus);
+    let mut retirement = session.retire();
+
+    let default_error = composite_context(&factory, "", TEST_RATE_F32, CHANNELS)
+        .expect_err("the default route must observe its retired Script bus");
+    assert_eq!(
+        default_error.kind(),
+        web_audio_api::context::AudioContextBuildErrorKind::OutputRejected
+    );
+    assert_eq!(
+        default_error.output_error().map(AudioOutputError::kind),
+        Some(AudioOutputErrorKind::BackendSpecific)
+    );
+
+    let none = composite_context(&factory, "none", 44_100.0, 1)
+        .expect("the silent route is independent of a retired Script bus");
+    assert_eq!(none.sink_id(), "none");
+    assert!((none.sample_rate() - 44_100.0).abs() < f32::EPSILON);
+
+    let unsupported = composite_context(&factory, "named-device", TEST_RATE_F32, CHANNELS)
+        .expect_err("unsupported classification must not depend on bus state");
+    let unsupported = unsupported.output_error().unwrap();
+    assert_eq!(unsupported.kind(), AudioOutputErrorKind::NotSupported);
+    assert_eq!(
+        unsupported.message(),
+        "Smudgy Web Audio supports only the default and none output sinks"
+    );
+
+    assert!(matches!(
+        none.request_close().unwrap().wait(),
+        AudioContextShutdownOutcome::Confirmed(_)
+    ));
+    let wake = Waker::from(Arc::new(WakeProbe::default()));
+    let mut context = Context::from_waker(&wake);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Poll::Ready(result) = Pin::new(&mut retirement).poll(&mut context) {
+            result.expect("the retired session is exactly acknowledged");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session retirement was not acknowledged"
+        );
+        let _ = probe.render();
+        thread::yield_now();
+    }
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn composite_mixes_two_defaults_and_native_while_none_stays_private() {
+    let (service, session, probe) = service(117);
+    let script = session.script_bus();
+    let native = session.native_bus();
+    let factory = SessionAudioOutputFactory::new(script.clone());
+    assert_eq!(probe.physical_start_count(), 1);
+    assert_eq!(probe.physical_play_count(), 1);
+    script.set_gain(0.5).unwrap();
+    native.set_gain(0.25).unwrap();
+    let native = native
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(ConstantInput(0.125)))
+        .unwrap();
+
+    let first = composite_context(&factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let second = composite_context(&factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let none = composite_context(&factory, "none", TEST_RATE_F32, CHANNELS).unwrap();
+    let _first_graph = attach_constant(&first, 0.25, 0.5);
+    let _second_graph = attach_constant(&second, 0.5, 0.5);
+    let _none_graph = attach_constant(&none, 1.0, 1.0);
+
+    // The none graph renders on its private silent owner and contributes
+    // nothing to the process mixer.
+    render_until(&probe, 0.21875);
+    assert!(matches!(
+        none.request_close().unwrap().wait(),
+        AudioContextShutdownOutcome::Confirmed(_)
+    ));
+    render_until(&probe, 0.21875);
+    assert_eq!(probe.physical_start_count(), 1);
+    assert_eq!(probe.physical_play_count(), 1);
+
+    control_while_rendering(&probe, &first, AudioContext::suspend_sync);
+    render_until(&probe, 0.15625);
+    control_while_rendering(&probe, &first, AudioContext::resume_sync);
+    render_until(&probe, 0.21875);
+    control_while_rendering(&probe, &first, AudioContext::close_sync);
+    render_until(&probe, 0.15625);
+    control_while_rendering(&probe, &second, AudioContext::close_sync);
+    render_until(&probe, 0.03125);
+    assert!(block_on(native.shutdown()).unwrap().is_clean());
+    render_until(&probe, 0.0);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn physical_device_death_affects_default_but_none_closes_independently() {
+    let (service, session, probe) = service(118);
+    let script = session.script_bus();
+    let factory = SessionAudioOutputFactory::new(script.clone());
+    let default = composite_context(&factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let none = composite_context(&factory, "none", TEST_RATE_F32, CHANNELS).unwrap();
+    let _default_graph = attach_constant(&default, 0.25, 1.0);
+    let _none_graph = attach_constant(&none, 0.5, 1.0);
+    render_until(&probe, 0.25);
+
+    assert!(probe.fail_output());
+    let default_close = default
+        .request_close()
+        .expect("physical death retains default-route cleanup proof");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match script.set_gain(0.75) {
+            Err(MixerControlError::OwnerStopped) => break,
+            Ok(()) | Err(MixerControlError::Saturated) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "device death did not seal the Script route"
+                );
+                thread::yield_now();
+            }
+            Err(error) => panic!("unexpected post-death Script result: {error:?}"),
+        }
+    }
+
+    assert_eq!(none.state(), AudioContextState::Running);
+    let AudioContextShutdownOutcome::Confirmed(none_report) = none.request_close().unwrap().wait()
+    else {
+        panic!("silent-route cleanup was not confirmed")
+    };
+    assert_eq!(none_report.endpoint_death(), None);
+    assert_eq!(none.state(), AudioContextState::Closed);
+
+    assert!(service.shutdown().clean);
+    let AudioContextShutdownOutcome::Confirmed(default_report) = default_close.wait() else {
+        panic!("default-route cleanup was not confirmed")
+    };
+    assert_eq!(
+        default_report.endpoint_death(),
+        Some(AudioOutputDeathReason::BackendFailure)
+    );
+    assert_eq!(default.state(), AudioContextState::Closed);
 }
 
 #[test]

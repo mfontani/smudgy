@@ -14,7 +14,7 @@ use deno_audio::{
     AudioOutputConfig, AudioOutputDeathReason, AudioOutputEndpointShutdown, AudioOutputError,
     AudioOutputErrorKind, AudioOutputEventSink, AudioOutputFactory, AudioOutputRequest,
     AudioOutputStartFailure, AudioRenderCallback, AudioRenderFormat, AudioRenderStatus,
-    PreparedAudioOutput, RunningAudioOutput,
+    PreparedAudioOutput, RunningAudioOutput, SystemAudioOutput,
 };
 use smudgy_audio::{
     MixerControlError, MixerFailureObserver, MixerFrame, MixerInput, MixerInputReservation,
@@ -25,6 +25,46 @@ use smudgy_audio::{
 const CHANNELS: usize = 2;
 const FRAMES: usize = 128;
 const INTERLEAVED_SAMPLES: usize = CHANNELS * FRAMES;
+
+/// Routes one session's Web Audio contexts to its shared Script bus or to a
+/// private silent endpoint.
+///
+/// The default sink consumes one bounded Script-bus input. The exact `"none"`
+/// sink delegates to [`SystemAudioOutput`]'s joinable silent implementation and
+/// never mutates mixer capacity. Other sink identifiers are rejected before
+/// either delegate is invoked.
+#[derive(Clone, Debug)]
+pub struct SessionAudioOutputFactory {
+    script: ScriptBusAudioOutputFactory,
+    silent: SystemAudioOutput,
+}
+
+impl SessionAudioOutputFactory {
+    /// Binds context construction to one session's scoped Script bus.
+    #[must_use]
+    pub const fn new(bus: MixerScriptBusHandle) -> Self {
+        Self {
+            script: ScriptBusAudioOutputFactory::new(bus),
+            silent: SystemAudioOutput::new(),
+        }
+    }
+}
+
+impl AudioOutputFactory for SessionAudioOutputFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        match request.sink_id() {
+            "" => self.script.prepare(request),
+            "none" => self.silent.prepare(request),
+            _ => Err(output_error(
+                AudioOutputErrorKind::NotSupported,
+                "Smudgy Web Audio supports only the default and none output sinks",
+            )),
+        }
+    }
+}
 
 /// Creates one private hosted Web Audio output on a session's Script mixer bus.
 ///
