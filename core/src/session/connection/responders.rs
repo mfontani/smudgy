@@ -319,6 +319,11 @@ pub struct ProtocolState {
     /// Whether a CHARSET `REQUEST` of ours is outstanding. Gates the answer path, so an
     /// `ACCEPTED` nobody asked for can never move the connection's encoding.
     charset_requested: bool,
+    /// Whether that outstanding request still holds outbound text (RFC 2066 §5). Set only
+    /// when the offer could actually change our outbound encoding, and cleared by
+    /// [`release_charset_hold`](Self::release_charset_hold) when the socket task gives up
+    /// waiting — separate from `charset_requested`, so a late answer still lands.
+    charset_hold: bool,
 }
 
 impl ProtocolState {
@@ -330,6 +335,7 @@ impl ProtocolState {
             window_size,
             last_sent_dims: None,
             charset_requested: false,
+            charset_hold: false,
         }
     }
 
@@ -391,9 +397,44 @@ impl ProtocolState {
     /// Send our CHARSET `REQUEST`, framed into `replies` right behind the `WILL CHARSET` that
     /// occasioned it. RFC 2066's minimal implementation in full: a server that sent only `DO`
     /// may not request, so if we do not ask, no charset is ever negotiated.
-    pub fn send_charset_request(&mut self, configured: &'static Encoding, replies: &mut Vec<u8>) {
+    ///
+    /// `active` is the encoding outbound text is being written in right now. If every charset
+    /// offered *is* that encoding, no answer can change how we encode and the exchange is
+    /// invisible to the write path; otherwise the request also takes the §5 outbound hold
+    /// ([`charset_holds_outbound`](Self::charset_holds_outbound)).
+    pub fn send_charset_request(
+        &mut self,
+        configured: &'static Encoding,
+        active: &'static Encoding,
+        replies: &mut Vec<u8>,
+    ) {
         self.charset_requested = true;
+        self.charset_hold = charset::offer(configured)
+            .iter()
+            .any(|offered| *offered != active);
         charset::frame_request(configured, replies);
+    }
+
+    /// Whether outbound text must wait for the answer to our `REQUEST` (RFC 2066 §5: "While a
+    /// CHARSET subnegotiation is in progress, data SHOULD be queued").
+    ///
+    /// The rule matters in this direction and no other. A server changes how it *decodes* our
+    /// stream the moment it sends `ACCEPTED`, and we have no way to mark that position in a
+    /// stream flowing the other way — so for one round trip anything we write is read under a
+    /// charset we did not encode it in. (The mirror case is safe for free: when the server
+    /// requests and we answer, it switches on receiving our `ACCEPTED`, and everything sent
+    /// before that arrives before it.)
+    #[must_use]
+    pub const fn charset_holds_outbound(&self) -> bool {
+        self.charset_requested && self.charset_hold
+    }
+
+    /// Give up holding outbound text: the answer is taking too long, and a server that ignores
+    /// a `REQUEST` outright is ordinary rather than exceptional. Only the hold is dropped — the
+    /// request stays outstanding, so an answer that does eventually arrive is still honored
+    /// (by then it describes a switch we can only make going forward anyway).
+    pub const fn release_charset_hold(&mut self) {
+        self.charset_hold = false;
     }
 
     /// The encoding the server's answer to our outstanding `REQUEST` switches us to, or `None`
@@ -408,6 +449,7 @@ impl ProtocolState {
             return None;
         }
         self.charset_requested = false;
+        self.charset_hold = false;
         charset::accepted_encoding(payload, configured)
     }
 
@@ -417,6 +459,7 @@ impl ProtocolState {
     /// the negative acknowledgment it owes ours is then nothing we need to wait for.
     pub fn reset_charset_request(&mut self) {
         self.charset_requested = false;
+        self.charset_hold = false;
     }
 }
 
@@ -433,7 +476,8 @@ mod tests {
     use super::super::telnet::command::{IAC, SB, SE};
     use super::super::telnet::option::{NAWS, NEW_ENVIRON, TTYPE};
     use super::{
-        CLIENT_NAME, ProtocolState, TERMINAL_TYPE, mtts, new_environ, pack_dims, ttype, unpack_dims,
+        CLIENT_NAME, ProtocolState, TERMINAL_TYPE, charset, mtts, new_environ, pack_dims, ttype,
+        unpack_dims,
     };
 
     /// Strip one `IAC SB <opt> … IAC SE` frame, returning the option and payload.
@@ -754,7 +798,11 @@ mod tests {
         );
 
         let mut replies = Vec::new();
-        state.send_charset_request(encoding_rs::WINDOWS_1252, &mut replies);
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
         assert_eq!(
             state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
             Some(encoding_rs::UTF_8)
@@ -765,12 +813,57 @@ mod tests {
             "the exchange is closed by the first answer"
         );
 
-        state.send_charset_request(encoding_rs::WINDOWS_1252, &mut replies);
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
         state.reset_charset_request();
         assert_eq!(
             state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
             None,
             "a withdrawn request accepts no answer"
+        );
+    }
+
+    /// The RFC 2066 §5 hold is taken only when an answer could change how we encode, and it
+    /// ends on the answer, on a reset, or when the socket task gives up — the last of which
+    /// leaves the request itself outstanding so a late answer still lands.
+    #[test]
+    fn the_outbound_hold_covers_only_a_request_that_could_change_the_encoding() {
+        let mut replies = Vec::new();
+        let mut state = ProtocolState::with_fixed_dims(super::DEFAULT_DIMS);
+        assert!(!state.charset_holds_outbound(), "nothing requested yet");
+
+        // UTF-8 offered to a UTF-8 connection: whatever the server answers, our encoder does
+        // not move, so the write path never notices the exchange.
+        state.send_charset_request(encoding_rs::UTF_8, encoding_rs::UTF_8, &mut replies);
+        assert!(!state.charset_holds_outbound());
+
+        // The override case: `windows-1252 UTF-8` offered while encoding windows-1252 — the
+        // UTF-8 fallback would change the encoder, so outbound waits.
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        assert!(state.charset_holds_outbound());
+
+        let accepted = [&[charset::ACCEPTED][..], b"UTF-8"].concat();
+        state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252);
+        assert!(!state.charset_holds_outbound(), "the answer ends the hold");
+
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        state.release_charset_hold();
+        assert!(!state.charset_holds_outbound());
+        assert_eq!(
+            state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
+            Some(encoding_rs::UTF_8),
+            "giving up on the wait must not discard a late answer"
         );
     }
 

@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's manual encoding setting first with UTF-8 behind it — instead of declining
   the conversation. Servers that hold back their UTF-8 output until a client asks now
   send it, so accented letters and line-drawing arrive as the server meant them
-  instead of as mojibake.
+  instead of as mojibake. On the connections where the choice can actually change
+  something — a server with a manual encoding set — what you type is held for the
+  moment the negotiation takes, so it goes out in the encoding both sides agreed on
+  rather than the one it started in.
 
 ## [0.5.4] - 2026-08-18
 
