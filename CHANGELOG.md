@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Servers offering to negotiate a character set now get an answer.** When a server
   asks smudgy to choose an encoding, smudgy names its preference — UTF-8, or the
   server's manual encoding setting ahead of UTF-8 when one is set — instead of
-  declining the conversation. That preference is the same whichever side opens the
-  negotiation, so a server with a manual encoding set lands on it either way. Servers that hold back their UTF-8 output until a client asks now
+  declining the conversation. That preference now reads the same whichever side opens
+  the negotiation — before, a manual encoding setting could be quietly passed over for
+  UTF-8 depending on who asked first. Servers that hold back their UTF-8 output until a client asks now
   send it, so accented letters and line-drawing arrive as the server meant them
   instead of as mojibake. On the connections where the choice can actually change
   something — a server with a manual encoding set — what you type is held for the

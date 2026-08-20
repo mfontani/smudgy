@@ -104,25 +104,49 @@ mod ingest {
         ///
         /// A server REQUEST is answered — [`answer_request`](responders::charset::answer_request)
         /// always frames a reply (ACCEPTED or the mandatory REJECTED) — and takes the right of
-        /// way over a REQUEST of ours still in flight (the simultaneous-request rule). Anything
-        /// else is the server's answer to our own REQUEST, which counts only while one is
-        /// outstanding.
+        /// way over a REQUEST of ours still in flight (the simultaneous-request rule).
+        ///
+        /// Only `ACCEPTED` and `REJECTED` are answers to a REQUEST of ours, and only they close
+        /// the exchange. Anything else must leave our request outstanding: closing on a message
+        /// that is not an answer would discard the real answer behind it and leave the two sides
+        /// reading each other in different charsets. `TTABLE-IS` is declined explicitly, since
+        /// §5 lets no further subnegotiation start until this one completes and silence would
+        /// strand the server; the remaining codes are inert.
         ///
         /// Either way the transcoder switches at this exact stream position: encodings change
         /// only after the ACCEPTED crosses, so in-order delivery makes the switch race-free.
         fn on_charset_subnegotiation(&mut self, payload: &[u8]) {
-            let switch_to = match payload.split_first() {
-                Some((&responders::charset::REQUEST, offer)) => {
+            use responders::charset;
+            let Some((&code, rest)) = payload.split_first() else {
+                return;
+            };
+            let switch_to = match code {
+                charset::REQUEST => {
                     self.protocol.reset_charset_request();
-                    responders::charset::answer_request(
-                        offer,
+                    charset::answer_request(
+                        rest,
                         self.transcode.configured_encoding(),
                         self.replies,
                     )
                 }
-                _ => self
+                charset::ACCEPTED | charset::REJECTED => self
                     .protocol
                     .on_charset_answer(payload, self.transcode.configured_encoding()),
+                // We never offer `[TTABLE]`, so a table is unsolicited — but it is still a
+                // subnegotiation the server is waiting on, and TTABLE-REJECTED is the message
+                // RFC 2066 §2 requires every implementation to be able to send. It terminates
+                // the exchange, so any request of ours dies with it rather than waiting for an
+                // answer that is no longer coming.
+                charset::TTABLE_IS => {
+                    telnet::frame_subnegotiation(
+                        telnet::option::CHARSET,
+                        &[charset::TTABLE_REJECTED],
+                        self.replies,
+                    );
+                    self.protocol.reset_charset_request();
+                    None
+                }
+                _ => None,
             };
             if let Some(encoding) = switch_to {
                 self.transcode.switch_to(encoding);
@@ -2090,6 +2114,67 @@ mod tests {
             _ => None,
         });
         assert_eq!(line.as_deref(), Some("caf\u{e9}"));
+    }
+
+    /// A `TTABLE-IS` is declined with the `TTABLE-REJECTED` RFC 2066 §2 requires every
+    /// implementation to be able to send — silence would strand the server, since §5 lets no
+    /// further CHARSET subnegotiation start until this one completes.
+    #[test]
+    fn charset_ttable_is_declined_rather_than_ignored() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[responders::charset::TTABLE_IS, 0x08, 0x08],
+            &mut input,
+        );
+
+        let (replies, _) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+            &mut expected,
+        );
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[responders::charset::TTABLE_REJECTED],
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
+    }
+
+    /// Only `ACCEPTED` and `REJECTED` answer a REQUEST of ours. A subnegotiation that is not
+    /// an answer must leave the request outstanding — closing the exchange early would discard
+    /// the real answer behind it and leave the two sides reading each other in different
+    /// charsets.
+    #[test]
+    fn a_non_answer_does_not_consume_the_outstanding_charset_request() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::WINDOWS_1252);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        // Neither of these answers our REQUEST: an empty subnegotiation and a TTABLE-ACK.
+        telnet::frame_subnegotiation(CHARSET, &[], &mut input);
+        telnet::frame_subnegotiation(CHARSET, &[6], &mut input);
+        // ...so the ACCEPTED behind them is still live and must land.
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::ACCEPTED][..], b"UTF-8"].concat(),
+            &mut input,
+        );
+
+        let (_, _) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+        assert_eq!(
+            transcode.encoding(),
+            encoding_rs::UTF_8,
+            "the ACCEPTED must still be honored"
+        );
     }
 
     /// An `ACCEPTED` naming a charset we never offered is ignored — the server picks from our

@@ -161,10 +161,24 @@ pub mod charset {
     pub const ACCEPTED: u8 = 2;
     /// "None of those" — no offered label is supported.
     pub const REJECTED: u8 = 3;
+    /// A translation table, offered in answer to a `REQUEST` carrying `[TTABLE]`.
+    pub const TTABLE_IS: u8 = 4;
+    /// "I cannot use that translation table." RFC 2066 §2 makes this one of the four
+    /// messages every CHARSET implementation MUST support, even one that never sends a
+    /// `TTABLE-IS` of its own — it is the only way to end an exchange a server opened with
+    /// one, and silence would strand the server mid-subnegotiation (§5: another cannot
+    /// start until this one completes).
+    pub const TTABLE_REJECTED: u8 = 5;
 
-    /// The `[TTABLE]` marker an RFC 2066 REQUEST may carry before the separator.
-    /// Translation tables are a dead letter nobody implements; a request carrying one is
-    /// answered `REJECTED` outright.
+    /// The `[TTABLE]` marker a REQUEST may carry, ahead of a version octet and then the
+    /// ordinary charset list: RFC 2066 §2 gives the shape as
+    /// `REQUEST { "[TTABLE ]" <Version> } <char set list>`.
+    ///
+    /// The marker is an *offer* — "answer with a translation table if you would rather" —
+    /// not a replacement for the list. Declining the table is right (nobody implements
+    /// them); declining the request is not, since §2 reserves `REJECTED` for a receiver
+    /// "not capable of handling any of the specified character sets", and the list the
+    /// marker precedes may well name one we speak.
     const TTABLE_MARKER: &[u8] = b"[TTABLE]";
 
     /// The separator our own REQUEST uses. RFC 2066 reads the byte after `REQUEST` as the
@@ -238,8 +252,13 @@ pub mod charset {
     ///
     /// `configured` is the per-server `encoding` setting, and it is preferred over UTF-8
     /// whenever the server offers both — the same order [`offer`] puts on the wire when we
-    /// are the side asking, so the negotiated charset does not depend on which side opened
-    /// the exchange (or, on a crossed REQUEST, on who won the race).
+    /// are the side asking, so the preference reads the same from either end.
+    ///
+    /// It is only a preference in one of those directions. When we drive, the *server* picks
+    /// from our list, and §2 lets it "choose one based on its own preferences" rather than
+    /// take the first it can handle — so a UTF-8-preferring server can still land the
+    /// connection on UTF-8 with `configured` leading the offer. What this ordering removes is
+    /// smudgy contradicting itself, not the server's last word.
     pub fn answer_request(
         payload: &[u8],
         configured: &'static Encoding,
@@ -274,10 +293,13 @@ pub mod charset {
         payload: &'a [u8],
         configured: &'static Encoding,
     ) -> Option<(&'a [u8], &'static Encoding)> {
-        if payload.starts_with(TTABLE_MARKER) {
-            return None;
-        }
-        let (&sep, names) = payload.split_first()?;
+        // Skip a leading `[TTABLE]` and the version octet behind it; what follows is an
+        // ordinary charset list, and the table on offer is simply not taken up.
+        let list = match payload.strip_prefix(TTABLE_MARKER) {
+            Some(versioned) => versioned.split_first()?.1,
+            None => payload,
+        };
+        let (&sep, names) = list.split_first()?;
         let mut utf8 = None;
         let mut first_supported = None;
         for label in names.split(|&b| b == sep).filter(|l| !l.is_empty()) {
@@ -781,9 +803,9 @@ mod tests {
     }
 
     #[test]
-    fn charset_request_with_nothing_supported_or_a_ttable_is_rejected() {
+    fn charset_request_with_nothing_supported_is_rejected() {
         use super::charset;
-        for payload in [&b";EBCDIC-US;KLINGON"[..], b"[TTABLE]\x01;UTF-8", b""] {
+        for payload in [&b";EBCDIC-US;KLINGON"[..], b""] {
             let mut replies = Vec::new();
             assert_eq!(
                 charset::answer_request(payload, encoding_rs::UTF_8, &mut replies),
@@ -792,6 +814,33 @@ mod tests {
             let (_, reply) = unframe(&replies);
             assert_eq!(reply, vec![charset::REJECTED], "payload {payload:02x?}");
         }
+    }
+
+    /// RFC 2066 §2 shapes a REQUEST as `{ "[TTABLE ]" <Version> } <char set list>`: the
+    /// marker offers a translation table, it does not replace the list behind it. Declining
+    /// the table must not decline a charset we speak — REJECTED is for a receiver "not
+    /// capable of handling any of the specified character sets".
+    #[test]
+    fn charset_request_reads_the_list_behind_a_ttable_marker() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(b"[TTABLE]\x01;UTF-8", encoding_rs::UTF_8, &mut replies);
+        assert_eq!(enc, Some(encoding_rs::UTF_8));
+        let (_, payload) = unframe(&replies);
+        assert_eq!(payload[0], charset::ACCEPTED);
+        assert_eq!(&payload[1..], b"UTF-8");
+    }
+
+    /// A TTABLE request whose list holds nothing we speak is still a REJECTED, on the
+    /// strength of the list rather than the marker.
+    #[test]
+    fn charset_request_with_a_ttable_and_no_usable_label_is_rejected() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(b"[TTABLE]\x01;KLINGON", encoding_rs::UTF_8, &mut replies);
+        assert_eq!(enc, None);
+        let (_, reply) = unframe(&replies);
+        assert_eq!(reply, vec![charset::REJECTED]);
     }
 
     /// The WHATWG mapping resolves these labels to the *replacement* encoding, whose
