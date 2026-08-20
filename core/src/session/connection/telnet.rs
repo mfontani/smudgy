@@ -260,18 +260,27 @@ fn offered_codec(name: &[u8]) -> Option<CompressionStart> {
 }
 
 /// Whether we agree to enable `option` on **our** side when the server sends `DO` (we reply
-/// `WILL`). We accept `SGA` (harmless, and common), `EOR`, and the two options whose
+/// `WILL`). We accept `SGA` (harmless, and common), `EOR`, and the options whose
 /// subnegotiation responders live in the connection layer (`responders.rs`): `TTYPE` (terminal
-/// type + MTTS capability advertisement), `NAWS` (window-size report), and `NEW_ENVIRON`
-/// (truthful client capability variables). `DO CHARSET` is
-/// refused: per RFC 2066 the WILL side is expected to drive the REQUEST, and smudgy only
-/// *answers* requests — accepting would leave a strict server waiting forever for a REQUEST
-/// that never comes. Servers negotiate charsets with us via their own `WILL CHARSET`.
+/// type + MTTS capability advertisement), `NAWS` (window-size report), `NEW_ENVIRON`
+/// (truthful client capability variables), and `CHARSET`.
+///
+/// `CHARSET` carries an obligation the others do not. RFC 2066 lets a subnegotiation come from
+/// "whichever side has sent a WILL CHARSET message and also received a DO CHARSET message", so a
+/// server that only sent `DO` may not `REQUEST` — answering `WILL` makes *us* the requester, and
+/// the RFC names that exact exchange its minimal implementation: "the server send DO CHARSET, and
+/// the client send WILL CHARSET and CHARSET REQUEST". The connection layer holds up our end from
+/// `on_option`; refusing instead would decline the only charset negotiation most servers offer.
 #[must_use]
 fn accept_local(option: u8) -> bool {
     matches!(
         option,
-        option::SGA | option::EOR | option::TTYPE | option::NAWS | option::NEW_ENVIRON
+        option::SGA
+            | option::EOR
+            | option::TTYPE
+            | option::NAWS
+            | option::NEW_ENVIRON
+            | option::CHARSET
     )
 }
 
@@ -814,20 +823,22 @@ mod tests {
         );
     }
 
-    /// `DO CHARSET` is refused (the WILL side owns the REQUEST, and smudgy never
-    /// initiates one — accepting would deadlock a strict RFC 2066 server), while the
-    /// server-driven `WILL CHARSET` is accepted so its REQUEST can be answered.
+    /// CHARSET is accepted from either direction. `DO` obliges us to send the REQUEST
+    /// (RFC 2066's minimal implementation — the connection layer's `on_option` does it, off
+    /// the `Local` notification asserted here); `WILL` lets the server drive its own.
     #[test]
-    fn charset_is_accepted_remote_but_refused_local() {
-        use super::command::WONT;
+    fn charset_is_accepted_from_either_direction() {
         use super::option::CHARSET;
         let r = run(&[IAC, DO, CHARSET, IAC, WILL, CHARSET]);
         assert_eq!(
             r.sent,
-            &[IAC, WONT, CHARSET, IAC, DO, CHARSET],
-            "DO answered WONT; WILL answered DO"
+            &[IAC, WILL, CHARSET, IAC, DO, CHARSET],
+            "DO answered WILL; WILL answered DO"
         );
-        assert_eq!(r.options, &[(Side::Remote, CHARSET, true)]);
+        assert_eq!(
+            r.options,
+            &[(Side::Local, CHARSET, true), (Side::Remote, CHARSET, true)]
+        );
     }
 
     #[test]

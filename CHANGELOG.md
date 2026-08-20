@@ -5,6 +5,17 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Servers offering to negotiate a character set now get an answer.** When a server
+  asks smudgy to choose an encoding, smudgy names its preference — UTF-8, or the
+  server's manual encoding setting first with UTF-8 behind it — instead of declining
+  the conversation. Servers that hold back their UTF-8 output until a client asks now
+  send it, so accented letters and line-drawing arrive as the server meant them
+  instead of as mojibake.
+
 ## [0.5.4] - 2026-08-18
 
 ### Added

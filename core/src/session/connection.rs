@@ -99,6 +99,33 @@ mod ingest {
         }
     }
 
+    impl TelnetBridge<'_> {
+        /// One CHARSET subnegotiation (RFC 2066), in either direction.
+        ///
+        /// A server REQUEST is answered — [`answer_request`](responders::charset::answer_request)
+        /// always frames a reply (ACCEPTED or the mandatory REJECTED) — and takes the right of
+        /// way over a REQUEST of ours still in flight (the simultaneous-request rule). Anything
+        /// else is the server's answer to our own REQUEST, which counts only while one is
+        /// outstanding.
+        ///
+        /// Either way the transcoder switches at this exact stream position: encodings change
+        /// only after the ACCEPTED crosses, so in-order delivery makes the switch race-free.
+        fn on_charset_subnegotiation(&mut self, payload: &[u8]) {
+            let switch_to = match payload.split_first() {
+                Some((&responders::charset::REQUEST, offer)) => {
+                    self.protocol.reset_charset_request();
+                    responders::charset::answer_request(offer, self.replies)
+                }
+                _ => self
+                    .protocol
+                    .on_charset_answer(payload, self.transcode.configured_encoding()),
+            };
+            if let Some(encoding) = switch_to {
+                self.transcode.switch_to(encoding);
+            }
+        }
+    }
+
     impl telnet::TelnetSink for TelnetBridge<'_> {
         fn on_data(&mut self, data: &[u8]) {
             if self.transcode.is_passthrough() {
@@ -155,18 +182,7 @@ mod ingest {
                 return;
             }
             if option == telnet::option::CHARSET {
-                // RFC 2066: answer the server's REQUEST — `answer_request` always frames a
-                // reply (ACCEPTED or the mandatory REJECTED) — and switch the transcoder at
-                // this exact stream position: the server changes encodings only after
-                // seeing our ACCEPTED, so in-order delivery makes the switch race-free.
-                // ACCEPTED/REJECTED we never solicited (we don't initiate) fall through
-                // ignored.
-                if let Some((&responders::charset::REQUEST, offer)) = payload.split_first() {
-                    let accepted = responders::charset::answer_request(offer, self.replies);
-                    if let Some(encoding) = accepted {
-                        self.transcode.switch_to(encoding);
-                    }
-                }
+                self.on_charset_subnegotiation(payload);
                 return;
             }
             if option == telnet::option::MSDP {
@@ -249,6 +265,16 @@ mod ingest {
                     // A disable restarts the TTYPE cycle so a renegotiation re-reports
                     // from the client name (the MTTS convention).
                     telnet::option::TTYPE if !enabled => self.protocol.reset_ttype(),
+                    // RFC 2066's minimal implementation, our half: the server sends DO
+                    // CHARSET, we send WILL CHARSET and then the REQUEST. Nothing else will
+                    // drive it — a server that sent only DO has not itself sent WILL, so the
+                    // RFC does not entitle it to request, and both sides would wait forever.
+                    telnet::option::CHARSET if enabled => self
+                        .protocol
+                        .send_charset_request(self.transcode.configured_encoding(), self.replies),
+                    // The option going away drops any request still outstanding, so a later
+                    // renegotiation starts clean.
+                    telnet::option::CHARSET => self.protocol.reset_charset_request(),
                     _ => {}
                 }
                 return;
@@ -1949,6 +1975,136 @@ mod tests {
             _ => None,
         });
         assert_eq!(line.as_deref(), Some("caf\u{e9} \u{ff}"));
+    }
+
+    /// RFC 2066's minimal implementation, end to end: `DO CHARSET` is answered `WILL
+    /// CHARSET` and, immediately behind it, our own `REQUEST`. A server that sent only `DO`
+    /// is not entitled to request, so this is the whole negotiation if we do not.
+    #[test]
+    fn do_charset_is_answered_with_will_and_our_own_request() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+
+        let (replies, _) = ingest_buffer_with(
+            &[command::IAC, command::DO, CHARSET],
+            &mut protocol,
+            &mut transcode,
+        );
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
+    }
+
+    /// The other half of that exchange: a connection configured to windows-1252 offers it
+    /// first, the server takes the UTF-8 fallback, and the application bytes right behind the
+    /// `ACCEPTED` decode through the switched encoding.
+    #[test]
+    fn charset_accepted_switches_decoding_at_the_stream_position() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::WINDOWS_1252);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::ACCEPTED][..], b"UTF-8"].concat(),
+            &mut input,
+        );
+        // "café\r\n" as UTF-8 — the same bytes read as "cafÃ©" under windows-1252.
+        input.extend_from_slice("caf\u{e9}\r\n".as_bytes());
+
+        let (replies, actions) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" windows-1252 UTF-8"].concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected, "the ACCEPTED itself is not answered");
+        assert_eq!(transcode.encoding(), encoding_rs::UTF_8);
+
+        let line = actions.iter().find_map(|action| match action {
+            RuntimeAction::HandleIncomingLine(line) => Some(line.text.clone()),
+            _ => None,
+        });
+        assert_eq!(line.as_deref(), Some("caf\u{e9}"));
+    }
+
+    /// An `ACCEPTED` naming a charset we never offered is ignored — the server picks from our
+    /// list, and honoring anything else would hand it the session's encoding outright. So is
+    /// one that arrives with no request of ours outstanding.
+    #[test]
+    fn charset_accepted_is_ignored_when_unoffered_or_unsolicited() {
+        use super::telnet::option::CHARSET;
+        let accepted_big5 = {
+            let mut frame = Vec::new();
+            telnet::frame_subnegotiation(
+                CHARSET,
+                &[&[responders::charset::ACCEPTED][..], b"big5"].concat(),
+                &mut frame,
+            );
+            frame
+        };
+
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+        let mut negotiated = vec![command::IAC, command::DO, CHARSET];
+        negotiated.extend_from_slice(&accepted_big5);
+        ingest_buffer_with(&negotiated, &mut protocol, &mut transcode);
+        assert_eq!(
+            transcode.encoding(),
+            encoding_rs::UTF_8,
+            "big5 was never in our offer"
+        );
+
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+        let (replies, _) = ingest_buffer_with(&accepted_big5, &mut protocol, &mut transcode);
+        assert_eq!(transcode.encoding(), encoding_rs::UTF_8);
+        assert!(replies.is_empty(), "an unsolicited answer is inert");
+    }
+
+    /// RFC 2066's simultaneous-request rule: when the server's own `REQUEST` crosses ours, the
+    /// server's wins — we answer it, and the negative acknowledgment it owes ours is nothing
+    /// we wait for.
+    #[test]
+    fn a_server_request_overrides_our_outstanding_one() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" big5"].concat(),
+            &mut input,
+        );
+        // The server's rejection of our crossed request must not be mistaken for an answer
+        // that still matters.
+        telnet::frame_subnegotiation(CHARSET, &[responders::charset::REJECTED], &mut input);
+
+        let (replies, _) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+            &mut expected,
+        );
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::ACCEPTED][..], b"big5"].concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
+        assert_eq!(transcode.encoding(), encoding_rs::BIG5);
     }
 
     #[tokio::test]
