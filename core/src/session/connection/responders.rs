@@ -234,10 +234,18 @@ pub mod charset {
     /// Answer one CHARSET `REQUEST`, framing `ACCEPTED <label>` or `REJECTED` into
     /// `replies` and returning the encoding to switch the connection to (`None` on
     /// reject). Payload shape: `<sep> name <sep> name …` where the first byte is the
-    /// separator; UTF-8 is preferred whenever offered, otherwise the first label
-    /// `encoding_rs` resolves wins. Labels echo back exactly as the server spelled them.
-    pub fn answer_request(payload: &[u8], replies: &mut Vec<u8>) -> Option<&'static Encoding> {
-        if let Some((label, encoding)) = choose(payload) {
+    /// separator. Labels echo back exactly as the server spelled them.
+    ///
+    /// `configured` is the per-server `encoding` setting, and it is preferred over UTF-8
+    /// whenever the server offers both — the same order [`offer`] puts on the wire when we
+    /// are the side asking, so the negotiated charset does not depend on which side opened
+    /// the exchange (or, on a crossed REQUEST, on who won the race).
+    pub fn answer_request(
+        payload: &[u8],
+        configured: &'static Encoding,
+        replies: &mut Vec<u8>,
+    ) -> Option<&'static Encoding> {
+        if let Some((label, encoding)) = choose(payload, configured) {
             let mut reply = Vec::with_capacity(label.len() + 1);
             reply.push(ACCEPTED);
             reply.extend_from_slice(label);
@@ -252,27 +260,43 @@ pub mod charset {
     /// The `(label, encoding)` pick for a REQUEST payload, or `None` when nothing offered
     /// is supported (or the request is malformed / carries a TTABLE).
     ///
+    /// Preference order: `configured` first — the user named it for this server, so a server
+    /// able to speak it should — then UTF-8 wherever in the list it appears, then the first
+    /// label `encoding_rs` resolves. The list order the server sent is only the tiebreak;
+    /// RFC 2066 §2 leaves the pick to the receiver ("may choose one based on its own
+    /// preferences").
+    ///
     /// `for_label_no_replacement`, not `for_label`: the WHATWG mapping resolves the
     /// ISO-2022-CN/KR and HZ labels to the *replacement* encoding, whose decoder collapses
     /// every input run to a single U+FFFD — accepting one would destroy the whole session's
     /// feed. Those labels must be REJECTED like any other unsupported charset.
-    fn choose(payload: &[u8]) -> Option<(&[u8], &'static Encoding)> {
+    fn choose<'a>(
+        payload: &'a [u8],
+        configured: &'static Encoding,
+    ) -> Option<(&'a [u8], &'static Encoding)> {
         if payload.starts_with(TTABLE_MARKER) {
             return None;
         }
         let (&sep, names) = payload.split_first()?;
+        let mut utf8 = None;
         let mut first_supported = None;
         for label in names.split(|&b| b == sep).filter(|l| !l.is_empty()) {
             if let Some(encoding) = Encoding::for_label_no_replacement(label) {
-                if encoding == UTF_8 {
+                // Nothing later in the list can outrank the configured encoding, so the
+                // first spelling of it settles the pick. (When `configured` *is* UTF-8 the
+                // two preferences coincide and this is the UTF-8 early-out.)
+                if encoding == configured {
                     return Some((label, encoding));
+                }
+                if encoding == UTF_8 && utf8.is_none() {
+                    utf8 = Some((label, encoding));
                 }
                 if first_supported.is_none() {
                     first_supported = Some((label, encoding));
                 }
             }
         }
-        first_supported
+        utf8.or(first_supported)
     }
 }
 
@@ -671,12 +695,15 @@ mod tests {
         assert_eq!(payload, vec![0, 1, 0, 1], "0x0 must never reach the wire");
     }
 
+    /// UTF-8 outranks whatever the server listed first, so long as the per-server
+    /// `encoding` setting is not itself on offer.
     #[test]
     fn charset_request_prefers_utf8_over_earlier_offers() {
         use super::super::telnet::option::CHARSET;
         use super::charset;
         let mut replies = Vec::new();
-        let enc = charset::answer_request(b";big5;UTF-8;iso-8859-1", &mut replies);
+        let enc =
+            charset::answer_request(b";big5;UTF-8;iso-8859-1", encoding_rs::UTF_8, &mut replies);
         assert_eq!(enc, Some(encoding_rs::UTF_8));
         let (opt, payload) = unframe(&replies);
         assert_eq!(opt, CHARSET);
@@ -688,13 +715,66 @@ mod tests {
         );
     }
 
+    /// The configured encoding outranks UTF-8 when the server offers both — the same order
+    /// [`charset::offer`] puts on the wire, so the outcome does not depend on which side
+    /// opened the negotiation.
+    #[test]
+    fn charset_request_prefers_the_configured_encoding_over_utf8() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(
+            b";UTF-8;windows-1252",
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        assert_eq!(
+            enc,
+            Some(encoding_rs::WINDOWS_1252),
+            "the user named windows-1252 for this server; a server that speaks it should"
+        );
+        let (_, payload) = unframe(&replies);
+        assert_eq!(&payload[1..], b"windows-1252");
+    }
+
+    /// Configured-beats-UTF-8 applies only when the server actually offers it; otherwise
+    /// UTF-8 still wins over the rest of the list.
+    #[test]
+    fn charset_request_falls_back_to_utf8_when_configured_is_not_offered() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(b";big5;UTF-8", encoding_rs::WINDOWS_1252, &mut replies);
+        assert_eq!(enc, Some(encoding_rs::UTF_8));
+        let (_, payload) = unframe(&replies);
+        assert_eq!(&payload[1..], b"UTF-8");
+    }
+
+    /// Labels are compared by the encoding they resolve to, so a server spelling the
+    /// configured charset differently than the setting does still matches.
+    #[test]
+    fn charset_request_matches_configured_by_encoding_not_spelling() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(b";UTF-8;cp1252", encoding_rs::WINDOWS_1252, &mut replies);
+        assert_eq!(enc, Some(encoding_rs::WINDOWS_1252));
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            &payload[1..],
+            b"cp1252",
+            "the echo keeps the server's spelling"
+        );
+    }
+
     #[test]
     fn charset_request_takes_the_first_resolvable_label() {
         use super::charset;
         let mut replies = Vec::new();
         // "NO-SUCH-CHARSET" resolves to nothing, so the first WHATWG-resolvable
         // offer (big5) wins over the later latin1.
-        let enc = charset::answer_request(b" NO-SUCH-CHARSET big5 latin1", &mut replies);
+        let enc = charset::answer_request(
+            b" NO-SUCH-CHARSET big5 latin1",
+            encoding_rs::UTF_8,
+            &mut replies,
+        );
         assert_eq!(enc, Some(encoding_rs::BIG5));
         let (_, payload) = unframe(&replies);
         assert_eq!(&payload[1..], b"big5");
@@ -705,7 +785,10 @@ mod tests {
         use super::charset;
         for payload in [&b";EBCDIC-US;KLINGON"[..], b"[TTABLE]\x01;UTF-8", b""] {
             let mut replies = Vec::new();
-            assert_eq!(charset::answer_request(payload, &mut replies), None);
+            assert_eq!(
+                charset::answer_request(payload, encoding_rs::UTF_8, &mut replies),
+                None
+            );
             let (_, reply) = unframe(&replies);
             assert_eq!(reply, vec![charset::REJECTED], "payload {payload:02x?}");
         }
@@ -721,7 +804,7 @@ mod tests {
             let mut replies = Vec::new();
             let payload = format!(";{label}");
             assert_eq!(
-                charset::answer_request(payload.as_bytes(), &mut replies),
+                charset::answer_request(payload.as_bytes(), encoding_rs::UTF_8, &mut replies),
                 None,
                 "label {label} must not be accepted"
             );

@@ -114,7 +114,11 @@ mod ingest {
             let switch_to = match payload.split_first() {
                 Some((&responders::charset::REQUEST, offer)) => {
                     self.protocol.reset_charset_request();
-                    responders::charset::answer_request(offer, self.replies)
+                    responders::charset::answer_request(
+                        offer,
+                        self.transcode.configured_encoding(),
+                        self.replies,
+                    )
                 }
                 _ => self
                     .protocol
