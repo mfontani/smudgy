@@ -100,6 +100,11 @@ winapi = { workspace = true, features = [
 ] }
 
 [features]
+# Development gate for trying Web Audio from user scripts and sandboxed accessibility packages. Use the
+# CPAL variant for speakers; the base feature keeps `sinkId: "none"` available
+# to deterministic tests and headless environments.
+web-audio = ["smudgy_core/web-audio"]
+web-audio-cpal = ["web-audio", "smudgy_core/web-audio-cpal"]
 # Attach iced's devtools to the running app (iced_debug + the in-app overlay, plus the
 # beacon a running `comet` viewer connects to). Dev-only instrumentation -- keep it out
 # of release builds. Usage: cargo run --features iced-debug

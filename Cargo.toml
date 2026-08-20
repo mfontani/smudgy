@@ -1,5 +1,5 @@
 [workspace]
-members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector"]
+members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector", "audio"]
 # Everything except `inspector` and `scriptref`. This leaves exactly one bin target (ui's
 # `smudgy`) in the default set, so a bare `cargo run` / `cargo build` / `cargo
 # test` resolves to the app without needing `-p` or `--bin`. `inspector` is a
@@ -10,7 +10,7 @@ members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "insp
 # `scriptref` (`smudgy_scriptref`) is likewise a standalone dev tool — the script
 # API reference generator/publisher — excluded for the same reason; run it with
 # `cargo run -p smudgy_scriptref`.
-default-members = ["ui", "core", "cloud", "map_widget", "bench", "script"]
+default-members = ["ui", "core", "cloud", "map_widget", "bench", "script", "audio"]
 resolver = "2"
 
 # Define shared dependencies for the workspace
@@ -83,6 +83,11 @@ smudgy_cloud = { path = "./cloud", features = ["cloud"] }
 smudgy_widgets = { path = "./widgets" }
 smudgy_map_widget = { path = "./map_widget" }
 smudgy_i18n = { path = "./i18n" }
+smudgy_audio = { path = "./audio" }
+kira = { version = "0.12.3", default-features = false }
+# Published Web Audio extension. Keep the revision immutable: this is the exact
+# reviewed alpha that matches the workspace's Deno 2.9.5 crate tuple.
+deno_audio = { git = "https://github.com/smudgy-mud/deno_audio.git", rev = "a5890dd08904724ef6c65d43d8fcc4068fbbb5a3", default-features = false }
 tokio = { version = "1.44.2", features = ["full"] }
 parking_lot = "0.12.1"
 pretty_env_logger = "0.5.0"

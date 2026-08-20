@@ -49,6 +49,7 @@ rustls = "0.23"
 rustls-platform-verifier = "0.6"
 log = { workspace = true }
 smudgy_script = { workspace = true }
+deno_audio = { workspace = true, optional = true }
 vtparse = { workspace = true }
 deno_core = { workspace = true }
 deno_error = { workspace = true }
@@ -97,6 +98,12 @@ rcgen = "0.13"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 [features]
+# Install the reviewed Web Audio extension in every session isolate, including
+# sandboxed accessibility packages. The hardware-independent form supports `sinkId: "none"`; CPAL is a
+# separate opt-in so normal/headless workspace builds do not acquire an audio
+# device dependency.
+web-audio = ["dep:deno_audio", "smudgy_script/web-audio"]
+web-audio-cpal = ["web-audio", "deno_audio/cpal"]
 # Exposes otherwise-private internals so the `smudgy_bench` crate can drive real
 # subsystems: the trigger engine (`session::runtime::Manager` + `PushTriggerParams`),
 # the inbound telnet+VT ingest glue (`session::connection::{feed_inbound, TelnetBridge}`

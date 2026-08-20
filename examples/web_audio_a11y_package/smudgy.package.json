@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "description": "A sandboxed accessibility-package example that plays a short Web Audio earcon.",
+  "entry": "index.ts",
+  "permissions": {
+    "smudgy": {
+      "automations": ["aliases"],
+      "session": ["echo"]
+    }
+  }
+}

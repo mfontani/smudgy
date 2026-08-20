@@ -261,6 +261,51 @@ async fn coexists_across_main_and_sandboxed_isolate() {
     );
 }
 
+/// Accessibility packages run in sandboxed isolates, so Web Audio is installed there as a
+/// first-class web API rather than being limited to the trusted main isolate. The silent sink
+/// exercises the complete hosted render/lifecycle path without depending on CI audio hardware.
+#[cfg(feature = "web-audio")]
+#[tokio::test]
+async fn sandboxed_package_can_render_web_audio() {
+    let pkg = TestPackage::new(
+        "a11y",
+        "earcon",
+        "1.0.0",
+        r#"
+        import { echo } from "smudgy:core";
+
+        const context = new AudioContext({ sampleRate: 48_000, sinkId: "none" });
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        gain.gain.value = 0.05;
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.onended = async () => {
+            await context.close();
+            echo("SANDBOX_WEB_AUDIO_OK");
+        };
+        oscillator.start();
+        oscillator.stop(context.currentTime + 0.02);
+        "#,
+    );
+
+    let lines = run_scenario(
+        9_211,
+        "pi_sandbox_web_audio",
+        &[],
+        vec![pkg],
+        "SANDBOX_WEB_AUDIO_OK",
+        1,
+        "noop",
+    )
+    .await;
+
+    assert!(
+        lines.iter().any(|line| line == "SANDBOX_WEB_AUDIO_OK"),
+        "sandboxed accessibility package must render and close Web Audio; transcript:\n{lines:#?}"
+    );
+}
+
 /// Cross-isolate depth-first ordering with a real second isolate: a main-isolate alias
 /// `send`s a command that a sandboxed package's alias matches and expands. Depth-first order must
 /// hold across the boundary (the package's expansion completes before the main alias's sibling

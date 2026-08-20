@@ -68,6 +68,23 @@ static STARTUP_SNAPSHOT: &[u8] =
 // build.rs) and registered via `WorkerOptions::residual_lazy_*_sources`.
 include!(concat!(env!("OUT_DIR"), "/residual_lazy_sources.rs"));
 
+/// Embeds deno_audio's exact extension modules and defers their entry point until deno_runtime
+/// has installed the URL and Event globals those modules use.
+///
+/// This is feature-internal embedder glue; it does not grant a script any native authority.
+#[cfg(feature = "web-audio")]
+#[doc(hidden)]
+pub fn prepare_deferred_web_audio_extension(extension: &mut deno_core::Extension) {
+    let deferred = std::mem::take(extension.esm_files.to_mut());
+
+    // A runtime Extension may not retain unevaluated eager ESM. Register the exact graph as
+    // lazy-loaded ESM so MainWorker can bootstrap Deno first, then import the entry point through
+    // the internal ext: module map. The matching startup snapshot supplies their embedded residual
+    // sources; static peer imports within deno_audio remain closed to that map.
+    extension.lazy_loaded_esm_files.to_mut().extend(deferred);
+    extension.esm_entry_point = None;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModulePolicy {
     pub allow_https: bool,
@@ -230,6 +247,10 @@ impl ScriptRuntime {
         // CryptoProvider available". Install once across all sessions.
         install_default_crypto_provider();
 
+        let initialize_web_audio = options
+            .extensions
+            .iter()
+            .any(|extension| extension.name == "deno_audio");
         let data_dir = options.data_dir;
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("failed to create script data dir {}", data_dir.display()))?;
@@ -370,10 +391,29 @@ impl ScriptRuntime {
         // drives them. This only bites when stdout is a TTY (e.g. `cargo run` from
         // a terminal) — under `cargo test` or a windowed build stdout is a pipe, so
         // the stdio handles aren't TTYs and `uv_tty_init` is never reached.
-        let worker = {
+        let mut worker = {
             let _tokio_guard = options.tokio.enter();
             MainWorker::bootstrap_from_options(&main_module, services, worker_options)
         };
+
+        // deno_audio's exact module graph is registered as lazy-loaded ESM. Import its entry point
+        // only after deno_runtime has installed the URL/Event globals it imports. Native state and
+        // ops were supplied by the matching runtime extension before bootstrap.
+        if initialize_web_audio {
+            let specifier = ModuleSpecifier::parse("file:///__smudgy_web_audio_bootstrap.js")
+                .context("failed to parse the Web Audio bootstrap module")?;
+            let module_id = options
+                .tokio
+                .block_on(worker.js_runtime.load_side_es_module_from_code(
+                    &specifier,
+                    "import 'ext:deno_audio/99_main.js';",
+                ))
+                .context("failed to load the Web Audio extension entry point")?;
+            options
+                .tokio
+                .block_on(worker.evaluate_module(module_id))
+                .context("failed to initialize the Web Audio extension")?;
+        }
 
         Ok(Self {
             worker: ManuallyDrop::new(worker),

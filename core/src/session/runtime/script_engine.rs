@@ -92,6 +92,28 @@ fn inspector_config() -> Option<InspectorConfig> {
     }
 }
 
+/// Bounded aggregate audio accounting for one session-engine generation.
+///
+/// Each isolate retains `deno_audio`'s stricter per-isolate defaults. These shared limits let
+/// roughly four busy isolates coexist while preventing an unbounded number of sandboxed packages
+/// from multiplying those defaults. S3 moves this same policy to application ownership so the
+/// final accounting domain spans sessions as well.
+#[cfg(feature = "web-audio")]
+fn session_audio_host() -> Arc<deno_audio::AudioHost> {
+    let limits = deno_audio::AudioHostLimits::unlimited()
+        .max_online_contexts(Some(24))
+        .max_live_audio_bytes(Some(256 * 1024 * 1024))
+        .max_graph_nodes(Some(4_096))
+        .max_graph_connections(Some(1_024))
+        .max_scheduled_sources(Some(2_048))
+        .max_automation_events(Some(16_384))
+        .max_queued_control_commands(Some(1_024))
+        .max_queued_events(Some(1_024))
+        .max_decode_jobs(Some(8))
+        .max_offline_render_jobs(Some(4));
+    Arc::new(deno_audio::AudioHost::new(limits))
+}
+
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq, Hash, Into)]
 pub struct ScriptId(usize);
 
@@ -989,6 +1011,11 @@ impl<'a> ScriptEngine<'a> {
         let pane_input_callbacks = params.pane_input_callbacks.clone();
         let mapper = params.mapper.clone();
         let extra_extensions = params.extra_script_extensions.clone();
+        // One accounting domain per session engine generation. Every isolate receives the
+        // Web Audio API: accessibility packages are a primary consumer. Per-isolate limits
+        // remain independent, while this shared host enforces aggregate session ceilings.
+        #[cfg(feature = "web-audio")]
+        let audio_host = session_audio_host();
         let current_line_for_ext = current_line.clone();
         // The same introspection mirror the `Manager` writes; bound into every isolate's ops.
         let automation_registry = params.automation_registry.clone();
@@ -1085,7 +1112,18 @@ impl<'a> ScriptEngine<'a> {
                 let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
                 let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
                     Rc::new(RefCell::new(Vec::new()));
-                let mut extensions = vec![
+                let mut extensions = Vec::new();
+                // Register native state and embedded JS sources now; smudgy_script evaluates
+                // the entry point only after deno_runtime bootstrap installs URL/Event globals.
+                #[cfg(feature = "web-audio")]
+                {
+                    let mut extension = deno_audio::deno_audio::init(
+                        deno_audio::AudioExtensionOptions::new(Arc::clone(&audio_host)),
+                    );
+                    smudgy_script::prepare_deferred_web_audio_extension(&mut extension);
+                    extensions.push(extension);
+                }
+                extensions.extend([
                     ops::smudgy_ops::init(
                         session_id,
                         Arc::clone(&server_name),
@@ -1163,7 +1201,7 @@ impl<'a> ScriptEngine<'a> {
                         image_policy,
                     ),
                     mapper_api::smudgy_mapper::init(mapper.clone()),
-                ];
+                ]);
                 extensions.extend((extra_extensions)());
                 (extensions, script_functions, instance)
             };

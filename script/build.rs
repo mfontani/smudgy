@@ -12,10 +12,12 @@
 //!    `include_js_files!` source (and deno_runtime's `99_main.js`) is recorded
 //!    as an absolute build-machine path, never embedded. A runtime without a
 //!    startup snapshot reads those paths at every `JsRuntime::new`, which fails
-//!    on any machine but the builder. The snapshot bakes the deno_runtime BASE
-//!    extension set only; smudgy's own extensions (smudgy_ops / smudgy_mapper /
-//!    smudgy_widgets) carry per-session state, live in crates above this one,
-//!    and instead embed their ESM via each `extension!`'s customizer.
+//!    on any machine but the builder. The snapshot bakes the deno_runtime base
+//!    extension set plus feature-selected, state-free extension schemas such as
+//!    deno_audio's op/object table and deferred ESM. Smudgy's own extensions
+//!    (smudgy_ops / smudgy_mapper / smudgy_widgets) carry per-session state, live
+//!    in crates above this one, and instead embed their ESM via each `extension!`'s
+//!    customizer.
 //!    `residual_lazy_sources.rs` holds `(specifier, source)` tables for
 //!    `lazy_loaded_*` files the snapshot did not consume
 //!    (`WorkerOptions::residual_lazy_{js,esm}_sources`); they load on demand
@@ -30,7 +32,10 @@
 //!    running machine either way.
 
 use std::collections::HashSet;
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use deno_core::{ModuleCodeString, ModuleName};
 use deno_runtime::ops::bootstrap::SnapshotOptions;
@@ -42,7 +47,16 @@ fn main() {
     write_startup_snapshot(&out_dir);
 }
 
-fn write_dts_libs(out_dir: &PathBuf) {
+#[cfg(feature = "web-audio")]
+fn deferred_web_audio_extension() -> deno_core::Extension {
+    let mut extension = deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
+    let deferred = std::mem::take(extension.esm_files.to_mut());
+    extension.lazy_loaded_esm_files.to_mut().extend(deferred);
+    extension.esm_entry_point = None;
+    extension
+}
+
+fn write_dts_libs(out_dir: &Path) {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let lib_dir = PathBuf::from(&manifest_dir).join("vendor/typescript/lib");
 
@@ -79,9 +93,13 @@ fn write_dts_libs(out_dir: &PathBuf) {
     );
 }
 
-fn write_startup_snapshot(out_dir: &PathBuf) {
+fn write_startup_snapshot(out_dir: &Path) {
     let snapshot_path = out_dir.join("SMUDGY_RUNTIME_SNAPSHOT.bin");
-    let output = create_runtime_snapshot(snapshot_path, SnapshotOptions::default(), Vec::new());
+    #[cfg(feature = "web-audio")]
+    let extensions = vec![deferred_web_audio_extension()];
+    #[cfg(not(feature = "web-audio"))]
+    let extensions = Vec::new();
+    let output = create_runtime_snapshot(snapshot_path, SnapshotOptions::default(), extensions);
 
     let consumed: HashSet<&str> = output
         .consumed_lazy_specifiers
