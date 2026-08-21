@@ -348,6 +348,7 @@ struct ForcedWaiter {
 struct PreparedRetirement {
     source: Option<Box<dyn MixerInput>>,
     observer: ManuallyDrop<Option<Arc<dyn MixerFailureObserver>>>,
+    pending_failure_notification: Option<MixerOutputFailure>,
     result: Result<MixerInputRetirement, MixerRetirementError>,
 }
 
@@ -551,14 +552,17 @@ impl InputSlot {
             if slot_generation(word) != generation {
                 return false;
             }
-            match slot_phase(word) {
+            let phase = slot_phase(word);
+            match phase {
                 SlotPhase::Reserved => return self.close(generation, false),
-                SlotPhase::Installed | SlotPhase::Running => {}
-                SlotPhase::Closing
-                | SlotPhase::Retiring
-                | SlotPhase::ForcedClean
-                | SlotPhase::Quarantined => return true,
+                SlotPhase::Installed | SlotPhase::Running | SlotPhase::Closing => {}
+                SlotPhase::Retiring | SlotPhase::ForcedClean | SlotPhase::Quarantined => {
+                    return true;
+                }
                 SlotPhase::Free => return false,
+            }
+            if word & FAILED != 0 && decode_slot_failure(word) == Some(failure) {
+                return true;
             }
             let next = slot_word(
                 generation,
@@ -643,10 +647,16 @@ impl InputSlot {
         } else {
             Err(MixerRetirementError::Structural)
         };
+        let pending_failure_notification = decode_slot_failure(word).filter(|_| {
+            self.failure_notified
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
         let observer = self.take_failure_observer();
         Ok(PreparedRetirement {
             source,
             observer: ManuallyDrop::new(observer),
+            pending_failure_notification,
             result,
         })
     }
@@ -699,11 +709,12 @@ impl InputSlot {
                 Err(MixerRetirementError::Structural)
             };
         let flags = result.as_ref().map_or(FAILED, |retirement| {
-            if retirement.failed_before_retirement {
+            let failed = if retirement.failed_before_retirement {
                 FAILED
             } else {
                 0
-            }
+            };
+            failed | retirement.output_failure.map_or(0, slot_failure_cause)
         });
         self.word.store(
             slot_word(
@@ -772,12 +783,18 @@ impl InputSlot {
         } else {
             Err(MixerRetirementError::Structural)
         };
+        let pending_failure_notification = decode_slot_failure(word).filter(|_| {
+            self.failure_notified
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
         let observer = self.take_failure_observer();
         Some((
             generation,
             PreparedRetirement {
                 source,
                 observer: ManuallyDrop::new(observer),
+                pending_failure_notification,
                 result,
             },
         ))
@@ -2558,6 +2575,7 @@ fn submit_shutdown(
     slot: Arc<InputSlot>,
     generation: u64,
     control: &Weak<ControlInner>,
+    retained_driver_status: Option<&DriverStatus>,
     session: &Arc<SessionControl>,
 ) -> MixerInputShutdown {
     let live_control = control.upgrade();
@@ -2583,9 +2601,13 @@ fn submit_shutdown(
             },
         };
     }
-    let failure = live_control
-        .as_ref()
-        .and_then(|control| control.driver_status.failure());
+    let failure = retained_driver_status
+        .and_then(DriverStatus::failure)
+        .or_else(|| {
+            live_control
+                .as_ref()
+                .and_then(|control| control.driver_status.failure())
+        });
     let closed = failure.map_or_else(
         || slot.close(generation, false),
         |failure| slot.close_after_output_failure(generation, failure),
@@ -2678,7 +2700,7 @@ impl MixerInputReservation {
         let control = self.control.clone();
         let session = Arc::clone(&self.session);
         std::mem::forget(self);
-        submit_shutdown(slot, generation, &control, &session)
+        submit_shutdown(slot, generation, &control, None, &session)
     }
 
     /// Install a preallocated input while holding exact start admission.
@@ -2713,13 +2735,15 @@ impl MixerInputReservation {
         // SAFETY: ownership transfers into Installed and Drop is suppressed.
         let slot = unsafe { ManuallyDrop::take(&mut this.slot) };
         let generation = this.generation;
-        let control = this.control.clone();
+        let driver_status = Arc::clone(&control.driver_status);
+        let weak_control = this.control.clone();
         let session = Arc::clone(&this.session);
         std::mem::forget(this);
         Ok(InstalledMixerInput {
             slot: ManuallyDrop::new(slot),
             generation,
-            control,
+            control: weak_control,
+            driver_status,
             session,
             admission: Some(admission),
         })
@@ -2750,7 +2774,7 @@ impl Drop for MixerInputReservation {
     fn drop(&mut self) {
         // SAFETY: the field is initialized on every ordinary Drop path.
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
-        let shutdown = submit_shutdown(slot, self.generation, &self.control, &self.session);
+        let shutdown = submit_shutdown(slot, self.generation, &self.control, None, &self.session);
         drop(shutdown);
     }
 }
@@ -2829,6 +2853,7 @@ struct InstalledMixerInput {
     slot: ManuallyDrop<Arc<InputSlot>>,
     generation: u64,
     control: Weak<ControlInner>,
+    driver_status: Arc<DriverStatus>,
     session: Arc<SessionControl>,
     admission: Option<StartAdmission>,
 }
@@ -2855,11 +2880,10 @@ impl InstalledMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let generation = self.generation;
         let control = self.control.clone();
+        let driver_status = Arc::clone(&self.driver_status);
         let session = Arc::clone(&self.session);
         let live_control = control.upgrade();
-        let driver_snapshot = live_control
-            .as_ref()
-            .map(|control| control.driver_status.snapshot());
+        let driver_snapshot = Some(driver_status.snapshot());
         #[cfg(test)]
         if let Some(control) = live_control.as_ref() {
             control.driver_status.pause_after_open_snapshot();
@@ -2887,6 +2911,7 @@ impl InstalledMixerInput {
                     slot: ManuallyDrop::new(slot),
                     generation,
                     control,
+                    driver_status,
                     session,
                 },
             });
@@ -2898,6 +2923,7 @@ impl InstalledMixerInput {
             slot: ManuallyDrop::new(slot),
             generation,
             control,
+            driver_status,
             session,
         })
     }
@@ -2909,7 +2935,13 @@ impl Drop for InstalledMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let _ = slot.close(self.generation, false);
         self.admission.take();
-        let shutdown = submit_shutdown(slot, self.generation, &self.control, &self.session);
+        let shutdown = submit_shutdown(
+            slot,
+            self.generation,
+            &self.control,
+            Some(&self.driver_status),
+            &self.session,
+        );
         drop(shutdown);
     }
 }
@@ -2932,6 +2964,7 @@ pub struct RunningMixerInput {
     slot: ManuallyDrop<Arc<InputSlot>>,
     generation: u64,
     control: Weak<ControlInner>,
+    driver_status: Arc<DriverStatus>,
     session: Arc<SessionControl>,
 }
 
@@ -2952,10 +2985,7 @@ impl RunningMixerInput {
             return false;
         };
         !self.session.is_closing()
-            && self
-                .control
-                .upgrade()
-                .is_some_and(|control| control.driver_status.is_live())
+            && self.driver_status.is_live()
             && self.slot.set_suspended(self.generation, true)
     }
     /// Reopen a suspended logical input from the next render entry onward.
@@ -2965,10 +2995,7 @@ impl RunningMixerInput {
             return false;
         };
         !self.session.is_closing()
-            && self
-                .control
-                .upgrade()
-                .is_some_and(|control| control.driver_status.is_live())
+            && self.driver_status.is_live()
             && self.slot.set_suspended(self.generation, false)
     }
     /// Absorbingly close and commit off-render retirement.
@@ -2978,9 +3005,10 @@ impl RunningMixerInput {
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
         let generation = self.generation;
         let control = self.control.clone();
+        let driver_status = Arc::clone(&self.driver_status);
         let session = Arc::clone(&self.session);
         std::mem::forget(self);
-        submit_shutdown(slot, generation, &control, &session)
+        submit_shutdown(slot, generation, &control, Some(&driver_status), &session)
     }
     /// Whether rendering or the installed callback failed closed.
     #[must_use]
@@ -2996,11 +3024,7 @@ impl RunningMixerInput {
         let attached = (slot_generation(word) == self.generation && word & FAILED != 0)
             .then(|| decode_slot_failure(word))
             .flatten();
-        attached.or_else(|| {
-            self.control
-                .upgrade()
-                .and_then(|control| control.driver_status.failure())
-        })
+        attached.or_else(|| self.driver_status.failure())
     }
 }
 
@@ -3008,7 +3032,13 @@ impl Drop for RunningMixerInput {
     fn drop(&mut self) {
         // SAFETY: initialized on every ordinary Drop path.
         let slot = unsafe { ManuallyDrop::take(&mut self.slot) };
-        let shutdown = submit_shutdown(slot, self.generation, &self.control, &self.session);
+        let shutdown = submit_shutdown(
+            slot,
+            self.generation,
+            &self.control,
+            Some(&self.driver_status),
+            &self.session,
+        );
         drop(shutdown);
     }
 }
@@ -3973,12 +4003,23 @@ fn run_cleanup_worker(jobs: &Receiver<CleanupTask>, results: &SyncSender<Cleanup
     while let Ok(task) = jobs.recv() {
         match task {
             CleanupTask::Retire(mut job) => {
+                // Retirement can take the sole observer before the owner's failure scan. Publish
+                // that exact cause first so source/callback destruction cannot win the hosted
+                // context's terminal latch and erase the physical-output failure.
+                let observer = job.prepared.observer.take();
+                if let (Some(observer), Some(failure)) =
+                    (observer.as_ref(), job.prepared.pending_failure_notification)
+                {
+                    forget_panic(catch_unwind(AssertUnwindSafe(|| {
+                        observer.output_failed(failure);
+                    })));
+                }
+                forget_observer_panic(observer);
                 if let Some(source) = job.prepared.source.take()
                     && forget_panic(catch_unwind(AssertUnwindSafe(|| drop(source)))).is_none()
                 {
                     job.prepared.result = Err(MixerRetirementError::SourceDestructorPanicked);
                 }
-                forget_observer_panic(job.prepared.observer.take());
                 if results
                     .send(CleanupResult {
                         record: job.record,

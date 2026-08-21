@@ -355,6 +355,47 @@ impl MixerInput for ObservedInput {
     }
 }
 
+struct RetirementRaceObserver {
+    notifications: mpsc::SyncSender<MixerOutputFailure>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl MixerFailureObserver for RetirementRaceObserver {
+    fn output_failed(&self, failure: MixerOutputFailure) {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.notifications
+            .try_send(failure)
+            .expect("the one-shot failure notification remains bounded");
+    }
+}
+
+struct RetirementRaceInput {
+    observer: Arc<RetirementRaceObserver>,
+    drops: Arc<AtomicUsize>,
+    notified_before_drop: Arc<AtomicBool>,
+}
+
+impl MixerInput for RetirementRaceInput {
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        output.fill(MixerFrame::ZERO);
+        MixerInputStatus::Active
+    }
+
+    fn output_failure_observer(&self) -> Option<Arc<dyn MixerFailureObserver>> {
+        Some(Arc::clone(&self.observer) as Arc<dyn MixerFailureObserver>)
+    }
+}
+
+impl Drop for RetirementRaceInput {
+    fn drop(&mut self) {
+        self.notified_before_drop.store(
+            self.observer.calls.load(Ordering::Acquire) == 1,
+            Ordering::Release,
+        );
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 struct RetainedFailureObserver {
     calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
@@ -2084,6 +2125,11 @@ fn early_driver_death_seals_control_notifies_each_live_input_once_and_joins() {
     let shutdown = service.shutdown();
     assert!(shutdown.clean);
     assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    assert_eq!(
+        second.output_failure(),
+        Some(MixerOutputFailure::BackendFailure),
+        "terminal cleanup must retain the exact cause for a late endpoint close"
+    );
     let first_retirement = block_on(first_shutdown).unwrap();
     let second_retirement = block_on(second.shutdown()).unwrap();
     assert!(first_retirement.failed_before_retirement);
@@ -2098,6 +2144,65 @@ fn early_driver_death_seals_control_notifies_each_live_input_once_and_joins() {
     );
     assert_eq!(first_observer.calls.load(Ordering::Acquire), 1);
     assert_eq!(second_observer.calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn retirement_extraction_delivers_a_racing_output_failure_before_source_drop() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let session = service.add_session(AudioSessionId(911)).unwrap();
+    let bus = session.script_bus();
+    let (notifications, received) = mpsc::sync_channel(1);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let notified_before_drop = Arc::new(AtomicBool::new(false));
+    let observer = Arc::new(RetirementRaceObserver {
+        notifications,
+        calls: Arc::clone(&calls),
+    });
+    let running = bus
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(RetirementRaceInput {
+            observer,
+            drops: Arc::clone(&drops),
+            notified_before_drop: Arc::clone(&notified_before_drop),
+        }))
+        .unwrap();
+
+    let (scan_paused, scan_paused_receiver) = mpsc::sync_channel(1);
+    let release_scan = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.retirement_scan_hook) =
+        Some(Arc::new(RetirementScanHook {
+            entered: scan_paused,
+            release: Arc::clone(&release_scan),
+            armed: AtomicBool::new(true),
+        }));
+    scan_paused_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner did not pause between its failure check and second retirement scan");
+
+    assert!(probe.fail_output());
+    let retirement = running.shutdown();
+    release_scan.wait();
+
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        MixerOutputFailure::BackendFailure
+    );
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let retirement = block_on(retirement).unwrap();
+    assert!(retirement.failed_before_retirement);
+    assert_eq!(
+        retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert!(notified_before_drop.load(Ordering::Acquire));
 }
 
 #[test]
@@ -2402,6 +2507,7 @@ fn standalone_running(
             slot: ManuallyDrop::new(Arc::clone(&slot)),
             generation,
             control: Arc::downgrade(control),
+            driver_status: Arc::clone(&control.driver_status),
             session: Arc::new(SessionControl::new(slot.address.session)),
         },
         slot,

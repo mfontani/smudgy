@@ -103,6 +103,28 @@ fn prove_full_script_bus_reuse(bus: &smudgy_audio::MixerScriptBusHandle) {
 }
 
 #[cfg(feature = "web-audio")]
+fn prove_script_bus_occupancy(bus: &smudgy_audio::MixerScriptBusHandle, occupied: usize) {
+    let available = smudgy_audio::INPUTS_PER_BUS
+        .checked_sub(occupied)
+        .expect("test occupancy fits the fixed Script bus");
+    let reservations = (0..available)
+        .map(|_| {
+            bus.try_reserve_input()
+                .expect("every unoccupied Script slot is reservable")
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(smudgy_audio::MixerControlError::InputCapacity)
+    ));
+    for reservation in reservations {
+        let retirement = futures::executor::block_on(reservation.abort())
+            .expect("occupancy probe reservation retires exactly");
+        assert!(retirement.is_clean());
+    }
+}
+
+#[cfg(feature = "web-audio")]
 async fn wait_for_quiescent_audio_usage(
     application: &smudgy_audio_web::ApplicationAudioOwner,
     online_contexts: usize,
@@ -151,6 +173,132 @@ async fn wait_for_exact_audio_usage(
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+#[cfg(feature = "web-audio")]
+async fn wait_for_audio_markers(
+    events: &mut Pin<Box<dyn Stream<Item = TaggedSessionEvent>>>,
+    transcript: &mut Vec<String>,
+    expected: &[String],
+    description: &str,
+) {
+    let mut observed = expected
+        .iter()
+        .filter(|marker| transcript.contains(marker))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = expected
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    tokio::time::timeout(Duration::from_mins(1), async {
+        while observed != expected {
+            let event = events.next().await.expect("audio session remains live");
+            if let SessionEvent::UpdateBuffer(updates) = event.event {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        transcript.push(line.text.clone());
+                        if expected.contains(&line.text) {
+                            observed.insert(line.text.clone());
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for {description}; observed {observed:?}; transcript: {transcript:#?}"
+        )
+    });
+}
+
+#[cfg(feature = "web-audio")]
+fn s4c_package_module(label: &str, foreign_label: &str) -> String {
+    r#"
+        import { createAlias, echo } from "smudgy:core";
+
+        const label = "__LABEL__";
+        const cycleKey = "smudgy-s4c-__LABEL__-cycle";
+        const generation = Number(localStorage.getItem(cycleKey) ?? "0") + 1;
+        localStorage.setItem(cycleKey, String(generation));
+        if (Object.prototype.hasOwnProperty.call(globalThis, "__s4c_package_heap_brand")) {
+          throw new Error("an old package heap survived full-session reload");
+        }
+        if (globalThis.__s4c_main_context !== undefined
+            || globalThis.__s4c___FOREIGN___context !== undefined) {
+          throw new Error("a package can inspect another isolate's graph");
+        }
+        globalThis.__s4c_package_heap_brand = Symbol(label + "-generation-" + generation);
+
+        const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+        if (!(context instanceof AudioContext)
+            || Object.getPrototypeOf(context) !== AudioContext.prototype
+            || context.sinkId !== "") {
+          throw new Error("package received a stale or foreign AudioContext brand");
+        }
+        globalThis.__s4c___LABEL___context = context;
+        if (generation === 1) {
+          context.onstatechange = () => {
+            if (context.state !== "closed") return;
+            const current = Number(localStorage.getItem(cycleKey) ?? "0");
+            echo(current > generation
+              ? "S4C_FORBIDDEN_OLD_" + label + "_STATE_AFTER_REPLACEMENT"
+              : "S4C_" + label + "_OLD_STATE_DURING_RETIREMENT:1");
+            context.resume().then(
+              () => echo("S4C_FORBIDDEN_OLD_" + label + "_CONTEXT_REOPENED"),
+              () => {},
+            );
+          };
+          const oldSource = context.createOscillator();
+          oldSource.connect(context.destination);
+          oldSource.onended = () => {
+            globalThis.__s4c_old_package_waiter = (async () => {
+              echo("S4C_" + label + "_OLD_HANDLER_ENTERED:1");
+              await new Promise(() => {});
+              if (Number(localStorage.getItem(cycleKey) ?? "0") > generation) {
+                echo("S4C_FORBIDDEN_OLD_" + label + "_ENDED_AFTER_REPLACEMENT");
+              }
+              await context.resume();
+              echo("S4C_FORBIDDEN_OLD_" + label + "_CONTEXT_REOPENED");
+            })();
+          };
+          oldSource.start();
+          oldSource.stop(context.currentTime + 0.02);
+        } else {
+          context.onstatechange = () => {
+            if (context.state === "closed") {
+              echo("S4C_" + label + "_CLOSED:2");
+            }
+          };
+        }
+
+        createAlias("^s4c_package_status$", () => {
+          echo("S4C_" + label + "_STATE:" + context.state);
+        });
+        __ALPHA_CONTROLS__
+        echo("S4C_" + label + "_READY:" + generation);
+    "#
+    .replace("__LABEL__", label)
+    .replace("__FOREIGN__", foreign_label)
+    .replace(
+        "__ALPHA_CONTROLS__",
+        if label == "ALPHA" {
+            r#"
+            createAlias("^s4c_alpha_suspend$", async () => {
+              await context.suspend();
+              echo("S4C_ALPHA_SUSPENDED:" + context.state);
+            });
+            createAlias("^s4c_alpha_resume$", async () => {
+              await context.resume();
+              echo("S4C_ALPHA_RESUMED:" + context.state);
+            });
+            "#
+        } else {
+            ""
+        },
+    )
 }
 
 /// One `smudgy://owner/name` test package: its version and module sources (entry is `index.js`).
@@ -1065,6 +1213,587 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
     render_thread.join().expect("fake physical renderer joins");
     let shutdown = service.shutdown();
     assert!(shutdown.clean);
+    assert_eq!(probe.start_count(), 1);
+    assert_eq!(probe.play_count(), 1);
+    assert_eq!(probe.close_count(), 1);
+}
+
+/// Full-session replacement destroys old main/package heaps before their Script slots can be
+/// reused. A later process-output death closes every replacement default context exactly once,
+/// while a device-free sibling remains independently controllable in its own runtime.
+#[cfg(feature = "web-audio")]
+#[tokio::test]
+#[allow(clippy::await_holding_lock, clippy::too_many_lines)]
+async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
+    let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    let target_server = "pi_s4c_failure_security";
+    let sibling_server = "pi_s4c_silent_sibling";
+    for server in [target_server, sibling_server] {
+        std::fs::create_dir_all(home.join(server).join("modules"))
+            .expect("create module directory");
+        std::fs::create_dir_all(home.join(server).join("logs")).expect("create log directory");
+    }
+
+    std::fs::write(
+        home.join(sibling_server).join("modules/sibling.ts"),
+        r#"
+        import { createAlias, echo } from "smudgy:core";
+        const context = new AudioContext({ sampleRate: 48_000, sinkId: "none" });
+        if (context.sinkId !== "none") throw new Error("silent sibling did not keep its sink");
+        createAlias("^s4c_sibling_status$", () => {
+          echo("S4C_SIBLING_STATE:" + context.state);
+        });
+        createAlias("^s4c_sibling_ping$", () => echo("S4C_SIBLING_PONG"));
+        createAlias("^s4c_sibling_close$", async () => {
+          await context.close();
+          echo("S4C_SIBLING_CLOSED:" + context.state);
+        });
+        echo("S4C_SIBLING_READY");
+        "#,
+    )
+    .expect("write silent sibling module");
+    std::fs::write(
+        home.join(target_server).join("modules/main.ts"),
+        r#"
+        import { createAlias, echo } from "smudgy:core";
+
+        const cycleKey = "smudgy-s4c-main-cycle";
+        const generation = Number(localStorage.getItem(cycleKey) ?? "0") + 1;
+        localStorage.setItem(cycleKey, String(generation));
+        if (Object.prototype.hasOwnProperty.call(globalThis, "__s4c_main_heap_brand")) {
+          throw new Error("the old main heap survived full-session reload");
+        }
+        globalThis.__s4c_main_heap_brand = Symbol("main-generation-" + generation);
+        globalThis.addEventListener("error", (event) => {
+          if (event.error?.message === "intentional S4c event-handler failure") {
+            echo("S4C_THROWING_HANDLER_REPORTED");
+            event.preventDefault();
+          }
+        });
+
+        const primary = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+        const eventContext = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+        for (const context of [primary, eventContext]) {
+          if (!(context instanceof AudioContext)
+              || Object.getPrototypeOf(context) !== AudioContext.prototype) {
+            throw new Error("main received a stale or foreign AudioContext brand");
+          }
+        }
+        globalThis.__s4c_main_context = primary;
+
+        if (generation === 1) {
+          primary.onstatechange = () => {
+            if (primary.state !== "closed") return;
+            const current = Number(localStorage.getItem(cycleKey) ?? "0");
+            echo(current > generation
+              ? "S4C_FORBIDDEN_OLD_STATE_AFTER_REPLACEMENT"
+              : "S4C_MAIN_OLD_STATE_DURING_RETIREMENT:1");
+            primary.resume().then(
+              () => echo("S4C_FORBIDDEN_OLD_CONTEXT_REOPENED"),
+              () => {},
+            );
+          };
+          const oldSource = primary.createOscillator();
+          oldSource.connect(primary.destination);
+          oldSource.onended = () => {
+            // Root a cancelled JS waiter which captures the old context. Runtime replacement,
+            // rather than script-authored close or promise observation, must release it.
+            globalThis.__s4c_old_waiter = (async () => {
+              echo("S4C_MAIN_OLD_HANDLER_ENTERED:1");
+              await new Promise(() => {});
+              if (Number(localStorage.getItem(cycleKey) ?? "0") > generation) {
+                echo("S4C_FORBIDDEN_OLD_ENDED_AFTER_REPLACEMENT");
+              }
+              await primary.resume();
+              echo("S4C_FORBIDDEN_OLD_CONTEXT_REOPENED");
+            })();
+          };
+          oldSource.start();
+          oldSource.stop(primary.currentTime + 0.02);
+        } else {
+          primary.onstatechange = () => {
+            if (primary.state === "closed") echo("S4C_MAIN_PRIMARY_CLOSED:2");
+          };
+          eventContext.onstatechange = () => {
+            if (eventContext.state === "closed") echo("S4C_MAIN_EVENT_CLOSED:2");
+          };
+
+          const gain = eventContext.createGain();
+          gain.gain.value = 0;
+          gain.connect(eventContext.destination);
+          const throwing = eventContext.createOscillator();
+          const following = eventContext.createOscillator();
+          throwing.connect(gain);
+          following.connect(gain);
+          throwing.onended = () => {
+            echo("S4C_THROWING_HANDLER_ENTERED");
+            throw new Error("intentional S4c event-handler failure");
+          };
+          following.onended = () => echo("S4C_HANDLER_AFTER_THROW");
+          throwing.start();
+          following.start();
+          const end = eventContext.currentTime + 0.02;
+          throwing.stop(end);
+          following.stop(end + 0.02);
+        }
+
+        createAlias("^s4c_main_status$", () => {
+          echo("S4C_MAIN_PRIMARY_STATE:" + primary.state);
+          echo("S4C_MAIN_EVENT_STATE:" + eventContext.state);
+        });
+        echo("S4C_MAIN_READY:" + generation);
+        "#,
+    )
+    .expect("write target main module");
+
+    let packages = vec![
+        TestPackage::new(
+            "s4c",
+            "alpha",
+            "1.0.0",
+            &s4c_package_module("ALPHA", "BETA"),
+        ),
+        TestPackage::new("s4c", "beta", "1.0.0", &s4c_package_module("BETA", "ALPHA")),
+    ];
+    for package in &packages {
+        let specifier = format!("smudgy://{}/{}", package.owner, package.name);
+        shared_packages::install_package(target_server, &specifier, UpdateMode::Auto, true)
+            .expect("install S4c package");
+        shared_packages::record_consent(
+            target_server,
+            &specifier,
+            &PackagePermissions {
+                smudgy: SmudgyCapabilities::all(),
+                ..Default::default()
+            },
+        )
+        .expect("grant package test capabilities");
+    }
+    let package_factory: PackageProviderFactory = Arc::new(move || {
+        let mut provider = InMemoryPackageProvider::new();
+        for package in &packages {
+            provider.insert(ResolvedPackage {
+                key: PackageKey {
+                    owner: package.owner.to_string(),
+                    name: package.name.to_string(),
+                },
+                resolved_version: package.version.to_string(),
+                manifest: PackageManifest::parse(&format!(
+                    "{{ \"name\": \"{}\", \"version\": \"{}\" }}",
+                    package.name, package.version
+                ))
+                .expect("valid S4c package manifest"),
+                integrity: format!("s4c-{}-{}", package.name, package.version),
+                modules: package
+                    .modules
+                    .iter()
+                    .map(|(subpath, text)| PackageModuleSource {
+                        subpath: (*subpath).to_string(),
+                        text: text.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        Rc::new(provider) as Rc<dyn PackageProvider>
+    });
+
+    let (service, probe) = smudgy_audio::test_support::start_test_mixer(
+        48_000,
+        smudgy_audio::test_support::TestDriverConfig::default(),
+    )
+    .expect("fake process mixer starts");
+    let render_done = Arc::new(AtomicBool::new(false));
+    let render_thread = {
+        let render_done = Arc::clone(&render_done);
+        let probe = probe.clone();
+        thread::spawn(move || {
+            let mut output = [0.0; 256];
+            while !render_done.load(Ordering::Acquire) {
+                let _ = probe.render(&mut output, 2);
+                thread::yield_now();
+            }
+        })
+    };
+
+    let mut application = Arc::new(smudgy_audio_web::ApplicationAudioOwner::new(
+        deno_audio::AudioHostLimits::unlimited()
+            .max_online_contexts(Some(5))
+            .max_live_audio_bytes(Some(8 * 1024 * 1024))
+            .max_graph_nodes(Some(128))
+            .max_graph_connections(Some(128))
+            .max_scheduled_sources(Some(32))
+            .max_automation_events(Some(128))
+            .max_queued_control_commands(Some(128))
+            .max_queued_events(Some(128))
+            .max_decode_jobs(Some(1))
+            .max_offline_render_jobs(Some(1)),
+    ));
+    let empty_baseline = application.usage();
+    assert_eq!(empty_baseline, deno_audio::AudioHostUsage::default());
+
+    let sibling_numeric_id = 9_223;
+    let sibling_id = SessionId::from(sibling_numeric_id);
+    let sibling_owner = service
+        .add_session(smudgy_audio::AudioSessionId(u64::from(sibling_numeric_id)))
+        .expect("silent sibling joins mixer ownership");
+    let sibling_registration = application
+        .registrar()
+        .register_session(sibling_owner)
+        .expect("silent sibling audio registration succeeds");
+    let sibling_scope = sibling_registration.scope();
+    let sibling_params = Arc::new(SessionParams {
+        session_id: sibling_id,
+        server_name: Arc::new(sibling_server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+    let mut sibling_events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = Box::pin(
+        smudgy_core::session::spawn_with_audio(sibling_params, sibling_scope.clone())
+            .expect("silent sibling audio scope matches"),
+    );
+    let mut sibling_transcript = Vec::new();
+    let sibling_tx = loop {
+        let event = sibling_events.next().await.expect("silent sibling starts");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        sibling_transcript.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+    wait_for_audio_markers(
+        &mut sibling_events,
+        &mut sibling_transcript,
+        &["S4C_SIBLING_READY".to_string()],
+        "silent sibling readiness",
+    )
+    .await;
+    let sibling_baseline =
+        wait_for_quiescent_audio_usage(&application, 1, "silent sibling baseline").await;
+    assert_eq!(sibling_baseline.online_contexts(), 1);
+    assert_eq!(sibling_baseline.scheduled_sources(), 0);
+
+    let target_numeric_id = 9_224;
+    let target_id = SessionId::from(target_numeric_id);
+    let target_owner = service
+        .add_session(smudgy_audio::AudioSessionId(u64::from(target_numeric_id)))
+        .expect("target joins mixer ownership");
+    let target_script_bus = target_owner.script_bus();
+    let target_registration = application
+        .registrar()
+        .register_session(target_owner)
+        .expect("target audio registration succeeds");
+    let target_scope = target_registration.scope();
+    let rebuild_count = Arc::new(AtomicUsize::new(0));
+    let on_engine_rebuild: Arc<dyn Fn() + Send + Sync> = {
+        let application = Arc::clone(&application);
+        let target_script_bus = target_script_bus.clone();
+        let rebuild_count = Arc::clone(&rebuild_count);
+        Arc::new(move || {
+            assert_eq!(
+                application.usage(),
+                sibling_baseline,
+                "old target generation must return every one of the ten host counters"
+            );
+            prove_full_script_bus_reuse(&target_script_bus);
+            rebuild_count.fetch_add(1, Ordering::AcqRel);
+        })
+    };
+    let target_params = Arc::new(SessionParams {
+        session_id: target_id,
+        server_name: Arc::new(target_server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: Some(Arc::clone(&on_engine_rebuild)),
+    });
+    let mut target_events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = Box::pin(
+        spawn_with_package_provider_and_audio(target_params, package_factory, target_scope.clone())
+            .expect("target audio scope matches"),
+    );
+    let mut target_transcript = Vec::new();
+    let target_tx = loop {
+        let event = target_events.next().await.expect("target starts");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        target_transcript.push(line.text.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &[
+            "S4C_MAIN_READY:1".to_string(),
+            "S4C_ALPHA_READY:1".to_string(),
+            "S4C_BETA_READY:1".to_string(),
+            "S4C_MAIN_OLD_HANDLER_ENTERED:1".to_string(),
+            "S4C_ALPHA_OLD_HANDLER_ENTERED:1".to_string(),
+            "S4C_BETA_OLD_HANDLER_ENTERED:1".to_string(),
+        ],
+        "first generation and rooted old event waiter",
+    )
+    .await;
+    assert_eq!(rebuild_count.load(Ordering::Acquire), 1);
+    wait_for_quiescent_audio_usage(&application, 5, "first loaded generation").await;
+    prove_script_bus_occupancy(&target_script_bus, 4);
+
+    target_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_alpha_suspend".to_string(),
+        )))
+        .expect("target accepts alpha suspend");
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &["S4C_ALPHA_SUSPENDED:suspended".to_string()],
+        "alpha-only suspend",
+    )
+    .await;
+    target_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_package_status".to_string(),
+        )))
+        .expect("target accepts package status");
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &[
+            "S4C_ALPHA_STATE:suspended".to_string(),
+            "S4C_BETA_STATE:running".to_string(),
+        ],
+        "independent package control state",
+    )
+    .await;
+    target_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_alpha_resume".to_string(),
+        )))
+        .expect("target accepts alpha resume");
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &["S4C_ALPHA_RESUMED:running".to_string()],
+        "alpha-only resume",
+    )
+    .await;
+
+    target_tx
+        .send(RuntimeAction::Reload)
+        .expect("target accepts full-session reload");
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &[
+            "S4C_MAIN_READY:2".to_string(),
+            "S4C_ALPHA_READY:2".to_string(),
+            "S4C_BETA_READY:2".to_string(),
+            "S4C_THROWING_HANDLER_ENTERED".to_string(),
+            "S4C_THROWING_HANDLER_REPORTED".to_string(),
+            "S4C_HANDLER_AFTER_THROW".to_string(),
+        ],
+        "replacement generation and contained throwing handler",
+    )
+    .await;
+    assert_eq!(rebuild_count.load(Ordering::Acquire), 2);
+    let throwing_index = target_transcript
+        .iter()
+        .position(|line| line == "S4C_THROWING_HANDLER_ENTERED")
+        .expect("throwing handler marker exists");
+    let following_index = target_transcript
+        .iter()
+        .position(|line| line == "S4C_HANDLER_AFTER_THROW")
+        .expect("following handler marker exists");
+    assert!(
+        throwing_index < following_index,
+        "a thrown event handler must not block the following handler; transcript: {target_transcript:#?}"
+    );
+    assert!(
+        !target_transcript
+            .iter()
+            .any(|line| line.starts_with("S4C_FORBIDDEN_")),
+        "old-generation event/context authority escaped replacement: {target_transcript:#?}"
+    );
+    wait_for_quiescent_audio_usage(&application, 5, "replacement loaded generation").await;
+    prove_script_bus_occupancy(&target_script_bus, 4);
+
+    sibling_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_sibling_status".to_string(),
+        )))
+        .expect("sibling accepts pre-failure status");
+    wait_for_audio_markers(
+        &mut sibling_events,
+        &mut sibling_transcript,
+        &["S4C_SIBLING_STATE:running".to_string()],
+        "pre-failure silent sibling state",
+    )
+    .await;
+
+    assert!(probe.fail_output());
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &[
+            "S4C_MAIN_PRIMARY_CLOSED:2".to_string(),
+            "S4C_ALPHA_CLOSED:2".to_string(),
+            "S4C_BETA_CLOSED:2".to_string(),
+        ],
+        "physical failure closure of observable main and package contexts",
+    )
+    .await;
+    // The intentionally throwing context has a deliberately lossy JS consumer: a later callback
+    // cannot be cleanup authority. The exact five-to-one host transition proves that context's
+    // native endpoint, graph, event queue, and permits retired along with the observable three.
+    wait_for_exact_audio_usage(
+        &application,
+        sibling_baseline,
+        "all physical contexts settled while sink:none stayed live",
+    )
+    .await;
+
+    target_tx
+        .send(RuntimeAction::Send(Arc::new("s4c_main_status".to_string())))
+        .expect("target runtime accepts post-failure status");
+    target_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_package_status".to_string(),
+        )))
+        .expect("package runtimes accept post-failure status");
+    wait_for_audio_markers(
+        &mut target_events,
+        &mut target_transcript,
+        &[
+            "S4C_MAIN_PRIMARY_STATE:closed".to_string(),
+            "S4C_ALPHA_STATE:closed".to_string(),
+            "S4C_BETA_STATE:closed".to_string(),
+        ],
+        "post-failure public context state",
+    )
+    .await;
+    assert!(
+        !target_transcript
+            .iter()
+            .any(|line| line.starts_with("S4C_FORBIDDEN_")),
+        "a delayed old-generation event/context authority escaped replacement: {target_transcript:#?}"
+    );
+    sibling_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_sibling_status".to_string(),
+        )))
+        .expect("silent sibling accepts post-failure status");
+    sibling_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_sibling_ping".to_string(),
+        )))
+        .expect("silent sibling accepts post-failure ping");
+    wait_for_audio_markers(
+        &mut sibling_events,
+        &mut sibling_transcript,
+        &[
+            "S4C_SIBLING_STATE:running".to_string(),
+            "S4C_SIBLING_PONG".to_string(),
+        ],
+        "silent sibling continuity after physical failure",
+    )
+    .await;
+    sibling_tx
+        .send(RuntimeAction::Send(Arc::new(
+            "s4c_sibling_close".to_string(),
+        )))
+        .expect("silent sibling accepts independent close");
+    wait_for_audio_markers(
+        &mut sibling_events,
+        &mut sibling_transcript,
+        &["S4C_SIBLING_CLOSED:closed".to_string()],
+        "independent silent sibling close",
+    )
+    .await;
+    wait_for_exact_audio_usage(&application, empty_baseline, "empty final host baseline").await;
+    let final_usage = application.usage();
+    assert_eq!(final_usage.online_contexts(), 0);
+    assert_eq!(final_usage.live_audio_bytes(), 0);
+    assert_eq!(final_usage.graph_nodes(), 0);
+    assert_eq!(final_usage.graph_connections(), 0);
+    assert_eq!(final_usage.scheduled_sources(), 0);
+    assert_eq!(final_usage.automation_events(), 0);
+    assert_eq!(final_usage.queued_control_commands(), 0);
+    assert_eq!(final_usage.queued_events(), 0);
+    assert_eq!(final_usage.decode_jobs(), 0);
+    assert_eq!(final_usage.offline_render_jobs(), 0);
+
+    target_tx
+        .send(RuntimeAction::Shutdown)
+        .expect("target accepts shutdown");
+    sibling_tx
+        .send(RuntimeAction::Shutdown)
+        .expect("silent sibling accepts shutdown");
+    drop(target_tx);
+    drop(sibling_tx);
+    drop(target_events);
+    drop(sibling_events);
+    for (session_id, description) in [(target_id, "target"), (sibling_id, "silent sibling")] {
+        let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+            .await
+            .unwrap_or_else(|_| panic!("{description} runtime join task panicked"));
+        assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
+    }
+
+    // Once process output has failed, its owner has absorbingly stopped accepting session
+    // retirements. Explicit late retirement must report that uncertainty rather than false-ack.
+    assert_eq!(
+        target_registration.retire().await,
+        Err(smudgy_audio::MixerSessionRetirementError::OwnerUncertain)
+    );
+    assert_eq!(
+        sibling_registration.retire().await,
+        Err(smudgy_audio::MixerSessionRetirementError::OwnerUncertain)
+    );
+    drop(target_scope);
+    drop(sibling_scope);
+    drop(target_script_bus);
+    drop(on_engine_rebuild);
+    assert!(
+        Arc::get_mut(&mut application)
+            .expect("all application audio scopes retired")
+            .seal()
+    );
+    assert_eq!(application.usage(), empty_baseline);
+
+    render_done.store(true, Ordering::Release);
+    render_thread.join().expect("fake renderer joins");
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(
+        shutdown.failure,
+        Some(smudgy_audio::MixerOutputFailure::BackendFailure)
+    );
     assert_eq!(probe.start_count(), 1);
     assert_eq!(probe.play_count(), 1);
     assert_eq!(probe.close_count(), 1);
