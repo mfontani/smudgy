@@ -470,6 +470,305 @@ pub fn command_prefilter(name: &str) -> String {
     format!("^{}(?:\\s|$)", regex::escape(name))
 }
 
+/// The runtime half of a Command alias: what the matcher needs at match time
+/// to decide firing and produce captures. Built from the alias sidecar when a
+/// definition loads — the one place the runtime reads authoring state. Safe
+/// against a stale or lying sidecar: [`assign`] re-checks the first word
+/// itself, so a mismatch between the stored prefilter and this spec can only
+/// fall through, never fire wrongly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub name: String,
+    pub args: Vec<ArgSpec>,
+    pub parse: ParseMode,
+}
+
+impl AliasMatcherSource {
+    /// The runtime [`CommandSpec`] this sidecar implies; `None` for a Pattern.
+    #[must_use]
+    pub fn command_spec(&self) -> Option<CommandSpec> {
+        match self {
+            Self::Command {
+                name, args, parse, ..
+            } => Some(CommandSpec {
+                name: name.clone(),
+                args: args.clone(),
+                parse: *parse,
+            }),
+            Self::Pattern { .. } => None,
+        }
+    }
+}
+
+/// One Command token: its grouped/unescaped value and the byte offset of its
+/// first character in the tokenized string (which a `Rest` argument uses to
+/// slice the raw remainder, spacing and quoting intact).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub value: String,
+    pub start: usize,
+}
+
+/// A Command tokenizer failure. Distinct from a mere non-match: the editor
+/// surfaces these verbatim in the Try-it verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizeError {
+    UnterminatedQuote,
+    UnbalancedBraces,
+}
+
+/// Why a Command alias did not fire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandMiss {
+    /// No tokens at all.
+    Empty,
+    /// The first whitespace-delimited word is not the command name
+    /// (case-sensitive, D12).
+    WrongFirstWord,
+    /// A required argument had no token — the D10 outcome: the runtime echoes
+    /// the usage line locally and swallows the input.
+    MissingRequired {
+        name: String,
+    },
+    /// Tokens remain after every argument was satisfied and there is no
+    /// `Rest` argument to claim them; the typed line falls through.
+    Unclaimed {
+        text: String,
+    },
+    Tokenize(TokenizeError),
+}
+
+/// The result of matching one typed line against a Command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// One entry per [`ArgSpec`], in declaration order. `None` is an absent
+    /// optional — distinct from an empty string, though the runtime's capture
+    /// list flattens both to empty (the regex convention for a group that did
+    /// not participate); the editor's Try-it keeps the distinction.
+    Fired {
+        args: Vec<(String, Option<String>)>,
+    },
+    NotFired(CommandMiss),
+}
+
+/// Splits a Command's argument text into tokens per the parse mode
+/// (`matching-logic.md` §1). Backslash escapes the next character in every
+/// context; quotes do not nest, braces do.
+///
+/// # Errors
+///
+/// Returns [`TokenizeError`] for an unterminated quote or unbalanced braces.
+#[allow(clippy::missing_panics_doc)] // the depth bookkeeping cannot underflow
+pub fn tokenize(input: &str, parse: ParseMode) -> Result<Vec<Token>, TokenizeError> {
+    let spaces_split = parse != ParseMode::Raw;
+    let quotes_group = matches!(parse, ParseMode::Quotes | ParseMode::All);
+    let braces_group = matches!(parse, ParseMode::Braces | ParseMode::All);
+
+    if !spaces_split {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![Token {
+            value: trimmed.to_string(),
+            start: input.len() - input.trim_start().len(),
+        }]);
+    }
+
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].1.is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = chars[i].0;
+        let mut value = String::new();
+
+        if braces_group && chars[i].1 == '{' {
+            let mut depth = 0i32;
+            loop {
+                if i >= chars.len() {
+                    break;
+                }
+                let c = chars[i].1;
+                if c == '\\' && i + 1 < chars.len() {
+                    value.push(chars[i + 1].1);
+                    i += 2;
+                    continue;
+                }
+                if c == '{' {
+                    depth += 1;
+                    if depth == 1 {
+                        i += 1;
+                        continue;
+                    }
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                value.push(c);
+                i += 1;
+            }
+            if depth != 0 {
+                return Err(TokenizeError::UnbalancedBraces);
+            }
+            tokens.push(Token { value, start });
+            continue;
+        }
+
+        // A bare token runs to the next whitespace; a quoted segment inside it
+        // glues into the same token, shell-style (`"ugly"}` is one token,
+        // `ugly}`), which is what the design fixtures pin.
+        while i < chars.len() && !chars[i].1.is_whitespace() {
+            let c = chars[i].1;
+            if quotes_group && (c == '"' || c == '\'') {
+                let quote = c;
+                i += 1;
+                let mut closed = false;
+                while i < chars.len() {
+                    let c = chars[i].1;
+                    if c == '\\' && i + 1 < chars.len() {
+                        value.push(chars[i + 1].1);
+                        i += 2;
+                        continue;
+                    }
+                    if c == quote {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    value.push(c);
+                    i += 1;
+                }
+                if !closed {
+                    return Err(TokenizeError::UnterminatedQuote);
+                }
+                continue;
+            }
+            if c == '\\' && i + 1 < chars.len() {
+                value.push(chars[i + 1].1);
+                i += 2;
+                continue;
+            }
+            value.push(c);
+            i += 1;
+        }
+        tokens.push(Token { value, start });
+    }
+    Ok(tokens)
+}
+
+/// Matches one typed line against a Command: tokenize, check the command
+/// word, then assign tokens to arguments (`matching-logic.md` §2). Required
+/// args consume first; an optional yields only when enough tokens remain for
+/// the required args after it; a `Rest` arg takes the **raw** remainder of
+/// the trimmed input, spacing and quoting preserved.
+#[must_use]
+pub fn assign(input: &str, name: &str, specs: &[ArgSpec], parse: ParseMode) -> CommandOutcome {
+    let trimmed = input.trim();
+    let tokens = match tokenize(trimmed, parse) {
+        Ok(tokens) => tokens,
+        Err(err) => return CommandOutcome::NotFired(CommandMiss::Tokenize(err)),
+    };
+    let Some(first) = tokens.first() else {
+        return CommandOutcome::NotFired(CommandMiss::Empty);
+    };
+    if first.value != name {
+        return CommandOutcome::NotFired(CommandMiss::WrongFirstWord);
+    }
+    let rest = &tokens[1..];
+
+    let required_after = |n: usize| {
+        specs[n + 1..]
+            .iter()
+            .filter(|s| s.kind == ArgKind::Required)
+            .count()
+    };
+
+    let mut args: Vec<(String, Option<String>)> = Vec::with_capacity(specs.len());
+    let mut idx = 0usize;
+    for (n, spec) in specs.iter().enumerate() {
+        match spec.kind {
+            ArgKind::Required => {
+                if idx >= rest.len() {
+                    return CommandOutcome::NotFired(CommandMiss::MissingRequired {
+                        name: spec.name.clone(),
+                    });
+                }
+                args.push((spec.name.clone(), Some(rest[idx].value.clone())));
+                idx += 1;
+            }
+            ArgKind::Optional => {
+                if rest.len() - idx > required_after(n) {
+                    args.push((spec.name.clone(), Some(rest[idx].value.clone())));
+                    idx += 1;
+                } else {
+                    args.push((spec.name.clone(), None));
+                }
+            }
+            ArgKind::Rest => {
+                if idx < rest.len() {
+                    args.push((
+                        spec.name.clone(),
+                        Some(trimmed[rest[idx].start..].to_string()),
+                    ));
+                    idx = rest.len();
+                } else {
+                    args.push((spec.name.clone(), None));
+                }
+                // Rest is always last (the editor enforces it).
+                break;
+            }
+        }
+    }
+
+    if idx < rest.len() {
+        let text = rest[idx..]
+            .iter()
+            .map(|t| t.value.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return CommandOutcome::NotFired(CommandMiss::Unclaimed { text });
+    }
+    CommandOutcome::Fired { args }
+}
+
+/// The generated usage line — `greet <person> [words...]` — used by both the
+/// editor's `Usage` row and the D10 missing-argument echo, so the two cannot
+/// drift.
+#[must_use]
+pub fn usage_line(name: &str, args: &[ArgSpec]) -> String {
+    let mut out = String::from(name);
+    for arg in args {
+        out.push(' ');
+        match arg.kind {
+            ArgKind::Required => {
+                out.push('<');
+                out.push_str(&arg.name);
+                out.push('>');
+            }
+            ArgKind::Optional => {
+                out.push('[');
+                out.push_str(&arg.name);
+                out.push(']');
+            }
+            ArgKind::Rest => {
+                out.push('[');
+                out.push_str(&arg.name);
+                out.push_str("...]");
+            }
+        }
+    }
+    out
+}
+
 /// The stored `pattern` derived from an alias sidecar — what a save writes.
 ///
 /// # Errors
@@ -848,6 +1147,189 @@ mod tests {
                 .expect("matches the raw line");
             assert_eq!(&captures["hp"], "42");
             assert!(!regex.is_match("42hp"));
+        }
+    }
+
+    mod tokenizer {
+        use super::*;
+
+        fn values(input: &str, parse: ParseMode) -> Vec<String> {
+            tokenize(input, parse)
+                .expect("tokenizes")
+                .into_iter()
+                .map(|t| t.value)
+                .collect()
+        }
+
+        /// fixtures.md §1 — tokens by parse mode.
+        #[test]
+        fn fixture_rows() {
+            use ParseMode::{All, Braces, Quotes, Raw, Spaces};
+            assert_eq!(
+                values(r#"big "ugly" troll"#, Spaces),
+                ["big", "\"ugly\"", "troll"]
+            );
+            assert_eq!(values("big   ugly", Spaces), ["big", "ugly"]);
+            assert_eq!(values(r#""big ugly" troll"#, Quotes), ["big ugly", "troll"]);
+            assert_eq!(values("'big ugly' troll", Quotes), ["big ugly", "troll"]);
+            assert_eq!(
+                tokenize(r#""big ugly troll"#, Quotes),
+                Err(TokenizeError::UnterminatedQuote)
+            );
+            assert_eq!(values(r#"say \"hi\""#, Quotes), ["say", "\"hi\""]);
+            // A closed quote glues into the surrounding bare run.
+            assert_eq!(
+                values(r#"{big "ugly"} troll"#, Quotes),
+                ["{big", "ugly}", "troll"]
+            );
+            assert_eq!(
+                values(r#"{big "ugly"} troll"#, Braces),
+                ["big \"ugly\"", "troll"]
+            );
+            assert_eq!(
+                values("{cast {magic missile}} now", Braces),
+                ["cast {magic missile}", "now"]
+            );
+            assert_eq!(
+                tokenize("{big ugly", Braces),
+                Err(TokenizeError::UnbalancedBraces)
+            );
+            assert_eq!(
+                values(r#""big ugly" troll"#, Braces),
+                ["\"big", "ugly\"", "troll"]
+            );
+            assert_eq!(
+                values(r#""big ugly" {a "gift"}"#, All),
+                ["big ugly", "a \"gift\""]
+            );
+            assert_eq!(values("big ugly troll", Raw), ["big ugly troll"]);
+            assert_eq!(values("  big  ugly  ", Raw), ["big  ugly"]);
+        }
+    }
+
+    mod command_assignment {
+        use super::*;
+
+        fn spec(name: &str, kind: ArgKind) -> ArgSpec {
+            ArgSpec {
+                name: name.to_string(),
+                kind,
+            }
+        }
+
+        fn fired(outcome: &CommandOutcome) -> &[(String, Option<String>)] {
+            match outcome {
+                CommandOutcome::Fired { args } => args,
+                CommandOutcome::NotFired(miss) => panic!("expected a fire, got {miss:?}"),
+            }
+        }
+
+        fn arg(outcome: &CommandOutcome, name: &str) -> Option<String> {
+            fired(outcome)
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| v.clone())
+        }
+
+        /// fixtures.md §2 — command matching, parse mode All unless noted.
+        #[test]
+        fn fixture_rows() {
+            use ArgKind::{Optional, Required, Rest};
+            let all = ParseMode::All;
+
+            // No args.
+            assert!(matches!(
+                assign("greet", "greet", &[], all),
+                CommandOutcome::Fired { .. }
+            ));
+            assert!(matches!(
+                assign("GREET", "greet", &[], all),
+                CommandOutcome::NotFired(CommandMiss::WrongFirstWord)
+            ));
+            for input in ["lobe", "obey", "greeting"] {
+                assert!(
+                    matches!(
+                        assign(input, "greet", &[], all),
+                        CommandOutcome::NotFired(CommandMiss::WrongFirstWord)
+                    ),
+                    "{input}"
+                );
+            }
+            assert!(matches!(
+                assign("greet Mira", "greet", &[], all),
+                CommandOutcome::NotFired(CommandMiss::Unclaimed { .. })
+            ));
+
+            let required = [spec("person", Required)];
+            let o = assign("greet Mira", "greet", &required, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("Mira"));
+            assert!(matches!(
+                assign("greet", "greet", &required, all),
+                CommandOutcome::NotFired(CommandMiss::MissingRequired { .. })
+            ));
+            let o = assign(r#"greet "big ugly troll""#, "greet", &required, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("big ugly troll"));
+
+            let optional = [spec("person", Optional)];
+            let o = assign("greet", "greet", &optional, all);
+            assert_eq!(arg(&o, "person"), None, "absent, not empty-string");
+            let o = assign("greet Mira", "greet", &optional, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("Mira"));
+
+            let rest = [spec("person", Rest)];
+            let o = assign("greet Mira and Bob", "greet", &rest, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("Mira and Bob"));
+            // The raw remainder: spacing and quoting preserved.
+            let o = assign(r#"greet "Mira"  and   Bob"#, "greet", &rest, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("\"Mira\"  and   Bob"));
+
+            let req_rest = [spec("person", Required), spec("mood", Rest)];
+            let o = assign("greet Mira warmly and often", "greet", &req_rest, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("Mira"));
+            assert_eq!(arg(&o, "mood").as_deref(), Some("warmly and often"));
+
+            // An optional yields to a later required.
+            let opt_req = [spec("person", Optional), spec("target", Required)];
+            let o = assign("greet Bob", "greet", &opt_req, all);
+            assert_eq!(arg(&o, "person"), None);
+            assert_eq!(arg(&o, "target").as_deref(), Some("Bob"));
+            let o = assign("greet Mira Bob", "greet", &opt_req, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("Mira"));
+            assert_eq!(arg(&o, "target").as_deref(), Some("Bob"));
+
+            assert!(matches!(
+                assign("greet Mira Bob", "greet", &required, all),
+                CommandOutcome::NotFired(CommandMiss::Unclaimed { .. })
+            ));
+            assert!(matches!(
+                assign(
+                    r#"greet "big ugly troll""#,
+                    "greet",
+                    &required,
+                    ParseMode::Spaces
+                ),
+                CommandOutcome::NotFired(CommandMiss::Unclaimed { .. })
+            ));
+
+            // Metacharacter names match as whole words, case-sensitively.
+            let star_rest = [spec("person", Rest)];
+            let o = assign("* waves hello", "*", &star_rest, all);
+            assert_eq!(arg(&o, "person").as_deref(), Some("waves hello"));
+            assert!(matches!(
+                assign("*waves", "*", &star_rest, all),
+                CommandOutcome::NotFired(CommandMiss::WrongFirstWord)
+            ));
+        }
+
+        #[test]
+        fn usage_line_matches_the_deck_format() {
+            let args = [
+                spec("target", ArgKind::Required),
+                spec("count", ArgKind::Optional),
+                spec("words", ArgKind::Rest),
+            ];
+            assert_eq!(usage_line("obe", &args), "obe <target> [count] [words...]");
+            assert_eq!(usage_line("greet", &[]), "greet");
         }
     }
 

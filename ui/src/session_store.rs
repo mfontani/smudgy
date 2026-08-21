@@ -1778,6 +1778,8 @@ impl ManagedSession {
                         let settings = load_settings();
                         let mut script_settings = ScriptSettings::from(&settings);
                         script_settings.palette = Some(crate::prefs::script_palette(&settings));
+                        self.input
+                            .set_command_separator(settings.command_separator.clone());
                         if let Err(e) = tx.send(RuntimeAction::ApplySettings {
                             command_separator: Arc::new(settings.command_separator),
                             raw_line_prefix: Arc::new(settings.raw_line_prefix),
@@ -2088,6 +2090,13 @@ impl ManagedSession {
                         }
                         Task::none()
                     }
+                    SessionEvent::CommandNames { names } => {
+                        // Command aliases match the main input pipeline only,
+                        // so the name list feeds the main input's completion
+                        // and nothing else.
+                        self.input.set_command_names(names);
+                        Task::none()
+                    }
                 }
             }
             Message::SyncUserAutomations => {
@@ -2169,6 +2178,8 @@ impl ManagedSession {
 
                 let mut script_settings = ScriptSettings::from(&settings);
                 script_settings.palette = Some(crate::prefs::script_palette(&settings));
+                self.input
+                    .set_command_separator(settings.command_separator.clone());
                 self.send_runtime_action(RuntimeAction::ApplySettings {
                     command_separator: Arc::new(settings.command_separator),
                     raw_line_prefix: Arc::new(settings.raw_line_prefix),

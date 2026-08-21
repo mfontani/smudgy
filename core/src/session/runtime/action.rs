@@ -165,6 +165,19 @@ pub enum RuntimeAction {
         is_alias: bool,
     },
     Echo(Arc<String>),
+    /// A Command alias matched its first word but a required argument was
+    /// missing (D10's third outcome): echo the usage line locally and mark the
+    /// input captured, so nothing reaches the MUD and no script runs. Not a
+    /// fire — `record_fire` is never called, so `fireLimit` does not tick —
+    /// but it participates in fallthrough exactly as a fire would: it honors
+    /// `stopped` and applies the alias's own `fallthrough`. Queued by
+    /// `Trigger::run` in place of [`Self::RunAutomation`].
+    EchoUsage {
+        text: Arc<String>,
+        is_captured: Option<Arc<AtomicBool>>,
+        stopped: Arc<AtomicBool>,
+        fallthrough: bool,
+    },
     /// Echo pre-styled whole lines (a styled `echo`): each element is one on-screen
     /// line whose spans were built — tiling, gap-free — at the op boundary. Takes the
     /// same counted Append path as [`RuntimeAction::Echo`].
