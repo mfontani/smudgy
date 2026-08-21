@@ -1818,6 +1818,18 @@ impl AutomationsWindow {
             Message::ScriptEditorAction(action) => matches!(action, text_editor::Action::Edit(_)),
             Message::SetName(_)
             | Message::SetAliasPattern(_)
+            | Message::SetAliasKind(_)
+            | Message::SetCommandName(_)
+            | Message::SetArgName(_, _)
+            | Message::SetArgKind(_, _)
+            | Message::AddArg
+            | Message::RemoveArg(_)
+            | Message::SetCmdMode(_)
+            | Message::SetParseMode(_)
+            | Message::SetPatternSource(_)
+            | Message::ToggleAnchorStart
+            | Message::ToggleAnchorEnd
+            | Message::TogglePrompt
             | Message::SetBehavior(_)
             | Message::AdjustPriority(_)
             | Message::ToggleFallthrough
@@ -1825,6 +1837,10 @@ impl AutomationsWindow {
             | Message::RemovePattern(_)
             | Message::SetPatternKind(_, _)
             | Message::SetPatternText(_, _)
+            | Message::SetRowSyntax(_, _)
+            | Message::ToggleRowAnchorStart(_)
+            | Message::ToggleRowAnchorEnd(_)
+            | Message::InsertReference(_)
             | Message::MarkHotkeyState(_) => true,
             _ => false,
         }
