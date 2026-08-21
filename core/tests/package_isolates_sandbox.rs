@@ -14,7 +14,7 @@
 use std::pin::Pin;
 use std::rc::Rc;
 #[cfg(feature = "web-audio")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "web-audio")]
 use std::thread;
@@ -41,6 +41,117 @@ const QUIET_PERIOD: Duration = Duration::from_millis(900);
 // runtimes concurrently. Every runtime helper holds this through stream teardown and the runtime
 // thread join, so no isolate destruction can overlap the next snapshot deserialize.
 static PACKAGE_ISOLATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(feature = "web-audio")]
+fn retained_online_context_module(label: &str, count: usize) -> String {
+    r#"
+        import { echo } from "smudgy:core";
+
+        if (Object.prototype.hasOwnProperty.call(globalThis, "__full_reload_heap_brand")) {
+          throw new Error("an old engine heap survived full-session reload");
+        }
+        globalThis.__full_reload_heap_brand = Symbol("__LABEL__-heap");
+
+        const held = [];
+        for (let index = 0; index < __COUNT__; index += 1) {
+          const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+          const gain = context.createGain();
+          const oscillator = context.createOscillator();
+          if (!(context instanceof AudioContext)
+              || Object.getPrototypeOf(context) !== AudioContext.prototype
+              || !(gain instanceof GainNode)
+              || Object.getPrototypeOf(gain) !== GainNode.prototype
+              || !(oscillator instanceof OscillatorNode)
+              || Object.getPrototypeOf(oscillator) !== OscillatorNode.prototype) {
+            throw new Error("replacement Web Audio objects have stale or foreign brands");
+          }
+          gain.gain.value = 0;
+          oscillator.connect(gain);
+          gain.connect(context.destination);
+          oscillator.start();
+          held.push({ context, gain, oscillator, graphBrand: Object.freeze({ index }) });
+        }
+        globalThis.__full_reload_retained_online_contexts = held;
+
+        const cycleKey = "smudgy-full-reload-__LABEL__-cycle";
+        const previous = Number(localStorage.getItem(cycleKey) ?? "0");
+        const cycle = previous + 1;
+        localStorage.setItem(cycleKey, String(cycle));
+        echo("FULL_RELOAD___LABEL___READY:" + cycle);
+    "#
+    .replace("__LABEL__", label)
+    .replace("__COUNT__", &count.to_string())
+}
+
+#[cfg(feature = "web-audio")]
+fn prove_full_script_bus_reuse(bus: &smudgy_audio::MixerScriptBusHandle) {
+    let reservations = (0..smudgy_audio::INPUTS_PER_BUS)
+        .map(|_| {
+            bus.try_reserve_input()
+                .expect("every Script slot is reusable at the engine boundary")
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(smudgy_audio::MixerControlError::InputCapacity)
+    ));
+    for reservation in reservations {
+        let retirement = futures::executor::block_on(reservation.abort())
+            .expect("boundary Script reservation retires exactly");
+        assert!(retirement.is_clean());
+    }
+}
+
+#[cfg(feature = "web-audio")]
+async fn wait_for_quiescent_audio_usage(
+    application: &smudgy_audio_web::ApplicationAudioOwner,
+    online_contexts: usize,
+    description: &str,
+) -> deno_audio::AudioHostUsage {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut previous = None;
+    let mut stable_samples = 0;
+    loop {
+        let usage = application.usage();
+        let quiescent = usage.online_contexts() == online_contexts
+            && usage.queued_control_commands() == 0
+            && usage.queued_events() == 0;
+        if quiescent && previous == Some(usage) {
+            stable_samples += 1;
+            if stable_samples >= 3 {
+                return usage;
+            }
+        } else {
+            previous = Some(usage);
+            stable_samples = 0;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {description}; last usage: {usage:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(feature = "web-audio")]
+async fn wait_for_exact_audio_usage(
+    application: &smudgy_audio_web::ApplicationAudioOwner,
+    expected: deno_audio::AudioHostUsage,
+    description: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let usage = application.usage();
+        if usage == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {description}; expected {expected:?}, got {usage:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 /// One `smudgy://owner/name` test package: its version and module sources (entry is `index.js`).
 struct TestPackage {
@@ -465,6 +576,498 @@ async fn sandboxed_package_can_render_web_audio() {
     assert_eq!(probe.play_count(), 1);
     drop(registration);
     assert!(service.shutdown().clean);
+}
+
+/// A live reload replaces the complete script engine: trusted main and every sandboxed package
+/// isolate. This stress keeps every old online context intentionally open and makes the runtime's
+/// generation retirement, rather than script-authored `close()`, return the exact application
+/// permits and Script slots before the replacement can construct anything.
+#[cfg(feature = "web-audio")]
+#[tokio::test]
+#[allow(clippy::await_holding_lock, clippy::too_many_lines)]
+async fn repeated_full_session_reload_returns_exact_audio_baseline() {
+    let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    let reload_server = "pi_full_session_audio_reload";
+    let sibling_server = "pi_full_reload_sibling";
+    for server in [reload_server, sibling_server] {
+        std::fs::create_dir_all(home.join(server).join("modules"))
+            .expect("create module directory");
+        std::fs::create_dir_all(home.join(server).join("logs")).expect("create log directory");
+    }
+
+    std::fs::write(
+        home.join(sibling_server).join("modules/sibling.ts"),
+        r#"
+        import { createAlias, echo } from "smudgy:core";
+        const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+        const gain = context.createGain();
+        const oscillator = context.createOscillator();
+        gain.gain.value = 0.025;
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start();
+        globalThis.__full_reload_sibling_audio = { context, gain, oscillator };
+        createAlias("^full_reload_ping$", () => echo("FULL_RELOAD_SIBLING_PONG"));
+        echo("FULL_RELOAD_SIBLING_READY");
+        "#,
+    )
+    .expect("write sibling module");
+    std::fs::write(
+        home.join(reload_server).join("modules/main.ts"),
+        retained_online_context_module("MAIN", 5),
+    )
+    .expect("write reloader main module");
+
+    let packages = vec![
+        TestPackage::new(
+            "reload",
+            "alpha",
+            "1.0.0",
+            &retained_online_context_module("ALPHA", 5),
+        ),
+        TestPackage::new(
+            "reload",
+            "bravo",
+            "1.0.0",
+            &retained_online_context_module("BRAVO", 5),
+        ),
+        TestPackage::new(
+            "reload",
+            "charlie",
+            "1.0.0",
+            &retained_online_context_module("CHARLIE", 5),
+        ),
+        TestPackage::new(
+            "reload",
+            "delta",
+            "1.0.0",
+            &retained_online_context_module("DELTA", 5),
+        ),
+        TestPackage::new(
+            "reload",
+            "echo",
+            "1.0.0",
+            &retained_online_context_module("ECHO", 5),
+        ),
+        TestPackage::new(
+            "reload",
+            "zulu",
+            "1.0.0",
+            &retained_online_context_module("ZULU", 2),
+        ),
+    ];
+    for package in &packages {
+        let specifier = format!("smudgy://{}/{}", package.owner, package.name);
+        shared_packages::install_package(reload_server, &specifier, UpdateMode::Auto, true)
+            .expect("install reload package");
+        shared_packages::record_consent(
+            reload_server,
+            &specifier,
+            &PackagePermissions {
+                smudgy: SmudgyCapabilities::all(),
+                ..Default::default()
+            },
+        )
+        .expect("grant package echo capability");
+    }
+    let package_factory: PackageProviderFactory = Arc::new(move || {
+        let mut provider = InMemoryPackageProvider::new();
+        for package in &packages {
+            provider.insert(ResolvedPackage {
+                key: PackageKey {
+                    owner: package.owner.to_string(),
+                    name: package.name.to_string(),
+                },
+                resolved_version: package.version.to_string(),
+                manifest: PackageManifest::parse(&format!(
+                    "{{ \"name\": \"{}\", \"version\": \"{}\" }}",
+                    package.name, package.version
+                ))
+                .expect("valid reload package manifest"),
+                integrity: format!("reload-{}-{}", package.name, package.version),
+                modules: package
+                    .modules
+                    .iter()
+                    .map(|(subpath, text)| PackageModuleSource {
+                        subpath: (*subpath).to_string(),
+                        text: text.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        Rc::new(provider) as Rc<dyn PackageProvider>
+    });
+
+    let (service, probe) = smudgy_audio::test_support::start_test_mixer(
+        48_000,
+        smudgy_audio::test_support::TestDriverConfig::default(),
+    )
+    .expect("headless process mixer starts once");
+    let render_done = Arc::new(AtomicBool::new(false));
+    let rendered_quanta = Arc::new(AtomicUsize::new(0));
+    let non_silent_quanta = Arc::new(AtomicUsize::new(0));
+    let render_thread = {
+        let render_done = Arc::clone(&render_done);
+        let rendered_quanta = Arc::clone(&rendered_quanta);
+        let non_silent_quanta = Arc::clone(&non_silent_quanta);
+        let probe = probe.clone();
+        thread::spawn(move || {
+            let mut output = [0.0; 256];
+            while !render_done.load(Ordering::Acquire) {
+                if probe.render(&mut output, 2).is_ok() {
+                    rendered_quanta.fetch_add(1, Ordering::AcqRel);
+                    if output.iter().any(|sample| sample.abs() > f32::EPSILON) {
+                        non_silent_quanta.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+
+    let mut application = Arc::new(smudgy_audio_web::ApplicationAudioOwner::new(
+        deno_audio::AudioHostLimits::unlimited()
+            .max_online_contexts(Some(33))
+            .max_live_audio_bytes(Some(32 * 1024 * 1024))
+            .max_graph_nodes(Some(1_024))
+            .max_graph_connections(Some(1_024))
+            .max_scheduled_sources(Some(512))
+            .max_automation_events(Some(1_024))
+            .max_queued_control_commands(Some(2_048))
+            .max_queued_events(Some(2_048))
+            .max_decode_jobs(Some(2))
+            .max_offline_render_jobs(Some(2)),
+    ));
+    let empty_baseline = application.usage();
+    assert_eq!(empty_baseline, deno_audio::AudioHostUsage::default());
+
+    let sibling_numeric_id = 9_220;
+    let sibling_id = SessionId::from(sibling_numeric_id);
+    let sibling_owner = service
+        .add_session(smudgy_audio::AudioSessionId(u64::from(sibling_numeric_id)))
+        .expect("sibling joins process mixer");
+    let sibling_registration = application
+        .registrar()
+        .register_session(sibling_owner)
+        .expect("sibling audio registration succeeds");
+    let sibling_params = Arc::new(SessionParams {
+        session_id: sibling_id,
+        server_name: Arc::new(sibling_server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+    let mut sibling_events = Box::pin(
+        smudgy_core::session::spawn_with_audio(sibling_params, sibling_registration.scope())
+            .expect("sibling audio scope matches"),
+    );
+    let mut sibling_tx = None;
+    tokio::time::timeout(Duration::from_mins(1), async {
+        let mut ready = false;
+        while sibling_tx.is_none() || !ready {
+            let event = sibling_events.next().await.expect("sibling remains live");
+            match event.event {
+                SessionEvent::RuntimeReady(tx) => sibling_tx = Some(tx),
+                SessionEvent::UpdateBuffer(updates) => {
+                    ready |= updates.iter().any(|update| {
+                        matches!(update, BufferUpdate::Append(line) if line.text == "FULL_RELOAD_SIBLING_READY")
+                    });
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("sibling starts");
+    let sibling_baseline =
+        wait_for_quiescent_audio_usage(&application, 1, "sibling-only host baseline").await;
+    assert_eq!(sibling_baseline.graph_nodes(), 5);
+    assert_eq!(sibling_baseline.graph_connections(), 2);
+    assert_eq!(sibling_baseline.scheduled_sources(), 1);
+
+    let reload_numeric_id = 9_221;
+    let reload_id = SessionId::from(reload_numeric_id);
+    let reload_owner = service
+        .add_session(smudgy_audio::AudioSessionId(u64::from(reload_numeric_id)))
+        .expect("reloader joins the same process mixer");
+    let reload_script_bus = reload_owner.script_bus();
+    let reload_native_bus = reload_owner.native_bus();
+    let reload_speech_bus = reload_owner.speech_bus();
+    let reload_registration = application
+        .registrar()
+        .register_session(reload_owner)
+        .expect("reloader audio registration succeeds");
+    let reload_scope = reload_registration.scope();
+    let scope_debug = format!("{reload_scope:?}");
+    let rebuild_count = Arc::new(AtomicUsize::new(0));
+    let on_engine_rebuild: Arc<dyn Fn() + Send + Sync> = {
+        let application = Arc::clone(&application);
+        let reload_script_bus = reload_script_bus.clone();
+        let rebuild_count = Arc::clone(&rebuild_count);
+        Arc::new(move || {
+            assert_eq!(
+                application.usage(),
+                sibling_baseline,
+                "old main/package contexts must drain before replacement construction"
+            );
+            prove_full_script_bus_reuse(&reload_script_bus);
+            assert_eq!(application.usage(), sibling_baseline);
+            rebuild_count.fetch_add(1, Ordering::AcqRel);
+        })
+    };
+    let reload_params = Arc::new(SessionParams {
+        session_id: reload_id,
+        server_name: Arc::new(reload_server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: Some(Arc::clone(&on_engine_rebuild)),
+    });
+    let mut reload_events = Box::pin(
+        spawn_with_package_provider_and_audio(reload_params, package_factory, reload_scope.clone())
+            .expect("reloader audio scope matches"),
+    );
+    let mut reload_tx = None;
+    let labels = ["MAIN", "ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "ZULU"];
+    let mut transcript = Vec::new();
+    let mut loaded_baseline = None;
+    let mut cross_reload_render_threshold = None;
+
+    for cycle in 1..=4 {
+        let expected = labels
+            .iter()
+            .map(|label| format!("FULL_RELOAD_{label}_READY:{cycle}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut observed = std::collections::BTreeSet::new();
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while observed != expected {
+                let event = reload_events.next().await.expect("reloader remains live");
+                match event.event {
+                    SessionEvent::RuntimeReady(tx) => reload_tx = Some(tx),
+                    SessionEvent::UpdateBuffer(updates) => {
+                        for update in updates.iter() {
+                            if let BufferUpdate::Append(line) = update {
+                                transcript.push(line.text.clone());
+                                if expected.contains(&line.text) {
+                                    observed.insert(line.text.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "generation {cycle} did not reconstruct every isolate; observed {observed:?}; transcript: {transcript:#?}"
+            )
+        });
+        if let Some((rendered_before_reload, non_silent_before_reload)) =
+            cross_reload_render_threshold.take()
+        {
+            assert!(
+                rendered_quanta.load(Ordering::Acquire) > rendered_before_reload
+                    && non_silent_quanta.load(Ordering::Acquire) > non_silent_before_reload,
+                "sibling physical output did not advance across reload cycle {cycle}"
+            );
+        }
+        assert_eq!(rebuild_count.load(Ordering::Acquire), cycle);
+        assert_eq!(format!("{reload_scope:?}"), scope_debug);
+        assert_eq!(reload_scope.session_id(), u64::from(reload_numeric_id));
+
+        let loaded = wait_for_quiescent_audio_usage(
+            &application,
+            33,
+            &format!("loaded Web Audio generation {cycle}"),
+        )
+        .await;
+        assert!(matches!(
+            reload_script_bus.try_reserve_input(),
+            Err(smudgy_audio::MixerControlError::InputCapacity)
+        ));
+        if let Some(expected_loaded) = loaded_baseline {
+            assert_eq!(loaded, expected_loaded);
+        } else {
+            assert_eq!(
+                loaded.online_contexts() - sibling_baseline.online_contexts(),
+                32
+            );
+            assert_eq!(loaded.graph_nodes() - sibling_baseline.graph_nodes(), 160);
+            assert_eq!(
+                loaded.graph_connections() - sibling_baseline.graph_connections(),
+                64
+            );
+            assert_eq!(
+                loaded.scheduled_sources() - sibling_baseline.scheduled_sources(),
+                32
+            );
+            assert_eq!(
+                loaded.live_audio_bytes(),
+                sibling_baseline.live_audio_bytes()
+            );
+            assert_eq!(
+                loaded.automation_events(),
+                sibling_baseline.automation_events()
+            );
+            assert_eq!(
+                loaded.queued_control_commands(),
+                sibling_baseline.queued_control_commands()
+            );
+            assert_eq!(loaded.queued_events(), sibling_baseline.queued_events());
+            assert_eq!(loaded.decode_jobs(), sibling_baseline.decode_jobs());
+            assert_eq!(
+                loaded.offline_render_jobs(),
+                sibling_baseline.offline_render_jobs()
+            );
+            loaded_baseline = Some(loaded);
+        }
+
+        let native_gains = [0.55, 0.60, 0.65, 0.70];
+        let speech_gains = [0.70, 0.65, 0.60, 0.55];
+        reload_native_bus
+            .set_gain(native_gains[cycle - 1])
+            .expect("the exact Native bus survives reload");
+        reload_speech_bus
+            .set_gain(speech_gains[cycle - 1])
+            .expect("the exact Speech bus survives reload");
+        let rendered_before = rendered_quanta.load(Ordering::Acquire);
+        let non_silent_before = non_silent_quanta.load(Ordering::Acquire);
+        let render_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while rendered_quanta.load(Ordering::Acquire) == rendered_before
+            || non_silent_quanta.load(Ordering::Acquire) == non_silent_before
+        {
+            assert!(
+                tokio::time::Instant::now() < render_deadline,
+                "sibling rendering stopped during reload cycle {cycle}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        sibling_tx
+            .as_ref()
+            .expect("sibling published its runtime")
+            .send(RuntimeAction::Send(Arc::new(
+                "full_reload_ping".to_string(),
+            )))
+            .expect("sibling accepts a per-cycle action");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = sibling_events.next().await.expect("sibling remains responsive");
+                if let SessionEvent::UpdateBuffer(updates) = event.event
+                    && updates.iter().any(|update| {
+                        matches!(update, BufferUpdate::Append(line) if line.text == "FULL_RELOAD_SIBLING_PONG")
+                    })
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("sibling stopped responding during reload cycle {cycle}"));
+        assert_eq!(application.usage(), loaded);
+        assert_eq!(probe.start_count(), 1);
+        assert_eq!(probe.play_count(), 1);
+
+        if cycle < 4 {
+            cross_reload_render_threshold = Some((
+                rendered_quanta.load(Ordering::Acquire),
+                non_silent_quanta.load(Ordering::Acquire),
+            ));
+            reload_tx
+                .as_ref()
+                .expect("reloader published its runtime")
+                .send(RuntimeAction::Reload)
+                .expect("reloader accepts full-session reload");
+        }
+    }
+
+    reload_tx
+        .take()
+        .expect("reloader published its runtime")
+        .send(RuntimeAction::Shutdown)
+        .expect("reloader accepts shutdown");
+    drop(reload_events);
+    let reload_join = tokio::task::spawn_blocking(move || join_runtime_thread(reload_id))
+        .await
+        .expect("reloader join task does not panic");
+    assert_eq!(
+        reload_join,
+        RuntimeThreadJoinOutcome::Clean {
+            session_id: reload_id
+        }
+    );
+    wait_for_exact_audio_usage(
+        &application,
+        sibling_baseline,
+        "final reloader generation retirement",
+    )
+    .await;
+    prove_full_script_bus_reuse(&reload_script_bus);
+    reload_registration
+        .retire()
+        .await
+        .expect("reloader mixer session retires exactly");
+
+    sibling_tx
+        .take()
+        .expect("sibling published its runtime")
+        .send(RuntimeAction::Shutdown)
+        .expect("sibling accepts shutdown");
+    drop(sibling_events);
+    let sibling_join = tokio::task::spawn_blocking(move || join_runtime_thread(sibling_id))
+        .await
+        .expect("sibling join task does not panic");
+    assert_eq!(
+        sibling_join,
+        RuntimeThreadJoinOutcome::Clean {
+            session_id: sibling_id
+        }
+    );
+    wait_for_exact_audio_usage(
+        &application,
+        empty_baseline,
+        "empty application host baseline",
+    )
+    .await;
+    sibling_registration
+        .retire()
+        .await
+        .expect("sibling mixer session retires exactly");
+
+    drop(reload_scope);
+    drop(reload_script_bus);
+    drop(reload_native_bus);
+    drop(reload_speech_bus);
+    drop(on_engine_rebuild);
+    assert!(
+        Arc::get_mut(&mut application)
+            .expect("all scoped application authorities are retired")
+            .seal()
+    );
+    assert_eq!(application.usage(), empty_baseline);
+
+    render_done.store(true, Ordering::Release);
+    render_thread.join().expect("fake physical renderer joins");
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(probe.start_count(), 1);
+    assert_eq!(probe.play_count(), 1);
+    assert_eq!(probe.close_count(), 1);
 }
 
 /// Cross-isolate depth-first ordering with a real second isolate: a main-isolate alias
