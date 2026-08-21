@@ -210,6 +210,91 @@ async fn capture_matches_object_is_numeric_and_named() {
     );
 }
 
+/// A module registering aliases that exercise `RegExp` flag translation: `/…/i` must
+/// match case-insensitively (the flag is baked into the engine-facing source as a
+/// `(?i:…)` wrapper), the wrapper must not disturb capture-group numbering, and a
+/// flagless pattern must stay case-sensitive.
+const FLAGS_TS: &str = r#"
+import { createAlias, echo } from "smudgy:core";
+
+createAlias(/^flagged (\w+) (?<who>\w+)$/i, (m) => {
+    const ok = m[0] === "FLAGGED One Two" && m[1] === "One" && m.who === "Two";
+    echo(ok
+        ? "FLAGS_OK"
+        : ("FLAGS_FAIL 0=" + m[0] + " 1=" + m[1] + " who=" + m.who));
+});
+
+createAlias("^plain (\\w+)$", () => { echo("PLAIN_FIRED"); });
+"#;
+
+/// Drive `FLAGS_TS`: an `/…/i` alias fires on differently-cased input with intact
+/// group numbering, while a flagless pattern stays case-sensitive.
+#[tokio::test]
+async fn regexp_flags_are_honored() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "Flags";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules_dir.join("flags.ts"), FLAGS_TS).unwrap();
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(7013),
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    tx.send(RuntimeAction::Send(Arc::new("FLAGGED One Two".to_string())))
+        .unwrap();
+    tx.send(RuntimeAction::Send(Arc::new("PLAIN x".to_string())))
+        .unwrap();
+
+    let mut lines = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+
+    tx.send(RuntimeAction::Shutdown).ok();
+
+    let transcript = lines.join("\n");
+    assert!(
+        lines.iter().any(|l| l == "FLAGS_OK"),
+        "an /i alias must fire on differently-cased input with intact group numbering.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "PLAIN_FIRED"),
+        "a flagless pattern must stay case-sensitive.\nTranscript:\n{transcript}"
+    );
+}
+
 /// One alias, two patterns. Sending `first x` fires pattern one, where `a`
 /// participates, `opt` (an optional group of the fired pattern) does not, and
 /// `b` belongs to the pattern that did not fire. The handler reports what each

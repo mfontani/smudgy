@@ -2683,9 +2683,7 @@ function createAlias(
     const priority = normalizePriority(options);
     const fallthrough = normalizeFallthrough(options);
 
-    const patternList = (Array.isArray(patterns) ? patterns : [patterns]).map((p) =>
-        p instanceof RegExp ? p.source : p,
-    );
+    const patternList = (Array.isArray(patterns) ? patterns : [patterns]).map(patternSource);
     const name = resolveAutomationName(options.name, () => derivePatternName(patternList));
 
     const singleton = options.singleton ?? false;
@@ -2905,6 +2903,27 @@ function validateCreateTriggerParams(
     return { name, normalizedPatterns, script };
 }
 
+/**
+ * The engine-facing source of one pattern. A string passes through as regex source.
+ * A RegExp contributes its source with its flags translated: `i` and `s` carry the
+ * same meaning in the host engine and are baked in as a non-capturing inline-flag
+ * group, `(?is:...)`, which leaves capture-group numbering untouched. The remaining
+ * flags are dropped: `m` would promise interior line boundaries that a
+ * one-line-at-a-time subject never contains, `g`, `y`, and `d` are
+ * iteration/stateful flags with no meaning for a match-once-per-line engine, and
+ * `u`/`v` are moot because the host engine is Unicode-aware by default (a `v`-mode
+ * source using set notation may still be rejected by the host at registration).
+ */
+function patternSource(p: Pattern): string {
+    if (!(p instanceof RegExp)) {
+        return p;
+    }
+    let flags = "";
+    if (p.ignoreCase) flags += "i";
+    if (p.dotAll) flags += "s";
+    return flags === "" ? p.source : `(?${flags}:${p.source})`;
+}
+
 /** Normalizes the patterns for a trigger. */
 function normalizePatterns(patterns: Pattern | TriggerPatterns): {
     patterns: string[];
@@ -2918,17 +2937,11 @@ function normalizePatterns(patterns: Pattern | TriggerPatterns): {
     };
 
     if (typeof patterns === "string" || patterns instanceof RegExp) {
-        normalized.patterns = [patterns instanceof RegExp ? patterns.source : patterns];
+        normalized.patterns = [patternSource(patterns)];
     } else if (typeof patterns === "object") {
-        normalized.patterns = (patterns.patterns || []).map((p) =>
-            p instanceof RegExp ? p.source : p,
-        );
-        normalized.rawPatterns = (patterns.rawPatterns || []).map((p) =>
-            p instanceof RegExp ? p.source : p,
-        );
-        normalized.antiPatterns = (patterns.antiPatterns || []).map((p) =>
-            p instanceof RegExp ? p.source : p,
-        );
+        normalized.patterns = (patterns.patterns || []).map(patternSource);
+        normalized.rawPatterns = (patterns.rawPatterns || []).map(patternSource);
+        normalized.antiPatterns = (patterns.antiPatterns || []).map(patternSource);
     }
 
     return normalized;

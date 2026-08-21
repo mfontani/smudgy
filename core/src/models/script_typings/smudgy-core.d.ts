@@ -1741,6 +1741,13 @@ declare module "smudgy:core" {
    * A match pattern: a regular expression, written either as a `RegExp`
    * (`/^You follow/`) or as a string of regex source (`"^You follow"`).
    * Strings are compiled as regexes, not matched literally.
+   *
+   * A `RegExp`'s flags are honored: `i` and `s` carry their usual meaning.
+   * The rest are dropped. `m` would promise interior line boundaries, but only
+   * a single line is ever matched; `g`, `y`, and `d` have nothing to change in
+   * a pattern matched once per line; and `u`/`v` are unnecessary — matching is
+   * Unicode-aware by default (a `v`-mode pattern using set notation may be
+   * rejected when the automation is created).
    */
   type Pattern = string | RegExp;
 
