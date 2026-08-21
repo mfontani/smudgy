@@ -293,6 +293,10 @@ pub enum Message {
     ToggleAnchorStart,
     ToggleAnchorEnd,
     TogglePrompt,
+    RevealOrder,
+    HideOrder,
+    /// Insert a capture reference at the caret in the action body.
+    InsertReference(String),
     /// Move the open script to a folder (`None` = top level). Also dispatched by
     /// the palette's "Move to…" group for the selected script.
     SetScriptFolder(Option<String>),
@@ -594,6 +598,10 @@ pub struct AutomationsWindow {
     /// The alias editor's matcher draft (kind + every kind's buffers), seeded
     /// on open/create like `hotkey_state` and consumed at save.
     pub(super) alias_draft: model::AliasMatcherDraft,
+    /// Whether the "When it runs" module is disclosed by the user's click.
+    /// Non-default values force it open regardless (and it cannot re-hide
+    /// while they hold); reset when an editor opens.
+    pub(super) order_revealed: bool,
     pub(super) test_input: String,
     pub(super) dirty: bool,
     pub(super) pending_nav: Option<Box<Message>>,
@@ -826,6 +834,7 @@ impl AutomationsWindow {
             editor_content: text_editor::Content::new(),
             hotkey_state: Vec::new(),
             alias_draft: model::AliasMatcherDraft::default(),
+            order_revealed: false,
             test_input: String::new(),
             dirty: false,
             pending_nav: None,
@@ -1230,6 +1239,21 @@ impl AutomationsWindow {
                 {
                     *prompt = !*prompt;
                 }
+                Update::none()
+            }
+            Message::RevealOrder => {
+                self.order_revealed = true;
+                Update::none()
+            }
+            Message::HideOrder => {
+                self.order_revealed = false;
+                Update::none()
+            }
+            Message::InsertReference(reference) => {
+                self.editor_content
+                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(reference),
+                    )));
                 Update::none()
             }
             Message::SetScriptFolder(folder) => self.set_script_folder(folder),

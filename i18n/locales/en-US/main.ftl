@@ -1038,6 +1038,10 @@ editor-unclaimed = Nothing captures "{ $text }"
 editor-unterminated-quote = Unterminated quote
 editor-unbalanced-braces = Unbalanced braces
 editor-row-error = Row { $row }: { $error }
+editor-reveal-order-aliases = Adjust priority or prevent other aliases from firing
+editor-reveal-order-triggers = Adjust priority or prevent other triggers from firing
+editor-hide-order = Hide priority options
+editor-matched-values = Matched values
 widget-hotkey-click-to-record = click to record
 widget-hotkey-listening = listening...
 

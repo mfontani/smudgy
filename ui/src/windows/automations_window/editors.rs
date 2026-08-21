@@ -89,6 +89,7 @@ impl AutomationsWindow {
         self.clear_selection();
         self.selection = Selection::Script(key.clone());
         self.test_input.clear();
+        self.order_revealed = false;
 
         let body = match &script {
             Script::Alias(a) => a.script.clone().unwrap_or_default(),
@@ -139,6 +140,7 @@ impl AutomationsWindow {
         self.selection = Selection::None;
         self.editor_content = text_editor::Content::new();
         self.test_input.clear();
+        self.order_revealed = false;
         // Command is the default kind for new aliases.
         self.alias_draft = AliasMatcherDraft::default();
         self.pane = Pane::Editor(EditorState {
@@ -165,6 +167,7 @@ impl AutomationsWindow {
         self.selection = Selection::None;
         self.editor_content = text_editor::Content::new();
         self.test_input.clear();
+        self.order_revealed = false;
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -1042,6 +1045,137 @@ impl AutomationsWindow {
         .into()
     }
 
+    /// The "When it runs" module behind its disclosure: hidden as a text link
+    /// until clicked, forced open — and not re-hideable — while any value is
+    /// non-default, with a hide link when open on pure defaults.
+    fn order_module<'a>(
+        &self,
+        priority: i32,
+        fallthrough: bool,
+        prompt: Option<bool>,
+        trigger: bool,
+    ) -> Elem<'a> {
+        let non_default = priority != 0 || !fallthrough || prompt == Some(true);
+        if !non_default && !self.order_revealed {
+            let label = if trigger {
+                crate::i18n::t!("editor-reveal-order-triggers")
+            } else {
+                crate::i18n::t!("editor-reveal-order-aliases")
+            };
+            return field_row(
+                "",
+                button(text(label).size(12.0).style(common::muted))
+                    .style(button_style::link)
+                    .on_press(Message::RevealOrder)
+                    .padding(0)
+                    .into(),
+            );
+        }
+        let mut module = column![self.matching_options(priority, fallthrough, prompt)].spacing(6.0);
+        if !non_default {
+            module = module.push(field_row(
+                "",
+                button(
+                    text(crate::i18n::t!("editor-hide-order"))
+                        .size(12.0)
+                        .style(common::muted),
+                )
+                .style(button_style::link)
+                .on_press(Message::HideOrder)
+                .padding(0)
+                .into(),
+            ));
+        }
+        module.into()
+    }
+
+    /// The Matched-values rail: one clickable badge per capture the current
+    /// matcher provides, inserting its reference at the caret in the action
+    /// body. Absent entirely when nothing is captured.
+    fn matched_values_rail<'a>(&self, references: Vec<String>) -> Option<Elem<'a>> {
+        if references.is_empty() {
+            return None;
+        }
+        let mut rail = row![].spacing(6.0).align_y(Vertical::Center);
+        for reference in references {
+            rail = rail.push(
+                button(
+                    text(reference.clone())
+                        .size(12.0)
+                        .font(fonts::GEIST_MONO_VF),
+                )
+                .style(button_style::secondary)
+                .on_press(Message::InsertReference(reference))
+                .padding([3, 8]),
+            );
+        }
+        Some(
+            column![
+                common::section_label(crate::i18n::ts!("editor-matched-values")),
+                rail,
+            ]
+            .spacing(4.0)
+            .into(),
+        )
+    }
+
+    /// The capture references the open alias's draft provides, rendered in the
+    /// action language's vocabulary (`$name` for text, `matches.name` for JS).
+    fn alias_capture_references(&self, language: ScriptLang) -> Vec<String> {
+        let draft = &self.alias_draft;
+        let captures: Vec<Option<String>> = match draft.kind {
+            AliasKind::Command => draft
+                .args
+                .iter()
+                .map(|arg| Some(arg.name.clone()))
+                .collect(),
+            AliasKind::Pattern => {
+                let compiled = matchers::compile_pattern(
+                    &draft.pattern_source,
+                    draft.anchor_start,
+                    draft.anchor_end,
+                );
+                if compiled.errors.is_empty() {
+                    compiled.captures
+                } else {
+                    Vec::new()
+                }
+            }
+            AliasKind::Regex => regex::Regex::new(&draft.regex_source)
+                .map(|re| {
+                    re.capture_names()
+                        .skip(1)
+                        .map(|n| n.map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        render_references(&captures, language)
+    }
+
+    /// The capture references a trigger's Match/Raw rows provide (the union,
+    /// in row order).
+    fn trigger_capture_references(rows: &[TriggerRow], language: ScriptLang) -> Vec<String> {
+        let mut captures: Vec<Option<String>> = Vec::new();
+        for row in rows {
+            if row.role == PatternKind::Anti || row.source.trim().is_empty() {
+                continue;
+            }
+            let Ok(source) = row.compiled() else { continue };
+            let Ok(re) = regex::Regex::new(&source) else {
+                continue;
+            };
+            for name in re.capture_names().skip(1) {
+                let name = name.map(str::to_string);
+                if name.is_some() && captures.contains(&name) {
+                    continue;
+                }
+                captures.push(name);
+            }
+        }
+        render_references(&captures, language)
+    }
+
     fn matching_options<'a>(
         &self,
         priority: i32,
@@ -1334,8 +1468,12 @@ impl AutomationsWindow {
             }
         }
         body = body.push(self.tester_box(crate::i18n::ts!("editor-test-command"), "", true));
-        body = body.push(self.matching_options(alias.priority, alias.fallthrough, None));
+        body = body.push(self.order_module(alias.priority, alias.fallthrough, None, false));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
+        if let Some(rail) = self.matched_values_rail(self.alias_capture_references(alias.language))
+        {
+            body = body.push(rail);
+        }
         body = body.push(self.code_editor(alias.language));
         if let Some(bar) = self.save_bar(
             create,
@@ -1584,8 +1722,13 @@ impl AutomationsWindow {
         ));
 
         body = body.push(self.tester_box(crate::i18n::ts!("editor-test-line"), "", false));
-        body = body.push(self.matching_options(priority, fallthrough, Some(prompt)));
+        body = body.push(self.order_module(priority, fallthrough, Some(prompt), true));
         body = body.push(field_row("Behavior", self.behavior_radios(language)));
+        if let Some(rail) =
+            self.matched_values_rail(Self::trigger_capture_references(rows, language))
+        {
+            body = body.push(rail);
+        }
         body = body.push(self.code_editor(language));
         if let Some(bar) = self.save_bar(
             create,
@@ -2350,6 +2493,21 @@ fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style 
         NodeStatus::Warning => common::warning,
         NodeStatus::Disabled => common::muted,
     }
+}
+
+/// Renders capture references in the action language's vocabulary: `$name` /
+/// `$N` for a text body, `matches.name` / `matches[N]` for JavaScript.
+fn render_references(captures: &[Option<String>], language: ScriptLang) -> Vec<String> {
+    captures
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match (name, language) {
+            (Some(name), ScriptLang::Plaintext) => format!("${name}"),
+            (Some(name), _) => format!("matches.{name}"),
+            (None, ScriptLang::Plaintext) => format!("${}", i + 1),
+            (None, _) => format!("matches[{}]", i + 1),
+        })
+        .collect()
 }
 
 /// The Try-it verdict for a Command miss, in the deck's words.
