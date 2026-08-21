@@ -1,12 +1,14 @@
-# Web Audio preview
+# Web Audio support
 
 Smudgy has a bounded, standards-shaped Web Audio integration for short
 scripted synthesis such as accessibility earcons. It is available to trusted
 modules and sandboxed packages through the same per-session output boundary.
 
-This is currently a source-build preview. Official release builds remain
-hardware-free until the physical-output release slice is completed and tested.
-Packages must not yet require Web Audio in a published release of Smudgy.
+Official Windows, macOS, and Flatpak build paths select the physical Web Audio
+feature. The API remains available through hosted silent emulation when a
+compatible physical output is absent, full, or unavailable at startup. Platform
+runtime evidence is listed below; configured packaging is not itself a runtime
+or device-support claim.
 
 Audio is optional: an unavailable physical output or lifecycle worker never
 prevents the terminal client or Web Audio globals from starting. A no-argument
@@ -19,7 +21,7 @@ not persisted as a successful change.
 
 ## Volume and mute controls
 
-The source preview exposes one master row, one row for every active session,
+The audio panel exposes one master row, one row for every active session,
 and one row for each enabled sandbox package root. Trusted packages run on
 Main and are explicitly labeled as session-controlled; Smudgy does not claim
 truthful per-package control inside that shared isolate.
@@ -47,11 +49,11 @@ announcements remain out of scope.
 
 | Configuration | Web Audio availability | Output |
 | --- | --- | --- |
-| No feature (the release default) | Not installed in ordinary sessions | No audio device dependency |
+| No feature (crate default) | Not installed in ordinary sessions | No audio device dependency |
 | `web-audio` | Available only to callers that construct an explicit audio-scoped session | An injected logical output, including `sinkId: "none"`; no CPAL device backend |
-| `web-audio-cpal` | Enables the desktop audio coordinator and includes `web-audio` | One shared default-device stream when available; otherwise default output and `sinkId: "none"` use hosted silent emulation |
+| `web-audio-cpal` (official desktop packages) | Enables the desktop audio coordinator and includes `web-audio` | One shared default-device stream when available; otherwise default output and `sinkId: "none"` use hosted silent emulation |
 
-For the physical preview:
+For a physical source build:
 
 ```sh
 cargo run -p smudgy_ui --features web-audio-cpal
@@ -106,11 +108,29 @@ module-loading, subprocess, FFI, system-information, or audio-capture authority.
 Audio sources remain subject to the package's existing source-access rules.
 Graphs and mixer inputs are private to their context, isolate, and session.
 
+The Flatpak package statically grants `--socket=pulseaudio`. That is a broad
+application-level sandbox opening because the PulseAudio protocol can expose
+both playback and capture capabilities to native code. Smudgy's CPAL integration
+opens output only, and Web Audio provides no capture API or operation. Sandboxed
+packages receive no new module-loading, filesystem, network, subprocess, FFI,
+system-information, or capture authority; all existing checks remain in force.
+The trusted Main isolate is already allow-all, including FFI. Native code it is
+already authorized to load can inherit the Flatpak's new audio-server
+reachability, including protocol-level capture capability. That residual is why
+the static socket grant is broader than the Web Audio output API.
+
 ## Manual physical checks
 
 ### Current evidence
 
-On 2026-08-19 the ignored Windows/WASAPI lifecycle smoke passed with:
+On 2026-08-20 `./bin/release.ps1 -BuildOnly` completed the unsigned
+`release-full` physical-feature build. A validation-only unsigned Inno compile
+then assembled the installer, and its compiler log confirmed that the app,
+inspector, runtime DLLs, and `THIRD-PARTY-NOTICES.md` were included. That
+installer was neither signed nor launched, so this is build/package-assembly
+evidence only.
+
+The ignored Windows/WASAPI lifecycle smoke also passed with:
 
 ```powershell
 cargo test -p smudgy_audio --features physical-output --lib `
@@ -122,21 +142,25 @@ The test opened the default device, exercised suspend/resume and logical input
 shutdown, and reported `shutdown.clean == true` with `failure == None`. An
 immediate second service open/shutdown also reported clean/none.
 
-This branch configures platform compile and injected-output test jobs, but those
-jobs are not runtime-device evidence until CI has run them. Windows live device
-removal and default-device change remain pending. Physical runtime exercises on
-Linux and macOS also remain pending.
+Windows live device removal, audible playback, and default-device change remain
+pending. Physical runtime exercises on Linux and macOS also remain pending.
 
 CI is configured to compile the physical feature and run injected-output tests
 on Windows, Linux, and macOS, but it never requires a default audio device.
-Before enabling physical output in a release, record the following on available
-hosts:
+Configuration and compile results are not runtime evidence. The current support
+table is intentionally evidence-bounded:
 
-| Platform | Backend | Required exercise |
-| --- | --- | --- |
-| Windows | WASAPI | playback, suspend/resume, close/reopen, live removal, default-device change |
-| Linux | ALSA | playback, suspend/resume, close/reopen, live removal, default-device change |
-| macOS | CoreAudio | playback, suspend/resume, close/reopen, live removal, default-device change |
+| Platform | Backend | Current runtime evidence | Still pending |
+| --- | --- | --- | --- |
+| Windows | WASAPI | Default-device stream open, suspend/resume, clean close, and immediate reopen | Packaged-app launch, audible playback, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, restart-only physical recovery, live removal, default-device change |
+| Linux Flatpak | ALSA via PulseAudio/PipeWire | None; release manifest and CI are configuration only on this Windows-authored checkpoint | Packaged-app runtime, playback, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, restart-only physical recovery, close/reopen, live removal, default-device change |
+| macOS | CoreAudio | None; release script and CI are configuration only on this Windows-authored checkpoint | Packaged-app runtime, playback, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, restart-only physical recovery, close/reopen, live removal, default-device change |
+
+Deterministic injected tests separately cover unavailable startup, a
+time-advancing emulated no-argument default context, `sinkId: "none"`, truthful
+not-applied controls, and restart-only physical recovery. Those proofs do not
+replace any packaged-app/manual gate, including a host with its device removed
+or disabled.
 
 For removal, keep at least two default-output contexts and one `sinkId: "none"`
 context alive. Confirm the first operational failure seals new physical
@@ -147,7 +171,7 @@ cleanup separately.
 
 For a default-device change, record whether the operating system keeps the
 existing stream alive or reports failure; Smudgy does not promise live migration
-in this preview. A later service start should use the then-current default.
+in this release. A later service start should use the then-current default.
 
 Smudgy's shutdown proof covers its own joined physical-driver loop and exact
 logical callback/source retirement. CPAL and an operating-system backend may

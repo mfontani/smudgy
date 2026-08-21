@@ -107,9 +107,9 @@ winapi = { workspace = true, features = [
 # `sinkId: "none"` available without acquiring a device; by itself it does not make ordinary
 # desktop sessions audio-scoped.
 web-audio = ["smudgy_core/web-audio"]
-# Opt-in desktop coordinator and direct CPAL output (WASAPI/ALSA/CoreAudio) through
-# `smudgy_audio/physical-output`. Production packaging intentionally does not select this yet:
-# accessible master/session/package controls are the release gate.
+# Desktop coordinator and direct CPAL output (WASAPI/ALSA/CoreAudio) through
+# `smudgy_audio/physical-output`. Production packaging selects this feature
+# explicitly while crate defaults remain hardware-independent for embedders and tests.
 web-audio-cpal = [
     "web-audio",
     "dep:futures",

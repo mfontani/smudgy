@@ -10,7 +10,8 @@
 # Prerequisites (one-time):
 #   - Xcode command-line tools          (codesign, xcrun, ditto, lipo)  -- xcode-select --install
 #   - Rust + both darwin targets        rustup target add aarch64-apple-darwin x86_64-apple-darwin
-#   - cargo install cargo-bundle cargo-about
+#   - cargo install cargo-bundle --version 0.7.0
+#   - cargo install --locked cargo-about --version 0.9.0 --features cli
 #   - brew install create-dmg
 #   - A "Developer ID Application" identity in the login keychain.
 #   - Notarization credentials, any of (keychain preferred locally):
@@ -72,8 +73,14 @@ need xcrun      "install the Xcode command-line tools (xcode-select --install)"
 need ditto      "install the Xcode command-line tools (xcode-select --install)"
 need lipo       "install the Xcode command-line tools (xcode-select --install)"
 need create-dmg "brew install create-dmg"
-cargo bundle --version >/dev/null 2>&1 || { echo "error: cargo-bundle missing; run 'cargo install cargo-bundle'" >&2; exit 1; }
-cargo about  --version >/dev/null 2>&1 || { echo "error: cargo-about missing; run 'cargo install cargo-about'" >&2; exit 1; }
+[[ "$(cargo bundle --version 2>/dev/null)" == "cargo-bundle v0.7.0" ]] || {
+    echo "error: cargo-bundle 0.7.0 required; run 'cargo install cargo-bundle --version 0.7.0'" >&2
+    exit 1
+}
+[[ "$(cargo about --version 2>/dev/null)" == "cargo-about 0.9.0" ]] || {
+    echo "error: cargo-about 0.9.0 required; run 'cargo install --locked cargo-about --version 0.9.0 --features cli'" >&2
+    exit 1
+}
 
 # The signing identity must be in a keychain codesign can see.
 if ! security find-identity -v -p codesigning | grep -qF "$SIGN_IDENTITY"; then
@@ -131,19 +138,22 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> cargo patch-crate --force"
     cargo patch-crate --force
 
-    echo "==> cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md"
-    cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
+    echo "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md"
+    cargo about generate --workspace --features smudgy_ui/web-audio-cpal \
+        --locked about.hbs -o THIRD-PARTY-NOTICES.md
+    python3 bin/normalize-third-party-notices.py
 
     # Make sure both darwin targets are installed (no-op if already present).
     if command -v rustup >/dev/null 2>&1; then
         rustup target add "${TARGETS[@]}" >/dev/null
     fi
 
-    # Build the app and the inspector sidecar for each architecture -- mirrors
-    # release.ps1's explicit "-p smudgy_ui -p smudgy_inspector".
+    # Build the physical-Web-Audio app and the inspector sidecar for each
+    # architecture -- mirrors release.ps1's package-qualified feature selection.
     for t in "${TARGETS[@]}"; do
-        echo "==> cargo build --profile $PROFILE --target $t -p smudgy_ui -p smudgy_inspector"
-        cargo build --profile "$PROFILE" --target "$t" -p smudgy_ui -p smudgy_inspector
+        echo "==> cargo build --profile $PROFILE --target $t -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal"
+        cargo build --profile "$PROFILE" --target "$t" -p smudgy_ui -p smudgy_inspector \
+            --features smudgy_ui/web-audio-cpal
     done
 
     # Assemble the .app skeleton from the bundle target's already-built smudgy_ui
@@ -161,8 +171,9 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     # (name = "Smudgy") -> Smudgy.app. With --bin it instead expects a per-bin
     # [package.metadata.bundle.bin.smudgy] table, ignores that name override,
     # and emits smudgy_ui.app -- which the path below would then fail to find.
-    echo "==> (cd ui && cargo bundle --profile $PROFILE --target $BUNDLE_TARGET --format osx)"
-    ( cd ui && cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" --format osx )
+    echo "==> (cd ui && cargo bundle --profile $PROFILE --target $BUNDLE_TARGET --format osx --features smudgy_ui/web-audio-cpal)"
+    ( cd ui && cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" \
+        --format osx --features smudgy_ui/web-audio-cpal )
 fi
 
 # --- locate the .app --------------------------------------------------------
@@ -173,6 +184,13 @@ if [[ ! -d "$app" ]]; then
 fi
 [[ -n "$app" && -d "$app" ]] || { echo "error: Smudgy.app was not produced (run without --skip-build first?)" >&2; exit 1; }
 macos_dir="$app/Contents/MacOS"
+resources_dir="$app/Contents/Resources"
+mkdir -p "$resources_dir"
+install -m 644 THIRD-PARTY-NOTICES.md "$resources_dir/THIRD-PARTY-NOTICES.md"
+cmp -s THIRD-PARTY-NOTICES.md "$resources_dir/THIRD-PARTY-NOTICES.md" || {
+    echo "error: third-party notice was not copied into Smudgy.app" >&2
+    exit 1
+}
 
 # --- fuse universal binaries into the bundle --------------------------------
 # The app finds the sidecar next to its own executable (current_exe().parent()),

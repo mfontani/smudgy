@@ -109,6 +109,7 @@ Source: "..\target\release-full\smudgy.exe"; DestDir: "{app}"; Flags: ignorevers
 ; The bundled v8-inspector DevTools sidecar, spawned by the app's "Show Inspector"
 ; button. Must sit next to smudgy.exe (the app resolves it relative to its own exe).
 Source: "..\target\release-full\smudgy_inspector.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 ; App-local VC++ runtime (from the VS Redist\MSVC folder, version 14.44.35211)
 ; so smudgy runs on machines without the VC++ Redistributable installed.
 ; smudgy.exe imports only these two CRT DLLs (verified with dumpbin /dependents);
@@ -161,4 +162,3 @@ begin
     end;
   end;
 end;
-

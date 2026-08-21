@@ -4,6 +4,7 @@
 #   - az login                      (DefaultAzureCredential; service principal env vars also work in CI)
 #   - Inno Setup 6
 #   - Windows SDK signtool (the Microsoft.Trusted.Signing.Client package is fetched automatically)
+#   - cargo install --locked cargo-about --version 0.9.0 --features cli
 #
 # Signing uses Azure Artifact Signing; the cert is short-lived, so every
 # signature is RFC 3161 timestamped against timestamp.acs.microsoft.com.
@@ -65,6 +66,11 @@ $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
 if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
 if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found" }
 
+$cargoAboutVersion = (& cargo about --version 2>$null)
+if ($LASTEXITCODE -ne 0 -or $cargoAboutVersion -ne 'cargo-about 0.9.0') {
+    throw "cargo-about 0.9.0 is required; run 'cargo install --locked cargo-about --version 0.9.0 --features cli'"
+}
+
 if (-not $SkipBuild) {
     # Materialize the patch-crate-managed dependency patches (patches/*.patch ->
     # target/patch/): [patch.crates-io] points there, so every cargo invocation
@@ -79,12 +85,15 @@ if (-not $SkipBuild) {
     cargo patch-crate --force
     if ($LASTEXITCODE -ne 0) { throw "cargo patch-crate failed" }
 
-    Write-Host "==> cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
-    cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
-    Write-Host "==> cargo build --profile release-full" -ForegroundColor Cyan
+    Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
+    cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
+    if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
+    python bin/normalize-third-party-notices.py
+    if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    Write-Host "==> cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal" -ForegroundColor Cyan
     # smudgy_inspector (the bundled DevTools sidecar) is not in the workspace
     # default-members, so name it explicitly alongside the app.
-    cargo build --profile release-full -p smudgy_ui -p smudgy_inspector
+    cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 }
 

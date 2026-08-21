@@ -26,6 +26,10 @@ finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
+  # Physical Web Audio output through the host PulseAudio/PipeWire service.
+  # This is a broad static app-sandbox grant; the narrower script authority
+  # boundary and the absence of capture APIs are documented in README.md.
+  - --socket=pulseaudio
   # GPU for iced's wgpu backend (Vulkan/GL). `dri`, not `all`.
   - --device=dri
   # User data (profiles, maps, scripts, logs) in the host's ~/Documents/smudgy,
@@ -65,11 +69,16 @@ modules:
       # cargo finds the subcommand in $CARGO_HOME/bin without a PATH change.
       - cargo install --locked patch-crate
       - cargo patch-crate --force
-      # LTO release build of just the app binary, default features (regex backend;
-      # the optional hyperscan C++ backend stays off). `release-full` is the same
-      # LTO'd profile the Windows/macOS releases use (root Cargo.toml); it outputs
-      # to target/release-full/ and is slower to build than plain --release.
-      - cargo build --profile release-full -p smudgy_ui --bin smudgy
+      # Generate the canonical Windows/macOS/Linux target-union notice for the
+      # exact feature this package compiles, then ship it below.
+      - cargo install --locked cargo-about --version 0.9.0 --features cli
+      - cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
+      - python3 bin/normalize-third-party-notices.py
+      # LTO release build of the physical-Web-Audio app. The optional hyperscan
+      # C++ backend stays off. `release-full` is the same LTO'd profile the
+      # Windows/macOS releases use (root Cargo.toml); it outputs to
+      # target/release-full/ and is slower to build than plain --release.
+      - cargo build --profile release-full -p smudgy_ui --bin smudgy --features smudgy_ui/web-audio-cpal
       # Real binary under .bin; the wrapper takes the `smudgy` (command:) slot.
       - install -Dm755 target/release-full/smudgy /app/bin/smudgy.bin
       - install -Dm755 packaging/linux/smudgy-wrapper.sh /app/bin/smudgy
@@ -82,6 +91,8 @@ modules:
         /app/share/icons/hicolor/256x256/apps/org.smudgy.Smudgy.png
       - install -Dm644 packaging/linux/org.smudgy.Smudgy-512.png
         /app/share/icons/hicolor/512x512/apps/org.smudgy.Smudgy.png
+      - install -Dm644 THIRD-PARTY-NOTICES.md
+        /app/share/doc/smudgy/THIRD-PARTY-NOTICES.md
     sources:
       - type: dir
         path: ../..

@@ -16,12 +16,19 @@
       Scripts run in a sandboxed Deno runtime with per-package permissions, and maps,
       profiles, and packages can sync through the optional Smudgy cloud.
     </p>
+    <p>
+      This package enables bounded Web Audio for scripted accessibility earcons. It is
+      configured to attempt shared physical output and uses time-advancing silent emulation
+      when compatible output is unavailable; see the Web Audio support page for current
+      platform evidence and limitations.
+    </p>
   </description>
   <launchable type="desktop-id">org.smudgy.Smudgy.desktop</launchable>
   <developer id="org.smudgy">
     <name>Walter Kalata</name>
   </developer>
   <url type="homepage">https://smudgy.org</url>
+  <url type="help">https://github.com/smudgy-mud/smudgy/blob/main/WEB_AUDIO.md</url>
   <content_rating type="oars-1.1" />
   <releases>
     <release version="0.3.6" date="2026-07-06" />

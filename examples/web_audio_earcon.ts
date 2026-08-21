@@ -1,6 +1,6 @@
-// This source-build preview needs `--features web-audio-cpal`. Copy this file
-// into a server's `modules/` directory, connect, and enter `/earcon`. Official
-// release builds do not enable physical Web Audio yet; see WEB_AUDIO.md.
+// Official desktop packages include Web Audio. For a source build, select
+// `--features web-audio-cpal`. Copy this file into a server's `modules/`
+// directory, connect, and enter `/earcon`; see WEB_AUDIO.md for platform status.
 //
 // The same module can be the entry point of a sandboxed accessibility package.
 // Such a package needs Smudgy `aliases` and `echo` capabilities, but no network,

@@ -5,11 +5,12 @@ manifest asks only for the Smudgy alias and echo capabilities. Web Audio is a
 baseline bounded API and needs no package audio permission; this package has no
 filesystem, network, subprocess, FFI, or system-information access.
 
-This is a source-build preview. Official release builds do not enable physical
-Web Audio yet; see the repository's [Web Audio support and manual-test
-matrix](../../WEB_AUDIO.md).
+Official desktop packages include Web Audio. See the repository's [Web Audio
+support and manual-test matrix](../../WEB_AUDIO.md) for physical-output status
+and the hosted silent fallback.
 
-1. Build or run Smudgy with `--features web-audio-cpal`.
+1. Install an official desktop package, or build Smudgy with
+   `--features web-audio-cpal`.
 2. Copy this directory to
    `<smudgy-home>/<server>/packages/web-audio-a11y/` and enable the local package
    in Smudgy's Automations window.

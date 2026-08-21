@@ -9,8 +9,13 @@ import tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DENO_AUDIO_REV = "2998104e06b1e6021855902a65427df85ba5d8f3"
-WEB_AUDIO_API_REV = "06bcc862de63edb8de6f6b8a38b04f8b5249cf1a"
+DENO_AUDIO_REV = "bee0b39235f6d907f00faa491a8ed81417c2dcb0"
+WEB_AUDIO_API_REV = "cb1d7a03f8f0805b0c974f90116eb57735630660"
+RELEASE_FEATURE = "smudgy_ui/web-audio-cpal"
+CARGO_ABOUT_VERSION = "0.9.0"
+CARGO_BUNDLE_VERSION = "0.7.0"
+WINDOWS_NOTICE_NORMALIZER = "python bin/normalize-third-party-notices.py"
+POSIX_NOTICE_NORMALIZER = "python3 bin/normalize-third-party-notices.py"
 
 
 def load_toml(relative: str) -> dict:
@@ -64,8 +69,80 @@ def dependency_sites(manifest: dict, dependency: str) -> set[str]:
     return sites
 
 
+def continued_shell_commands(text: str) -> list[str]:
+    """Join backslash-continued shell commands while ignoring comments/blank lines."""
+    commands: list[str] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        pending = f"{pending} {line}".strip()
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        commands.append(pending)
+        pending = ""
+    require(not pending, "release shell script ends in an unfinished command")
+    return commands
+
+
+def yaml_list_item(text: str, header: str) -> list[str]:
+    """Return one indentation-bounded YAML list item, with blank lines removed."""
+    lines = text.splitlines()
+    matches = [index for index, line in enumerate(lines) if line.strip() == header]
+    require(len(matches) == 1, f"expected exactly one YAML item {header!r}")
+    start = matches[0]
+    indentation = len(lines[start]) - len(lines[start].lstrip())
+    item = [lines[start].strip()]
+    for line in lines[start + 1 :]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) <= indentation:
+            break
+        item.append(stripped)
+    return item
+
+
+def yaml_mapping_entry(text: str, header: str) -> list[str]:
+    """Return one indentation-bounded YAML mapping entry as stripped lines."""
+    lines = text.splitlines()
+    matches = [index for index, line in enumerate(lines) if line.strip() == header]
+    require(len(matches) == 1, f"expected exactly one YAML mapping {header!r}")
+    start = matches[0]
+    indentation = len(lines[start]) - len(lines[start].lstrip())
+    entry = [lines[start].strip()]
+    for line in lines[start + 1 :]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) <= indentation:
+            break
+        entry.append(stripped)
+    return entry
+
+
 def main() -> None:
+    normalizer_path = ROOT / "bin/normalize-third-party-notices.py"
+    require(
+        normalizer_path.is_file(),
+        "release notice normalizer is missing",
+    )
+    normalizer_text = normalizer_path.read_text(encoding="utf-8")
+    normalizer_invariants = (
+        'NOTICE = ROOT / "THIRD-PARTY-NOTICES.md"',
+        'NOTICE.read_text(encoding="utf-8")',
+        '"\\n".join(line.rstrip() for line in source.splitlines()).rstrip() + "\\n"',
+        'NOTICE.write_text(normalized, encoding="utf-8", newline="\\n")',
+    )
+    require(
+        all(normalizer_text.count(invariant) == 1 for invariant in normalizer_invariants),
+        "release notice normalizer must retain its reviewed UTF-8/LF/trailing-whitespace behavior",
+    )
+
     workspace = load_toml("Cargo.toml")
+    about = load_toml("about.toml")
     ui = load_toml("ui/Cargo.toml")
     core = load_toml("core/Cargo.toml")
     script = load_toml("script/Cargo.toml")
@@ -179,6 +256,17 @@ def main() -> None:
         },
         crate="smudgy_ui",
     )
+    release_targets = [
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ]
+    require(
+        about.get("targets") == release_targets,
+        "cargo-about target union must exactly cover every shipped release target",
+    )
 
     for crate, manifest in (
         ("smudgy_ui", ui),
@@ -216,35 +304,301 @@ def main() -> None:
         f"git+https://github.com/smudgy-mud/web-audio-api-rs?rev={WEB_AUDIO_API_REV}#{WEB_AUDIO_API_REV}",
     )
 
-    # Release-readiness intentionally leaves shipping artifacts hardware-free.
-    # Accessible mixer controls must land before all three paths are enabled
-    # together and this gate is revised in the same change.
-    for relative in (
-        "bin/release.ps1",
-        "bin/release-mac.sh",
-        "packaging/linux/org.smudgy.Smudgy.yml",
-        ".github/workflows/release.yml",
-    ):
-        release_text = (ROOT / relative).read_text(encoding="utf-8")
-        if relative == ".github/workflows/release.yml":
-            cargo_about_install = "cargo install --locked cargo-about --features cli"
-            require(
-                release_text.count(cargo_about_install) == 2,
-                "release workflow cargo-about setup drifted",
-            )
-            release_text = release_text.replace(cargo_about_install, "")
-        for marker in (
-            "--features",
-            "--all-features",
-            "web-audio-cpal",
-            "smudgy_audio/physical-output",
-        ):
-            require(
-                marker not in release_text,
-                f"{relative} contains {marker!r} before accessible controls",
-            )
+    windows_text = (ROOT / "bin/release.ps1").read_text(encoding="utf-8")
+    windows_command = (
+        "cargo build --profile release-full -p smudgy_ui -p smudgy_inspector "
+        f"--features {RELEASE_FEATURE}"
+    )
+    require(
+        [
+            line.strip()
+            for line in windows_text.splitlines()
+            if line.strip().startswith(("cargo build ", "cargo bundle "))
+        ]
+        == [windows_command],
+        "Windows release cargo build/bundle command list drifted",
+    )
+    notice_command = (
+        "cargo about generate --workspace "
+        f"--features {RELEASE_FEATURE} --locked about.hbs "
+        "-o THIRD-PARTY-NOTICES.md"
+    )
+    require(
+        [
+            line.strip()
+            for line in windows_text.splitlines()
+            if line.strip().startswith("cargo about generate ")
+        ]
+        == [notice_command],
+        "Windows release must generate the feature/target-union notice exactly",
+    )
+    require(
+        sum(
+            line.strip() == WINDOWS_NOTICE_NORMALIZER
+            for line in windows_text.splitlines()
+        )
+        == 1,
+        "Windows release must normalize the generated notice exactly once",
+    )
+    require(
+        windows_text.count(
+            f"$cargoAboutVersion = (& cargo about --version 2>$null)"
+        )
+        == 1
+        and windows_text.count(
+            f"$cargoAboutVersion -ne 'cargo-about {CARGO_ABOUT_VERSION}'"
+        )
+        == 1,
+        "Windows release must require the pinned cargo-about version",
+    )
+    installer_text = (ROOT / "assets/installer.iss").read_text(encoding="utf-8")
+    installer_notice = (
+        'Source: "..\\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; '
+        "Flags: ignoreversion"
+    )
+    require(
+        sum(line.strip() == installer_notice for line in installer_text.splitlines()) == 1,
+        "Windows installer must ship the canonical third-party notice exactly once",
+    )
 
-    print("Web Audio dependency, feature, lockfile, and release-readiness wiring is exact.")
+    mac_text = (ROOT / "bin/release-mac.sh").read_text(encoding="utf-8")
+    mac_commands = continued_shell_commands(mac_text)
+    mac_build = (
+        'cargo build --profile "$PROFILE" --target "$t" '
+        f"-p smudgy_ui -p smudgy_inspector --features {RELEASE_FEATURE}"
+    )
+    mac_bundle = (
+        '( cd ui && cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" '
+        f"--format osx --features {RELEASE_FEATURE} )"
+    )
+    require(
+        [
+            command
+            for command in mac_commands
+            if command.startswith(("cargo build ", "cargo bundle ", "( cd ui && cargo bundle "))
+        ]
+        == [
+            mac_build,
+            mac_bundle,
+        ],
+        "macOS release cargo build/bundle command list drifted",
+    )
+    require(
+        mac_text.count(
+            '[[ "$(cargo bundle --version 2>/dev/null)" '
+            f'== "cargo-bundle v{CARGO_BUNDLE_VERSION}" ]]'
+        )
+        == 1,
+        "macOS release must require the pinned cargo-bundle version",
+    )
+    require(
+        [
+            command
+            for command in mac_commands
+            if command.startswith("cargo about generate ")
+        ]
+        == [notice_command],
+        "macOS release must generate the feature/target-union notice exactly",
+    )
+    require(
+        mac_commands.count(POSIX_NOTICE_NORMALIZER) == 1,
+        "macOS release must normalize the generated notice exactly once",
+    )
+    require(
+        mac_text.count(
+            f'[[ "$(cargo about --version 2>/dev/null)" == "cargo-about {CARGO_ABOUT_VERSION}" ]]'
+        )
+        == 1,
+        "macOS release must require the pinned cargo-about version",
+    )
+    require(
+        mac_text.count(
+            'install -m 644 THIRD-PARTY-NOTICES.md '
+            '"$resources_dir/THIRD-PARTY-NOTICES.md"'
+        )
+        == 1
+        and mac_text.count(
+            'cmp -s THIRD-PARTY-NOTICES.md '
+            '"$resources_dir/THIRD-PARTY-NOTICES.md"'
+        )
+        == 1,
+        "macOS release must copy and verify the canonical notice in the app bundle",
+    )
+    require(
+        mac_text.count("TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)") == 1,
+        "macOS release target list drifted from the cargo-about union",
+    )
+
+    flatpak_text = (ROOT / "packaging/linux/org.smudgy.Smudgy.yml").read_text(
+        encoding="utf-8"
+    )
+    flatpak_lines = [line.strip() for line in flatpak_text.splitlines()]
+    flatpak_build = (
+        "- cargo build --profile release-full -p smudgy_ui --bin smudgy "
+        f"--features {RELEASE_FEATURE}"
+    )
+    require(
+        [
+            line
+            for line in flatpak_lines
+            if line.startswith(("- cargo build ", "- cargo bundle "))
+        ]
+        == [flatpak_build],
+        "Flatpak release cargo build/bundle command list drifted",
+    )
+    flatpak_notice = f"- {notice_command}"
+    require(
+        flatpak_lines.count(flatpak_notice) == 1,
+        "Flatpak must generate the feature/target-union notice exactly once",
+    )
+    require(
+        flatpak_lines.count(f"- {POSIX_NOTICE_NORMALIZER}") == 1,
+        "Flatpak must normalize the generated notice exactly once",
+    )
+    flatpak_about_install = (
+        "- cargo install --locked cargo-about "
+        f"--version {CARGO_ABOUT_VERSION} --features cli"
+    )
+    require(
+        flatpak_lines.count(flatpak_about_install) == 1,
+        "Flatpak must install the pinned cargo-about version exactly once",
+    )
+    require(
+        flatpak_lines.count("- install -Dm644 THIRD-PARTY-NOTICES.md") == 1
+        and flatpak_lines.count(
+            "/app/share/doc/smudgy/THIRD-PARTY-NOTICES.md"
+        )
+        == 1,
+        "Flatpak must install the canonical third-party notice exactly once",
+    )
+    require(
+        flatpak_text.count("--socket=pulseaudio") == 1
+        and flatpak_lines.count("- --socket=pulseaudio") == 1,
+        "Flatpak must grant the PulseAudio socket exactly once",
+    )
+
+    workflow_text = (ROOT / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    cargo_about_install = (
+        "cargo install --locked cargo-about "
+        f"--version {CARGO_ABOUT_VERSION} --features cli"
+    )
+    require(
+        workflow_text.count(cargo_about_install) == 2,
+        "release workflow cargo-about setup drifted",
+    )
+    require(
+        workflow_text.count(
+            f"cargo install cargo-bundle --version {CARGO_BUNDLE_VERSION}"
+        )
+        == 1,
+        "release workflow cargo-bundle setup drifted",
+    )
+    require(
+        yaml_list_item(
+            workflow_text, f"- name: Audit {RELEASE_FEATURE} release wiring"
+        )
+        == [
+            f"- name: Audit {RELEASE_FEATURE} release wiring",
+            "run: python bin/check-web-audio-wiring.py",
+        ],
+        "release workflow must run the exact physical feature audit as a gating step",
+    )
+    verify_job = yaml_mapping_entry(workflow_text, "verify-version:")
+    audit_name = f"- name: Audit {RELEASE_FEATURE} release wiring"
+    require(
+        verify_job.count(audit_name) == 1
+        and verify_job.count("run: python bin/check-web-audio-wiring.py") == 1,
+        "physical feature audit must remain inside verify-version",
+    )
+
+    flatpak_job = yaml_mapping_entry(workflow_text, "flatpak:")
+    windows_job = yaml_mapping_entry(workflow_text, "windows:")
+    macos_job = yaml_mapping_entry(workflow_text, "macos:")
+    require(
+        flatpak_job.count("needs: verify-version") == 1
+        and flatpak_job.count(
+            "run: dbus-run-session -- bin/release-linux.sh --arch ${{ matrix.arch }}"
+        )
+        == 1
+        and flatpak_job.count("- arch: x86_64") == 1
+        and flatpak_job.count("- arch: aarch64") == 1,
+        "Flatpak job must depend on the audit, invoke its release script, and ship both target arches",
+    )
+    linux_release_text = (ROOT / "bin/release-linux.sh").read_text(encoding="utf-8")
+    require(
+        [
+            line.strip()
+            for line in linux_release_text.splitlines()
+            if line.strip().startswith("manifest=")
+        ]
+        == ['manifest="packaging/linux/$APP_ID.yml"']
+        and linux_release_text.count("APP_ID=org.smudgy.Smudgy") == 1
+        and linux_release_text.count('"$build_dir" "$repo_root/$manifest"') == 1,
+        "Flatpak release script must build the reviewed application manifest",
+    )
+    require(
+        windows_job.count("needs: verify-version") == 1
+        and windows_job.count("runs-on: windows-latest") == 1
+        and windows_job.count(f"run: {cargo_about_install}") == 1
+        and windows_job.count("run: ./bin/release.ps1 -BuildOnly") == 1
+        and windows_job.count("./bin/release.ps1 -SkipBuild") == 1,
+        "Windows job must install pinned cargo-about, depend on the audit, and invoke both release-script stages",
+    )
+    require(
+        macos_job.count("needs: verify-version") == 1
+        and macos_job.count("runs-on: macos-latest") == 1
+        and macos_job.count(cargo_about_install) == 1
+        and macos_job.count(
+            f"cargo install cargo-bundle --version {CARGO_BUNDLE_VERSION}"
+        )
+        == 1
+        and macos_job.count("run: bin/release-mac.sh") == 1,
+        "macOS job must install pinned packaging tools, depend on the audit, and invoke its release script on macOS",
+    )
+
+    for relative, release_text in (
+        ("bin/release.ps1", windows_text),
+        ("bin/release-mac.sh", mac_text),
+        ("packaging/linux/org.smudgy.Smudgy.yml", flatpak_text),
+    ):
+        require(
+            "--all-features" not in release_text,
+            f"{relative} must select only the reviewed release feature",
+        )
+
+    metainfo_text = (
+        ROOT / "packaging/linux/org.smudgy.Smudgy.metainfo.xml"
+    ).read_text(encoding="utf-8")
+    require(
+        "Web Audio" in metainfo_text and "silent" in metainfo_text,
+        "Flatpak package metadata must describe physical Web Audio and silent fallback",
+    )
+
+    notice_text = (ROOT / "THIRD-PARTY-NOTICES.md").read_text(encoding="utf-8")
+    notice_lines = notice_text.splitlines()
+    required_physical_notices = {
+        "- cpal 0.18.2",
+        "- alsa 0.11.0",
+        "- alsa-sys 0.4.0",
+        "- coreaudio-rs 0.14.2",
+        "- mach2 0.6.0",
+        "- windows 0.62.2",
+        "- windows-core 0.62.2",
+    }
+    require(
+        required_physical_notices.issubset(notice_lines),
+        "canonical notice must cover CPAL plus Linux ALSA, macOS CoreAudio, and Windows edges",
+    )
+    require(
+        notice_text.endswith("\n")
+        and not notice_text.endswith("\n\n")
+        and all(line == line.rstrip() for line in notice_lines),
+        "canonical notice must retain deterministic diff-clean normalization",
+    )
+
+    print("Web Audio dependency, feature, lockfile, and physical-release wiring is exact.")
 
 
 if __name__ == "__main__":
