@@ -1507,6 +1507,68 @@ fn apply_live_audio_gain(
 }
 
 #[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioAnnouncement {
+    TargetClosed,
+    AppliedAndSaved,
+    AppliedSaveFailed,
+    ChangeFailed,
+    PreferenceSaved,
+    PreferenceSaveFailed,
+    OutputFailed,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn localized_audio_announcement(
+    translator: smudgy_i18n::Translator,
+    announcement: AudioAnnouncement,
+) -> (String, iced_runtime::window::AnnouncementPriority) {
+    use iced_runtime::window::AnnouncementPriority::{Assertive, Polite};
+
+    match announcement {
+        AudioAnnouncement::TargetClosed => (
+            translator.translate("audio-notice-target-closed"),
+            Assertive,
+        ),
+        AudioAnnouncement::AppliedAndSaved => {
+            (translator.translate("audio-notice-applied-saved"), Polite)
+        }
+        AudioAnnouncement::AppliedSaveFailed => (
+            translator.translate("audio-announcement-applied-save-failed"),
+            Assertive,
+        ),
+        AudioAnnouncement::ChangeFailed => {
+            (translator.translate("audio-announcement-failed"), Assertive)
+        }
+        AudioAnnouncement::PreferenceSaved => (
+            translator.translate("audio-notice-preference-saved"),
+            Polite,
+        ),
+        AudioAnnouncement::PreferenceSaveFailed => (
+            translator.translate("audio-announcement-preference-save-failed"),
+            Assertive,
+        ),
+        AudioAnnouncement::OutputFailed => {
+            (translator.translate("audio-notice-output-dead"), Assertive)
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_control_feedback(
+    smudgy: &mut Smudgy,
+    window_id: window::Id,
+    notice: String,
+    announcement: AudioAnnouncement,
+) -> Task<Message> {
+    smudgy.audio_panel.notice = Some(notice);
+    let (text, priority) =
+        i18n::with_translator(|translator| localized_audio_announcement(translator, announcement));
+
+    window::announce(window_id, text, priority)
+}
+
+#[cfg(feature = "web-audio-cpal")]
 fn handle_audio_control(
     smudgy: &mut Smudgy,
     window_id: window::Id,
@@ -1523,8 +1585,12 @@ fn handle_audio_control(
         current_audio_widget_id(smudgy, window_id, &target),
         &widget_id,
     ) {
-        smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-target-closed"));
-        return Task::none();
+        return audio_control_feedback(
+            smudgy,
+            window_id,
+            i18n::t!("audio-notice-target-closed"),
+            AudioAnnouncement::TargetClosed,
+        );
     }
     if action == widgets::audio_gain::Action::Focus {
         smudgy
@@ -1534,8 +1600,12 @@ fn handle_audio_control(
         return scoped_audio_focus(window_id, widget_id);
     }
     let Some(current) = exact_audio_target_gain(smudgy, &target) else {
-        smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-target-closed"));
-        return Task::none();
+        return audio_control_feedback(
+            smudgy,
+            window_id,
+            i18n::t!("audio-notice-target-closed"),
+            AudioAnnouncement::TargetClosed,
+        );
     };
     let Some(desired) = audio_action_gain(current, action) else {
         return Task::none();
@@ -1551,7 +1621,7 @@ fn handle_audio_control(
         return Task::none();
     }
 
-    match audio_control_route_for_target(smudgy, &target) {
+    let announcement = match audio_control_route_for_target(smudgy, &target) {
         AudioControlRoute::Physical => {
             match apply_live_audio_gain(smudgy, &target, desired, action) {
                 Ok(applied) => {
@@ -1566,12 +1636,14 @@ fn handle_audio_control(
                             smudgy.audio_panel.preferences = next;
                             smudgy.audio_panel.notice =
                                 Some(i18n::t!("audio-notice-applied-saved"));
+                            AudioAnnouncement::AppliedAndSaved
                         }
                         Err(error) => {
                             smudgy.audio_panel.notice = Some(i18n::t!(
                                 "audio-notice-applied-save-failed",
                                 "error" => error
                             ));
+                            AudioAnnouncement::AppliedSaveFailed
                         }
                     }
                 }
@@ -1586,6 +1658,7 @@ fn handle_audio_control(
                         "audio-notice-failed",
                         "error" => error.to_string()
                     ));
+                    AudioAnnouncement::ChangeFailed
                 }
             }
         }
@@ -1601,20 +1674,28 @@ fn handle_audio_control(
                     smudgy.audio_panel.preferences = next;
                     set_preference_only_live_row(smudgy, &target, stored);
                     smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-preference-saved"));
+                    AudioAnnouncement::PreferenceSaved
                 }
                 Err(error) => {
                     smudgy.audio_panel.notice = Some(i18n::t!(
                         "audio-notice-preference-save-failed",
                         "error" => error
                     ));
+                    AudioAnnouncement::PreferenceSaveFailed
                 }
             }
         }
         AudioControlRoute::Failed => {
             smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
+            AudioAnnouncement::OutputFailed
         }
-    }
-    Task::none()
+    };
+    let notice = smudgy
+        .audio_panel
+        .notice
+        .clone()
+        .expect("audio control feedback sets a notice");
+    audio_control_feedback(smudgy, window_id, notice, announcement)
 }
 
 /// `event::listen_with` filter feeding the window tracker while a pane drag
@@ -6661,6 +6742,127 @@ mod tests {
         };
         operate_mounted(element, tree, node, &mut operation);
         operation.focused.unwrap_or(false)
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn every_locale_maps_exact_audio_feedback_to_the_frozen_priority() {
+        use iced_runtime::window::AnnouncementPriority::{Assertive, Polite};
+
+        let cases = [
+            (
+                AudioAnnouncement::TargetClosed,
+                "audio-notice-target-closed",
+                Assertive,
+            ),
+            (
+                AudioAnnouncement::AppliedAndSaved,
+                "audio-notice-applied-saved",
+                Polite,
+            ),
+            (
+                AudioAnnouncement::AppliedSaveFailed,
+                "audio-announcement-applied-save-failed",
+                Assertive,
+            ),
+            (
+                AudioAnnouncement::ChangeFailed,
+                "audio-announcement-failed",
+                Assertive,
+            ),
+            (
+                AudioAnnouncement::PreferenceSaved,
+                "audio-notice-preference-saved",
+                Polite,
+            ),
+            (
+                AudioAnnouncement::PreferenceSaveFailed,
+                "audio-announcement-preference-save-failed",
+                Assertive,
+            ),
+            (
+                AudioAnnouncement::OutputFailed,
+                "audio-notice-output-dead",
+                Assertive,
+            ),
+        ];
+
+        for catalog in smudgy_i18n::available_catalogs() {
+            let translator =
+                smudgy_i18n::Translator::for_tag(catalog.tag).expect("manifest locale resolves");
+
+            for (announcement, message_id, priority) in cases {
+                let (actual_text, actual_priority) =
+                    localized_audio_announcement(translator, announcement);
+                assert_eq!(actual_text, translator.translate(message_id));
+                assert_eq!(actual_priority, priority);
+                assert!(
+                    !actual_text.starts_with('⟦'),
+                    "missing {message_id} in {}",
+                    catalog.tag
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn detailed_audio_errors_stay_visible_but_never_enter_announce_actions() {
+        use iced_runtime::futures::futures::{FutureExt, StreamExt};
+        use iced_runtime::window::AnnouncementPriority::Assertive;
+
+        const RAW_MARKER: &str = "PRIVATE-device-path-7f84";
+        let translator = smudgy_i18n::Translator::for_tag("en-US").unwrap();
+        let cases = [
+            (
+                "audio-notice-applied-save-failed",
+                AudioAnnouncement::AppliedSaveFailed,
+                "Audio changed for this launch but could not be saved.",
+            ),
+            (
+                "audio-notice-failed",
+                AudioAnnouncement::ChangeFailed,
+                "Audio change failed; nothing was saved.",
+            ),
+            (
+                "audio-notice-preference-save-failed",
+                AudioAnnouncement::PreferenceSaveFailed,
+                "Audio preference was not saved.",
+            ),
+        ];
+
+        for (visible_id, announcement, expected_announcement) in cases {
+            let mut args = smudgy_i18n::FluentArgs::new();
+            args.set("error", RAW_MARKER);
+            let visible = translator.translate_with(visible_id, &args);
+            assert!(visible.contains(RAW_MARKER));
+
+            let (text, priority) = localized_audio_announcement(translator, announcement);
+            assert_eq!(text, expected_announcement);
+            assert_eq!(priority, Assertive);
+            assert!(!text.contains(RAW_MARKER));
+
+            let id = window::Id::unique();
+            let task: Task<Message> = window::announce(id, text, priority);
+            let mut stream =
+                iced_runtime::task::into_stream(task).expect("announcement effect stream");
+            let action = stream
+                .next()
+                .now_or_never()
+                .flatten()
+                .expect("announcement action");
+            let iced_runtime::Action::Window(iced_runtime::window::Action::Announce(
+                actual_id,
+                action_text,
+                Assertive,
+            )) = action
+            else {
+                panic!("expected assertive window announcement action");
+            };
+            assert_eq!(actual_id, id);
+            assert_eq!(action_text, expected_announcement);
+            assert!(!action_text.contains(RAW_MARKER));
+        }
     }
 
     #[cfg(feature = "web-audio-cpal")]

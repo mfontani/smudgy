@@ -40,10 +40,60 @@ row, the arrow keys adjust volume by five points, `Home` and `End` select 0 and
 are scrolled into view.
 
 These are visible, keyboard-focusable controls, not a full screen-reader
-semantics claim. The pinned official iced 0.14 widget stack does not yet expose
-the required accessibility semantics for this custom surface. Smudgy does not
-ship an iced/AccessKit fork in this slice, and full screen-reader navigation and
-announcements remain out of scope.
+semantics claim. Smudgy carries narrow patch-crate changes to iced runtime and
+winit that expose one AccessKit live region per native window. The audio panel
+uses it only for its localized applied, saved, and failure feedback. It does not
+describe the controls, their values, focus, or the rest of the widget tree, so
+full screen-reader navigation remains out of scope.
+
+Each window holds at most one pending announcement of at most 4 KiB. The newest
+valid request in an event-loop batch replaces the earlier one; empty and
+oversize requests are ignored. Inactive accessibility drops requests and never
+replays them after activation. Repeated identical feedback is reset and sent
+again through the same stable live-region node. Closing a window makes its id
+stale before native teardown, so pending or later feedback cannot cross into a
+different window.
+
+Announcements contain only localized control outcomes. Detailed errors may
+remain visible in the panel and in existing diagnostic logs, but raw error text
+is never copied into the AccessKit update. Announcement text is not logged or
+persisted. The effect is best effort: completion means only that iced accepted
+the request, not that assistive technology was active or that speech occurred.
+This bridge is not TTS, does not use a Web Audio bus, and exposes no script API.
+
+### Screen-reader evidence
+
+The bridge pins `accesskit` 0.24.1 and `accesskit_winit` 0.33.2. Automated tests
+cover the fixed two-node tree, bounds and coalescing, repeated text, inactive
+lifecycle, multi-window stale routing, event ordering, and native-window
+retirement. Those tests do not establish end-user screen-reader support.
+
+Run the dependency-patch unit tests on Windows, macOS, or Linux with:
+
+```sh
+python bin/test-iced-accessibility-patches.py
+```
+
+The helper rematerializes the tracked patches, copies the patched crates to a
+temporary workspace, restricts resolution to package versions already present
+in Smudgy's lock file, and runs both dependency test suites with `--locked`.
+CI runs this command once on each supported desktop OS.
+
+Manual packaged tests with NVDA on Windows, VoiceOver on macOS, and Orca on both
+X11 and Wayland remain pending. Until those literal-text checks are recorded,
+this document makes no platform speech or exact-once delivery claim.
+
+Each evidence record must include the exact Smudgy commit, OS and packaged
+build, AccessKit versions and enabled features, and screen-reader version and
+settings. Linux records must additionally name the desktop, AT-SPI version, and
+X11 or Wayland session. Use the same literal Unicode feedback and capture it in
+NVDA Speech Viewer, VoiceOver Caption Panel, or Orca speech/debug output; a tree
+inspector alone is insufficient. Run with the reader active before launch and
+activated after launch. Check exact-once polite success and assertive failure,
+identical-text repetition, rapid latest-wins replacement, independent windows,
+unchanged focus, queued-close and post-close stale rejection, close/reopen, and
+deactivate/reactivate without replay. The Windows record must also exercise the
+existing Restart Manager and rounded-frame native subclass hooks.
 
 ## Build features
 

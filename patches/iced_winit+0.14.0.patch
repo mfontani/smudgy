@@ -1,0 +1,1310 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 025b8ec..92574a7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -93,6 +93,18 @@ version = "0.30"
+ features = ["rwh_06"]
+ default-features = false
+ 
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies.accesskit]
++version = "=0.24.1"
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies.accesskit_winit]
++version = "=0.33.2"
++features = [
++    "accesskit_unix",
++    "tokio",
++    "rwh_06",
++]
++default-features = false
++
+ [target.'cfg(target_arch = "wasm32")'.dependencies.wasm-bindgen-futures]
+ version = "0.4"
+ 
+diff --git a/Cargo.toml.orig b/Cargo.toml.orig
+index cdce9c1..fcf166f 100644
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -36,6 +36,10 @@ winit.workspace = true
+ sysinfo.workspace = true
+ sysinfo.optional = true
+ 
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++accesskit = "=0.24.1"
++accesskit_winit = { version = "=0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
++
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ web-sys.workspace = true
+ web-sys.features = ["Document", "Window", "HtmlCanvasElement"]
+diff --git a/src/accessibility.rs b/src/accessibility.rs
+new file mode 100644
+index 0000000..bd7c39e
+--- /dev/null
++++ b/src/accessibility.rs
+@@ -0,0 +1,948 @@
++use crate::core::window::Id;
++use crate::runtime::window::AnnouncementPriority;
++
++use accesskit::{
++    ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Live, Node, NodeId, Role,
++    Tree, TreeId, TreeUpdate,
++};
++use accesskit_winit::Adapter;
++use std::cell::RefCell;
++use std::collections::BTreeMap;
++#[cfg(target_os = "windows")]
++use std::mem;
++use std::rc::Rc;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use winit::event::WindowEvent;
++use winit::event_loop::ActiveEventLoop;
++use winit::window::{Window, WindowId};
++
++const ROOT_ID: NodeId = NodeId(0);
++const ANNOUNCEMENT_ID: NodeId = NodeId(1);
++const MAX_ANNOUNCEMENT_BYTES: usize = 4 * 1024;
++
++pub(crate) type SharedManager = Rc<RefCell<Manager>>;
++
++pub(crate) fn shared_manager() -> SharedManager {
++    Rc::new(RefCell::new(Manager::default()))
++}
++
++fn live_region(text: &str, live: Live) -> Node {
++    let mut node = Node::new(Role::Label);
++    node.set_value(text);
++    node.set_live(live);
++    node
++}
++
++fn initial_tree() -> TreeUpdate {
++    let mut root = Node::new(Role::Window);
++    root.set_children(vec![ANNOUNCEMENT_ID]);
++
++    TreeUpdate {
++        nodes: vec![
++            (ROOT_ID, root),
++            (ANNOUNCEMENT_ID, live_region("", Live::Off)),
++        ],
++        tree: Some(Tree::new(ROOT_ID)),
++        tree_id: TreeId::ROOT,
++        focus: ROOT_ID,
++    }
++}
++
++fn announcement_update(text: &str, live: Live) -> TreeUpdate {
++    TreeUpdate {
++        nodes: vec![(ANNOUNCEMENT_ID, live_region(text, live))],
++        tree: None,
++        tree_id: TreeId::ROOT,
++        focus: ROOT_ID,
++    }
++}
++
++#[derive(Default)]
++struct Lifecycle {
++    active: AtomicBool,
++    epoch: AtomicU64,
++}
++
++impl Lifecycle {
++    fn activate(&self) {
++        let _ = self.epoch.fetch_add(1, Ordering::SeqCst);
++        self.active.store(true, Ordering::SeqCst);
++    }
++
++    fn deactivate(&self) {
++        self.active.store(false, Ordering::SeqCst);
++        let _ = self.epoch.fetch_add(1, Ordering::SeqCst);
++    }
++
++    fn snapshot(&self) -> (bool, u64) {
++        loop {
++            let before = self.epoch.load(Ordering::SeqCst);
++            let active = self.active.load(Ordering::SeqCst);
++            let after = self.epoch.load(Ordering::SeqCst);
++
++            if before == after {
++                return (active, after);
++            }
++        }
++    }
++}
++
++struct InitialTreeHandler(Arc<Lifecycle>);
++
++impl ActivationHandler for InitialTreeHandler {
++    fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
++        self.0.activate();
++        Some(initial_tree())
++    }
++}
++
++struct IgnoreActions;
++
++impl ActionHandler for IgnoreActions {
++    fn do_action(&mut self, _request: ActionRequest) {}
++}
++
++struct DeactivateHandler(Arc<Lifecycle>);
++
++impl DeactivationHandler for DeactivateHandler {
++    fn deactivate_accessibility(&mut self) {
++        self.0.deactivate();
++    }
++}
++
++trait TreeAdapter {
++    fn update_if_active(&mut self, update: TreeUpdate) -> bool;
++}
++
++struct NativeAdapter<A> {
++    inner: Option<A>,
++}
++
++impl<A> NativeAdapter<A> {
++    fn new(adapter: A) -> Self {
++        Self {
++            inner: Some(adapter),
++        }
++    }
++
++    fn get_mut(&mut self) -> Option<&mut A> {
++        self.inner.as_mut()
++    }
++
++    fn drop_after_native_destroy(mut self) {
++        drop(self.inner.take());
++    }
++}
++
++#[cfg(target_os = "windows")]
++impl<A> Drop for NativeAdapter<A> {
++    fn drop(&mut self) {
++        if let Some(adapter) = self.inner.take() {
++            // A remaining adapter has no observed native-destruction barrier.
++            // Retaining it until process reclamation is safer than uninstalling
++            // its WNDPROC ahead of later common-controls subclasses.
++            mem::forget(adapter);
++        }
++    }
++}
++
++struct PlatformAdapter {
++    inner: NativeAdapter<Adapter>,
++}
++
++impl PlatformAdapter {
++    fn new(event_loop: &ActiveEventLoop, window: &Window, lifecycle: &Arc<Lifecycle>) -> Self {
++        Self {
++            inner: NativeAdapter::new(Adapter::with_direct_handlers(
++                event_loop,
++                window,
++                InitialTreeHandler(Arc::clone(lifecycle)),
++                IgnoreActions,
++                DeactivateHandler(Arc::clone(lifecycle)),
++            )),
++        }
++    }
++
++    fn process_event(&mut self, window: &Window, event: &WindowEvent) {
++        if let Some(adapter) = self.inner.get_mut() {
++            adapter.process_event(window, event);
++        }
++    }
++
++    fn drop_after_native_destroy(self) {
++        self.inner.drop_after_native_destroy();
++    }
++}
++
++impl TreeAdapter for PlatformAdapter {
++    fn update_if_active(&mut self, update: TreeUpdate) -> bool {
++        let Some(adapter) = self.inner.get_mut() else {
++            return false;
++        };
++        let mut applied = false;
++
++        adapter.update_if_active(|| {
++            applied = true;
++            update
++        });
++
++        applied
++    }
++}
++
++struct Pending {
++    text: String,
++    priority: AnnouncementPriority,
++    epoch: u64,
++}
++
++struct Bridge<A> {
++    adapter: Option<A>,
++    lifecycle: Arc<Lifecycle>,
++    pending: Option<Pending>,
++}
++
++impl<A: TreeAdapter> Bridge<A> {
++    fn with_adapter(adapter: A, lifecycle: Arc<Lifecycle>) -> Self {
++        Self {
++            adapter: Some(adapter),
++            lifecycle,
++            pending: None,
++        }
++    }
++
++    fn queue(&mut self, text: String, priority: AnnouncementPriority) -> bool {
++        let (active, epoch) = self.lifecycle.snapshot();
++
++        if !active {
++            self.pending = None;
++            return false;
++        }
++
++        if text.is_empty() || text.len() > MAX_ANNOUNCEMENT_BYTES {
++            return false;
++        }
++
++        self.pending = Some(Pending {
++            text,
++            priority,
++            epoch,
++        });
++        true
++    }
++
++    fn clear(&mut self) {
++        self.pending = None;
++    }
++
++    fn flush(&mut self) {
++        let Some(pending) = self.pending.take() else {
++            return;
++        };
++        let (active, epoch) = self.lifecycle.snapshot();
++
++        if !active || epoch != pending.epoch {
++            return;
++        }
++
++        let Some(adapter) = self.adapter.as_mut() else {
++            return;
++        };
++
++        let _ = adapter.update_if_active(announcement_update("", Live::Off));
++        let live = match pending.priority {
++            AnnouncementPriority::Polite => Live::Polite,
++            AnnouncementPriority::Assertive => Live::Assertive,
++        };
++        let _ = adapter.update_if_active(announcement_update(&pending.text, live));
++    }
++}
++
++impl Bridge<PlatformAdapter> {
++    fn new(event_loop: &ActiveEventLoop, window: &Window) -> Self {
++        let lifecycle = Arc::new(Lifecycle::default());
++        let adapter = PlatformAdapter::new(event_loop, window, &lifecycle);
++        Self::with_adapter(adapter, lifecycle)
++    }
++
++    fn process_event(&mut self, window: &Window, event: &WindowEvent) {
++        if let Some(adapter) = self.adapter.as_mut() {
++            adapter.process_event(window, event);
++        }
++    }
++
++    fn drop_after_native_destroy(mut self) {
++        if let Some(adapter) = self.adapter.take() {
++            adapter.drop_after_native_destroy();
++        }
++    }
++}
++
++struct LiveWindow {
++    raw: Arc<Window>,
++    bridge: Bridge<PlatformAdapter>,
++}
++
++struct Retired<B> {
++    bridge: B,
++    destroyed_seen: bool,
++}
++
++struct Routing<K, L, B> {
++    aliases: BTreeMap<Id, K>,
++    live: BTreeMap<K, (Id, L)>,
++    retired: BTreeMap<K, Retired<B>>,
++}
++
++impl<K: Copy + Ord, L, B> Default for Routing<K, L, B> {
++    fn default() -> Self {
++        Self {
++            aliases: BTreeMap::new(),
++            live: BTreeMap::new(),
++            retired: BTreeMap::new(),
++        }
++    }
++}
++
++impl<K: Copy + Ord, L, B> Routing<K, L, B> {
++    fn insert(&mut self, id: Id, key: K, live: L) {
++        assert!(!self.aliases.contains_key(&id));
++        assert!(!self.live.contains_key(&key));
++        let _ = self.aliases.insert(id, key);
++        let _ = self.live.insert(key, (id, live));
++    }
++
++    fn live_mut(&mut self, key: K) -> Option<&mut L> {
++        self.live.get_mut(&key).map(|(_, live)| live)
++    }
++
++    fn live_mut_by_id(&mut self, id: Id) -> Option<&mut L> {
++        let key = self.aliases.get(&id).copied()?;
++        self.live_mut(key)
++    }
++
++    fn take_live_by_key(&mut self, key: K) -> Option<L> {
++        let (id, live) = self.live.remove(&key)?;
++        let _ = self.aliases.remove(&id);
++        Some(live)
++    }
++
++    fn take_live_by_id(&mut self, id: Id, expected_key: K) -> Option<L> {
++        let key = self.aliases.get(&id).copied()?;
++        if key != expected_key {
++            return None;
++        }
++
++        self.take_live_by_key(key)
++    }
++
++    fn add_retired(&mut self, key: K, bridge: B, destroyed_seen: bool) {
++        assert!(!self.retired.contains_key(&key));
++        let _ = self.retired.insert(
++            key,
++            Retired {
++                bridge,
++                destroyed_seen,
++            },
++        );
++    }
++
++    fn mark_destroyed(&mut self, key: K) -> bool {
++        if let Some(window) = self.retired.get_mut(&key) {
++            window.destroyed_seen = true;
++            true
++        } else {
++            false
++        }
++    }
++
++    fn take_reused_destroyed(&mut self, key: K) -> Result<Option<B>, ()> {
++        let Some(retired) = self.retired.remove(&key) else {
++            return Ok(None);
++        };
++
++        if retired.destroyed_seen {
++            Ok(Some(retired.bridge))
++        } else {
++            let _ = self.retired.insert(key, retired);
++            Err(())
++        }
++    }
++
++    fn take_destroyed(&mut self) -> Vec<B> {
++        let destroyed = self
++            .retired
++            .iter()
++            .filter_map(|(key, window)| window.destroyed_seen.then_some(*key))
++            .collect::<Vec<_>>();
++
++        destroyed
++            .into_iter()
++            .filter_map(|key| self.retired.remove(&key).map(|window| window.bridge))
++            .collect()
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct Manager {
++    routing: Routing<WindowId, LiveWindow, Bridge<PlatformAdapter>>,
++}
++
++impl Manager {
++    pub(crate) fn insert(&mut self, event_loop: &ActiveEventLoop, id: Id, raw: Arc<Window>) {
++        let window_id = raw.id();
++        if let Some(bridge) = self
++            .routing
++            .take_reused_destroyed(window_id)
++            .expect("native window id reused before destruction was observed")
++        {
++            bridge.drop_after_native_destroy();
++        }
++        let bridge = Bridge::new(event_loop, &raw);
++
++        self.routing
++            .insert(id, window_id, LiveWindow { raw, bridge });
++    }
++
++    pub(crate) fn process_window_event(&mut self, window_id: WindowId, event: &WindowEvent) {
++        if matches!(event, WindowEvent::Destroyed) && self.routing.mark_destroyed(window_id) {
++            return;
++        }
++
++        if let Some(window) = self.routing.live_mut(window_id) {
++            window.bridge.process_event(&window.raw, event);
++
++            if matches!(event, WindowEvent::Destroyed) {
++                let mut window = self
++                    .routing
++                    .take_live_by_key(window_id)
++                    .expect("live window still present");
++                window.bridge.clear();
++                let LiveWindow { raw, bridge } = window;
++
++                drop(raw);
++                self.routing.add_retired(window_id, bridge, true);
++            }
++
++            return;
++        }
++    }
++
++    pub(crate) fn retire(&mut self, id: Id, expected_window_id: WindowId) {
++        let Some(mut window) = self.routing.take_live_by_id(id, expected_window_id) else {
++            return;
++        };
++
++        window.bridge.clear();
++        let LiveWindow { raw, bridge } = window;
++        self.routing.add_retired(expected_window_id, bridge, false);
++        drop(raw);
++    }
++
++    pub(crate) fn queue(&mut self, id: Id, text: String, priority: AnnouncementPriority) {
++        let Some(window) = self.routing.live_mut_by_id(id) else {
++            return;
++        };
++
++        let _ = window.bridge.queue(text, priority);
++    }
++
++    pub(crate) fn flush(&mut self) {
++        for (_, window) in self.routing.live.values_mut() {
++            window.bridge.flush();
++        }
++    }
++
++    pub(crate) fn drain_destroyed(&mut self) {
++        for bridge in self.routing.take_destroyed() {
++            bridge.drop_after_native_destroy();
++        }
++    }
++}
++
++impl Drop for Manager {
++    fn drop(&mut self) {
++        self.drain_destroyed();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[derive(Default)]
++    struct RecordingAdapter {
++        active: bool,
++        updates: Vec<TreeUpdate>,
++    }
++
++    impl TreeAdapter for RecordingAdapter {
++        fn update_if_active(&mut self, update: TreeUpdate) -> bool {
++            if self.active {
++                self.updates.push(update);
++                true
++            } else {
++                false
++            }
++        }
++    }
++
++    fn active_bridge() -> Bridge<RecordingAdapter> {
++        let lifecycle = Arc::new(Lifecycle::default());
++        lifecycle.activate();
++        Bridge::with_adapter(
++            RecordingAdapter {
++                active: true,
++                updates: Vec::new(),
++            },
++            lifecycle,
++        )
++    }
++
++    fn node(update: &TreeUpdate) -> &Node {
++        &update.nodes[0].1
++    }
++
++    #[test]
++    fn initial_tree_has_only_stable_root_and_live_region_nodes() {
++        let update = initial_tree();
++
++        assert_eq!(update.nodes.len(), 2);
++        assert_eq!(update.nodes[0].0, ROOT_ID);
++        assert_eq!(update.nodes[0].1.role(), Role::Window);
++        assert_eq!(update.nodes[0].1.children(), &[ANNOUNCEMENT_ID]);
++        assert_eq!(update.nodes[1].0, ANNOUNCEMENT_ID);
++        assert_eq!(update.nodes[1].1.role(), Role::Label);
++        assert_eq!(update.nodes[1].1.value(), Some(""));
++        assert_eq!(update.nodes[1].1.live(), Some(Live::Off));
++        assert_eq!(update.tree, Some(Tree::new(ROOT_ID)));
++        assert_eq!(update.focus, ROOT_ID);
++    }
++
++    #[test]
++    fn valid_requests_coalesce_per_window_and_invalid_requests_are_ignored() {
++        let mut bridge = active_bridge();
++
++        assert!(bridge.queue("first".into(), AnnouncementPriority::Polite));
++        assert!(!bridge.queue(String::new(), AnnouncementPriority::Assertive));
++        assert!(!bridge.queue(
++            "x".repeat(MAX_ANNOUNCEMENT_BYTES + 1),
++            AnnouncementPriority::Assertive,
++        ));
++        assert!(bridge.queue(
++            "é".repeat(MAX_ANNOUNCEMENT_BYTES / 2),
++            AnnouncementPriority::Assertive,
++        ));
++        bridge.flush();
++
++        let adapter = bridge.adapter.as_ref().unwrap();
++        assert_eq!(adapter.updates.len(), 2);
++        assert_eq!(node(&adapter.updates[0]).value(), Some(""));
++        assert_eq!(node(&adapter.updates[0]).live(), Some(Live::Off));
++        assert_eq!(
++            node(&adapter.updates[1]).value(),
++            Some("é".repeat(MAX_ANNOUNCEMENT_BYTES / 2).as_str())
++        );
++        assert_eq!(node(&adapter.updates[1]).live(), Some(Live::Assertive));
++    }
++
++    #[test]
++    fn identical_text_always_uses_an_off_then_requested_live_sequence() {
++        let mut bridge = active_bridge();
++
++        for _ in 0..2 {
++            assert!(bridge.queue("same".into(), AnnouncementPriority::Polite));
++            bridge.flush();
++        }
++
++        let adapter = bridge.adapter.as_ref().unwrap();
++        assert_eq!(adapter.updates.len(), 4);
++        for pair in adapter.updates.chunks_exact(2) {
++            assert_eq!(node(&pair[0]).value(), Some(""));
++            assert_eq!(node(&pair[0]).live(), Some(Live::Off));
++            assert_eq!(node(&pair[1]).value(), Some("same"));
++            assert_eq!(node(&pair[1]).live(), Some(Live::Polite));
++        }
++    }
++
++    #[test]
++    fn inactive_and_lifecycle_edges_drop_without_replay() {
++        let lifecycle = Arc::new(Lifecycle::default());
++        lifecycle.activate();
++        let mut bridge = Bridge::with_adapter(
++            RecordingAdapter {
++                active: true,
++                updates: Vec::new(),
++            },
++            Arc::clone(&lifecycle),
++        );
++        assert!(bridge.queue("stale".into(), AnnouncementPriority::Assertive));
++
++        lifecycle.deactivate();
++        lifecycle.activate();
++        bridge.flush();
++        assert!(bridge.adapter.as_ref().unwrap().updates.is_empty());
++
++        lifecycle.deactivate();
++        assert!(!bridge.queue("inactive".into(), AnnouncementPriority::Polite));
++        lifecycle.activate();
++        bridge.flush();
++        assert!(bridge.adapter.as_ref().unwrap().updates.is_empty());
++    }
++
++    #[test]
++    fn injected_inactive_lifecycle_and_inert_adapter_drop_without_replay() {
++        let lifecycle = Arc::new(Lifecycle::default());
++        let mut bridge = Bridge::with_adapter(
++            RecordingAdapter {
++                active: false,
++                updates: Vec::new(),
++            },
++            Arc::clone(&lifecycle),
++        );
++
++        assert!(!bridge.queue("inactive".into(), AnnouncementPriority::Polite));
++        lifecycle.activate();
++        bridge.flush();
++        assert!(bridge.pending.is_none());
++
++        assert!(bridge.queue("unsupported".into(), AnnouncementPriority::Assertive));
++        bridge.flush();
++        bridge.adapter.as_mut().unwrap().active = true;
++        bridge.flush();
++        assert!(bridge.adapter.as_ref().unwrap().updates.is_empty());
++    }
++
++    #[test]
++    fn two_windows_coalesce_and_flush_independently() {
++        let mut first = active_bridge();
++        let mut second = active_bridge();
++
++        assert!(first.queue("first-old".into(), AnnouncementPriority::Polite));
++        assert!(second.queue("second".into(), AnnouncementPriority::Assertive));
++        assert!(first.queue("first-new".into(), AnnouncementPriority::Assertive));
++
++        first.flush();
++        assert_eq!(first.adapter.as_ref().unwrap().updates.len(), 2);
++        assert_eq!(second.adapter.as_ref().unwrap().updates.len(), 0);
++        assert_eq!(
++            node(&first.adapter.as_ref().unwrap().updates[1]).value(),
++            Some("first-new")
++        );
++
++        second.flush();
++        assert_eq!(second.adapter.as_ref().unwrap().updates.len(), 2);
++        assert_eq!(
++            node(&second.adapter.as_ref().unwrap().updates[1]).value(),
++            Some("second")
++        );
++    }
++
++    #[test]
++    fn two_window_routing_is_independent_and_closed_ids_stay_stale() {
++        let first = Id::unique();
++        let second = Id::unique();
++        let mut routing = Routing::<u8, &'static str, &'static str>::default();
++        routing.insert(first, 1, "first-live");
++        routing.insert(second, 2, "second-live");
++
++        assert_eq!(
++            routing.live_mut_by_id(first).map(|value| *value),
++            Some("first-live")
++        );
++        assert_eq!(
++            routing.live_mut_by_id(second).map(|value| *value),
++            Some("second-live")
++        );
++        assert!(routing.take_live_by_id(first, 2).is_none());
++        assert_eq!(
++            routing.live_mut_by_id(first).map(|value| *value),
++            Some("first-live")
++        );
++
++        let first_live = routing.take_live_by_id(first, 1).unwrap();
++        routing.add_retired(1, first_live, false);
++
++        assert!(routing.live_mut_by_id(first).is_none());
++        assert_eq!(
++            routing.live_mut_by_id(second).map(|value| *value),
++            Some("second-live")
++        );
++        assert_eq!(routing.retired.get(&1).unwrap().bridge, "first-live");
++    }
++
++    #[test]
++    fn retired_destroyed_lookup_precedes_a_conflicting_live_alias() {
++        let live_id = Id::unique();
++        let mut routing = Routing::<u8, &'static str, &'static str>::default();
++        routing.insert(live_id, 5, "live");
++        routing.add_retired(5, "retired", false);
++
++        assert!(routing.mark_destroyed(5));
++        assert!(routing.retired.get(&5).unwrap().destroyed_seen);
++        assert_eq!(routing.live_mut(5).map(|value| *value), Some("live"));
++    }
++
++    #[derive(Clone)]
++    struct DropProbe {
++        name: &'static str,
++        log: Rc<RefCell<Vec<&'static str>>>,
++    }
++
++    impl Drop for DropProbe {
++        fn drop(&mut self) {
++            self.log.borrow_mut().push(self.name);
++        }
++    }
++
++    struct ModelLive {
++        manager_raw: DropProbe,
++        iced_raw: DropProbe,
++        surface: DropProbe,
++        adapter: DropProbe,
++    }
++
++    fn probe(name: &'static str, log: &Rc<RefCell<Vec<&'static str>>>) -> DropProbe {
++        DropProbe {
++            name,
++            log: Rc::clone(log),
++        }
++    }
++
++    #[test]
++    fn close_and_destroyed_barrier_preserve_native_teardown_order() {
++        let log = Rc::new(RefCell::new(Vec::new()));
++        let id = Id::unique();
++        let mut routing = Routing::<u8, ModelLive, DropProbe>::default();
++        routing.insert(
++            id,
++            1,
++            ModelLive {
++                manager_raw: probe("manager-raw-drop", &log),
++                iced_raw: probe("iced-raw-drop", &log),
++                surface: probe("surface-drop", &log),
++                adapter: probe("adapter-drop", &log),
++            },
++        );
++
++        let live = routing.take_live_by_id(id, 1).unwrap();
++        let ModelLive {
++            manager_raw,
++            iced_raw,
++            surface,
++            adapter,
++        } = live;
++        routing.add_retired(1, adapter, false);
++        drop(manager_raw);
++        drop(iced_raw);
++        drop(surface);
++
++        log.borrow_mut().push("wm-destroy");
++        log.borrow_mut().push("destroyed-callback");
++        assert!(routing.mark_destroyed(1));
++        assert!(!log.borrow().contains(&"adapter-drop"));
++        log.borrow_mut().push("callback-return");
++        log.borrow_mut().push("wm-ncdestroy");
++        log.borrow_mut().push("real-boundary");
++        for adapter in routing.take_destroyed() {
++            drop(adapter);
++        }
++
++        assert_eq!(
++            log.borrow().as_slice(),
++            [
++                "manager-raw-drop",
++                "iced-raw-drop",
++                "surface-drop",
++                "wm-destroy",
++                "destroyed-callback",
++                "callback-return",
++                "wm-ncdestroy",
++                "real-boundary",
++                "adapter-drop",
++            ]
++        );
++        assert!(routing.retired.is_empty());
++    }
++
++    #[test]
++    fn external_live_destroyed_forwards_first_then_becomes_stale_and_seen() {
++        let log = Rc::new(RefCell::new(Vec::new()));
++        let id = Id::unique();
++        let mut routing = Routing::<u8, ModelLive, DropProbe>::default();
++        routing.insert(
++            id,
++            7,
++            ModelLive {
++                manager_raw: probe("manager-raw-drop", &log),
++                iced_raw: probe("iced-raw-drop", &log),
++                surface: probe("surface-drop", &log),
++                adapter: probe("adapter-drop", &log),
++            },
++        );
++
++        log.borrow_mut().push("adapter-process-event");
++        let live = routing.take_live_by_key(7).unwrap();
++        let ModelLive {
++            manager_raw,
++            iced_raw,
++            surface,
++            adapter,
++        } = live;
++        routing.add_retired(7, adapter, true);
++        drop(manager_raw);
++        log.borrow_mut().push("iced-process-event");
++
++        assert!(routing.live_mut_by_id(id).is_none());
++        assert!(routing.retired.get(&7).unwrap().destroyed_seen);
++        assert_eq!(log.borrow()[0], "adapter-process-event");
++        assert_eq!(log.borrow()[2], "iced-process-event");
++        assert!(!log.borrow().contains(&"adapter-drop"));
++
++        drop(iced_raw);
++        drop(surface);
++        for adapter in routing.take_destroyed() {
++            drop(adapter);
++        }
++        assert!(log.borrow().contains(&"adapter-drop"));
++    }
++
++    #[test]
++    fn reused_native_id_drains_seen_retirement_before_new_registration() {
++        let log = Rc::new(RefCell::new(Vec::new()));
++        let mut routing = Routing::<u8, (), DropProbe>::default();
++        routing.add_retired(3, probe("old-adapter-drop", &log), true);
++
++        let old = routing
++            .take_reused_destroyed(3)
++            .expect("seen native id is reusable")
++            .expect("old adapter is drained");
++        drop(old);
++        routing.insert(Id::unique(), 3, ());
++
++        assert_eq!(log.borrow().as_slice(), ["old-adapter-drop"]);
++        assert!(routing.retired.is_empty());
++
++        routing.add_retired(4, probe("unseen-adapter", &log), false);
++        assert!(routing.take_reused_destroyed(4).is_err());
++        assert!(routing.retired.contains_key(&4));
++        assert_eq!(log.borrow().as_slice(), ["old-adapter-drop"]);
++    }
++
++    struct ExitBridge {
++        adapter: Option<DropProbe>,
++        _pending: Option<DropProbe>,
++        retained: Rc<RefCell<usize>>,
++    }
++
++    impl ExitBridge {
++        fn drop_after_native_destroy(mut self) {
++            drop(self.adapter.take());
++        }
++    }
++
++    impl Drop for ExitBridge {
++        fn drop(&mut self) {
++            #[cfg(target_os = "windows")]
++            if let Some(adapter) = self.adapter.take() {
++                *self.retained.borrow_mut() += 1;
++                mem::forget(adapter);
++            }
++        }
++    }
++
++    struct ExitLive {
++        _raw: DropProbe,
++        _bridge: ExitBridge,
++    }
++
++    struct ExitManager {
++        routing: Routing<u8, ExitLive, ExitBridge>,
++    }
++
++    impl Drop for ExitManager {
++        fn drop(&mut self) {
++            for bridge in self.routing.take_destroyed() {
++                bridge.drop_after_native_destroy();
++            }
++        }
++    }
++
++    fn exit_bridge(
++        adapter: &'static str,
++        pending: &'static str,
++        log: &Rc<RefCell<Vec<&'static str>>>,
++        retained: &Rc<RefCell<usize>>,
++    ) -> ExitBridge {
++        ExitBridge {
++            adapter: Some(probe(adapter, log)),
++            _pending: Some(probe(pending, log)),
++            retained: Rc::clone(retained),
++        }
++    }
++
++    #[test]
++    fn panic_unwind_without_later_boundary_drops_seen_and_bounds_unseen_retention() {
++        let log = Rc::new(RefCell::new(Vec::new()));
++        let retained = Rc::new(RefCell::new(0));
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let mut routing = Routing::<u8, ExitLive, ExitBridge>::default();
++            routing.add_retired(
++                1,
++                exit_bridge("seen-adapter", "seen-pending", &log, &retained),
++                true,
++            );
++            routing.add_retired(
++                2,
++                exit_bridge("unseen-adapter", "unseen-pending", &log, &retained),
++                false,
++            );
++            routing.insert(
++                Id::unique(),
++                3,
++                ExitLive {
++                    _raw: probe("live-raw", &log),
++                    _bridge: exit_bridge("live-adapter", "live-pending", &log, &retained),
++                },
++            );
++            let _manager = ExitManager { routing };
++
++            panic!("callback panic after the final native event");
++        }));
++
++        assert!(result.is_err());
++        let log = log.borrow();
++        assert!(log.contains(&"seen-adapter"));
++        assert!(log.contains(&"seen-pending"));
++        assert!(log.contains(&"unseen-pending"));
++        assert!(log.contains(&"live-pending"));
++        assert!(log.contains(&"live-raw"));
++
++        #[cfg(target_os = "windows")]
++        {
++            assert!(!log.contains(&"unseen-adapter"));
++            assert!(!log.contains(&"live-adapter"));
++            assert_eq!(*retained.borrow(), 2);
++        }
++
++        #[cfg(not(target_os = "windows"))]
++        {
++            assert!(log.contains(&"unseen-adapter"));
++            assert!(log.contains(&"live-adapter"));
++            assert_eq!(*retained.borrow(), 0);
++        }
++    }
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn last_window_exit_drops_seen_and_forgets_only_unseen_adapters() {
++        let log = Rc::new(RefCell::new(Vec::new()));
++
++        NativeAdapter::new(probe("destroyed-seen", &log)).drop_after_native_destroy();
++        drop(NativeAdapter::new(probe("retired-not-seen", &log)));
++        drop(NativeAdapter::new(probe("still-live", &log)));
++
++        assert_eq!(log.borrow().as_slice(), ["destroyed-seen"]);
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 9f48aa8..7888bed 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -29,6 +29,8 @@ pub use winit;
+ pub mod clipboard;
+ pub mod conversion;
+ 
++#[cfg(not(target_arch = "wasm32"))]
++mod accessibility;
+ mod error;
+ mod proxy;
+ mod window;
+@@ -127,12 +129,17 @@ where
+     let (control_sender, control_receiver) = mpsc::unbounded();
+     let (system_theme_sender, system_theme_receiver) = oneshot::channel();
+ 
++    #[cfg(not(target_arch = "wasm32"))]
++    let accessibility = accessibility::shared_manager();
++
+     let instance = Box::pin(run_instance::<P>(
+         program,
+         runtime,
+         proxy.clone(),
+         event_receiver,
+         control_sender,
++        #[cfg(not(target_arch = "wasm32"))]
++        accessibility.clone(),
+         display_handle,
+         is_daemon,
+         graphics_settings,
+@@ -144,6 +151,8 @@ where
+ 
+     struct Runner<Message: 'static, F> {
+         instance: std::pin::Pin<Box<F>>,
++        #[cfg(not(target_arch = "wasm32"))]
++        accessibility: accessibility::SharedManager,
+         context: task::Context<'static>,
+         id: Option<String>,
+         sender: mpsc::UnboundedSender<Event<Action<Message>>>,
+@@ -157,6 +166,8 @@ where
+ 
+     let runner = Runner {
+         instance,
++        #[cfg(not(target_arch = "wasm32"))]
++        accessibility,
+         context,
+         id: settings.id,
+         sender: event_sender,
+@@ -191,6 +202,9 @@ where
+             event_loop: &winit::event_loop::ActiveEventLoop,
+             cause: winit::event::StartCause,
+         ) {
++            #[cfg(not(target_arch = "wasm32"))]
++            self.accessibility.borrow_mut().drain_destroyed();
++
+             self.process_event(
+                 event_loop,
+                 Event::EventLoopAwakened(winit::event::Event::NewEvents(cause)),
+@@ -210,6 +224,31 @@ where
+                     | winit::event::WindowEvent::Moved(_)
+             );
+ 
++            #[cfg(not(target_arch = "wasm32"))]
++            {
++                let accessibility = self.accessibility.clone();
++                accessibility_before_iced(
++                    event,
++                    |event| {
++                        accessibility
++                            .borrow_mut()
++                            .process_window_event(window_id, event);
++                    },
++                    |event| {
++                        self.process_event(
++                            event_loop,
++                            Event::EventLoopAwakened(
++                                winit::event::Event::WindowEvent {
++                                    window_id,
++                                    event,
++                                },
++                            ),
++                        );
++                    },
++                );
++            }
++
++            #[cfg(target_arch = "wasm32")]
+             self.process_event(
+                 event_loop,
+                 Event::EventLoopAwakened(winit::event::Event::WindowEvent {
+@@ -231,6 +270,8 @@ where
+                             winit::event::Event::AboutToWait,
+                         ),
+                     );
++
++                    self.accessibility.borrow_mut().flush();
+                 }
+             }
+         }
+@@ -252,10 +293,16 @@ where
+             &mut self,
+             event_loop: &winit::event_loop::ActiveEventLoop,
+         ) {
++            #[cfg(not(target_arch = "wasm32"))]
++            self.accessibility.borrow_mut().drain_destroyed();
++
+             self.process_event(
+                 event_loop,
+                 Event::EventLoopAwakened(winit::event::Event::AboutToWait),
+             );
++
++            #[cfg(not(target_arch = "wasm32"))]
++            self.accessibility.borrow_mut().flush();
+         }
+     }
+ 
+@@ -350,6 +397,15 @@ where
+                                     .create_window(window_attributes)
+                                     .expect("Create window");
+ 
++                                let window = Arc::new(window);
++
++                                #[cfg(not(target_arch = "wasm32"))]
++                                self.accessibility.borrow_mut().insert(
++                                    event_loop,
++                                    id,
++                                    window.clone(),
++                                );
++
+                                 #[cfg(target_os = "macos")]
+                                 if let Some(position) = position {
+                                     window.set_outer_position(position);
+@@ -405,7 +461,7 @@ where
+                                     event_loop,
+                                     Event::WindowCreated {
+                                         id,
+-                                        window: Arc::new(window),
++                                        window,
+                                         exit_on_close_request,
+                                         make_visible: visible,
+                                         on_open,
+@@ -421,6 +477,12 @@ where
+                                 self.error = Some(error);
+                                 event_loop.exit();
+                             }
++                            #[cfg(not(target_arch = "wasm32"))]
++                            Control::Announce { id, text, priority } => {
++                                self.accessibility
++                                    .borrow_mut()
++                                    .queue(id, text, priority);
++                            }
+                             Control::SetAutomaticWindowTabbing(_enabled) => {
+                                 #[cfg(target_os = "macos")]
+                                 {
+@@ -462,6 +524,53 @@ where
+     }
+ }
+ 
++#[cfg(not(target_arch = "wasm32"))]
++fn accessibility_before_iced<T>(
++    event: T,
++    accessibility: impl FnOnce(&T),
++    iced: impl FnOnce(T),
++) {
++    accessibility(&event);
++    iced(event);
++}
++
++#[cfg(all(test, not(target_arch = "wasm32")))]
++mod event_order_tests {
++    use super::accessibility_before_iced;
++    use std::cell::RefCell;
++
++    #[test]
++    fn every_window_event_kind_reaches_accessibility_before_iced() {
++        let log = RefCell::new(Vec::new());
++
++        for event in [
++            "focused",
++            "keyboard",
++            "resized",
++            "redraw",
++            "close-requested",
++            "destroyed",
++        ] {
++            accessibility_before_iced(
++                event,
++                |event| {
++                    log.borrow_mut()
++                        .push((event.to_string(), "accessibility"));
++                },
++                |event| {
++                    log.borrow_mut().push((event.to_string(), "iced"));
++                },
++            );
++        }
++
++        for pair in log.borrow().chunks_exact(2) {
++            assert_eq!(pair[0].0, pair[1].0);
++            assert_eq!(pair[0].1, "accessibility");
++            assert_eq!(pair[1].1, "iced");
++        }
++    }
++}
++
+ #[derive(Debug)]
+ enum Event<Message: 'static> {
+     WindowCreated {
+@@ -480,6 +589,12 @@ enum Control {
+     ChangeFlow(winit::event_loop::ControlFlow),
+     Exit,
+     Crash(Error),
++    #[cfg(not(target_arch = "wasm32"))]
++    Announce {
++        id: window::Id,
++        text: String,
++        priority: runtime::window::AnnouncementPriority,
++    },
+     CreateWindow {
+         id: window::Id,
+         settings: window::Settings,
+@@ -497,6 +612,8 @@ async fn run_instance<P>(
+     mut proxy: Proxy<P::Message>,
+     mut event_receiver: mpsc::UnboundedReceiver<Event<Action<P::Message>>>,
+     mut control_sender: mpsc::UnboundedSender<Control>,
++    #[cfg(not(target_arch = "wasm32"))]
++    accessibility: accessibility::SharedManager,
+     display_handle: winit::event_loop::OwnedDisplayHandle,
+     is_daemon: bool,
+     graphics_settings: graphics::Settings,
+@@ -754,6 +871,8 @@ async fn run_instance<P>(
+                             &mut messages,
+                             &mut clipboard,
+                             &mut control_sender,
++                            #[cfg(not(target_arch = "wasm32"))]
++                            &accessibility,
+                             &mut user_interfaces,
+                             &mut window_manager,
+                             &mut ui_caches,
+@@ -890,6 +1009,8 @@ async fn run_instance<P>(
+                                         &mut messages,
+                                         &mut clipboard,
+                                         &mut control_sender,
++                                        #[cfg(not(target_arch = "wasm32"))]
++                                        &accessibility,
+                                         &mut user_interfaces,
+                                         &mut window_manager,
+                                         &mut ui_caches,
+@@ -1097,6 +1218,8 @@ async fn run_instance<P>(
+                                 &mut messages,
+                                 &mut clipboard,
+                                 &mut control_sender,
++                                #[cfg(not(target_arch = "wasm32"))]
++                                &accessibility,
+                                 &mut user_interfaces,
+                                 &mut window_manager,
+                                 &mut ui_caches,
+@@ -1241,6 +1364,8 @@ async fn run_instance<P>(
+                                     &mut messages,
+                                     &mut clipboard,
+                                     &mut control_sender,
++                                    #[cfg(not(target_arch = "wasm32"))]
++                                    &accessibility,
+                                     &mut user_interfaces,
+                                     &mut window_manager,
+                                     &mut ui_caches,
+@@ -1351,6 +1476,8 @@ fn run_action<'a, P, C>(
+     messages: &mut Vec<P::Message>,
+     clipboard: &mut Clipboard,
+     control_sender: &mut mpsc::UnboundedSender<Control>,
++    #[cfg(not(target_arch = "wasm32"))]
++    accessibility: &accessibility::SharedManager,
+     interfaces: &mut FxHashMap<
+         window::Id,
+         UserInterface<'a, P::Message, P::Theme, P::Renderer>,
+@@ -1401,7 +1528,9 @@ fn run_action<'a, P, C>(
+                 let _ = interfaces.remove(&id);
+ 
+                 if let Some(window) = window_manager.remove(id) {
+-                    if clipboard.window_id() == Some(window.raw.id()) {
++                    let window_id = window.raw.id();
++
++                    if clipboard.window_id() == Some(window_id) {
+                         *clipboard = window_manager
+                             .first()
+                             .map(|window| window.raw.clone())
+@@ -1409,16 +1538,30 @@ fn run_action<'a, P, C>(
+                             .unwrap_or_else(Clipboard::unconnected);
+                     }
+ 
++                    #[cfg(not(target_arch = "wasm32"))]
++                    accessibility.borrow_mut().retire(id, window_id);
++
+                     events.push((
+                         id,
+                         core::Event::Window(core::window::Event::Closed),
+                     ));
++
++                    drop(window);
+                 }
+ 
+                 if window_manager.is_empty() {
+                     *compositor = None;
+                 }
+             }
++            window::Action::Announce(id, text, priority) => {
++                #[cfg(not(target_arch = "wasm32"))]
++                control_sender
++                    .start_send(Control::Announce { id, text, priority })
++                    .expect("Send control action");
++
++                #[cfg(target_arch = "wasm32")]
++                let _ = (id, text, priority);
++            }
+             window::Action::GetOldest(channel) => {
+                 let id =
+                     window_manager.iter_mut().next().map(|(id, _window)| id);

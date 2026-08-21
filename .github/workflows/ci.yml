@@ -103,6 +103,10 @@ jobs:
       - name: Audit Web Audio dependency and feature wiring
         run: python bin/check-web-audio-wiring.py
 
+      - name: Test iced accessibility dependency patches
+        if: matrix.mode == 'default'
+        run: python bin/test-iced-accessibility-patches.py
+
       - name: Check hardware-free default product
         if: matrix.mode == 'default'
         run: >-

@@ -147,11 +147,24 @@ unic-langid = "0.9.6"
 #   scoped read+write grants can reach them; paired invariant: smudgy rejects
 #   pipe-namespace paths in manifest path axes, so a pipe fs-grant only ever
 #   originates from a consented Critical-tier `ipc` row.
+# - `iced_runtime` (patches/iced_runtime+0.14.0.patch): adds the narrow
+#   per-window announcement action used by the audio control panel.
+# - `iced_winit` (patches/iced_winit+0.14.0.patch): owns the matching bounded
+#   AccessKit live-region bridge and native-window retirement ordering.
 [workspace.metadata.patch]
-crates = ["iced_graphics", "cosmic-text", "vtparse", "deno_permissions"]
+crates = [
+    "iced_graphics",
+    "iced_runtime",
+    "iced_winit",
+    "cosmic-text",
+    "vtparse",
+    "deno_permissions",
+]
 
 [patch.crates-io]
 iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
+iced_runtime = { path = "./target/patch/iced_runtime-0.14.0" }
+iced_winit = { path = "./target/patch/iced_winit-0.14.0" }
 cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
 vtparse = { path = "./target/patch/vtparse-0.7.0" }
 deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }
