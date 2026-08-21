@@ -42,6 +42,7 @@ use crate::update::Update;
 mod common;
 mod dashboard;
 mod editors;
+mod highlight;
 mod manifest;
 mod model;
 mod packages;
@@ -279,7 +280,8 @@ pub enum Message {
 
     // ---- editor fields -----------------------------------------------------
     SetName(String),
-    SetAliasPattern(String),
+    /// An edit in the alias Regex field's one-line editor.
+    AliasRegexAction(text_editor::Action),
     // alias matcher draft
     SetAliasKind(model::AliasKind),
     SetCommandName(String),
@@ -289,7 +291,8 @@ pub enum Message {
     RemoveArg(usize),
     SetCmdMode(smudgy_core::models::matchers::CmdMode),
     SetParseMode(smudgy_core::models::matchers::ParseMode),
-    SetPatternSource(String),
+    /// An edit in the alias Simple-pattern field's one-line editor.
+    AliasPatternAction(text_editor::Action),
     ToggleAnchorStart,
     ToggleAnchorEnd,
     TogglePrompt,
@@ -313,7 +316,8 @@ pub enum Message {
     AddPattern,
     RemovePattern(usize),
     SetPatternKind(usize, PatternKind),
-    SetPatternText(usize, String),
+    /// An edit in a trigger row's one-line source editor.
+    RowSourceAction(usize, text_editor::Action),
     SetRowSyntax(usize, smudgy_core::models::matchers::MatcherSyntax),
     ToggleRowAnchorStart(usize),
     ToggleRowAnchorEnd(usize),
@@ -596,6 +600,14 @@ pub struct AutomationsWindow {
 
     // ---- shared editor buffers --------------------------------------------
     pub(super) editor_content: text_editor::Content,
+    /// The alias Simple-pattern field's buffer; `alias_draft.pattern_source`
+    /// mirrors it after every edit (the draft stays the compile input).
+    pub(super) alias_pattern_content: text_editor::Content,
+    /// The alias Regex field's buffer, mirrored into `alias_draft.regex_source`.
+    pub(super) alias_regex_content: text_editor::Content,
+    /// One buffer per trigger matcher row, kept index-aligned with the open
+    /// trigger's `rows` through every add/remove/reorder.
+    pub(super) trigger_row_contents: Vec<text_editor::Content>,
     pub(super) hotkey_state: Vec<MaybePhysicalKey>,
     /// The alias editor's matcher draft (kind + every kind's buffers), seeded
     /// on open/create like `hotkey_state` and consumed at save.
@@ -836,6 +848,9 @@ impl AutomationsWindow {
             chip: Chip::All,
             new_menu_open: false,
             editor_content: text_editor::Content::new(),
+            alias_pattern_content: text_editor::Content::new(),
+            alias_regex_content: text_editor::Content::new(),
+            trigger_row_contents: Vec::new(),
             hotkey_state: Vec::new(),
             alias_draft: model::AliasMatcherDraft::default(),
             order_revealed: false,
@@ -1171,10 +1186,12 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
-            Message::SetAliasPattern(pattern) => {
+            Message::AliasRegexAction(action) => {
                 // The Regex kind's source buffer; `pattern` on the definition is
                 // written from the draft at save time.
-                self.alias_draft.regex_source = pattern;
+                editors::perform_single_line(&mut self.alias_regex_content, action);
+                self.alias_draft.regex_source =
+                    editors::single_line_text(&self.alias_regex_content);
                 Update::none()
             }
             Message::SetAliasKind(kind) => {
@@ -1224,8 +1241,10 @@ impl AutomationsWindow {
                 self.alias_draft.parse = parse;
                 Update::none()
             }
-            Message::SetPatternSource(source) => {
-                self.alias_draft.pattern_source = source;
+            Message::AliasPatternAction(action) => {
+                editors::perform_single_line(&mut self.alias_pattern_content, action);
+                self.alias_draft.pattern_source =
+                    editors::single_line_text(&self.alias_pattern_content);
                 Update::none()
             }
             Message::ToggleAnchorStart => {
@@ -1322,6 +1341,7 @@ impl AutomationsWindow {
                 }) = &mut self.pane
                 {
                     rows.push(model::TriggerRow::new(PatternKind::Match));
+                    self.trigger_row_contents.push(text_editor::Content::new());
                 }
                 Update::none()
             }
@@ -1333,6 +1353,9 @@ impl AutomationsWindow {
                     && i < rows.len()
                 {
                     rows.remove(i);
+                    if i < self.trigger_row_contents.len() {
+                        self.trigger_row_contents.remove(i);
+                    }
                 }
                 Update::none()
             }
@@ -1351,14 +1374,18 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
-            Message::SetPatternText(i, text) => {
-                if let Pane::Editor(EditorState {
-                    node: EditNode::Trigger { rows, .. },
-                    ..
-                }) = &mut self.pane
-                    && let Some(row) = rows.get_mut(i)
-                {
-                    row.source = text;
+            Message::RowSourceAction(i, action) => {
+                if let Some(content) = self.trigger_row_contents.get_mut(i) {
+                    editors::perform_single_line(content, action);
+                    let source = editors::single_line_text(content);
+                    if let Pane::Editor(EditorState {
+                        node: EditNode::Trigger { rows, .. },
+                        ..
+                    }) = &mut self.pane
+                        && let Some(row) = rows.get_mut(i)
+                    {
+                        row.source = source;
+                    }
                 }
                 Update::none()
             }
@@ -1824,9 +1851,13 @@ impl AutomationsWindow {
 
     fn is_edit_message(message: &Message) -> bool {
         match message {
-            Message::ScriptEditorAction(action) => matches!(action, text_editor::Action::Edit(_)),
+            Message::ScriptEditorAction(action)
+            | Message::AliasPatternAction(action)
+            | Message::AliasRegexAction(action)
+            | Message::RowSourceAction(_, action) => {
+                matches!(action, text_editor::Action::Edit(_))
+            }
             Message::SetName(_)
-            | Message::SetAliasPattern(_)
             | Message::SetAliasKind(_)
             | Message::SetCommandName(_)
             | Message::SetArgName(_, _)
@@ -1835,7 +1866,6 @@ impl AutomationsWindow {
             | Message::RemoveArg(_)
             | Message::SetCmdMode(_)
             | Message::SetParseMode(_)
-            | Message::SetPatternSource(_)
             | Message::ToggleAnchorStart
             | Message::ToggleAnchorEnd
             | Message::TogglePrompt
@@ -1845,7 +1875,6 @@ impl AutomationsWindow {
             | Message::AddPattern
             | Message::RemovePattern(_)
             | Message::SetPatternKind(_, _)
-            | Message::SetPatternText(_, _)
             | Message::SetRowSyntax(_, _)
             | Message::ToggleRowAnchorStart(_)
             | Message::ToggleRowAnchorEnd(_)

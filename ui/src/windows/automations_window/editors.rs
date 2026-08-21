@@ -25,6 +25,7 @@ use crate::update::Update;
 use crate::widgets::hotkey_input::HotkeyInput;
 
 use super::common;
+use super::highlight;
 use super::model::{
     AliasKind, AliasMatcherDraft, ArgKindChoice, NodeStatus, ParseModeChoice, PatternKind, Script,
     ScriptKey, SyntaxChoice, TriggerRow, pattern_error_text, rows_into_trigger, trigger_rows,
@@ -109,21 +110,32 @@ impl AutomationsWindow {
                         key.script_name
                     );
                 }
+                self.alias_pattern_content =
+                    text_editor::Content::with_text(&self.alias_draft.pattern_source);
+                self.alias_regex_content =
+                    text_editor::Content::with_text(&self.alias_draft.regex_source);
                 EditNode::Alias(a)
             }
             Script::Hotkey(h) => {
                 self.hotkey_state = hotkey_definition_to_keys(&h);
                 EditNode::Hotkey(h)
             }
-            Script::Trigger(t) => EditNode::Trigger {
-                enabled: t.enabled,
-                language: t.language,
-                prompt: t.prompt,
-                priority: t.priority,
-                fallthrough: t.fallthrough,
-                package: t.package.clone(),
-                rows: trigger_rows(&t),
-            },
+            Script::Trigger(t) => {
+                let rows = trigger_rows(&t);
+                self.trigger_row_contents = rows
+                    .iter()
+                    .map(|row| text_editor::Content::with_text(&row.source))
+                    .collect();
+                EditNode::Trigger {
+                    enabled: t.enabled,
+                    language: t.language,
+                    prompt: t.prompt,
+                    priority: t.priority,
+                    fallthrough: t.fallthrough,
+                    package: t.package.clone(),
+                    rows,
+                }
+            }
             Script::Folder(_, _) => return Update::none(),
         };
         self.pane = Pane::Editor(EditorState {
@@ -145,6 +157,8 @@ impl AutomationsWindow {
         self.try_it_open = false;
         // Command is the default kind for new aliases.
         self.alias_draft = AliasMatcherDraft::default();
+        self.alias_pattern_content = text_editor::Content::new();
+        self.alias_regex_content = text_editor::Content::new();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -171,6 +185,7 @@ impl AutomationsWindow {
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
+        self.trigger_row_contents = vec![text_editor::Content::new()];
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -1284,6 +1299,38 @@ impl AutomationsWindow {
         .into()
     }
 
+    /// The send-text action body: the shared body editor with `$ref`
+    /// highlighting — known references take the capture accent, unknown ones
+    /// the error color (`matching-logic.md` §9).
+    fn send_text_editor<'a>(&'a self, known: Vec<String>) -> Elem<'a> {
+        let editor = text_editor(&self.editor_content)
+            .highlight_with::<highlight::PatternHighlighter>(
+                highlight::FieldSyntax::SendText { known },
+                token_format,
+            )
+            .font(fonts::GEIST_MONO_VF)
+            .on_action(Message::ScriptEditorAction)
+            .height(Length::Fixed(220.0));
+        column![
+            common::section_label(crate::i18n::ts!("editor-script")),
+            container(editor).style(common::code_surface_style),
+        ]
+        .spacing(6.0)
+        .into()
+    }
+
+    /// The action body editor for `language`: `$ref`-aware for send-text
+    /// bodies, the stock code highlighter for scripts. `known` is every
+    /// reference the current matcher provides, `$0` included.
+    fn action_body_editor<'a>(&'a self, language: ScriptLang, mut known: Vec<String>) -> Elem<'a> {
+        if language == ScriptLang::Plaintext {
+            known.push("$0".to_string());
+            self.send_text_editor(known)
+        } else {
+            self.code_editor(language)
+        }
+    }
+
     /// The syntax-highlighted code body editor.
     fn code_editor<'a>(&'a self, language: ScriptLang) -> Elem<'a> {
         let token = match language {
@@ -1439,13 +1486,14 @@ impl AutomationsWindow {
             AliasKind::Pattern => {
                 body = body.push(field_row(
                     crate::i18n::ts!("editor-pattern"),
-                    text_input(
+                    matcher_field(
+                        &self.alias_pattern_content,
                         crate::i18n::ts!("editor-example-alias-simple"),
-                        &self.alias_draft.pattern_source,
-                    )
-                    .on_input(Message::SetPatternSource)
-                    .size(14.0)
-                    .into(),
+                        highlight::FieldSyntax::Pattern,
+                        (!self.alias_draft.anchor_start, !self.alias_draft.anchor_end),
+                        true,
+                        Message::AliasPatternAction,
+                    ),
                 ));
                 body = body.push(field_row(
                     "",
@@ -1474,24 +1522,25 @@ impl AutomationsWindow {
             AliasKind::Regex => {
                 body = body.push(field_row(
                     crate::i18n::ts!("editor-regex"),
-                    text_input(
+                    matcher_field(
+                        &self.alias_regex_content,
                         crate::i18n::ts!("editor-example-alias-regex"),
-                        &self.alias_draft.regex_source,
-                    )
-                    .on_input(Message::SetAliasPattern)
-                    .size(14.0)
-                    .into(),
+                        highlight::FieldSyntax::Regex,
+                        regex_loose_sides(&self.alias_draft.regex_source),
+                        false,
+                        Message::AliasRegexAction,
+                    ),
                 ));
             }
         }
         body = body.push(self.tester_box(true, false));
         body = body.push(self.order_module(alias.priority, alias.fallthrough, None, false));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
-        if let Some(rail) = self.matched_values_rail(self.alias_capture_references(alias.language))
-        {
+        let references = self.alias_capture_references(alias.language);
+        if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
         }
-        body = body.push(self.code_editor(alias.language));
+        body = body.push(self.action_body_editor(alias.language, references));
         if let Some(bar) = self.save_bar(
             create,
             !create,
@@ -1643,7 +1692,9 @@ impl AutomationsWindow {
         let raw_subject = raw_of(&self.test_input);
         let plain_subject = plain_of(&raw_subject);
         let mut patterns = Column::new().spacing(6.0);
-        for (i, trigger_row) in rows.iter().enumerate() {
+        for (i, (trigger_row, row_content)) in
+            rows.iter().zip(&self.trigger_row_contents).enumerate()
+        {
             let subject = if trigger_row.role == PatternKind::Raw {
                 raw_subject.as_str()
             } else {
@@ -1679,7 +1730,8 @@ impl AutomationsWindow {
                         move |k| { Message::SetPatternKind(i, k) }
                     )
                     .text_size(13.0),
-                    text_input(
+                    matcher_field(
+                        row_content,
                         if trigger_row.syntax == MatcherSyntax::Pattern {
                             crate::i18n::ts!("editor-example-trigger-pattern")
                         } else if trigger_row.role == PatternKind::Raw {
@@ -1687,11 +1739,19 @@ impl AutomationsWindow {
                         } else {
                             crate::i18n::ts!("editor-example-trigger-regex")
                         },
-                        &trigger_row.source
-                    )
-                    .on_input(move |v| Message::SetPatternText(i, v))
-                    .size(14.0)
-                    .width(Length::Fill),
+                        if trigger_row.syntax == MatcherSyntax::Pattern {
+                            highlight::FieldSyntax::Pattern
+                        } else {
+                            highlight::FieldSyntax::Regex
+                        },
+                        if trigger_row.syntax == MatcherSyntax::Pattern {
+                            (!trigger_row.anchor_start, !trigger_row.anchor_end)
+                        } else {
+                            regex_loose_sides(&trigger_row.source)
+                        },
+                        trigger_row.syntax == MatcherSyntax::Pattern,
+                        move |action| Message::RowSourceAction(i, action),
+                    ),
                     container(common::status_dot(valid)).padding(Padding {
                         top: 0.0,
                         bottom: 0.0,
@@ -1754,12 +1814,11 @@ impl AutomationsWindow {
         body = body.push(self.tester_box(false, has_raw));
         body = body.push(self.order_module(priority, fallthrough, Some(prompt), true));
         body = body.push(field_row("Behavior", self.behavior_radios(language)));
-        if let Some(rail) =
-            self.matched_values_rail(Self::trigger_capture_references(rows, language))
-        {
+        let references = Self::trigger_capture_references(rows, language);
+        if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
         }
-        body = body.push(self.code_editor(language));
+        body = body.push(self.action_body_editor(language, references));
         if let Some(bar) = self.save_bar(
             create,
             !create,
@@ -2526,6 +2585,171 @@ fn danger_link<'a>(label: String, message: Message) -> Elem<'a> {
         .into()
 }
 
+// ---- one-line matcher fields ------------------------------------------------
+
+/// Applies an action to a one-line field's buffer: Enter is dropped and
+/// pasted newlines flatten to spaces, so the buffer never grows a second line.
+pub(super) fn perform_single_line(content: &mut text_editor::Content, action: text_editor::Action) {
+    use text_editor::{Action, Edit};
+    let action = match action {
+        Action::Edit(Edit::Enter) => return,
+        Action::Edit(Edit::Paste(pasted)) if pasted.contains('\n') || pasted.contains('\r') => {
+            Action::Edit(Edit::Paste(Arc::new(
+                pasted.replace("\r\n", "\n").replace(['\r', '\n'], " "),
+            )))
+        }
+        other => other,
+    };
+    content.perform(action);
+}
+
+/// A one-line buffer's text, without the trailing newline `Content::text`
+/// always appends.
+pub(super) fn single_line_text(content: &text_editor::Content) -> String {
+    let mut text = content.text();
+    while text.ends_with('\n') || text.ends_with('\r') {
+        text.pop();
+    }
+    text
+}
+
+/// Which sides of a regex source are unanchored (fixtures §10): left iff no
+/// leading `^`, right iff no unescaped trailing `$`; neither while empty.
+fn regex_loose_sides(source: &str) -> (bool, bool) {
+    let source = source.trim();
+    if source.is_empty() {
+        return (false, false);
+    }
+    let anchored_end =
+        source.ends_with('$') && (source.len() == 1 || !source[..source.len() - 1].ends_with('\\'));
+    (!source.starts_with('^'), !anchored_end)
+}
+
+/// A small tooltip chip.
+fn tip<'a>(content: Elem<'a>, label: String) -> Elem<'a> {
+    iced::widget::tooltip(
+        content,
+        container(text(label).size(11.0))
+            .padding(6.0)
+            .style(common::banner_style),
+        iced::widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
+/// A `. . .` gutter cell (visual-contract §6): the literal spaced string in
+/// the mono font on a faint wash, flush against the field inside the
+/// composite's single border.
+fn gutter_cell<'a>(tooltip_label: String) -> Elem<'a> {
+    let cell = container(text(". . .").size(11.0).font(fonts::GEIST_MONO_VF).style(
+        |theme: &Theme| iced::widget::text::Style {
+            color: Some(theme.styles.text.normal.scale_alpha(0.32)),
+        },
+    ))
+    .padding(Padding {
+        top: 0.0,
+        bottom: 0.0,
+        left: 8.0,
+        right: 8.0,
+    })
+    .height(Length::Fill)
+    .align_y(Vertical::Center)
+    .style(|theme: &Theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(
+            theme.styles.text.normal.scale_alpha(0.04),
+        )),
+        ..Default::default()
+    });
+    tip(cell.into(), tooltip_label)
+}
+
+/// The color a highlighted run takes (visual-contract §1). The island run is
+/// specified as ink on a wash; a highlighter `Format` has no background
+/// channel, so the island borrows the Regex kind hue instead — the
+/// in-language way to mark "this run is raw regex".
+fn token_format(
+    token: &highlight::Token,
+    theme: &Theme,
+) -> iced::advanced::text::highlighter::Format<Font> {
+    use highlight::Token;
+    let color = match token {
+        Token::Hole | Token::GroupOpen | Token::Escape | Token::KnownRef => common::KIND_PATTERN,
+        Token::Wildcard => common::KIND_PATTERN.scale_alpha(0.65),
+        Token::Island => common::KIND_REGEX,
+        Token::UnknownRef => theme.styles.text.error,
+    };
+    iced::advanced::text::highlighter::Format {
+        color: Some(color),
+        font: None,
+    }
+}
+
+/// One matcher source field: `[gutter | editor | gutter]` composed inside a
+/// single bordered container (README §5.3) — the editor is chromeless, the
+/// composite owns the one border, and the `. . .` gutters appear per `loose`.
+/// The editor is a real `text_editor` with highlighted runs and a true caret;
+/// Enter is swallowed at the key-binding layer and again in the update path.
+fn matcher_field<'a>(
+    content: &'a text_editor::Content,
+    placeholder: &'a str,
+    syntax: highlight::FieldSyntax,
+    loose: (bool, bool),
+    pattern_tips: bool,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Elem<'a> {
+    let editor = text_editor(content)
+        .placeholder(placeholder)
+        .size(13.0)
+        .padding(8.0)
+        .font(fonts::GEIST_MONO_VF)
+        .class(crate::theme::TextEditorClass::Inline)
+        .key_binding(|key_press| {
+            match text_editor::Binding::from_key_press(key_press) {
+                // Swallow the break: captured, but edits nothing.
+                Some(text_editor::Binding::Enter) => {
+                    Some(text_editor::Binding::Sequence(Vec::new()))
+                }
+                other => other,
+            }
+        })
+        .highlight_with::<highlight::PatternHighlighter>(syntax, token_format)
+        .on_action(on_action);
+
+    let (left_tip, right_tip) = if pattern_tips {
+        (
+            crate::i18n::t!("editor-gutter-before-pattern"),
+            crate::i18n::t!("editor-gutter-after-pattern"),
+        )
+    } else {
+        (
+            crate::i18n::t!("editor-gutter-before-regex"),
+            crate::i18n::t!("editor-gutter-after-regex"),
+        )
+    };
+    let mut inner = row![];
+    if loose.0 {
+        inner = inner.push(gutter_cell(left_tip));
+    }
+    inner = inner.push(editor);
+    if loose.1 {
+        inner = inner.push(gutter_cell(right_tip));
+    }
+    container(inner)
+        .width(Length::Fill)
+        .style(|theme: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(
+                theme.styles.general.container_background,
+            )),
+            border: iced::Border {
+                color: theme.styles.general.border,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 fn error_bar<'a>(message: &str) -> Elem<'a> {
     container(
         row![
@@ -2693,7 +2917,7 @@ mod tests {
         let value = String::new();
         let valid = iced::widget::column![
             error_slot(None),
-            text_input("pattern", &value).on_input(Message::SetAliasPattern)
+            text_input("pattern", &value).on_input(Message::SetName)
         ];
         let mut tree = Tree::new(&valid as &dyn Widget<Message, Theme, iced::Renderer>);
 
@@ -2705,7 +2929,7 @@ mod tests {
 
         let invalid = iced::widget::column![
             error_slot(Some("invalid regular expression")),
-            text_input("pattern", &value).on_input(Message::SetAliasPattern)
+            text_input("pattern", &value).on_input(Message::SetName)
         ];
         tree.diff(&invalid as &dyn Widget<Message, Theme, iced::Renderer>);
 
@@ -2713,5 +2937,33 @@ mod tests {
             .state
             .downcast_ref::<iced::widget::text_input::State<Paragraph>>();
         assert!(input_state.is_focused());
+    }
+
+    /// The fixtures §10 gutter-derivation table for regex sources.
+    #[test]
+    fn regex_gutters_derive_from_the_source_anchors() {
+        assert_eq!(regex_loose_sides("^greet$"), (false, false));
+        assert_eq!(regex_loose_sides("greet$"), (true, false));
+        assert_eq!(regex_loose_sides("^greet"), (false, true));
+        assert_eq!(regex_loose_sides("greet"), (true, true));
+        // An escaped `$` is not an anchor.
+        assert_eq!(regex_loose_sides(r"costs 5\$"), (true, true));
+        assert_eq!(regex_loose_sides(""), (false, false));
+        assert_eq!(regex_loose_sides("$"), (true, false));
+    }
+
+    /// Enter never reaches a one-line buffer, and pasted newlines flatten.
+    #[test]
+    fn single_line_fields_stay_single_line() {
+        use iced::widget::text_editor::{Action, Content, Edit};
+
+        let mut content = Content::new();
+        perform_single_line(&mut content, Action::Edit(Edit::Insert('a')));
+        perform_single_line(&mut content, Action::Edit(Edit::Enter));
+        perform_single_line(
+            &mut content,
+            Action::Edit(Edit::Paste(Arc::new("b\r\nc\nd".to_string()))),
+        );
+        assert_eq!(single_line_text(&content), "ab c d");
     }
 }

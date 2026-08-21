@@ -1063,6 +1063,12 @@ editor-priority-note-triggers = Higher numbered triggers run first.
 editor-continue-aliases = Let other matching aliases run too
 editor-continue-triggers = Let other matching triggers run too
 
+# Gutter tooltips
+editor-gutter-before-pattern = Anything may come before the pattern
+editor-gutter-after-pattern = Anything may come after the pattern
+editor-gutter-before-regex = No ^ — anything may come before this
+editor-gutter-after-regex = No $ — anything may come after this
+
 # Header deck lines and footer links
 editor-deck-alias = Aliases let you create your own commands.
 editor-deck-trigger = Triggers react to text the game sends you.
