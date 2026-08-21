@@ -114,6 +114,9 @@ impl Serialize for TriggerDefinition {
         if !self.enabled {
             map.serialize_entry("enabled", &self.enabled)?;
         }
+        if self.prompt {
+            map.serialize_entry("prompt", &self.prompt)?;
+        }
         if self.priority != 0 {
             map.serialize_entry("priority", &self.priority)?;
         }
@@ -528,6 +531,26 @@ mod tests {
 
         // Empty vectors should not be serialized
         assert!(!json.contains("pattern"));
+    }
+
+    #[test]
+    fn prompt_survives_serialization_roundtrip() {
+        let trigger = TriggerDefinition {
+            patterns: Some(vec!["^hp".to_string()]),
+            prompt: true,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&trigger).expect("Failed to serialize");
+        assert!(json.contains("\"prompt\":true"));
+
+        let deserialized: TriggerDefinition =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+        assert!(deserialized.prompt);
+
+        // The sparse-serialization contract: a default (false) prompt is omitted.
+        let default_json = serde_json::to_string(&TriggerDefinition::default()).unwrap();
+        assert!(!default_json.contains("prompt"));
     }
 
     #[test]
