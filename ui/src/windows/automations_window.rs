@@ -1041,6 +1041,10 @@ impl AutomationsWindow {
     }
 
     pub fn update(&mut self, message: Message) -> Update<Message, Event> {
+        // Message tracing for GUI debugging: run with
+        // `SMUDGY_LOG=smudgy_ui::windows::automations_window=trace` to watch
+        // every message this window handles.
+        log::trace!("{message:?}");
         // Unsaved-changes guard: defer navigation away from a dirty editor or an edited but
         // unsaved manifest draft (the rich manifest editor tracks its own dirty flag).
         if (self.dirty || self.manifest_dirty) && Self::is_guarded_navigation(&message) {
