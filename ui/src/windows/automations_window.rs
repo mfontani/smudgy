@@ -314,8 +314,18 @@ pub enum Message {
     MarkHotkeyState(Vec<MaybePhysicalKey>),
     // trigger patterns
     AddPattern,
+    /// Add an exception row (Pattern syntax by default).
+    AddExceptionRow,
+    /// Add a raw row (always Regex syntax).
+    AddRawRow,
+    /// A click on one of the trigger pane's matcher cards: creates the first
+    /// matcher row at the teaching state, or re-shapes the single existing
+    /// matcher at the selector state (README §4).
+    SetTriggerCard(model::TriggerCard),
     RemovePattern(usize),
-    SetPatternKind(usize, PatternKind),
+    /// Move a row up/down within its role group (the phase order is fixed).
+    MoveRowUp(usize),
+    MoveRowDown(usize),
     /// An edit in a trigger row's one-line source editor.
     RowSourceAction(usize, text_editor::Action),
     SetRowSyntax(usize, smudgy_core::models::matchers::MatcherSyntax),
@@ -1340,9 +1350,89 @@ impl AutomationsWindow {
                     ..
                 }) = &mut self.pane
                 {
-                    rows.push(model::TriggerRow::new(PatternKind::Match));
+                    // "Another" means another of what you have: the new row
+                    // copies the last Match row's syntax, defaulting to the
+                    // Simple pattern for the first one.
+                    let syntax = rows
+                        .iter()
+                        .rev()
+                        .find(|row| row.role == PatternKind::Match)
+                        .map_or(
+                            smudgy_core::models::matchers::MatcherSyntax::Pattern,
+                            |row| row.syntax,
+                        );
+                    rows.push(model::TriggerRow {
+                        syntax,
+                        ..model::TriggerRow::new(PatternKind::Match)
+                    });
                     self.trigger_row_contents.push(text_editor::Content::new());
                 }
+                Update::none()
+            }
+            Message::AddExceptionRow => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                {
+                    rows.push(model::TriggerRow {
+                        syntax: smudgy_core::models::matchers::MatcherSyntax::Pattern,
+                        ..model::TriggerRow::new(PatternKind::Anti)
+                    });
+                    self.trigger_row_contents.push(text_editor::Content::new());
+                }
+                Update::none()
+            }
+            Message::AddRawRow => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                {
+                    rows.push(model::TriggerRow::new(PatternKind::Raw));
+                    self.trigger_row_contents.push(text_editor::Content::new());
+                }
+                Update::none()
+            }
+            Message::SetTriggerCard(card) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                {
+                    let (syntax, role) = card.shape();
+                    let matcher_indexes: Vec<usize> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| row.role != PatternKind::Anti)
+                        .map(|(i, _)| i)
+                        .collect();
+                    match matcher_indexes[..] {
+                        [] => {
+                            rows.push(model::TriggerRow {
+                                syntax,
+                                ..model::TriggerRow::new(role)
+                            });
+                            self.trigger_row_contents.push(text_editor::Content::new());
+                        }
+                        [index] => {
+                            if let Some(row) = rows.get_mut(index) {
+                                row.syntax = syntax;
+                                row.role = role;
+                            }
+                        }
+                        // The cards are not shown at two or more matchers.
+                        _ => {}
+                    }
+                }
+                Update::none()
+            }
+            Message::MoveRowUp(i) => {
+                self.move_trigger_row(i, false);
+                Update::none()
+            }
+            Message::MoveRowDown(i) => {
+                self.move_trigger_row(i, true);
                 Update::none()
             }
             Message::RemovePattern(i) => {
@@ -1355,21 +1445,6 @@ impl AutomationsWindow {
                     rows.remove(i);
                     if i < self.trigger_row_contents.len() {
                         self.trigger_row_contents.remove(i);
-                    }
-                }
-                Update::none()
-            }
-            Message::SetPatternKind(i, kind) => {
-                if let Pane::Editor(EditorState {
-                    node: EditNode::Trigger { rows, .. },
-                    ..
-                }) = &mut self.pane
-                    && let Some(row) = rows.get_mut(i)
-                {
-                    row.role = kind;
-                    // Raw implies Regex syntax (the invariant, applied forward).
-                    if kind == PatternKind::Raw {
-                        row.syntax = smudgy_core::models::matchers::MatcherSyntax::Regex;
                     }
                 }
                 Update::none()
@@ -1873,8 +1948,12 @@ impl AutomationsWindow {
             | Message::AdjustPriority(_)
             | Message::ToggleFallthrough
             | Message::AddPattern
+            | Message::AddExceptionRow
+            | Message::AddRawRow
+            | Message::SetTriggerCard(_)
             | Message::RemovePattern(_)
-            | Message::SetPatternKind(_, _)
+            | Message::MoveRowUp(_)
+            | Message::MoveRowDown(_)
             | Message::SetRowSyntax(_, _)
             | Message::ToggleRowAnchorStart(_)
             | Message::ToggleRowAnchorEnd(_)
@@ -1903,6 +1982,34 @@ impl AutomationsWindow {
                 | Message::NewModule
                 | Message::NewPackage
         )
+    }
+
+    /// Swaps a trigger row with its neighbor **within its role group** — the
+    /// phase order (exceptions, raw, matches) is fixed, so reordering never
+    /// crosses roles. The row buffers move with the rows.
+    fn move_trigger_row(&mut self, i: usize, down: bool) {
+        if let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &mut self.pane
+            && i < rows.len()
+        {
+            let role = rows[i].role;
+            let neighbor = if down {
+                rows[i + 1..]
+                    .iter()
+                    .position(|row| row.role == role)
+                    .map(|offset| i + 1 + offset)
+            } else {
+                rows[..i].iter().rposition(|row| row.role == role)
+            };
+            if let Some(j) = neighbor {
+                rows.swap(i, j);
+                if i < self.trigger_row_contents.len() && j < self.trigger_row_contents.len() {
+                    self.trigger_row_contents.swap(i, j);
+                }
+            }
+        }
     }
 
     /// Resets per-pane selection scaffolding before opening a new pane.

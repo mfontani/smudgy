@@ -954,8 +954,6 @@ editor-name = 名稱
 editor-pattern = 模式
 editor-behavior = 執行方式
 editor-shortcut = 快捷鍵
-editor-test-command = 以指令測試
-editor-test-line = 以文字行測試
 editor-patterns-invalid = 一個或多個模式無法編譯；請檢查標示的項目。
 editor-patterns = 模式
 editor-add-pattern = 新增模式
@@ -963,12 +961,9 @@ editor-create-alias = 建立別名
 editor-create-hotkey = 建立快捷鍵
 editor-create-trigger = 建立觸發器
 editor-no-match = 不相符
-editor-invalid-pattern = 模式無效
 editor-enter-line = 請輸入文字行
 editor-would-fire = 將會觸發
-editor-enter-pattern = 請輸入模式
 editor-enter-command = 請輸入指令
-editor-matches = 相符
 editor-folder-summary = 資料夾 · { $count } 個項目
 editor-path = 路徑
 editor-folder-disabled-help = 已停用；此資料夾中的腳本不會執行。使用「/」建立巢狀資料夾。
@@ -980,9 +975,6 @@ editor-delete-scripts-too = 一併刪除腳本
 editor-create-folder = 建立資料夾
 editor-module-help = 本機模組的載入方式類似套件，但會以完整權限執行且不使用沙箱
 editor-source = 原始碼
-pattern-kind-match = 必須相符
-pattern-kind-anti = 必須不相符
-pattern-kind-raw = 原始正規表示式
 widget-hotkey-click-to-record = 點擊以錄製按鍵
 widget-hotkey-listening = 正在偵測按鍵...
 
@@ -1169,7 +1161,6 @@ automation-publish-failed = 發佈失敗：{ $error }
 automation-reloaded = 已重新載入 { $server } 的指令碼。
 automation-nav-unsaved = 有尚未儲存的變更。
 automation-keep-editing = 繼續編輯
-editor-priority-order-help = 數值越高越先執行；數值相同時依註冊順序執行。
 
 # 套件管理
 package-sign-in-shared = 請從主視窗的「設定 → 帳號」登入，以查看你擁有及朋友分享的套件。
@@ -1498,7 +1489,6 @@ package-version-build-metadata = 版本不得包含建置中繼資料（請移�
 # 其餘應用程式外殼與編輯器介面
 badge-dependency = 相依
 editor-example-alias-name = 例如：kill
-editor-example-alias-pattern = 例如：^k (.+)$
 editor-example-hotkey-name = 例如：north
 editor-example-trigger-name = 例如：low-health-alert
 editor-example-folder-path = 例如：combat/healing

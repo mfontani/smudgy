@@ -17,6 +17,12 @@ use super::model::NodeStatus;
 // value is state: a kind keeps its hue everywhere it appears; selection and
 // dimming only change strength, never hue.
 
+/// Command kind.
+pub const KIND_COMMAND: Color = Color::from_rgb(
+    0x7E as f32 / 255.0,
+    0xC6 as f32 / 255.0,
+    0x99 as f32 / 255.0,
+);
 /// Simple-pattern kind; doubles as the generic "captured value" accent
 /// (capture badges, matched spans, the `❯` prompt glyph, the active tab).
 pub const KIND_PATTERN: Color = Color::from_rgb(
@@ -29,6 +35,12 @@ pub const KIND_REGEX: Color = Color::from_rgb(
     0xD9 as f32 / 255.0,
     0xA9 as f32 / 255.0,
     0x5C as f32 / 255.0,
+);
+/// Raw-bytes kind (and its `Wizardry` badge and `Raw matches` header).
+pub const KIND_RAW: Color = Color::from_rgb(
+    0xD2 as f32 / 255.0,
+    0xE6 as f32 / 255.0,
+    0x3C as f32 / 255.0,
 );
 
 /// The lavender "captured value" text accent — [`KIND_PATTERN`], the hue that

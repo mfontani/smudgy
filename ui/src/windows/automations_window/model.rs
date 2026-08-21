@@ -190,16 +190,6 @@ pub enum PatternKind {
 }
 
 impl PatternKind {
-    pub const ALL: [PatternKind; 3] = [PatternKind::Match, PatternKind::Anti, PatternKind::Raw];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            PatternKind::Match => crate::i18n::ts!("pattern-kind-match"),
-            PatternKind::Anti => crate::i18n::ts!("pattern-kind-anti"),
-            PatternKind::Raw => crate::i18n::ts!("pattern-kind-raw"),
-        }
-    }
-
     fn role(self) -> matchers::MatcherRole {
         match self {
             PatternKind::Match => matchers::MatcherRole::Match,
@@ -214,12 +204,6 @@ impl PatternKind {
             matchers::MatcherRole::Anti => PatternKind::Anti,
             matchers::MatcherRole::Raw => PatternKind::Raw,
         }
-    }
-}
-
-impl std::fmt::Display for PatternKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
     }
 }
 
@@ -295,6 +279,37 @@ pub enum AliasKind {
     Command,
     Pattern,
     Regex,
+}
+
+/// The trigger pane's three matcher cards (README §4): teaching cards while
+/// no matcher exists, a kind+role selector while exactly one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerCard {
+    Pattern,
+    Regex,
+    Raw,
+}
+
+impl TriggerCard {
+    /// The `(syntax, role)` a card stands for.
+    pub fn shape(self) -> (MatcherSyntax, PatternKind) {
+        match self {
+            TriggerCard::Pattern => (MatcherSyntax::Pattern, PatternKind::Match),
+            TriggerCard::Regex => (MatcherSyntax::Regex, PatternKind::Match),
+            TriggerCard::Raw => (MatcherSyntax::Regex, PatternKind::Raw),
+        }
+    }
+
+    /// The card describing an existing matcher row, for the selector state.
+    pub fn of_row(row: &TriggerRow) -> Self {
+        if row.role == PatternKind::Raw {
+            TriggerCard::Raw
+        } else if row.syntax == MatcherSyntax::Pattern {
+            TriggerCard::Pattern
+        } else {
+            TriggerCard::Regex
+        }
+    }
 }
 
 /// The alias editor's matcher draft: the selected kind plus every kind's
@@ -542,9 +557,8 @@ pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<TriggerRow> {
             ..TriggerRow::new(PatternKind::Raw)
         }));
     }
-    if rows.is_empty() {
-        rows.push(TriggerRow::new(PatternKind::Match));
-    }
+    // A trigger with no matchers opens at the teaching-cards state (README §4)
+    // rather than with a blank row pre-created.
     rows
 }
 

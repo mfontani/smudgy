@@ -28,8 +28,8 @@ use super::common;
 use super::highlight;
 use super::model::{
     AliasKind, AliasMatcherDraft, ArgKindChoice, NodeStatus, ParseModeChoice, PatternKind, Script,
-    ScriptKey, SyntaxChoice, TriggerRow, pattern_error_text, rows_into_trigger, trigger_rows,
-    upsert_script_folder,
+    ScriptKey, SyntaxChoice, TriggerCard, TriggerRow, pattern_error_text, rows_into_trigger,
+    trigger_rows, upsert_script_folder,
 };
 use super::{
     AutomationsWindow, EditNode, EditorMode, EditorState, Elem, Event, FolderState, Message,
@@ -185,7 +185,8 @@ impl AutomationsWindow {
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
-        self.trigger_row_contents = vec![text_editor::Content::new()];
+        // No rows yet: the pane opens at the teaching-cards state.
+        self.trigger_row_contents = Vec::new();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -197,7 +198,7 @@ impl AutomationsWindow {
                 priority: 0,
                 fallthrough: true,
                 package: self.current_folder(),
-                rows: vec![TriggerRow::new(PatternKind::Match)],
+                rows: Vec::new(),
             },
             error: None,
         });
@@ -1686,126 +1687,148 @@ impl AutomationsWindow {
                 .into(),
         ));
 
-        // The unified matcher row list: role + syntax dropdowns, the source
-        // field, its status dot against the test line, and (Pattern syntax)
-        // the anchor checkboxes on a second line.
-        let raw_subject = raw_of(&self.test_input);
-        let plain_subject = plain_of(&raw_subject);
-        let mut patterns = Column::new().spacing(6.0);
-        for (i, (trigger_row, row_content)) in
-            rows.iter().zip(&self.trigger_row_contents).enumerate()
-        {
-            let subject = if trigger_row.role == PatternKind::Raw {
-                raw_subject.as_str()
-            } else {
-                plain_subject.as_str()
-            };
-            let valid = if trigger_row.source.trim().is_empty() {
-                NodeStatus::Disabled
-            } else {
-                match trigger_row.compiled().map(|s| regex::Regex::new(&s)) {
-                    Err(_) | Ok(Err(_)) => NodeStatus::Error,
-                    Ok(Ok(re)) if !self.test_input.is_empty() && re.is_match(subject) => {
-                        // A matching exception is what BLOCKS the trigger.
-                        if trigger_row.role == PatternKind::Anti {
-                            NodeStatus::Error
-                        } else {
-                            NodeStatus::Ok
-                        }
-                    }
-                    Ok(Ok(_)) => NodeStatus::Disabled,
-                }
-            };
-            let mut row_column = Column::new().spacing(4.0).push(
-                row![
-                    pick_list(
-                        SyntaxChoice::ALL.to_vec(),
-                        Some(SyntaxChoice(trigger_row.syntax)),
-                        move |s| { Message::SetRowSyntax(i, s.0) }
-                    )
-                    .text_size(13.0),
-                    pick_list(
-                        PatternKind::ALL.to_vec(),
-                        Some(trigger_row.role),
-                        move |k| { Message::SetPatternKind(i, k) }
-                    )
-                    .text_size(13.0),
-                    matcher_field(
-                        row_content,
-                        if trigger_row.syntax == MatcherSyntax::Pattern {
-                            crate::i18n::ts!("editor-example-trigger-pattern")
-                        } else if trigger_row.role == PatternKind::Raw {
-                            crate::i18n::ts!("editor-example-trigger-raw")
-                        } else {
-                            crate::i18n::ts!("editor-example-trigger-regex")
-                        },
-                        if trigger_row.syntax == MatcherSyntax::Pattern {
-                            highlight::FieldSyntax::Pattern
-                        } else {
-                            highlight::FieldSyntax::Regex
-                        },
-                        if trigger_row.syntax == MatcherSyntax::Pattern {
-                            (!trigger_row.anchor_start, !trigger_row.anchor_end)
-                        } else {
-                            regex_loose_sides(&trigger_row.source)
-                        },
-                        trigger_row.syntax == MatcherSyntax::Pattern,
-                        move |action| Message::RowSourceAction(i, action),
-                    ),
-                    container(common::status_dot(valid)).padding(Padding {
-                        top: 0.0,
-                        bottom: 0.0,
-                        left: 4.0,
-                        right: 4.0,
-                    }),
-                    button(
-                        text(bootstrap_icons::TRASH_3)
-                            .font(fonts::BOOTSTRAP_ICONS)
-                            .size(14.0)
-                    )
-                    .style(button_style::secondary)
-                    .on_press(Message::RemovePattern(i))
-                    .padding(8),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            );
-            if trigger_row.syntax == MatcherSyntax::Pattern {
-                row_column = row_column.push(
-                    row![
-                        checkbox(!trigger_row.anchor_start)
-                            .label(crate::i18n::ts!("editor-allow-before"))
-                            .on_toggle(move |_| Message::ToggleRowAnchorStart(i))
-                            .size(14.0)
-                            .text_size(12.0),
-                        checkbox(!trigger_row.anchor_end)
-                            .label(crate::i18n::ts!("editor-allow-after"))
-                            .on_toggle(move |_| Message::ToggleRowAnchorEnd(i))
-                            .size(14.0)
-                            .text_size(12.0),
-                    ]
-                    .spacing(16.0),
-                );
+        // The matcher module (README §4): teaching cards at zero matchers, the
+        // same cards as a selector plus one full-width field at one, compact
+        // role-grouped rows at two or more. Exceptions and Raw render as
+        // labeled groups only when populated; every adder is a text link.
+        let match_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Match);
+        let anti_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Anti);
+        let raw_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Raw);
+        let matcher_count = match_ids.len() + raw_ids.len();
+
+        let mut matchers = Column::new().spacing(12.0);
+        match matcher_count {
+            0 => {
+                matchers = matchers.push(self.trigger_cards(None, true));
             }
-            patterns = patterns.push(row_column);
+            1 => {
+                let index = match_ids
+                    .first()
+                    .or_else(|| raw_ids.first())
+                    .copied()
+                    .expect("exactly one matcher row");
+                let trigger_row = &rows[index];
+                matchers = matchers
+                    .push(self.trigger_cards(Some(TriggerCard::of_row(trigger_row)), false));
+                if let Some(content) = self.trigger_row_contents.get(index) {
+                    matchers = matchers.push(
+                        row![
+                            trigger_row_field(index, trigger_row, content),
+                            dot_with_tooltip(self.row_status(trigger_row), trigger_row.role),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Vertical::Center),
+                    );
+                }
+                if trigger_row.syntax == MatcherSyntax::Pattern {
+                    matchers = matchers.push(anchors_row(index, trigger_row));
+                }
+                if trigger_row.role == PatternKind::Raw && trigger_row.source.trim().is_empty() {
+                    matchers = matchers.push(raw_hint());
+                }
+                // "Another" means another of what you have.
+                matchers = matchers.push(if trigger_row.role == PatternKind::Raw {
+                    Elem::from(
+                        row![
+                            text_link(
+                                crate::i18n::t!("editor-add-raw-another"),
+                                Message::AddRawRow
+                            ),
+                            text_link(crate::i18n::t!("editor-add-normal"), Message::AddPattern),
+                        ]
+                        .spacing(16.0),
+                    )
+                } else {
+                    text_link(crate::i18n::t!("editor-add-pattern"), Message::AddPattern)
+                });
+            }
+            _ => {
+                // The Matches group carries no header.
+                let mut group = Column::new().spacing(6.0);
+                for (nth, &index) in match_ids.iter().enumerate() {
+                    group = group.push(self.trigger_compact_row(
+                        index,
+                        &rows[index],
+                        nth,
+                        match_ids.len(),
+                    ));
+                }
+                group = group.push(if match_ids.is_empty() {
+                    text_link(crate::i18n::t!("editor-add-normal"), Message::AddPattern)
+                } else {
+                    text_link(crate::i18n::t!("editor-add-pattern"), Message::AddPattern)
+                });
+                matchers = matchers.push(group);
+            }
         }
-        patterns = patterns.push(
-            button(
-                row![
-                    text(bootstrap_icons::PLUS_LG)
-                        .font(fonts::BOOTSTRAP_ICONS)
-                        .size(12.0),
-                    text(crate::i18n::t!("editor-add-pattern")).size(13.0),
-                ]
-                .spacing(6.0)
-                .align_y(Vertical::Center),
-            )
-            .style(button_style::secondary)
-            .on_press(Message::AddPattern),
-        );
+
+        if !anti_ids.is_empty() {
+            let mut group = Column::new().spacing(6.0).push(group_header(
+                crate::i18n::ts!("editor-group-exceptions"),
+                crate::i18n::ts!("editor-group-exceptions-note"),
+                |theme: &Theme| iced::widget::text::Style {
+                    color: Some(theme.styles.text.error),
+                },
+            ));
+            for (nth, &index) in anti_ids.iter().enumerate() {
+                group =
+                    group.push(self.trigger_compact_row(index, &rows[index], nth, anti_ids.len()));
+            }
+            group = group.push(text_link(
+                crate::i18n::t!("editor-add-exception-another"),
+                Message::AddExceptionRow,
+            ));
+            matchers = matchers.push(group);
+        }
+
+        // At one matcher the lone raw row already renders under the cards; the
+        // labeled Raw group appears once the compact layout takes over.
+        if !raw_ids.is_empty() && matcher_count >= 2 {
+            let mut group = Column::new().spacing(6.0).push(group_header(
+                crate::i18n::ts!("editor-group-raw"),
+                crate::i18n::ts!("editor-group-raw-note"),
+                |_theme: &Theme| iced::widget::text::Style {
+                    color: Some(common::KIND_RAW),
+                },
+            ));
+            for (nth, &index) in raw_ids.iter().enumerate() {
+                group =
+                    group.push(self.trigger_compact_row(index, &rows[index], nth, raw_ids.len()));
+            }
+            group = group.push(text_link(
+                crate::i18n::t!("editor-add-raw-another"),
+                Message::AddRawRow,
+            ));
+            matchers = matchers.push(group);
+        }
+
+        // Disclosure links for the groups that do not exist yet.
+        let mut disclosures = row![].spacing(16.0);
+        let mut any_disclosure = false;
+        if anti_ids.is_empty() {
+            disclosures = disclosures.push(tip(
+                text_link(
+                    crate::i18n::t!("editor-add-exception"),
+                    Message::AddExceptionRow,
+                ),
+                crate::i18n::t!("editor-add-exception-tip"),
+            ));
+            any_disclosure = true;
+        }
+        if raw_ids.is_empty() {
+            disclosures = disclosures.push(tip(
+                text_link(crate::i18n::t!("editor-match-raw"), Message::AddRawRow),
+                crate::i18n::t!("editor-match-raw-tip"),
+            ));
+            any_disclosure = true;
+        }
+        if any_disclosure {
+            matchers = matchers.push(disclosures);
+        }
+
         body = body.push(field_row(
             crate::i18n::ts!("editor-patterns"),
-            patterns.into(),
+            matchers.into(),
         ));
 
         let has_raw = rows
@@ -1834,24 +1857,186 @@ impl AutomationsWindow {
         pane_scroll(body)
     }
 
-    /// The three alias type cards. Selection is the draft's kind; every kind's
-    /// buffers survive a switch.
+    /// The three alias type cards, styled per the kind palette. Selection is
+    /// the draft's kind; every kind's buffers survive a switch.
     fn alias_kind_cards<'a>(&self) -> Elem<'a> {
-        let card = |label: &str, kind: AliasKind| {
-            let selected = self.alias_draft.kind == kind;
-            button(text(label.to_string()).size(13.0))
-                .style(if selected {
-                    button_style::primary
-                } else {
-                    button_style::secondary
-                })
-                .on_press(Message::SetAliasKind(kind))
-                .padding([6, 12])
-        };
+        let selected = self.alias_draft.kind;
         row![
-            card(crate::i18n::ts!("editor-kind-command"), AliasKind::Command),
-            card(crate::i18n::ts!("editor-kind-pattern"), AliasKind::Pattern),
-            card(crate::i18n::ts!("editor-kind-regex"), AliasKind::Regex),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-command"),
+                example: crate::i18n::ts!("editor-card-example-command"),
+                badge: None,
+                blurb: None,
+                hue: common::KIND_COMMAND,
+                selected: selected == AliasKind::Command,
+                message: Message::SetAliasKind(AliasKind::Command),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-pattern"),
+                example: crate::i18n::ts!("editor-example-alias-simple"),
+                badge: None,
+                blurb: None,
+                hue: common::KIND_PATTERN,
+                selected: selected == AliasKind::Pattern,
+                message: Message::SetAliasKind(AliasKind::Pattern),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-regex"),
+                example: crate::i18n::ts!("editor-example-alias-regex"),
+                badge: Some(crate::i18n::ts!("editor-badge-advanced")),
+                blurb: None,
+                hue: common::KIND_REGEX,
+                selected: selected == AliasKind::Regex,
+                message: Message::SetAliasKind(AliasKind::Regex),
+            }),
+        ]
+        .spacing(12.0)
+        .into()
+    }
+
+    /// The trigger pane's three matcher cards: teaching cards (with blurbs)
+    /// while no matcher exists, a selector for the single matcher's kind+role
+    /// while exactly one does.
+    fn trigger_cards<'a>(&self, selected: Option<TriggerCard>, teach: bool) -> Elem<'a> {
+        let blurb = |key: &'static str| teach.then_some(key);
+        row![
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-pattern"),
+                example: crate::i18n::ts!("editor-example-trigger-pattern"),
+                badge: None,
+                blurb: blurb(crate::i18n::ts!("editor-card-blurb-pattern")),
+                hue: common::KIND_PATTERN,
+                selected: selected == Some(TriggerCard::Pattern),
+                message: Message::SetTriggerCard(TriggerCard::Pattern),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-regex"),
+                example: crate::i18n::ts!("editor-example-trigger-regex"),
+                badge: Some(crate::i18n::ts!("editor-badge-advanced")),
+                blurb: blurb(crate::i18n::ts!("editor-card-blurb-regex")),
+                hue: common::KIND_REGEX,
+                selected: selected == Some(TriggerCard::Regex),
+                message: Message::SetTriggerCard(TriggerCard::Regex),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-raw"),
+                example: crate::i18n::ts!("editor-example-trigger-raw"),
+                badge: Some(crate::i18n::ts!("editor-badge-wizardry")),
+                blurb: blurb(crate::i18n::ts!("editor-card-blurb-raw")),
+                hue: common::KIND_RAW,
+                selected: selected == Some(TriggerCard::Raw),
+                message: Message::SetTriggerCard(TriggerCard::Raw),
+            }),
+        ]
+        .spacing(12.0)
+        .into()
+    }
+
+    /// A row's status dot value against the current test line.
+    fn row_status(&self, trigger_row: &TriggerRow) -> NodeStatus {
+        if trigger_row.source.trim().is_empty() {
+            return NodeStatus::Disabled;
+        }
+        let raw_subject = raw_of(&self.test_input);
+        let subject = if trigger_row.role == PatternKind::Raw {
+            raw_subject.clone()
+        } else {
+            plain_of(&raw_subject)
+        };
+        match trigger_row.compiled().map(|s| regex::Regex::new(&s)) {
+            Err(_) | Ok(Err(_)) => NodeStatus::Error,
+            Ok(Ok(re)) if !self.test_input.is_empty() && re.is_match(&subject) => {
+                // A matching exception is what BLOCKS the trigger.
+                if trigger_row.role == PatternKind::Anti {
+                    NodeStatus::Error
+                } else {
+                    NodeStatus::Ok
+                }
+            }
+            Ok(Ok(_)) => NodeStatus::Disabled,
+        }
+    }
+
+    /// One compact matcher row (the 2+ layout): kind control, source field,
+    /// status dot, reorder scoped within the role group, and remove — behind
+    /// a 3px left bar in the row's kind hue, with the Pattern anchors (and
+    /// the raw teaching hint) on following lines.
+    fn trigger_compact_row<'a>(
+        &'a self,
+        index: usize,
+        trigger_row: &'a TriggerRow,
+        nth: usize,
+        group_len: usize,
+    ) -> Elem<'a> {
+        let Some(content) = self.trigger_row_contents.get(index) else {
+            return Column::new().into();
+        };
+        let kind_control: Elem<'a> = if trigger_row.role == PatternKind::Raw {
+            // Raw is always regex; the label is fixed.
+            container(
+                text(crate::i18n::ts!("editor-syntax-regex"))
+                    .size(13.0)
+                    .style(common::muted),
+            )
+            .padding(Padding {
+                top: 6.0,
+                bottom: 6.0,
+                left: 8.0,
+                right: 8.0,
+            })
+            .into()
+        } else {
+            pick_list(
+                SyntaxChoice::ALL.to_vec(),
+                Some(SyntaxChoice(trigger_row.syntax)),
+                move |choice| Message::SetRowSyntax(index, choice.0),
+            )
+            .text_size(13.0)
+            .into()
+        };
+
+        let mut lines = Column::new().spacing(4.0).push(
+            row![
+                kind_control,
+                trigger_row_field(index, trigger_row, content),
+                dot_with_tooltip(self.row_status(trigger_row), trigger_row.role),
+                icon_button(
+                    bootstrap_icons::CHEVRON_UP,
+                    crate::i18n::t!("editor-move-up"),
+                    (nth > 0).then_some(Message::MoveRowUp(index)),
+                ),
+                icon_button(
+                    bootstrap_icons::CHEVRON_DOWN,
+                    crate::i18n::t!("editor-move-down"),
+                    (nth + 1 < group_len).then_some(Message::MoveRowDown(index)),
+                ),
+                icon_button(
+                    bootstrap_icons::TRASH_3,
+                    crate::i18n::t!("editor-remove-line"),
+                    Some(Message::RemovePattern(index)),
+                ),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+        );
+        if trigger_row.syntax == MatcherSyntax::Pattern {
+            lines = lines.push(anchors_row(index, trigger_row));
+        }
+        if trigger_row.role == PatternKind::Raw && trigger_row.source.trim().is_empty() {
+            lines = lines.push(raw_hint());
+        }
+
+        let hue = row_kind_hue(trigger_row);
+        row![
+            container(Space::new())
+                .width(Length::Fixed(3.0))
+                .height(Length::Fill)
+                .style(move |_theme: &Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(hue)),
+                    border: iced::Border::default().rounded(2.0),
+                    ..Default::default()
+                }),
+            lines,
         ]
         .spacing(8.0)
         .into()
@@ -2747,6 +2932,258 @@ fn matcher_field<'a>(
             },
             ..Default::default()
         })
+        .into()
+}
+
+// ---- trigger matcher rows ---------------------------------------------------
+
+/// Indexes of the rows carrying `role`, in list order.
+fn row_ids_with_role(rows: &[TriggerRow], role: PatternKind) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.role == role)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A trigger row's kind hue (visual-contract §1): the card kind that made it —
+/// raw rows the Raw hue, otherwise the syntax's hue. Role stays out of the hue
+/// channel; it is position plus a wash.
+fn row_kind_hue(trigger_row: &TriggerRow) -> iced::Color {
+    if trigger_row.role == PatternKind::Raw {
+        common::KIND_RAW
+    } else if trigger_row.syntax == MatcherSyntax::Pattern {
+        common::KIND_PATTERN
+    } else {
+        common::KIND_REGEX
+    }
+}
+
+/// The source field for one trigger row: placeholder, grammar, gutters, and
+/// role wash all derived from the row.
+fn trigger_row_field<'a>(
+    index: usize,
+    trigger_row: &'a TriggerRow,
+    content: &'a text_editor::Content,
+) -> Elem<'a> {
+    let pattern = trigger_row.syntax == MatcherSyntax::Pattern;
+    matcher_field(
+        content,
+        if pattern {
+            crate::i18n::ts!("editor-example-trigger-pattern")
+        } else if trigger_row.role == PatternKind::Raw {
+            crate::i18n::ts!("editor-example-trigger-raw")
+        } else {
+            crate::i18n::ts!("editor-example-trigger-regex")
+        },
+        if pattern {
+            highlight::FieldSyntax::Pattern
+        } else {
+            highlight::FieldSyntax::Regex
+        },
+        if pattern {
+            (!trigger_row.anchor_start, !trigger_row.anchor_end)
+        } else {
+            regex_loose_sides(&trigger_row.source)
+        },
+        pattern,
+        move |action| Message::RowSourceAction(index, action),
+    )
+}
+
+/// The anchor checkboxes a Pattern-syntax row carries on its second line.
+fn anchors_row<'a>(index: usize, trigger_row: &TriggerRow) -> Elem<'a> {
+    row![
+        checkbox(!trigger_row.anchor_start)
+            .label(crate::i18n::ts!("editor-allow-before"))
+            .on_toggle(move |_| Message::ToggleRowAnchorStart(index))
+            .size(14.0)
+            .text_size(12.0),
+        checkbox(!trigger_row.anchor_end)
+            .label(crate::i18n::ts!("editor-allow-after"))
+            .on_toggle(move |_| Message::ToggleRowAnchorEnd(index))
+            .size(14.0)
+            .text_size(12.0),
+    ]
+    .spacing(16.0)
+    .into()
+}
+
+/// The raw kind's teaching hint, shown only while its field is blank.
+fn raw_hint<'a>() -> Elem<'a> {
+    text(crate::i18n::ts!("editor-raw-hint"))
+        .size(12.0)
+        .style(common::muted)
+        .into()
+}
+
+/// A status dot with its deck tooltip: matches / does not match / blocks.
+fn dot_with_tooltip<'a>(status: NodeStatus, role: PatternKind) -> Elem<'a> {
+    let dot = container(common::status_dot(status)).padding(Padding {
+        top: 0.0,
+        bottom: 0.0,
+        left: 4.0,
+        right: 4.0,
+    });
+    let label = match status {
+        NodeStatus::Ok => crate::i18n::t!("editor-dot-matches"),
+        NodeStatus::Error if role == PatternKind::Anti => crate::i18n::t!("editor-dot-blocks"),
+        NodeStatus::Disabled => crate::i18n::t!("editor-dot-no-match"),
+        // A compile error already reads inline; the dot stays bare.
+        NodeStatus::Error | NodeStatus::Warning => return dot.into(),
+    };
+    tip(dot.into(), label)
+}
+
+/// A small quiet icon button with a tooltip; renders disabled with no
+/// `on_press` (the ends of a role group's reorder range).
+fn icon_button<'a>(icon: &'a str, tooltip_label: String, on_press: Option<Message>) -> Elem<'a> {
+    let mut control = button(text(icon).font(fonts::BOOTSTRAP_ICONS).size(13.0))
+        .style(button_style::toolbar)
+        .padding(6);
+    if let Some(message) = on_press {
+        control = control.on_press(message);
+    }
+    tip(control.into(), tooltip_label)
+}
+
+/// A labeled group header: the colored title plus its precedence note.
+fn group_header<'a>(
+    title: &'a str,
+    note: &'a str,
+    title_style: impl Fn(&Theme) -> iced::widget::text::Style + 'a,
+) -> Elem<'a> {
+    row![
+        text(title)
+            .size(12.0)
+            .font(Font {
+                weight: iced::font::Weight::Semibold,
+                ..fonts::GEIST_VF
+            })
+            .style(title_style),
+        text(note).size(12.0).style(common::muted),
+    ]
+    .spacing(10.0)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+// ---- kind cards -------------------------------------------------------------
+
+/// One selectable kind card's content (visual-contract §1–2).
+struct KindCard<'a> {
+    title: &'a str,
+    example: &'a str,
+    badge: Option<&'a str>,
+    blurb: Option<&'a str>,
+    hue: iced::Color,
+    selected: bool,
+    message: Message,
+}
+
+/// The kind dot on a card: a small filled circle in the kind hue.
+fn kind_dot<'a>(hue: iced::Color) -> Elem<'a> {
+    container(Space::new())
+        .width(Length::Fixed(8.0))
+        .height(Length::Fixed(8.0))
+        .style(move |_theme: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(hue)),
+            border: iced::Border::default().rounded(4.0),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A difficulty badge (`Advanced` / `Wizardry`): a small uppercase pill
+/// outlined in the kind hue.
+fn kind_badge<'a>(label: &str, hue: iced::Color) -> Elem<'a> {
+    container(
+        text(label.to_uppercase())
+            .size(10.0)
+            .style(move |_theme: &Theme| iced::widget::text::Style { color: Some(hue) }),
+    )
+    .padding(Padding {
+        top: 1.0,
+        bottom: 1.0,
+        left: 6.0,
+        right: 6.0,
+    })
+    .style(move |_theme: &Theme| iced::widget::container::Style {
+        border: iced::Border {
+            color: hue,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// One selectable kind card. Hue is identity, value is state: selected takes
+/// the kind hue at full strength (border, dot, example, badge) over a 10%
+/// tint; unselected keeps the hue at 50% alpha on a neutral body with a
+/// hairline border — never grey. Hover is a faint wash, no hue change.
+fn kind_card<'a>(card: KindCard<'a>) -> Elem<'a> {
+    let strength = if card.selected {
+        card.hue
+    } else {
+        card.hue.scale_alpha(0.5)
+    };
+    let mut title_row = row![
+        kind_dot(strength),
+        text(card.title).size(13.0).font(Font {
+            weight: iced::font::Weight::Semibold,
+            ..fonts::GEIST_VF
+        }),
+    ]
+    .spacing(8.0)
+    .align_y(Vertical::Center);
+    if let Some(badge) = card.badge {
+        title_row = title_row.push(iced::widget::space::horizontal());
+        title_row = title_row.push(kind_badge(badge, strength));
+    }
+    let mut inner = column![
+        title_row,
+        text(card.example)
+            .size(12.0)
+            .font(fonts::GEIST_MONO_VF)
+            .style(move |_theme: &Theme| iced::widget::text::Style {
+                color: Some(strength),
+            }),
+    ]
+    .spacing(6.0);
+    if let Some(blurb) = card.blurb {
+        inner = inner.push(text(blurb).size(12.0).style(common::muted));
+    }
+    let hue = card.hue;
+    let selected = card.selected;
+    button(inner)
+        .style(move |theme: &Theme, status| {
+            let background = if selected {
+                hue.scale_alpha(0.10)
+            } else if status == iced::widget::button::Status::Hovered {
+                theme.styles.text.normal.scale_alpha(0.04)
+            } else {
+                iced::Color::TRANSPARENT
+            };
+            iced::widget::button::Style {
+                background: Some(iced::Background::Color(background)),
+                border: iced::Border {
+                    color: if selected {
+                        hue
+                    } else {
+                        theme.styles.general.border
+                    },
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                text_color: theme.styles.text.normal,
+                ..Default::default()
+            }
+        })
+        .padding(12)
+        .width(Length::FillPortion(1))
+        .on_press(card.message)
         .into()
 }
 

@@ -996,8 +996,6 @@ editor-name = Nazwa
 editor-pattern = Wzorzec
 editor-behavior = Zachowanie
 editor-shortcut = Skrót
-editor-test-command = Przetestuj na poleceniu
-editor-test-line = Przetestuj na wierszu
 editor-patterns-invalid = Co najmniej jeden wzorzec się nie kompiluje — sprawdź podświetlone wiersze.
 editor-patterns = Wzorce
 editor-add-pattern = Dodaj wzorzec
@@ -1005,12 +1003,9 @@ editor-create-alias = Utwórz alias
 editor-create-hotkey = Utwórz skrót klawiszowy
 editor-create-trigger = Utwórz wyzwalacz
 editor-no-match = Brak dopasowania
-editor-invalid-pattern = Nieprawidłowy wzorzec
 editor-enter-line = Wprowadź wiersz
 editor-would-fire = Zostałby wyzwolony
-editor-enter-pattern = Wprowadź wzorzec
 editor-enter-command = Wprowadź polecenie
-editor-matches = Pasuje
 editor-folder-summary = Folder · liczba elementów: { $count }
 editor-path = Ścieżka
 editor-folder-disabled-help = Wyłączony — skrypty w tym folderze nie będą uruchamiane. Użyj „/", aby zagnieżdżać foldery.
@@ -1022,9 +1017,6 @@ editor-delete-scripts-too = Usuń też skrypty
 editor-create-folder = Utwórz folder
 editor-module-help = Moduły lokalne są ładowane podobnie jak pakiety, ale działają z pełnymi uprawnieniami i bez sandboxu
 editor-source = Źródło
-pattern-kind-match = Dopasowanie
-pattern-kind-anti = Anty-dopasowanie
-pattern-kind-raw = Surowe wyrażenie regularne
 widget-hotkey-click-to-record = kliknij, aby zarejestrować
 widget-hotkey-listening = nasłuchiwanie...
 
@@ -1211,7 +1203,6 @@ automation-publish-failed = Publikacja nie powiodła się: { $error }
 automation-reloaded = Przeładowano skrypty dla { $server }.
 automation-nav-unsaved = Masz niezapisane zmiany.
 automation-keep-editing = Kontynuuj edycję
-editor-priority-order-help = Wyższe numery mają priorytet
 
 # Package management
 package-sign-in-shared = Zaloguj się w oknie głównym w Ustawienia → Konto, aby zobaczyć pakiety, które posiadasz, oraz te udostępnione przez znajomych.
@@ -1540,7 +1531,6 @@ package-version-build-metadata = Wersja nie może zawierać metadanych kompilacj
 # Remaining app-shell and editor surfaces
 badge-dependency = ZAL.
 editor-example-alias-name = np. kill
-editor-example-alias-pattern = np. ^k (.+)$
 editor-example-hotkey-name = np. north
 editor-example-trigger-name = np. low-health-alert
 editor-example-folder-path = np. combat/healing

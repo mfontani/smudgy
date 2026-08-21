@@ -996,8 +996,6 @@ editor-name = Назва
 editor-pattern = Шаблон
 editor-behavior = Поведінка
 editor-shortcut = Комбінація
-editor-test-command = Перевірити на команді
-editor-test-line = Перевірити на рядку
 editor-patterns-invalid = Щонайменше один шаблон не компілюється — перевірте підсвічені рядки.
 editor-patterns = Шаблони
 editor-add-pattern = Додати шаблон
@@ -1005,12 +1003,9 @@ editor-create-alias = Створити аліас
 editor-create-hotkey = Створити гарячу клавішу
 editor-create-trigger = Створити тригер
 editor-no-match = Немає збігу
-editor-invalid-pattern = Некоректний шаблон
 editor-enter-line = Введіть рядок
 editor-would-fire = Спрацював би
-editor-enter-pattern = Введіть шаблон
 editor-enter-command = Введіть команду
-editor-matches = Збігається
 editor-folder-summary = Тека · кількість елементів: { $count }
 editor-path = Шлях
 editor-folder-disabled-help = Вимкнено — скрипти в цій теці не запускатимуться. Використовуйте «/», щоб вкладати теки.
@@ -1022,9 +1017,6 @@ editor-delete-scripts-too = Видалити також скрипти
 editor-create-folder = Створити теку
 editor-module-help = Локальні модулі завантажуються подібно до пакунків, але працюють з повними правами й без пісочниці
 editor-source = Джерело
-pattern-kind-match = Збіг
-pattern-kind-anti = Анти-збіг
-pattern-kind-raw = Необроблений регулярний вираз
 widget-hotkey-click-to-record = Натисніть, щоб зареєструватися
 widget-hotkey-listening = слухання...
 
@@ -1211,7 +1203,6 @@ automation-publish-failed = Не вдалося опублікувати: { $err
 automation-reloaded = Перезавантажено скрипти для { $server }.
 automation-nav-unsaved = У вас є незбережені зміни.
 automation-keep-editing = Продовжити редагування
-editor-priority-order-help = Вищі номери мають пріоритет
 
 # Package management
 package-sign-in-shared = Увійдіть у головному вікні в Налаштування → Обліковий запис, щоб побачити пакунки, якими ви володієте, а також ті, що надані друзями.
@@ -1540,7 +1531,6 @@ package-version-build-metadata = Версія не може містити ме�
 # Remaining app-shell and editor surfaces
 badge-dependency = ЗАЛ.
 editor-example-alias-name = напр., kill
-editor-example-alias-pattern = напр., ^k (.+)$
 editor-example-hotkey-name = напр., north
 editor-example-trigger-name = напр., low-health-alert
 editor-example-folder-path = напр., combat/healing
