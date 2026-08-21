@@ -90,6 +90,7 @@ impl AutomationsWindow {
         self.selection = Selection::Script(key.clone());
         self.test_input.clear();
         self.order_revealed = false;
+        self.try_it_open = false;
 
         let body = match &script {
             Script::Alias(a) => a.script.clone().unwrap_or_default(),
@@ -141,6 +142,7 @@ impl AutomationsWindow {
         self.editor_content = text_editor::Content::new();
         self.test_input.clear();
         self.order_revealed = false;
+        self.try_it_open = false;
         // Command is the default kind for new aliases.
         self.alias_draft = AliasMatcherDraft::default();
         self.pane = Pane::Editor(EditorState {
@@ -168,6 +170,7 @@ impl AutomationsWindow {
         self.editor_content = text_editor::Content::new();
         self.test_input.clear();
         self.order_revealed = false;
+        self.try_it_open = false;
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -977,12 +980,16 @@ impl AutomationsWindow {
             .into()
     }
 
-    /// The sticky save bar shown for dirty editors / create panes.
+    /// The sticky save bar shown for dirty editors / create panes. A
+    /// `delete_link` label renders the destructive affordance as the deck's
+    /// red underlined text link (with `Cancel` beside `Save`); `None` keeps
+    /// the plain `Delete` button the other panes use.
     pub(super) fn save_bar<'a>(
         &self,
         create: bool,
         can_delete: bool,
         save_label: &str,
+        delete_link: Option<&str>,
     ) -> Option<Elem<'a>> {
         if !create && !self.dirty && !can_delete {
             return None;
@@ -997,11 +1004,13 @@ impl AutomationsWindow {
                 right: 0.0,
             });
         if can_delete {
-            bar = bar.push(
-                button(text(crate::i18n::t!("editor-delete")).size(13.0))
+            bar = bar.push(match delete_link {
+                Some(label) => danger_link(label.to_string(), Message::Delete),
+                None => button(text(crate::i18n::t!("editor-delete")).size(13.0))
                     .style(button_style::secondary)
-                    .on_press(Message::Delete),
-            );
+                    .on_press(Message::Delete)
+                    .into(),
+            });
         }
         if self.dirty {
             bar = bar.push(text("\u{25CF}").size(9.0).style(common::accent));
@@ -1011,8 +1020,13 @@ impl AutomationsWindow {
                     .style(common::muted),
             );
             bar = bar.push(iced::widget::space::horizontal());
+            let cancel = if delete_link.is_some() {
+                crate::i18n::t!("action-cancel")
+            } else {
+                crate::i18n::t!("editor-discard")
+            };
             bar = bar.push(
-                button(text(crate::i18n::t!("editor-discard")).size(13.0))
+                button(text(cancel).size(13.0))
                     .style(button_style::secondary)
                     .on_press(Message::Discard),
             );
@@ -1046,8 +1060,9 @@ impl AutomationsWindow {
     }
 
     /// The "When it runs" module behind its disclosure: hidden as a text link
-    /// until clicked, forced open — and not re-hideable — while any value is
-    /// non-default, with a hide link when open on pure defaults.
+    /// (its grid label rendered empty) until clicked, forced open — and not
+    /// re-hideable — while any value is non-default (`prompt` included), with
+    /// a hide link when open on pure defaults.
     fn order_module<'a>(
         &self,
         priority: i32,
@@ -1062,31 +1077,95 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::t!("editor-reveal-order-aliases")
             };
-            return field_row(
-                "",
-                button(text(label).size(12.0).style(common::muted))
-                    .style(button_style::link)
-                    .on_press(Message::RevealOrder)
-                    .padding(0)
-                    .into(),
+            return field_row("", text_link(label, Message::RevealOrder));
+        }
+
+        // The priority stepper: a collapsed-border [-|value|+] segment.
+        let stepper = container(
+            row![
+                button(text("-").size(14.0))
+                    .style(button_style::toolbar)
+                    .on_press(Message::AdjustPriority(-1))
+                    .padding(Padding {
+                        top: 2.0,
+                        bottom: 2.0,
+                        left: 10.0,
+                        right: 10.0,
+                    }),
+                container(text(priority.to_string()).size(13.0))
+                    .width(Length::Fixed(40.0))
+                    .align_x(iced::alignment::Horizontal::Center),
+                button(text("+").size(14.0))
+                    .style(button_style::toolbar)
+                    .on_press(Message::AdjustPriority(1))
+                    .padding(Padding {
+                        top: 2.0,
+                        bottom: 2.0,
+                        left: 10.0,
+                        right: 10.0,
+                    }),
+            ]
+            .align_y(Vertical::Center),
+        )
+        .style(common::outline_box_style);
+
+        let priority_row = row![
+            text(crate::i18n::ts!("editor-priority"))
+                .size(13.0)
+                .style(common::muted),
+            stepper,
+            text(if trigger {
+                crate::i18n::ts!("editor-priority-note-triggers")
+            } else {
+                crate::i18n::ts!("editor-priority-note-aliases")
+            })
+            .size(12.0)
+            .style(common::muted),
+        ]
+        .spacing(10.0)
+        .align_y(Vertical::Center);
+
+        let continue_row = checkbox(fallthrough)
+            .label(if trigger {
+                crate::i18n::ts!("editor-continue-triggers")
+            } else {
+                crate::i18n::ts!("editor-continue-aliases")
+            })
+            .on_toggle(|_| Message::ToggleFallthrough)
+            .size(14.0)
+            .text_size(13.0);
+
+        let mut inner = column![priority_row, continue_row].spacing(10.0);
+        if let Some(prompt) = prompt {
+            inner = inner.push(
+                column![
+                    checkbox(prompt)
+                        .label(crate::i18n::ts!("editor-prompt"))
+                        .on_toggle(|_| Message::TogglePrompt)
+                        .size(14.0)
+                        .text_size(13.0),
+                    container(
+                        text(crate::i18n::ts!("editor-prompt-note"))
+                            .size(12.0)
+                            .style(common::muted),
+                    )
+                    .padding(Padding {
+                        top: 0.0,
+                        bottom: 0.0,
+                        left: 22.0,
+                        right: 0.0,
+                    }),
+                ]
+                .spacing(2.0),
             );
         }
-        let mut module = column![self.matching_options(priority, fallthrough, prompt)].spacing(6.0);
         if !non_default {
-            module = module.push(field_row(
-                "",
-                button(
-                    text(crate::i18n::t!("editor-hide-order"))
-                        .size(12.0)
-                        .style(common::muted),
-                )
-                .style(button_style::link)
-                .on_press(Message::HideOrder)
-                .padding(0)
-                .into(),
+            inner = inner.push(text_link(
+                crate::i18n::t!("editor-hide-order"),
+                Message::HideOrder,
             ));
         }
-        module.into()
+        field_row(crate::i18n::ts!("editor-when-it-runs"), inner.into())
     }
 
     /// The Matched-values rail: one clickable badge per capture the current
@@ -1174,74 +1253,6 @@ impl AutomationsWindow {
             }
         }
         render_references(&captures, language)
-    }
-
-    fn matching_options<'a>(
-        &self,
-        priority: i32,
-        fallthrough: bool,
-        prompt: Option<bool>,
-    ) -> Elem<'a> {
-        let mut options = column![
-            field_row(
-                "Priority",
-                row![
-                    button(text("-").size(14.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::AdjustPriority(-1))
-                        .padding([5, 10]),
-                    container(text(priority.to_string()).size(13.0))
-                        .width(Length::Fixed(44.0))
-                        .align_x(iced::alignment::Horizontal::Center),
-                    button(text("+").size(14.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::AdjustPriority(1))
-                        .padding([5, 10]),
-                    text(crate::i18n::t!("editor-priority-order-help"))
-                        .size(12.0)
-                        .style(common::muted),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center)
-                .into(),
-            ),
-            field_row(
-                "Continue",
-                row![
-                    common::pill_switch(fallthrough, false, Some(Message::ToggleFallthrough),),
-                    text(if fallthrough {
-                        "Check later matches from this script or package."
-                    } else {
-                        "Stop after this automation runs."
-                    })
-                    .size(12.0)
-                    .style(common::muted),
-                ]
-                .spacing(10.0)
-                .align_y(Vertical::Center)
-                .into(),
-            ),
-        ]
-        .spacing(6.0);
-        if let Some(prompt) = prompt {
-            options = options.push(field_row(
-                crate::i18n::ts!("editor-prompt-label"),
-                row![
-                    checkbox(prompt)
-                        .label(crate::i18n::ts!("editor-prompt"))
-                        .on_toggle(|_| Message::TogglePrompt)
-                        .size(14.0)
-                        .text_size(13.0),
-                    text(crate::i18n::t!("editor-prompt-note"))
-                        .size(12.0)
-                        .style(common::muted),
-                ]
-                .spacing(10.0)
-                .align_y(Vertical::Center)
-                .into(),
-            ));
-        }
-        options.into()
     }
 
     /// The "Folder" control in a script editor: a `pick_list` of every folder
@@ -1400,6 +1411,12 @@ impl AutomationsWindow {
         ),]
         .spacing(16.0);
 
+        body = body.push(
+            text(crate::i18n::ts!("editor-deck-alias"))
+                .size(13.0)
+                .style(common::muted),
+        );
+
         if let Some(error) = &state.error {
             body = body.push(error_bar(error));
         }
@@ -1423,7 +1440,7 @@ impl AutomationsWindow {
                 body = body.push(field_row(
                     crate::i18n::ts!("editor-pattern"),
                     text_input(
-                        crate::i18n::ts!("editor-example-alias-pattern"),
+                        crate::i18n::ts!("editor-example-alias-simple"),
                         &self.alias_draft.pattern_source,
                     )
                     .on_input(Message::SetPatternSource)
@@ -1458,7 +1475,7 @@ impl AutomationsWindow {
                 body = body.push(field_row(
                     crate::i18n::ts!("editor-regex"),
                     text_input(
-                        crate::i18n::ts!("editor-example-alias-pattern"),
+                        crate::i18n::ts!("editor-example-alias-regex"),
                         &self.alias_draft.regex_source,
                     )
                     .on_input(Message::SetAliasPattern)
@@ -1467,7 +1484,7 @@ impl AutomationsWindow {
                 ));
             }
         }
-        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-command"), "", true));
+        body = body.push(self.tester_box(true, false));
         body = body.push(self.order_module(alias.priority, alias.fallthrough, None, false));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
         if let Some(rail) = self.matched_values_rail(self.alias_capture_references(alias.language))
@@ -1483,6 +1500,7 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::ts!("action-save")
             },
+            Some(crate::i18n::ts!("editor-delete-this-alias")),
         ) {
             body = body.push(bar);
         }
@@ -1552,6 +1570,7 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::ts!("action-save")
             },
+            None,
         ) {
             body = body.push(bar);
         }
@@ -1602,6 +1621,12 @@ impl AutomationsWindow {
             .error
             .as_deref()
             .or_else(|| any_invalid.then(|| crate::i18n::ts!("editor-patterns-invalid")));
+
+        body = body.push(
+            text(crate::i18n::ts!("editor-deck-trigger"))
+                .size(13.0)
+                .style(common::muted),
+        );
         body = body.push(error_slot(error));
 
         body = body.push(field_row(
@@ -1657,8 +1682,10 @@ impl AutomationsWindow {
                     text_input(
                         if trigger_row.syntax == MatcherSyntax::Pattern {
                             crate::i18n::ts!("editor-example-trigger-pattern")
+                        } else if trigger_row.role == PatternKind::Raw {
+                            crate::i18n::ts!("editor-example-trigger-raw")
                         } else {
-                            "\\bpattern\\b"
+                            crate::i18n::ts!("editor-example-trigger-regex")
                         },
                         &trigger_row.source
                     )
@@ -1721,7 +1748,10 @@ impl AutomationsWindow {
             patterns.into(),
         ));
 
-        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-line"), "", false));
+        let has_raw = rows
+            .iter()
+            .any(|row| row.role == PatternKind::Raw && !row.source.trim().is_empty());
+        body = body.push(self.tester_box(false, has_raw));
         body = body.push(self.order_module(priority, fallthrough, Some(prompt), true));
         body = body.push(field_row("Behavior", self.behavior_radios(language)));
         if let Some(rail) =
@@ -1738,6 +1768,7 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::ts!("action-save")
             },
+            Some(crate::i18n::ts!("editor-delete-this-trigger")),
         ) {
             body = body.push(bar);
         }
@@ -1907,34 +1938,89 @@ impl AutomationsWindow {
         .then(|| crate::i18n::t!("editor-matches-every-line"))
     }
 
-    /// The live tester box. `alias` true → verdict for the open alias's draft
-    /// (kind-aware); false → trigger verdict over the open trigger's rows.
-    fn tester_box<'a>(&self, label: &str, _unused: &str, alias: bool) -> Elem<'a> {
+    /// The Try-it module: a collapsed accordion whose header is a call to
+    /// action; expanded, the test field, its verdict, and (triggers, when a
+    /// raw row exists) the byte view of the simulated raw line.
+    fn tester_box<'a>(&self, alias: bool, show_bytes: bool) -> Elem<'a> {
+        let header = |chevron: &'static str, label: String| {
+            button(
+                row![text(chevron).size(11.0), text(label).size(13.0)]
+                    .spacing(8.0)
+                    .align_y(Vertical::Center),
+            )
+            .style(button_style::quiet_link)
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Message::ToggleTryIt)
+        };
+
+        if !self.try_it_open {
+            let label = if alias {
+                crate::i18n::t!("editor-try-alias-cta")
+            } else {
+                crate::i18n::t!("editor-try-trigger-cta")
+            };
+            let body = container(header("\u{25B8}", label))
+                .padding(12.0)
+                .width(Length::Fill)
+                .style(common::banner_style);
+            return field_row("", body.into());
+        }
+
+        let mut inner = column![header("\u{25BE}", crate::i18n::t!("editor-try-it"))].spacing(8.0);
+        if alias {
+            inner = inner.push(
+                row![
+                    text("\u{276F}")
+                        .size(13.0)
+                        .font(fonts::GEIST_MONO_VF)
+                        .style(common::capture_accent),
+                    text_input(
+                        crate::i18n::ts!("editor-test-placeholder-alias"),
+                        &self.test_input
+                    )
+                    .on_input(Message::SetTestInput)
+                    .size(13.0),
+                ]
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+            );
+        } else {
+            inner = inner.push(common::section_label(crate::i18n::ts!("editor-game-sent")));
+            inner = inner.push(
+                text_input(
+                    crate::i18n::ts!("editor-test-placeholder-trigger"),
+                    &self.test_input,
+                )
+                .on_input(Message::SetTestInput)
+                .size(13.0),
+            );
+            if show_bytes && !self.test_input.is_empty() {
+                let bytes = raw_of(&self.test_input).replace('\x1b', "\u{241B}");
+                inner = inner.push(
+                    text(format!(
+                        "{} {bytes}",
+                        crate::i18n::t!("editor-try-bytes-prefix")
+                    ))
+                    .size(11.0)
+                    .font(fonts::GEIST_MONO_VF)
+                    .style(common::faint),
+                );
+            }
+        }
         let (verdict, status): (String, NodeStatus) = if alias {
             self.alias_draft_verdict()
         } else {
             self.trigger_verdict()
         };
-        let placeholder = if alias {
-            "k goblin"
-        } else {
-            "You are badly hurt and bleeding."
-        };
-        let inner = column![
-            row![text(label.to_uppercase()).size(10.0).style(common::faint),],
-            text_input(placeholder, &self.test_input)
-                .on_input(Message::SetTestInput)
-                .size(13.0),
-            container(
-                row![
-                    common::status_dot(status),
-                    text(verdict).size(12.0).style(verdict_style(status)),
-                ]
-                .spacing(6.0)
-                .align_y(Vertical::Center)
-            ),
-        ]
-        .spacing(8.0);
+        inner = inner.push(container(
+            row![
+                common::status_dot(status),
+                text(verdict).size(12.0).style(verdict_style(status)),
+            ]
+            .spacing(6.0)
+            .align_y(Vertical::Center),
+        ));
         let body = container(inner)
             .padding(12.0)
             .width(Length::Fill)
@@ -1951,7 +2037,7 @@ impl AutomationsWindow {
             AliasKind::Pattern => {
                 if draft.pattern_source.trim().is_empty() {
                     return (
-                        crate::i18n::t!("editor-enter-pattern"),
+                        crate::i18n::t!("editor-verdict-no-pattern"),
                         NodeStatus::Disabled,
                     );
                 }
@@ -1961,7 +2047,12 @@ impl AutomationsWindow {
                     draft.anchor_end,
                 );
                 if let Some(error) = compiled.errors.first() {
-                    return (pattern_error_text(error), NodeStatus::Error);
+                    return (
+                        crate::i18n::t!(
+                            "editor-verdict-compile-error", "error" => pattern_error_text(error)
+                        ),
+                        NodeStatus::Error,
+                    );
                 }
                 if sample.is_empty() {
                     return (
@@ -1969,36 +2060,18 @@ impl AutomationsWindow {
                         NodeStatus::Disabled,
                     );
                 }
-                match compiled.regex.and_then(|re| {
-                    re.captures(sample).map(|captures| {
-                        re.capture_names()
-                            .skip(1)
-                            .enumerate()
-                            .filter_map(|(i, name)| {
-                                let value = captures.get(i + 1)?;
-                                Some(match name {
-                                    Some(name) => format!("{name}={}", value.as_str()),
-                                    None => format!("${}={}", i + 1, value.as_str()),
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                }) {
-                    Some(captures) if captures.is_empty() => {
+                match compiled.regex {
+                    Some(re) if re.is_match(sample) => {
                         (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
                     }
-                    Some(captures) => (
-                        crate::i18n::t!("editor-fires-with", "captures" => captures.join("  ")),
-                        NodeStatus::Ok,
-                    ),
-                    None => (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled),
+                    _ => (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled),
                 }
             }
             AliasKind::Command => {
                 let name = draft.command.trim();
                 if name.is_empty() {
                     return (
-                        crate::i18n::t!("editor-command-name-empty"),
+                        crate::i18n::t!("editor-verdict-no-command"),
                         NodeStatus::Disabled,
                     );
                 }
@@ -2014,23 +2087,8 @@ impl AutomationsWindow {
                     parse: draft.parse,
                 };
                 match matchers::assign(sample, &spec.name, &spec.args, spec.parse) {
-                    CommandOutcome::Fired { args } => {
-                        let captures: Vec<String> = args
-                            .iter()
-                            .filter_map(|(name, value)| {
-                                value.as_ref().map(|v| format!("{name}={v}"))
-                            })
-                            .collect();
-                        if captures.is_empty() {
-                            (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
-                        } else {
-                            (
-                                crate::i18n::t!(
-                                    "editor-fires-with", "captures" => captures.join("  ")
-                                ),
-                                NodeStatus::Ok,
-                            )
-                        }
+                    CommandOutcome::Fired { .. } => {
+                        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
                     }
                     CommandOutcome::NotFired(miss) => command_miss_verdict(name, &miss),
                 }
@@ -2057,8 +2115,14 @@ impl AutomationsWindow {
             .enumerate()
             .filter(|(_, row)| !row.source.trim().is_empty())
             .collect();
-        if filled.is_empty() || line.is_empty() {
+        if line.is_empty() {
             return (crate::i18n::t!("editor-enter-line"), NodeStatus::Disabled);
+        }
+        if !filled.iter().any(|(_, row)| row.role != PatternKind::Anti) {
+            return (
+                crate::i18n::t!("editor-verdict-no-matchers"),
+                NodeStatus::Disabled,
+            );
         }
 
         let raw_subject = raw_of(line);
@@ -2069,10 +2133,13 @@ impl AutomationsWindow {
                 .map_err(|e| crate::i18n::t!("editor-invalid-regex", "error" => e.to_string()))
         };
 
-        // Any compile error surfaces first, verbatim.
+        // Any compile error surfaces first, as a failing verdict.
         for (_, row) in &filled {
             if let Err(message) = row.compiled() {
-                return (message, NodeStatus::Error);
+                return (
+                    crate::i18n::t!("editor-verdict-compile-error", "error" => message),
+                    NodeStatus::Error,
+                );
             }
         }
 
@@ -2439,6 +2506,26 @@ fn field_row<'a>(label: &str, control: Elem<'a>) -> Elem<'a> {
         .into()
 }
 
+/// An underlined text link (D8): quiet at rest, full-strength on hover. The
+/// underline rule and both colors come from the theme crate so every link in
+/// these panes reads the same.
+fn text_link<'a>(label: String, message: Message) -> Elem<'a> {
+    button(button_style::underlined(text(label).size(12.0)))
+        .style(button_style::quiet_link)
+        .padding(0)
+        .on_press(message)
+        .into()
+}
+
+/// The destructive underlined link (the `Delete this alias/trigger` footer).
+fn danger_link<'a>(label: String, message: Message) -> Elem<'a> {
+    button(button_style::underlined(text(label).size(13.0)))
+        .style(button_style::danger_link)
+        .padding(0)
+        .on_press(message)
+        .into()
+}
+
 fn error_bar<'a>(message: &str) -> Elem<'a> {
     container(
         row![
@@ -2557,12 +2644,15 @@ fn plain_of(raw: &str) -> String {
 fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {
     if pattern.is_empty() {
         return (
-            crate::i18n::t!("editor-enter-pattern"),
+            crate::i18n::t!("editor-verdict-no-regex"),
             NodeStatus::Disabled,
         );
     }
     match regex::Regex::new(pattern) {
-        Err(_) => (crate::i18n::t!("editor-invalid-pattern"), NodeStatus::Error),
+        Err(e) => (
+            crate::i18n::t!("editor-verdict-invalid-regex", "error" => e.to_string()),
+            NodeStatus::Error,
+        ),
         Ok(re) => {
             if sample.is_empty() {
                 (
@@ -2570,7 +2660,7 @@ fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {
                     NodeStatus::Disabled,
                 )
             } else if re.is_match(sample) {
-                (crate::i18n::t!("editor-matches"), NodeStatus::Ok)
+                (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
             } else {
                 (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled)
             }

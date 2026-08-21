@@ -304,6 +304,8 @@ pub enum Message {
     AdjustPriority(i32),
     ToggleFallthrough,
     ScriptEditorAction(text_editor::Action),
+    /// Expand/collapse the Try-it accordion (collapsed by default).
+    ToggleTryIt,
     SetTestInput(String),
     ToggleEnabled,
     MarkHotkeyState(Vec<MaybePhysicalKey>),
@@ -602,6 +604,8 @@ pub struct AutomationsWindow {
     /// Non-default values force it open regardless (and it cannot re-hide
     /// while they hold); reset when an editor opens.
     pub(super) order_revealed: bool,
+    /// Whether the Try-it accordion is expanded; collapsed when an editor opens.
+    pub(super) try_it_open: bool,
     pub(super) test_input: String,
     pub(super) dirty: bool,
     pub(super) pending_nav: Option<Box<Message>>,
@@ -835,6 +839,7 @@ impl AutomationsWindow {
             hotkey_state: Vec::new(),
             alias_draft: model::AliasMatcherDraft::default(),
             order_revealed: false,
+            try_it_open: false,
             test_input: String::new(),
             dirty: false,
             pending_nav: None,
@@ -1295,6 +1300,10 @@ impl AutomationsWindow {
             }
             Message::ScriptEditorAction(action) => {
                 self.editor_content.perform(action);
+                Update::none()
+            }
+            Message::ToggleTryIt => {
+                self.try_it_open = !self.try_it_open;
                 Update::none()
             }
             Message::SetTestInput(value) => {
