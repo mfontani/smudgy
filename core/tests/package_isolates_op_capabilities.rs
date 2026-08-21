@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
-use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 use smudgy_core::session::{
     BufferUpdate, PackageProviderFactory, SessionEvent, SessionId, SessionParams,
     spawn_with_package_provider,
@@ -101,6 +101,7 @@ async fn run_capability_case(
     consent: Option<PackagePermissions>,
     pkg: ResolvedPackage,
 ) -> Vec<String> {
+    let session_id = SessionId::from(session_id);
     prepare_server(server);
     shared_packages::install_package(server, spec, UpdateMode::Auto, true).unwrap();
     if let Some(consent) = consent {
@@ -108,7 +109,7 @@ async fn run_capability_case(
     }
 
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(session_id),
+        session_id,
         server_name: Arc::new(server.to_string()),
         profile_name: Arc::new("test".to_string()),
         profile_subtext: Arc::new(String::new()),
@@ -136,7 +137,14 @@ async fn run_capability_case(
             collect(&updates, &mut lines);
         }
     }
-    tx.send(RuntimeAction::Shutdown).ok();
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
+    drop(tx);
+    drop(events);
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
     lines
 }
 

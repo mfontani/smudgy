@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use smudgy_core::models::shared_packages::{self, UpdateMode};
-use smudgy_core::session::runtime::{RuntimeAction, join_runtime_threads};
+use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 #[cfg(feature = "web-audio")]
 use smudgy_core::session::spawn_with_package_provider_and_audio;
 use smudgy_core::session::{
@@ -139,6 +139,7 @@ async fn run_scenario_inner(
     let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let session_id = SessionId::from(session_id);
 
     // The smudgy home override is a process-global `OnceLock` (first setter in the binary wins),
     // so re-read it after setting and scope everything under a unique server name per test.
@@ -207,7 +208,7 @@ async fn run_scenario_inner(
     });
 
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(session_id),
+        session_id,
         server_name: Arc::new(server.to_string()),
         profile_name: Arc::new("test".to_string()),
         profile_subtext: Arc::new(String::new()),
@@ -282,10 +283,14 @@ async fn run_scenario_inner(
             }
         }
     }
-    tx.send(RuntimeAction::Shutdown).ok();
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
     drop(tx);
     drop(events);
-    join_runtime_threads();
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
 
     assert!(
         sent,
@@ -833,6 +838,7 @@ async fn run_with_factory(
     let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let session_id = SessionId::from(session_id);
 
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -862,7 +868,7 @@ async fn run_with_factory(
     }
 
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(session_id),
+        session_id,
         server_name: Arc::new(server.to_string()),
         profile_name: Arc::new("test".to_string()),
         profile_subtext: Arc::new(String::new()),
@@ -919,10 +925,14 @@ async fn run_with_factory(
             }
         }
     }
-    tx.send(RuntimeAction::Shutdown).ok();
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
     drop(tx);
     drop(events);
-    join_runtime_threads();
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
 
     assert!(
         sent,

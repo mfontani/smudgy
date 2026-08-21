@@ -1108,12 +1108,18 @@ fn public_errors_and_private_settings_have_the_intended_traits() {
 
 #[test]
 fn system_wrapper_forwards_only_the_scoped_service_surface() {
+    fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+    assert_clone_send_sync::<crate::MixerSessionRegistrar>();
+
     let attempt = attempt_fake(FakeConfig::default(), TEST_RATE, fresh_lease_flag());
     let expected_physical = attempt.result.as_ref().unwrap().physical_output_format();
     let service = SystemMixerService(attempt.result.unwrap());
     assert_eq!(service.format().sample_rate(), TEST_RATE);
     assert_eq!(service.physical_output_format(), expected_physical);
-    let session = service.add_session(AudioSessionId(1234)).unwrap();
+    let session = service
+        .session_registrar()
+        .add_session(AudioSessionId(1234))
+        .unwrap();
     assert_eq!(session.script_bus().format().unwrap(), service.format());
     assert!(service.shutdown().clean);
 }

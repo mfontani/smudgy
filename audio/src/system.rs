@@ -24,7 +24,8 @@ use cpal::{
 use super::{
     AudioSessionId, DriverFailureSignal, JoinedOutputDriver, JoinedRenderer,
     MAX_PHYSICAL_CALLBACK_FRAMES, MixerControlError, MixerFormat, MixerOutputFailure, MixerService,
-    MixerSessionOwner, MixerShutdown, MixerStartError, PhysicalOutputFormat, PhysicalSampleFormat,
+    MixerSessionOwner, MixerSessionRegistrar, MixerShutdown, MixerStartError, PhysicalOutputFormat,
+    PhysicalSampleFormat,
 };
 
 const PHYSICAL_CHANNELS: usize = 2;
@@ -214,6 +215,15 @@ impl SystemMixerService {
     #[must_use]
     pub fn physical_output_format(&self) -> PhysicalOutputFormat {
         self.0.physical_output_format()
+    }
+
+    /// Returns a weak, cloneable session-registration authority.
+    ///
+    /// The registrar never owns this thread-affine service or its unique
+    /// physical-output join authority.
+    #[must_use]
+    pub fn session_registrar(&self) -> MixerSessionRegistrar {
+        self.0.session_registrar()
     }
 
     /// Add one fully preinstalled session subtree.

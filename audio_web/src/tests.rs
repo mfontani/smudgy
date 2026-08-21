@@ -311,7 +311,7 @@ fn stale_same_id_scope_is_inert_after_replacement_generation() {
 
 #[test]
 fn prepare_and_session_seal_are_totally_ordered_at_delegate_boundary() {
-    let (service, owner, _probe) = service(205);
+    let (service, owner, probe) = service(205);
     let application = ApplicationAudioOwner::new(authority_limits(4));
     let registrar = application.registrar();
     let registration = registrar.register_session(owner).unwrap();
@@ -330,7 +330,12 @@ fn prepare_and_session_seal_are_totally_ordered_at_delegate_boundary() {
     let prepare_scope = scope.clone();
     let prepare = thread::spawn(move || scoped_context(&prepare_scope, "none"));
     entered.wait();
-    let seal = thread::spawn(move || drop(registration));
+    let seal = thread::spawn(move || {
+        let mut registration = registration;
+        let first = registration.seal();
+        let second = registration.seal();
+        (registration, first, second)
+    });
     assert!(
         !seal.is_finished(),
         "session sealing crossed an admitted factory transaction"
@@ -340,7 +345,9 @@ fn prepare_and_session_seal_are_totally_ordered_at_delegate_boundary() {
         .join()
         .unwrap()
         .expect("prepare admitted before seal completes");
-    seal.join().unwrap();
+    let (registration, first, second) = seal.join().unwrap();
+    assert!(first, "the first explicit seal closes admission");
+    assert!(!second, "session sealing is absorbing and idempotent");
     context.close_sync();
 
     *application
@@ -349,6 +356,17 @@ fn prepare_and_session_seal_are_totally_ordered_at_delegate_boundary() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     assert!(scoped_context(&scope, "none").is_err());
+    assert_eq!(
+        service.add_session(AudioSessionId(205)).unwrap_err(),
+        MixerControlError::DuplicateSession,
+        "sealing retains the exact mixer owner until explicit retirement"
+    );
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+    let replacement = service
+        .add_session(AudioSessionId(205))
+        .expect("retirement receipt returns the exact mixer-session capacity");
+    drop(replacement);
     assert!(service.shutdown().clean);
 }
 

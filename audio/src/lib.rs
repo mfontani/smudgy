@@ -3269,6 +3269,42 @@ impl Drop for MixerSessionOwner {
 /// Compatibility name for the now-unique session owner.
 pub type MixerSessionHandle = MixerSessionOwner;
 
+/// Weak, cloneable authority for adding sessions to one live process mixer.
+///
+/// A registrar never owns the mixer owner thread or its physical-output join
+/// authority. It becomes inert when the originating service seals or dies,
+/// and every accepted session is still assigned its non-wrapping generation
+/// by that service's owner thread.
+#[derive(Clone)]
+pub struct MixerSessionRegistrar {
+    control: Weak<ControlInner>,
+}
+
+impl fmt::Debug for MixerSessionRegistrar {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MixerSessionRegistrar")
+            .field("service_live", &(self.control.strong_count() != 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl MixerSessionRegistrar {
+    /// Add and fully preinstall one exact Script/Native/Speech session subtree.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed bounded-control, topology, sealed-service, or dead-owner
+    /// error. No owner is published until every permanent slot is accepted.
+    pub fn add_session(&self, id: AudioSessionId) -> Result<MixerSessionOwner, MixerControlError> {
+        let control = self
+            .control
+            .upgrade()
+            .ok_or(MixerControlError::OwnerStopped)?;
+        add_session(&control, id)
+    }
+}
+
 /// Bounded control plus unique joined ownership of one process mixer.
 ///
 /// This join authority is intentionally thread-affine (`!Send` and `!Sync`).
@@ -3414,6 +3450,17 @@ impl MixerService {
         self.physical_format
     }
 
+    /// Returns a weak, cloneable session-registration authority.
+    ///
+    /// The registrar is `Send + Sync` but does not retain this thread-affine
+    /// service or its unique output-join authority.
+    #[must_use]
+    pub fn session_registrar(&self) -> MixerSessionRegistrar {
+        MixerSessionRegistrar {
+            control: self.control.as_ref().map_or_else(Weak::new, Arc::downgrade),
+        }
+    }
+
     /// Add and fully preinstall the fixed Script/Native/Speech subtree.
     ///
     /// # Errors
@@ -3425,12 +3472,7 @@ impl MixerService {
             .control
             .as_ref()
             .ok_or(MixerControlError::OwnerStopped)?;
-        let session = send_request(control, |response| OwnerCommand::AddSession(id, response))?
-            .map_err(MixerControlError::from)?;
-        Ok(MixerSessionOwner {
-            control: Arc::downgrade(control),
-            session: Some(session),
-        })
+        add_session(control, id)
     }
 
     /// Seal production, join the physical output owner, and force-resolve live slots.
@@ -3452,6 +3494,18 @@ impl MixerService {
             failure: self.driver_status.failure(),
         }
     }
+}
+
+fn add_session(
+    control: &Arc<ControlInner>,
+    id: AudioSessionId,
+) -> Result<MixerSessionOwner, MixerControlError> {
+    let session = send_request(control, |response| OwnerCommand::AddSession(id, response))?
+        .map_err(MixerControlError::from)?;
+    Ok(MixerSessionOwner {
+        control: Arc::downgrade(control),
+        session: Some(session),
+    })
 }
 
 impl Drop for MixerService {

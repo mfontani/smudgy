@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
     task::Poll,
     thread::{self},
 };
@@ -315,16 +315,836 @@ pub struct Runtime {
     start_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
-static RUNTIME_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+/// Exact, non-panicking result of consuming one runtime-thread join authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeThreadJoinOutcome {
+    /// The runtime thread returned normally.
+    Clean { session_id: SessionId },
+    /// The runtime thread panicked. Its opaque payload is deliberately leaked
+    /// so a hostile payload destructor cannot make the join API panic.
+    Panicked { session_id: SessionId },
+    /// The OS thread could not be spawned after the session id was reserved.
+    SpawnFailed { session_id: SessionId },
+    /// No join authority is available for this id. It was never spawned, or a
+    /// concurrent/earlier exact or all-session join already consumed it.
+    /// This is an absence report, not proof that a runtime shut down.
+    NotTrackedOrAlreadyJoined { session_id: SessionId },
+}
 
+impl RuntimeThreadJoinOutcome {
+    /// Session identity whose join was requested or completed.
+    #[must_use]
+    pub const fn session_id(self) -> SessionId {
+        match self {
+            Self::Clean { session_id }
+            | Self::Panicked { session_id }
+            | Self::SpawnFailed { session_id }
+            | Self::NotTrackedOrAlreadyJoined { session_id } => session_id,
+        }
+    }
+
+    /// Whether this outcome proves a normal runtime-thread return.
+    #[must_use]
+    pub const fn is_clean(self) -> bool {
+        matches!(self, Self::Clean { .. })
+    }
+}
+
+enum RuntimeThreadEntry {
+    /// The id is linearized before `Builder::spawn`; exact and drain-all joins
+    /// wait until it becomes `Running` or `SpawnFailed`.
+    Reserved,
+    /// The one result-bearing join authority for this exact session id.
+    Running(JoinHandle<()>),
+    /// One caller owns the OS join while every other observer shares its
+    /// completion. No observer may report missing/already-joined until this
+    /// proof is published.
+    Joining(Arc<RuntimeThreadJoinCompletion>),
+    /// Publication failed after reservation. Retained until a join observes it.
+    SpawnFailed,
+}
+
+#[derive(Default)]
+struct RuntimeThreadJoinCompletionState {
+    outcome: Option<RuntimeThreadJoinOutcome>,
+    #[cfg(test)]
+    waiters: usize,
+}
+
+#[derive(Default)]
+struct RuntimeThreadJoinCompletion {
+    state: Mutex<RuntimeThreadJoinCompletionState>,
+    ready: Condvar,
+}
+
+impl RuntimeThreadJoinCompletion {
+    fn publish(&self, outcome: RuntimeThreadJoinOutcome) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.outcome.is_none());
+        state.outcome = Some(outcome);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> RuntimeThreadJoinOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            state.waiters += 1;
+            self.ready.notify_all();
+        }
+        while state.outcome.is_none() {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        #[cfg(test)]
+        {
+            state.waiters -= 1;
+        }
+        state
+            .outcome
+            .expect("runtime-thread completion published an outcome")
+    }
+
+    #[cfg(test)]
+    fn wait_for_waiters(&self, expected: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.waiters != expected {
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(state, Duration::from_secs(2))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!timeout.timed_out(), "join observer did not begin waiting");
+            state = next;
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeThreadRegistryState {
+    entries: HashMap<SessionId, RuntimeThreadEntry>,
+    /// Temporarily stops new reservations while drain-all resolves every
+    /// already-reserved id into a result-bearing state.
+    drainers: usize,
+    #[cfg(test)]
+    reservation_waiters: usize,
+}
+
+#[derive(Default)]
+struct RuntimeThreadRegistry {
+    state: Mutex<RuntimeThreadRegistryState>,
+    changed: Condvar,
+    #[cfg(test)]
+    drain_snapshot_hook: Mutex<Option<Arc<TestDrainSnapshotHook>>>,
+}
+
+#[cfg(test)]
+struct TestDrainSnapshotHook {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<std::sync::Barrier>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeThreadReservationError {
+    AlreadyTracked,
+}
+
+struct RuntimeThreadReservation {
+    registry: Arc<RuntimeThreadRegistry>,
+    session_id: SessionId,
+    resolved: bool,
+}
+
+enum RuntimeThreadJoinClaim {
+    Owner {
+        session_id: SessionId,
+        handle: JoinHandle<()>,
+        completion: Arc<RuntimeThreadJoinCompletion>,
+    },
+    SpawnFailedOwner {
+        session_id: SessionId,
+        completion: Arc<RuntimeThreadJoinCompletion>,
+    },
+    Observer {
+        session_id: SessionId,
+        completion: Arc<RuntimeThreadJoinCompletion>,
+    },
+}
+
+impl RuntimeThreadJoinClaim {
+    const fn session_id(&self) -> SessionId {
+        match self {
+            Self::Owner { session_id, .. }
+            | Self::SpawnFailedOwner { session_id, .. }
+            | Self::Observer { session_id, .. } => *session_id,
+        }
+    }
+}
+
+impl RuntimeThreadRegistry {
+    fn reserve(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Result<RuntimeThreadReservation, RuntimeThreadReservationError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.drainers != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if state.entries.contains_key(&session_id) {
+            return Err(RuntimeThreadReservationError::AlreadyTracked);
+        }
+        state
+            .entries
+            .insert(session_id, RuntimeThreadEntry::Reserved);
+        drop(state);
+        Ok(RuntimeThreadReservation {
+            registry: Arc::clone(self),
+            session_id,
+            resolved: false,
+        })
+    }
+
+    fn join_exact(&self, session_id: SessionId) -> RuntimeThreadJoinOutcome {
+        let claim = loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.entries.get_mut(&session_id) {
+                Some(RuntimeThreadEntry::Reserved) => {
+                    #[cfg(test)]
+                    {
+                        state.reservation_waiters += 1;
+                        self.changed.notify_all();
+                    }
+                    state = self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    #[cfg(test)]
+                    {
+                        state.reservation_waiters -= 1;
+                    }
+                    drop(state);
+                }
+                Some(entry @ RuntimeThreadEntry::Running(_)) => {
+                    let completion = Arc::new(RuntimeThreadJoinCompletion::default());
+                    let RuntimeThreadEntry::Running(handle) = std::mem::replace(
+                        entry,
+                        RuntimeThreadEntry::Joining(Arc::clone(&completion)),
+                    ) else {
+                        unreachable!("matched running runtime-thread entry")
+                    };
+                    self.changed.notify_all();
+                    break RuntimeThreadJoinClaim::Owner {
+                        session_id,
+                        handle,
+                        completion,
+                    };
+                }
+                Some(RuntimeThreadEntry::Joining(completion)) => {
+                    break RuntimeThreadJoinClaim::Observer {
+                        session_id,
+                        completion: Arc::clone(completion),
+                    };
+                }
+                Some(entry @ RuntimeThreadEntry::SpawnFailed) => {
+                    let completion = Arc::new(RuntimeThreadJoinCompletion::default());
+                    *entry = RuntimeThreadEntry::Joining(Arc::clone(&completion));
+                    self.changed.notify_all();
+                    break RuntimeThreadJoinClaim::SpawnFailedOwner {
+                        session_id,
+                        completion,
+                    };
+                }
+                None => {
+                    return RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined { session_id };
+                }
+            }
+        };
+        self.resolve_claim(claim)
+    }
+
+    fn join_all(&self) -> Vec<RuntimeThreadJoinOutcome> {
+        let mut claims = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.drainers = state.drainers.saturating_add(1);
+            self.changed.notify_all();
+            while state
+                .entries
+                .values()
+                .any(|entry| matches!(entry, RuntimeThreadEntry::Reserved))
+            {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+
+            let mut claims = Vec::new();
+            for (session_id, entry) in &mut state.entries {
+                match entry {
+                    RuntimeThreadEntry::Running(_) => {
+                        let completion = Arc::new(RuntimeThreadJoinCompletion::default());
+                        let RuntimeThreadEntry::Running(handle) = std::mem::replace(
+                            entry,
+                            RuntimeThreadEntry::Joining(Arc::clone(&completion)),
+                        ) else {
+                            unreachable!("matched running runtime-thread entry")
+                        };
+                        claims.push(RuntimeThreadJoinClaim::Owner {
+                            session_id: *session_id,
+                            handle,
+                            completion,
+                        });
+                    }
+                    RuntimeThreadEntry::Joining(completion) => {
+                        claims.push(RuntimeThreadJoinClaim::Observer {
+                            session_id: *session_id,
+                            completion: Arc::clone(completion),
+                        });
+                    }
+                    RuntimeThreadEntry::SpawnFailed => {
+                        let completion = Arc::new(RuntimeThreadJoinCompletion::default());
+                        *entry = RuntimeThreadEntry::Joining(Arc::clone(&completion));
+                        claims.push(RuntimeThreadJoinClaim::SpawnFailedOwner {
+                            session_id: *session_id,
+                            completion,
+                        });
+                    }
+                    RuntimeThreadEntry::Reserved => {}
+                }
+            }
+            // The snapshot is now stable through Joining completions. Release
+            // the map lock before finishing this drain admission so concurrent
+            // drainers compose without blocking one another's observation.
+            drop(state);
+            #[cfg(test)]
+            self.pause_after_drain_snapshot();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.drainers = state.drainers.saturating_sub(1);
+            if state.drainers == 0 {
+                self.changed.notify_all();
+            }
+            claims
+        };
+
+        claims.sort_by_key(RuntimeThreadJoinClaim::session_id);
+        let mut outcomes = claims
+            .drain(..)
+            .map(|claim| self.resolve_claim(claim))
+            .collect::<Vec<_>>();
+        outcomes.sort_by_key(|outcome| outcome.session_id());
+        outcomes
+    }
+
+    #[cfg(test)]
+    fn pause_after_drain_snapshot(&self) {
+        let hook = self
+            .drain_snapshot_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            hook.entered.send(()).unwrap();
+            hook.release.wait();
+        }
+    }
+
+    fn resolve_claim(&self, claim: RuntimeThreadJoinClaim) -> RuntimeThreadJoinOutcome {
+        match claim {
+            RuntimeThreadJoinClaim::Owner {
+                session_id,
+                handle,
+                completion,
+            } => {
+                let outcome = join_runtime_handle(session_id, handle);
+                completion.publish(outcome);
+                self.remove_joining(session_id, &completion);
+                outcome
+            }
+            RuntimeThreadJoinClaim::SpawnFailedOwner {
+                session_id,
+                completion,
+            } => {
+                let outcome = RuntimeThreadJoinOutcome::SpawnFailed { session_id };
+                completion.publish(outcome);
+                self.remove_joining(session_id, &completion);
+                outcome
+            }
+            RuntimeThreadJoinClaim::Observer { completion, .. } => completion.wait(),
+        }
+    }
+
+    fn remove_joining(&self, session_id: SessionId, completion: &Arc<RuntimeThreadJoinCompletion>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.get(&session_id).is_some_and(|entry| {
+            matches!(entry, RuntimeThreadEntry::Joining(current) if Arc::ptr_eq(current, completion))
+        }) {
+            state.entries.remove(&session_id);
+            self.changed.notify_all();
+        }
+    }
+}
+
+impl RuntimeThreadReservation {
+    fn publish(mut self, handle: JoinHandle<()>) {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry @ RuntimeThreadEntry::Reserved) = state.entries.get_mut(&self.session_id)
+        else {
+            drop(state);
+            let _ = join_runtime_handle(self.session_id, handle);
+            panic!("runtime-thread reservation disappeared before publication");
+        };
+        *entry = RuntimeThreadEntry::Running(handle);
+        self.resolved = true;
+        self.registry.changed.notify_all();
+    }
+
+    fn fail(mut self) {
+        self.publish_failure();
+    }
+
+    fn publish_failure(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry @ RuntimeThreadEntry::Reserved) = state.entries.get_mut(&self.session_id)
+        {
+            *entry = RuntimeThreadEntry::SpawnFailed;
+        }
+        self.resolved = true;
+        self.registry.changed.notify_all();
+    }
+}
+
+impl Drop for RuntimeThreadReservation {
+    fn drop(&mut self) {
+        self.publish_failure();
+    }
+}
+
+fn join_runtime_handle(session_id: SessionId, handle: JoinHandle<()>) -> RuntimeThreadJoinOutcome {
+    match handle.join() {
+        Ok(()) => RuntimeThreadJoinOutcome::Clean { session_id },
+        Err(payload) => {
+            // Panic payloads are arbitrary user types; dropping one may panic.
+            std::mem::forget(payload);
+            RuntimeThreadJoinOutcome::Panicked { session_id }
+        }
+    }
+}
+
+static RUNTIME_THREADS: OnceLock<Arc<RuntimeThreadRegistry>> = OnceLock::new();
+
+fn runtime_threads() -> Arc<RuntimeThreadRegistry> {
+    Arc::clone(RUNTIME_THREADS.get_or_init(|| Arc::new(RuntimeThreadRegistry::default())))
+}
+
+/// Consume and join the exact runtime thread tracked for `session_id`.
+///
+/// The caller must request that exact runtime's shutdown before joining; a live
+/// runtime is allowed to keep this call blocked. A
+/// [`RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined`] result is not
+/// shutdown proof and must not authorize dependent resource retirement.
+///
+/// A reservation still being published is awaited. The map mutex is never
+/// held while the OS thread is joined, and thread panics are returned rather
+/// than propagated.
+#[must_use]
+pub fn join_runtime_thread(session_id: SessionId) -> RuntimeThreadJoinOutcome {
+    runtime_threads().join_exact(session_id)
+}
+
+/// Drain and join every runtime thread whose reservation preceded this call.
+///
+/// Callers must first request shutdown for every runtime in their lifecycle
+/// domain; live runtimes are allowed to keep this call blocked.
+///
+/// Drain-all first prevents new reservations and resolves every in-flight
+/// reservation to `Running` or `SpawnFailed`. It then reopens registration and
+/// releases the map lock before joining any thread. Outcomes are sorted by
+/// session id and no thread panic is propagated.
+#[must_use]
+pub fn join_all_runtime_threads() -> Vec<RuntimeThreadJoinOutcome> {
+    runtime_threads().join_all()
+}
+
+/// Compatibility join-all entry point retaining the former fail-fast behavior.
+///
+/// New lifecycle coordination should use [`join_all_runtime_threads`] and
+/// inspect every returned outcome. Existing callers that have not migrated
+/// still panic if any runtime failed, rather than silently treating a crash as
+/// clean shutdown.
+///
 /// # Panics
 ///
-/// Panics if the `RUNTIME_THREADS` mutex is poisoned, or if a joined runtime
-/// thread itself panicked.
+/// Panics after all tracked threads have been joined if any outcome is not
+/// [`RuntimeThreadJoinOutcome::Clean`].
 pub fn join_runtime_threads() {
-    let mut runtime_threads = RUNTIME_THREADS.lock().unwrap();
-    while let Some(join_handle) = runtime_threads.pop() {
-        join_handle.join().unwrap();
+    let outcomes = join_all_runtime_threads();
+    if let Some(failure) = outcomes.into_iter().find(|outcome| !outcome.is_clean()) {
+        panic!("runtime thread did not stop cleanly: {failure:?}");
+    }
+}
+
+#[cfg(test)]
+mod runtime_thread_registry_tests {
+    use super::*;
+    use std::panic::panic_any;
+    use std::sync::{Barrier, mpsc};
+    use std::time::Duration;
+
+    fn wait_for_state(
+        registry: &RuntimeThreadRegistry,
+        predicate: impl Fn(&RuntimeThreadRegistryState) -> bool,
+    ) {
+        let mut state = registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !predicate(&state) {
+            let (next, timeout) = registry
+                .changed
+                .wait_timeout(state, Duration::from_secs(2))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !timeout.timed_out(),
+                "runtime-thread registry state stalled"
+            );
+            state = next;
+        }
+    }
+
+    fn publish(
+        registry: &Arc<RuntimeThreadRegistry>,
+        session_id: SessionId,
+        body: impl FnOnce() + Send + 'static,
+    ) {
+        let reservation = registry.reserve(session_id).unwrap();
+        reservation.publish(thread::spawn(body));
+    }
+
+    fn wait_for_joining(
+        registry: &RuntimeThreadRegistry,
+        session_id: SessionId,
+    ) -> Arc<RuntimeThreadJoinCompletion> {
+        wait_for_state(registry, |state| {
+            matches!(
+                state.entries.get(&session_id),
+                Some(RuntimeThreadEntry::Joining(_))
+            )
+        });
+        let state = registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(RuntimeThreadEntry::Joining(completion)) = state.entries.get(&session_id) else {
+            panic!("runtime thread stopped joining before its completion was observed")
+        };
+        Arc::clone(completion)
+    }
+
+    #[test]
+    fn exact_join_reports_clean_panic_missing_and_duplicate_without_panicking() {
+        struct HostilePanicPayload;
+        impl Drop for HostilePanicPayload {
+            fn drop(&mut self) {
+                panic!("hostile panic-payload destructor");
+            }
+        }
+
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let clean_id = SessionId::from(98_001);
+        publish(&registry, clean_id, || {});
+        assert_eq!(
+            registry.join_exact(clean_id),
+            RuntimeThreadJoinOutcome::Clean {
+                session_id: clean_id
+            }
+        );
+        assert_eq!(
+            registry.join_exact(clean_id),
+            RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined {
+                session_id: clean_id
+            }
+        );
+
+        let panic_id = SessionId::from(98_002);
+        publish(&registry, panic_id, || panic_any(HostilePanicPayload));
+        assert_eq!(
+            registry.join_exact(panic_id),
+            RuntimeThreadJoinOutcome::Panicked {
+                session_id: panic_id
+            }
+        );
+
+        let missing_id = SessionId::from(98_003);
+        assert_eq!(
+            registry.join_exact(missing_id),
+            RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined {
+                session_id: missing_id
+            }
+        );
+    }
+
+    #[test]
+    fn exact_join_waits_for_reserved_handle_publication() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let session_id = SessionId::from(98_004);
+        let reservation = registry.reserve(session_id).unwrap();
+        let join_registry = Arc::clone(&registry);
+        let join = thread::spawn(move || join_registry.join_exact(session_id));
+        wait_for_state(&registry, |state| state.reservation_waiters == 1);
+        assert!(!join.is_finished());
+
+        reservation.publish(thread::spawn(|| {}));
+        assert_eq!(
+            join.join().unwrap(),
+            RuntimeThreadJoinOutcome::Clean { session_id }
+        );
+    }
+
+    #[test]
+    fn concurrent_exact_joins_share_the_in_progress_proof() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let session_id = SessionId::from(98_010);
+        let release = Arc::new(Barrier::new(2));
+        let worker_release = Arc::clone(&release);
+        publish(&registry, session_id, move || {
+            worker_release.wait();
+        });
+
+        let first_registry = Arc::clone(&registry);
+        let first = thread::spawn(move || first_registry.join_exact(session_id));
+        let completion = wait_for_joining(&registry, session_id);
+        let second_registry = Arc::clone(&registry);
+        let second = thread::spawn(move || second_registry.join_exact(session_id));
+        completion.wait_for_waiters(1);
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+
+        release.wait();
+        let expected = RuntimeThreadJoinOutcome::Clean { session_id };
+        assert_eq!(first.join().unwrap(), expected);
+        assert_eq!(second.join().unwrap(), expected);
+        assert_eq!(
+            registry.join_exact(session_id),
+            RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined { session_id }
+        );
+    }
+
+    #[test]
+    fn exact_join_and_join_all_share_the_in_progress_proof() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let session_id = SessionId::from(98_011);
+        let release = Arc::new(Barrier::new(2));
+        let worker_release = Arc::clone(&release);
+        publish(&registry, session_id, move || {
+            worker_release.wait();
+        });
+
+        let exact_registry = Arc::clone(&registry);
+        let exact = thread::spawn(move || exact_registry.join_exact(session_id));
+        let completion = wait_for_joining(&registry, session_id);
+        let all_registry = Arc::clone(&registry);
+        let all = thread::spawn(move || all_registry.join_all());
+        completion.wait_for_waiters(1);
+        assert!(!exact.is_finished());
+        assert!(!all.is_finished());
+
+        release.wait();
+        let expected = RuntimeThreadJoinOutcome::Clean { session_id };
+        assert_eq!(exact.join().unwrap(), expected);
+        assert_eq!(all.join().unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn concurrent_join_all_calls_do_not_reopen_reservation_early() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let session_id = SessionId::from(98_012);
+        let late_id = SessionId::from(98_013);
+        let join_release = Arc::new(Barrier::new(2));
+        let worker_release = Arc::clone(&join_release);
+        publish(&registry, session_id, move || {
+            worker_release.wait();
+        });
+
+        let (snapshot_entered, snapshot_entered_rx) = mpsc::sync_channel(1);
+        let snapshot_release = Arc::new(Barrier::new(2));
+        *registry
+            .drain_snapshot_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(TestDrainSnapshotHook {
+                entered: snapshot_entered,
+                release: Arc::clone(&snapshot_release),
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }));
+
+        let first_registry = Arc::clone(&registry);
+        let first = thread::spawn(move || first_registry.join_all());
+        snapshot_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first drain did not pause after its snapshot");
+        wait_for_state(&registry, |state| state.drainers == 1);
+
+        let completion = wait_for_joining(&registry, session_id);
+        let second_registry = Arc::clone(&registry);
+        let second = thread::spawn(move || second_registry.join_all());
+        completion.wait_for_waiters(1);
+        wait_for_state(&registry, |state| state.drainers == 1);
+
+        let (admitted, admitted_rx) = mpsc::sync_channel(1);
+        let reserve_registry = Arc::clone(&registry);
+        let reserve = thread::spawn(move || {
+            let reservation = reserve_registry.reserve(late_id).unwrap();
+            admitted.send(()).unwrap();
+            reservation.fail();
+        });
+        assert!(
+            matches!(
+                admitted_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the second drainer reopened reservation while the first was paused"
+        );
+
+        snapshot_release.wait();
+        admitted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reservation did not reopen after every drain snapshot finished");
+        reserve.join().unwrap();
+        join_release.wait();
+
+        let expected = RuntimeThreadJoinOutcome::Clean { session_id };
+        assert_eq!(first.join().unwrap(), vec![expected]);
+        assert_eq!(second.join().unwrap(), vec![expected]);
+        assert_eq!(
+            registry.join_exact(late_id),
+            RuntimeThreadJoinOutcome::SpawnFailed {
+                session_id: late_id
+            }
+        );
+    }
+
+    #[test]
+    fn spawn_failure_is_observed_once_then_the_exact_id_can_be_reused() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let session_id = SessionId::from(98_005);
+        registry.reserve(session_id).unwrap().fail();
+        assert_eq!(
+            registry.join_exact(session_id),
+            RuntimeThreadJoinOutcome::SpawnFailed { session_id }
+        );
+
+        publish(&registry, session_id, || {});
+        assert_eq!(
+            registry.join_exact(session_id),
+            RuntimeThreadJoinOutcome::Clean { session_id }
+        );
+    }
+
+    #[test]
+    fn exact_join_releases_the_map_lock_before_waiting_for_the_thread() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let first_id = SessionId::from(98_006);
+        let second_id = SessionId::from(98_007);
+        let release = Arc::new(Barrier::new(2));
+        let (reentered, reentered_rx) = mpsc::sync_channel(1);
+        let worker_registry = Arc::clone(&registry);
+        let worker_release = Arc::clone(&release);
+        publish(&registry, first_id, move || {
+            worker_release.wait();
+            publish(&worker_registry, second_id, || {});
+            reentered.send(()).unwrap();
+        });
+
+        let join_registry = Arc::clone(&registry);
+        let join = thread::spawn(move || join_registry.join_exact(first_id));
+        let _completion = wait_for_joining(&registry, first_id);
+        release.wait();
+        reentered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("joined thread could not reenter the unlocked registry");
+        assert_eq!(
+            join.join().unwrap(),
+            RuntimeThreadJoinOutcome::Clean {
+                session_id: first_id
+            }
+        );
+        assert_eq!(
+            registry.join_exact(second_id),
+            RuntimeThreadJoinOutcome::Clean {
+                session_id: second_id
+            }
+        );
+    }
+
+    #[test]
+    fn join_all_seals_and_resolves_reserved_entries_before_draining() {
+        let registry = Arc::new(RuntimeThreadRegistry::default());
+        let reserved_id = SessionId::from(98_008);
+        let failed_id = SessionId::from(98_009);
+        let reservation = registry.reserve(reserved_id).unwrap();
+        registry.reserve(failed_id).unwrap().fail();
+
+        let join_registry = Arc::clone(&registry);
+        let join = thread::spawn(move || join_registry.join_all());
+        wait_for_state(&registry, |state| state.drainers != 0);
+        assert!(!join.is_finished());
+        reservation.publish(thread::spawn(|| {}));
+
+        assert_eq!(
+            join.join().unwrap(),
+            vec![
+                RuntimeThreadJoinOutcome::Clean {
+                    session_id: reserved_id
+                },
+                RuntimeThreadJoinOutcome::SpawnFailed {
+                    session_id: failed_id
+                },
+            ]
+        );
+        assert!(registry.join_all().is_empty());
     }
 }
 
@@ -368,8 +1188,9 @@ impl Runtime {
     ///
     /// # Panics
     ///
-    /// Panics if the current-thread tokio runtime fails to build, or if the
-    /// `RUNTIME_THREADS` mutex is poisoned.
+    /// Panics if this session id already has an unconsumed runtime-thread join
+    /// authority, if the OS thread cannot be spawned, or if the current-thread
+    /// Tokio runtime fails to build.
     pub fn new(
         session_id: SessionId,
         server_name: Arc<String>,
@@ -430,7 +1251,16 @@ impl Runtime {
         let local_pane_input_callbacks = Arc::clone(&pane_input_callbacks);
         let (start_tx, start_rx) = std::sync::mpsc::channel();
 
-        let thread = thread::spawn(move || {
+        // Reserve the exact id before the OS thread can start. Exact and
+        // drain-all joins wait on this state until handle publication or an
+        // explicit spawn-failure tombstone, so no immediate exit can detach
+        // or overwrite its join authority.
+        let thread_reservation = runtime_threads().reserve(session_id).unwrap_or_else(
+            |RuntimeThreadReservationError::AlreadyTracked| {
+                panic!("runtime thread for session {session_id} is already tracked")
+            },
+        );
+        let thread_body = move || {
             // `Runtime::new` must spawn before it can return the registry
             // handle, but script top-level code may consult that registry.
             // Do not construct/evaluate the engine until registration opens
@@ -1033,9 +1863,18 @@ impl Runtime {
             shutdown_tokio_runtime(runtime);
 
             info!("Runtime thread shutting down");
-        });
+        };
+        let thread = thread::Builder::new()
+            .name(format!("smudgy-session-{session_id}"))
+            .spawn(thread_body);
 
-        RUNTIME_THREADS.lock().unwrap().push(thread);
+        match thread {
+            Ok(thread) => thread_reservation.publish(thread),
+            Err(error) => {
+                thread_reservation.fail();
+                panic!("failed to spawn runtime thread for session {session_id}: {error}");
+            }
+        }
 
         Self {
             session_id,

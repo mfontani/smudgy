@@ -329,6 +329,19 @@ impl SessionAudioRegistration {
         self.speech.clone()
     }
 
+    /// Absorbingly rejects new online output preparation for this session.
+    ///
+    /// The application gate is acquired before the session gate, matching the
+    /// permission and final factory checks. Returning therefore proves that an
+    /// already-admitted `prepare` delegation has finished and no later one can
+    /// begin. The mixer-session owner remains retained for explicit runtime
+    /// join followed by [`retire`](Self::retire).
+    ///
+    /// Returns `true` only for the transition from open to sealed.
+    pub fn seal(&mut self) -> bool {
+        self.seal_session()
+    }
+
     /// Seals online preparation before beginning exact mixer retirement.
     ///
     /// # Panics
@@ -337,21 +350,25 @@ impl SessionAudioRegistration {
     /// corrupted inside this crate.
     #[must_use = "session retirement is complete only after awaiting this receipt"]
     pub fn retire(mut self) -> MixerSessionRetirement {
-        self.seal_session();
+        let _ = self.seal();
         self.owner
             .take()
             .expect("session audio registration retires exactly once")
             .retire()
     }
 
-    fn seal_session(&self) {
-        lock_gate(&self.scope.inner.session_gate).open = false;
+    fn seal_session(&self) -> bool {
+        let _app_gate = lock_gate(&self.scope.inner.app.gate);
+        let mut session_gate = lock_gate(&self.scope.inner.session_gate);
+        let was_open = session_gate.open;
+        session_gate.open = false;
+        was_open
     }
 }
 
 impl Drop for SessionAudioRegistration {
     fn drop(&mut self) {
-        self.seal_session();
+        let _ = self.seal();
         // MixerSessionOwner::drop begins cancellation-independent retirement.
         self.owner.take();
     }

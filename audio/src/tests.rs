@@ -588,6 +588,181 @@ fn exact_capacity_rejects_without_mutation_and_reuses_after_retirement() {
 }
 
 #[test]
+fn session_registrar_is_weak_send_sync_and_reports_exact_capacity() {
+    fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+    assert_clone_send_sync::<MixerSessionRegistrar>();
+
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let registrar = service.session_registrar();
+    let owner = registrar.add_session(AudioSessionId(101)).unwrap();
+    assert_eq!(
+        registrar.add_session(AudioSessionId(102)).unwrap_err(),
+        MixerControlError::SessionCapacity
+    );
+    drop(owner);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn session_registrar_readds_same_id_without_reviving_stale_generation() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let registrar = service.session_registrar();
+    let owner = registrar.add_session(AudioSessionId(103)).unwrap();
+    let stale = owner.script_bus();
+    let mut retirement = owner.retire();
+    drive_session_retirement(&probe, &mut retirement).unwrap();
+
+    let replacement = registrar.add_session(AudioSessionId(103)).unwrap();
+    assert_eq!(
+        stale.try_reserve_input().unwrap_err(),
+        MixerControlError::UnknownSession
+    );
+    let reservation = replacement.script_bus().try_reserve_input().unwrap();
+    assert!(block_on(reservation.abort()).unwrap().is_clean());
+    drop(replacement);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn stale_session_registrar_cannot_retain_or_rebind_a_replacement_service() {
+    let first_probe = RenderProbe::default();
+    let first =
+        MixerService::start_with_driver::<TestBackend>(settings(first_probe), TEST_RATE).unwrap();
+    let stale = first.session_registrar();
+    assert!(first.shutdown().clean);
+    assert_eq!(
+        stale.add_session(AudioSessionId(104)).unwrap_err(),
+        MixerControlError::OwnerStopped
+    );
+
+    let second_probe = RenderProbe::default();
+    let second =
+        MixerService::start_with_driver::<TestBackend>(settings(second_probe), TEST_RATE).unwrap();
+    let owner = second
+        .session_registrar()
+        .add_session(AudioSessionId(104))
+        .unwrap();
+    assert_eq!(
+        stale.add_session(AudioSessionId(104)).unwrap_err(),
+        MixerControlError::OwnerStopped
+    );
+    drop(owner);
+    assert!(second.shutdown().clean);
+}
+
+#[test]
+fn session_registrar_rejects_after_live_service_sealing() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let registrar = service.session_registrar();
+    assert!(probe.fail_output());
+    assert_eq!(
+        registrar.add_session(AudioSessionId(105)).unwrap_err(),
+        MixerControlError::OwnerStopped
+    );
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn session_registrar_and_service_shutdown_have_one_exact_linearization() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
+    let registrar = service.session_registrar();
+    let start = Arc::new(Barrier::new(2));
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+
+    thread::scope(|scope| {
+        let worker_start = Arc::clone(&start);
+        scope.spawn(move || {
+            worker_start.wait();
+            result_sender
+                .send(registrar.add_session(AudioSessionId(106)))
+                .unwrap();
+        });
+        start.wait();
+        let shutdown = service.shutdown();
+        assert!(shutdown.clean);
+
+        match result_receiver.recv().unwrap() {
+            Ok(owner) => {
+                assert_eq!(owner.session_id(), AudioSessionId(106));
+                assert_eq!(
+                    owner.script_bus().try_reserve_input().unwrap_err(),
+                    MixerControlError::OwnerStopped
+                );
+            }
+            Err(error) => assert_eq!(error, MixerControlError::OwnerStopped),
+        }
+    });
+}
+
+#[test]
+fn cloned_session_registrars_serialize_concurrent_adds_on_the_exact_owner() {
+    const SESSION_COUNT: usize = 8;
+
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        SESSION_COUNT,
+        1,
+    )
+    .unwrap();
+    let registrar = service.session_registrar();
+    let owners = thread::scope(|scope| {
+        let workers = (0..SESSION_COUNT)
+            .map(|id| {
+                let registrar = registrar.clone();
+                scope.spawn(move || {
+                    registrar
+                        .add_session(AudioSessionId(200 + u64::try_from(id).unwrap()))
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let mut ids = owners
+        .iter()
+        .map(MixerSessionOwner::session_id)
+        .collect::<Vec<_>>();
+    ids.sort_by_key(|id| id.0);
+    assert_eq!(
+        ids,
+        (0..SESSION_COUNT)
+            .map(|id| AudioSessionId(200 + u64::try_from(id).unwrap()))
+            .collect::<Vec<_>>()
+    );
+    drop(owners);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
 fn exact_session_retirement_waits_for_render_ack_and_readds_same_id_safely() {
     let probe = RenderProbe::default();
     let service = MixerService::start_with_driver_and_limits::<TestBackend>(
