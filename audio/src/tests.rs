@@ -1583,6 +1583,14 @@ fn gain_authorities_fail_typed_after_output_death_and_joined_shutdown() {
         session_gain.set_muted(true),
         Err(MixerControlError::OwnerStopped)
     );
+    assert_eq!(
+        master.output_failure(),
+        Some(MixerOutputFailure::BackendFailure)
+    );
+    assert_eq!(
+        session_gain.output_failure(),
+        Some(MixerOutputFailure::BackendFailure)
+    );
     let retirement = session.retire();
     let shutdown = service.shutdown();
     assert!(shutdown.clean);
@@ -1593,6 +1601,8 @@ fn gain_authorities_fail_typed_after_output_death_and_joined_shutdown() {
         session_gain.set_linear(0.5),
         Err(MixerControlError::OwnerStopped)
     );
+    assert_eq!(master.output_failure(), None);
+    assert_eq!(session_gain.output_failure(), None);
 }
 
 #[test]

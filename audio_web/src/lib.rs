@@ -21,10 +21,11 @@ use deno_audio::{
 };
 use deno_error::JsErrorBox;
 use smudgy_audio::{
-    AudioSessionId, MixerControlError, MixerFailureObserver, MixerFrame, MixerInput,
-    MixerInputReservation, MixerInputShutdown, MixerInputStartFailure, MixerInputStatus,
-    MixerNativeBusHandle, MixerOutputFailure, MixerRetirementError, MixerScriptBusHandle,
-    MixerSessionOwner, MixerSessionRetirement, MixerSpeechBusHandle, RunningMixerInput,
+    AudioSessionId, MixerControlError, MixerFailureObserver, MixerFrame, MixerGainState,
+    MixerInput, MixerInputReservation, MixerInputShutdown, MixerInputStartFailure,
+    MixerInputStatus, MixerNativeBusHandle, MixerOutputFailure, MixerRetirementError,
+    MixerScriptBusHandle, MixerSessionGainAuthority, MixerSessionOwner, MixerSessionRetirement,
+    MixerSpeechBusHandle, RunningMixerInput,
 };
 
 const CHANNELS: usize = 2;
@@ -154,6 +155,17 @@ pub enum SessionAudioRegistrationError {
     GenerationExhausted,
 }
 
+/// Opaque identity of one exact hosted session-audio registration.
+///
+/// The process-wide non-wrapping generation prevents a delayed application
+/// command from controlling a later registration that reuses the same public
+/// session id. This key carries no mixer, output, or script authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionAudioControlKey {
+    session_id: AudioSessionId,
+    generation: u64,
+}
+
 /// Registration failure that returns the unconsumed mixer-session owner.
 pub struct SessionAudioRegistrationFailure {
     error: SessionAudioRegistrationError,
@@ -203,6 +215,7 @@ impl ApplicationAudioRegistrar {
         }
 
         let session_id = owner.session_id();
+        let gain = owner.gain_authority();
         let script = owner.script_bus();
         let native = owner.native_bus();
         let speech = owner.speech_bus();
@@ -240,6 +253,7 @@ impl ApplicationAudioRegistrar {
 
         Ok(SessionAudioRegistration {
             owner: Some(owner),
+            gain,
             native,
             speech,
             scope,
@@ -349,6 +363,7 @@ impl SessionAudioScope {
 /// Unique lifetime owner for one registered mixer-session generation.
 pub struct SessionAudioRegistration {
     owner: Option<MixerSessionOwner>,
+    gain: MixerSessionGainAuthority,
     native: MixerNativeBusHandle,
     speech: MixerSpeechBusHandle,
     scope: SessionAudioScope,
@@ -364,6 +379,41 @@ impl fmt::Debug for SessionAudioRegistration {
 }
 
 impl SessionAudioRegistration {
+    /// Opaque application-control identity for this exact registration.
+    #[must_use]
+    pub fn control_key(&self) -> SessionAudioControlKey {
+        SessionAudioControlKey {
+            session_id: self.scope.inner.session_id,
+            generation: self.scope.inner.generation,
+        }
+    }
+
+    /// Applies a remembered linear session gain on the mixer owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lower bounded-control outcome without exposing its raw
+    /// authority to the application or script runtime.
+    pub fn set_gain_linear(&self, linear: f32) -> Result<MixerGainState, MixerControlError> {
+        self.gain.set_linear(linear)
+    }
+
+    /// Applies the independent session mute on the mixer owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lower bounded-control outcome without exposing its raw
+    /// authority to the application or script runtime.
+    pub fn set_gain_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
+        self.gain.set_muted(muted)
+    }
+
+    /// Exact first-writer process-output failure observed by this authority.
+    #[must_use]
+    pub fn gain_output_failure(&self) -> Option<MixerOutputFailure> {
+        self.gain.output_failure()
+    }
+
     /// Cloneable opaque authority for this exact session generation.
     #[must_use]
     pub fn scope(&self) -> SessionAudioScope {
@@ -463,6 +513,15 @@ impl UnavailableSessionAudioRetirement {
 }
 
 impl UnavailableSessionAudioRegistration {
+    /// Opaque application-control identity for this mixer-free registration.
+    #[must_use]
+    pub fn control_key(&self) -> SessionAudioControlKey {
+        SessionAudioControlKey {
+            session_id: self.scope.inner.session_id,
+            generation: self.scope.inner.generation,
+        }
+    }
+
     /// Cloneable opaque authority for this exact mixer-free generation.
     #[must_use]
     pub fn scope(&self) -> SessionAudioScope {

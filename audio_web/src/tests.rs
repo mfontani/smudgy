@@ -77,6 +77,13 @@ fn assert_samples(output: &[f32], expected: f32) {
     );
 }
 
+fn assert_gain(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() < f32::EPSILON,
+        "expected gain {expected}, got {actual}"
+    );
+}
+
 fn render_until(probe: &RenderProbe, expected: f32) -> [f32; INTERLEAVED_SAMPLES] {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -266,6 +273,41 @@ fn application_and_session_authorities_share_only_the_intended_scope() {
     );
     assert!(scoped_context(&second_scope, "none").is_err());
     drop(second);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn hosted_registration_retains_exact_gain_authority_outside_script_scope() {
+    let (service, owner, probe) = service(2_011);
+    let mut application = ApplicationAudioOwner::new(authority_limits(2));
+    let registrar = application.registrar();
+    let registration = registrar.register_session(owner).unwrap();
+    let first_key = registration.control_key();
+    let scope = registration.scope();
+
+    let applied = registration.set_gain_linear(0.375).unwrap();
+    assert_gain(applied.linear(), 0.375);
+    assert!(!applied.is_muted());
+    let muted = registration.set_gain_muted(true).unwrap();
+    assert_gain(muted.linear(), 0.375);
+    assert!(muted.is_muted());
+    assert_gain(muted.effective_linear(), 0.0);
+    assert_eq!(registration.gain_output_failure(), None);
+
+    // Script scopes remain limited to Web Audio construction/lifecycle. The
+    // exact application-control key is minted and retained by registration.
+    assert_eq!(scope.session_id(), 2_011);
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+
+    let replacement_owner = service.add_session(AudioSessionId(2_011)).unwrap();
+    let replacement = registrar.register_session(replacement_owner).unwrap();
+    assert_ne!(first_key, replacement.control_key());
+    assert_gain(replacement.set_gain_muted(false).unwrap().linear(), 1.0);
+    let mut retirement = replacement.retire();
+    await_session_retirement(&mut retirement, &probe);
+
+    assert!(application.seal());
     assert!(service.shutdown().clean);
 }
 

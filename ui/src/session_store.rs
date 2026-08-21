@@ -63,7 +63,7 @@ use tokio::sync::mpsc::{self};
 #[cfg(feature = "web-audio-cpal")]
 use crate::application_audio::{
     AbortedSessionSpawnError, ApplicationAudioController, ApplicationAudioOpenError,
-    SessionAudioCloseDisposition,
+    ApplicationAudioSessionController, SessionAudioCloseDisposition,
 };
 
 #[cfg(feature = "web-audio-cpal")]
@@ -342,6 +342,10 @@ pub struct ManagedSession {
     /// iced only takes and polls this already-created stream.
     #[cfg(feature = "web-audio-cpal")]
     session_events: Option<SessionEventSource>,
+    /// Exact application-side audio-control generation retained for future
+    /// visible controls. It carries no raw mixer or script authority.
+    #[cfg(feature = "web-audio-cpal")]
+    _audio_control: Option<ApplicationAudioSessionController>,
     ui_commands: Option<UiCommandBus>,
     pub mapper: Option<Mapper>,
 
@@ -1105,6 +1109,8 @@ impl ManagedSession {
             ui_commands,
             #[cfg(feature = "web-audio-cpal")]
             session_events,
+            #[cfg(feature = "web-audio-cpal")]
+            _audio_control: None,
             server_config: Rc::new(RefCell::new(load_server(&server_name).map_or_else(
                 |e| {
                     // Sessions can outlive an on-disk rename; a fallback
@@ -1143,9 +1149,14 @@ impl ManagedSession {
             text_store,
         };
         #[cfg(feature = "web-audio-cpal")]
-        if let Some(pending_audio) = pending_audio {
-            pending_audio.commit();
-        }
+        let session = {
+            // This is the final publication boundary. Keep the rollback guard
+            // armed through every field initializer above so an unwind cannot
+            // strand a runtime/audio registration outside the store.
+            let mut session = session;
+            session._audio_control = pending_audio.take().map(|pending| pending.commit());
+            session
+        };
         Ok(session)
     }
 

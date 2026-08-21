@@ -3232,6 +3232,19 @@ impl MixerMasterGainAuthority {
     pub fn set_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
         self.update(MixerGainUpdate::Muted(muted))
     }
+
+    /// Returns the first process-output failure observed by this authority.
+    ///
+    /// The diagnostic is read-only and does not retain the mixer service or
+    /// its physical-output join authority. A first-writer cause remains stable
+    /// while the mixer control owner is reachable. `None` is not proof of
+    /// liveness and can also mean that owner has already gone away.
+    #[must_use]
+    pub fn output_failure(&self) -> Option<MixerOutputFailure> {
+        self.control
+            .upgrade()
+            .and_then(|control| control.driver_status.failure())
+    }
 }
 
 /// Weak, cloneable authority over one exact session-generation root gain.
@@ -3291,6 +3304,19 @@ impl MixerSessionGainAuthority {
     /// error.
     pub fn set_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
         self.update(MixerGainUpdate::Muted(muted))
+    }
+
+    /// Returns the first process-output failure observed by this authority.
+    ///
+    /// The diagnostic is shared by every session in the same process mixer. A
+    /// first-writer cause remains stable while the mixer control owner is
+    /// reachable. `None` is not proof of liveness and can also mean that owner
+    /// has already gone away.
+    #[must_use]
+    pub fn output_failure(&self) -> Option<MixerOutputFailure> {
+        self.control
+            .upgrade()
+            .and_then(|control| control.driver_status.failure())
     }
 }
 
