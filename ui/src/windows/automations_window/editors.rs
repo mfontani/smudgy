@@ -2202,6 +2202,9 @@ impl AutomationsWindow {
         }
 
         let hue = row_kind_hue(trigger_row);
+        // As in `matcher_field`: the bar's Fill height must stay internal, or
+        // `Row::push`'s size-enclosing would make the whole row report Fill
+        // and collapse the group it sits in.
         row![
             container(Space::new())
                 .width(Length::Fixed(3.0))
@@ -2214,6 +2217,7 @@ impl AutomationsWindow {
             lines,
         ]
         .spacing(8.0)
+        .height(Length::Shrink)
         .into()
     }
 
@@ -3211,13 +3215,23 @@ fn matcher_field<'a>(
     };
     // Both gutters stay mounted in every anchor state (see [`gutter_cell`]) so
     // the editor's tree position — and with it its focus — survives typing.
+    //
+    // The explicit Shrink heights keep the gutters' `Fill` INTERNAL to the
+    // composite: `Row::push` encloses child size hints (one Fill-height child
+    // makes the row report Fill), and `Container::new` derives its fluidity
+    // from its content's hint — without the pins the whole field would report
+    // Fill height, and a Fill-height field next to no fixed-size sibling (the
+    // trigger matcher module) measures against nothing and collapses the
+    // section.
     let inner = row![
         gutter_cell(loose.0, left_tip),
         editor,
         gutter_cell(loose.1, right_tip),
-    ];
+    ]
+    .height(Length::Shrink);
     container(inner)
         .width(Length::Fill)
+        .height(Length::Shrink)
         .style(|theme: &Theme| iced::widget::container::Style {
             background: Some(iced::Background::Color(
                 theme.styles.general.container_background,
@@ -3816,6 +3830,17 @@ mod tests {
                 loose,
                 false,
                 Message::AliasRegexAction,
+            );
+            // The composite must report a Shrink height in every state: the
+            // gutters are Fill-height internally, and if that fluidity leaks
+            // into the composite's own size hint (`Row::push` encloses child
+            // hints; `Container::new` derives from its content's), the field
+            // measures against nothing in rows with no fixed-size sibling and
+            // the whole matcher section collapses.
+            assert_eq!(
+                field.as_widget().size(),
+                iced::Size::new(Length::Fill, Length::Shrink),
+                "the field composite must not inherit the gutters' Fill height"
             );
             let tree = Tree::new(field.as_widget());
             let mut tags = Vec::new();
