@@ -6,10 +6,14 @@ use std::sync::Arc;
 
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, Space, button, column, container, pick_list, radio, row, text, text_editor, text_input,
+    Column, Space, button, checkbox, column, container, pick_list, radio, row, text, text_editor,
+    text_input,
 };
 use iced::{Element, Font, Length, Padding};
 
+use smudgy_core::models::matchers::{
+    self, ArgKind, CmdMode, CommandOutcome, CommandSpec, MatcherSyntax,
+};
 use smudgy_core::models::server;
 use smudgy_core::models::{ScriptLang, aliases, hotkeys, naming, packages, triggers};
 
@@ -22,7 +26,8 @@ use crate::widgets::hotkey_input::HotkeyInput;
 
 use super::common;
 use super::model::{
-    NodeStatus, PatternKind, Script, ScriptKey, rows_into_trigger, trigger_rows,
+    AliasKind, AliasMatcherDraft, ArgKindChoice, NodeStatus, ParseModeChoice, PatternKind, Script,
+    ScriptKey, SyntaxChoice, TriggerRow, pattern_error_text, rows_into_trigger, trigger_rows,
     upsert_script_folder,
 };
 use super::{
@@ -94,7 +99,16 @@ impl AutomationsWindow {
         self.editor_content = text_editor::Content::with_text(&body);
 
         let node = match script {
-            Script::Alias(a) => EditNode::Alias(a),
+            Script::Alias(a) => {
+                self.alias_draft = AliasMatcherDraft::from_definition(&a);
+                if self.alias_draft.degraded {
+                    log::info!(
+                        "alias {}: stored pattern no longer matches its sidecar; showing as regex",
+                        key.script_name
+                    );
+                }
+                EditNode::Alias(a)
+            }
             Script::Hotkey(h) => {
                 self.hotkey_state = hotkey_definition_to_keys(&h);
                 EditNode::Hotkey(h)
@@ -125,6 +139,8 @@ impl AutomationsWindow {
         self.selection = Selection::None;
         self.editor_content = text_editor::Content::new();
         self.test_input.clear();
+        // Command is the default kind for new aliases.
+        self.alias_draft = AliasMatcherDraft::default();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -160,7 +176,7 @@ impl AutomationsWindow {
                 priority: 0,
                 fallthrough: true,
                 package: self.current_folder(),
-                rows: vec![(PatternKind::Match, String::new())],
+                rows: vec![TriggerRow::new(PatternKind::Match)],
             },
             error: None,
         });
@@ -389,14 +405,43 @@ impl AutomationsWindow {
             return Update::none();
         }
 
+        // The alias matcher persists from the draft: the compiled pattern plus
+        // the authoring sidecar (absent for the Regex kind). A compile error
+        // blocks the save with its message.
+        let alias_matcher = if matches!(
+            &self.pane,
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(_),
+                ..
+            })
+        ) {
+            match self.alias_draft.to_pattern() {
+                Ok(pattern) => Some((pattern, self.alias_draft.to_matcher())),
+                Err(message) => {
+                    if let Pane::Editor(state) = &mut self.pane {
+                        state.error = Some(message);
+                    }
+                    return Update::none();
+                }
+            }
+        } else {
+            None
+        };
+
         let body = self.editor_content.text();
         let body = body.trim_end_matches('\n').to_string();
         let final_script = match &self.pane {
             Pane::Editor(EditorState { node, .. }) => match node {
-                EditNode::Alias(a) => Script::Alias(aliases::AliasDefinition {
-                    script: (!body.is_empty()).then_some(body),
-                    ..a.clone()
-                }),
+                EditNode::Alias(a) => {
+                    let (pattern, matcher) =
+                        alias_matcher.expect("computed above for the alias arm");
+                    Script::Alias(aliases::AliasDefinition {
+                        script: (!body.is_empty()).then_some(body),
+                        pattern,
+                        matcher,
+                        ..a.clone()
+                    })
+                }
                 EditNode::Hotkey(h) => {
                     let mut h = h.clone();
                     if !self.hotkey_state.is_empty() {
@@ -432,7 +477,15 @@ impl AutomationsWindow {
                         fallthrough: *fallthrough,
                         matchers: None,
                     };
-                    rows_into_trigger(rows, &mut t);
+                    if let Err((i, message)) = rows_into_trigger(rows, &mut t) {
+                        let message = crate::i18n::t!(
+                            "editor-row-error", "row" => (i + 1).to_string(), "error" => message
+                        );
+                        if let Pane::Editor(state) = &mut self.pane {
+                            state.error = Some(message);
+                        }
+                        return Update::none();
+                    }
                     Script::Trigger(t)
                 }
             },
@@ -989,8 +1042,13 @@ impl AutomationsWindow {
         .into()
     }
 
-    fn matching_options<'a>(&self, priority: i32, fallthrough: bool) -> Elem<'a> {
-        column![
+    fn matching_options<'a>(
+        &self,
+        priority: i32,
+        fallthrough: bool,
+        prompt: Option<bool>,
+    ) -> Elem<'a> {
+        let mut options = column![
             field_row(
                 "Priority",
                 row![
@@ -1030,8 +1088,26 @@ impl AutomationsWindow {
                 .into(),
             ),
         ]
-        .spacing(6.0)
-        .into()
+        .spacing(6.0);
+        if let Some(prompt) = prompt {
+            options = options.push(field_row(
+                crate::i18n::ts!("editor-prompt-label"),
+                row![
+                    checkbox(prompt)
+                        .label(crate::i18n::ts!("editor-prompt"))
+                        .on_toggle(|_| Message::TogglePrompt)
+                        .size(14.0)
+                        .text_size(13.0),
+                    text(crate::i18n::t!("editor-prompt-note"))
+                        .size(12.0)
+                        .style(common::muted),
+                ]
+                .spacing(10.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ));
+        }
+        options.into()
     }
 
     /// The "Folder" control in a script editor: a `pick_list` of every folder
@@ -1105,13 +1181,20 @@ impl AutomationsWindow {
             EditNode::Trigger {
                 enabled,
                 language,
+                prompt,
                 priority,
                 fallthrough,
                 rows,
                 ..
-            } => {
-                self.view_trigger_editor(state, *enabled, *language, *priority, *fallthrough, rows)
-            }
+            } => self.view_trigger_editor(
+                state,
+                *enabled,
+                *language,
+                *prompt,
+                *priority,
+                *fallthrough,
+                rows,
+            ),
         }
     }
 
@@ -1195,21 +1278,63 @@ impl AutomationsWindow {
                 .into(),
         ));
         body = body.push(field_row(
-            crate::i18n::ts!("editor-pattern"),
-            text_input(
-                crate::i18n::ts!("editor-example-alias-pattern"),
-                &alias.pattern,
-            )
-            .on_input(Message::SetAliasPattern)
-            .size(14.0)
-            .into(),
+            crate::i18n::ts!("editor-match-input-as"),
+            self.alias_kind_cards(),
         ));
-        body = body.push(self.tester_box(
-            crate::i18n::ts!("editor-test-command"),
-            &alias.pattern,
-            true,
-        ));
-        body = body.push(self.matching_options(alias.priority, alias.fallthrough));
+        match self.alias_draft.kind {
+            AliasKind::Command => {
+                body = self.alias_command_fields(body);
+            }
+            AliasKind::Pattern => {
+                body = body.push(field_row(
+                    crate::i18n::ts!("editor-pattern"),
+                    text_input(
+                        crate::i18n::ts!("editor-example-alias-pattern"),
+                        &self.alias_draft.pattern_source,
+                    )
+                    .on_input(Message::SetPatternSource)
+                    .size(14.0)
+                    .into(),
+                ));
+                body = body.push(field_row(
+                    "",
+                    row![
+                        checkbox(!self.alias_draft.anchor_start)
+                            .label(crate::i18n::ts!("editor-allow-before"))
+                            .on_toggle(|_| Message::ToggleAnchorStart)
+                            .size(14.0)
+                            .text_size(13.0),
+                        checkbox(!self.alias_draft.anchor_end)
+                            .label(crate::i18n::ts!("editor-allow-after"))
+                            .on_toggle(|_| Message::ToggleAnchorEnd)
+                            .size(14.0)
+                            .text_size(13.0),
+                    ]
+                    .spacing(16.0)
+                    .into(),
+                ));
+                if let Some(warning) = self.alias_pattern_warning() {
+                    body = body.push(field_row(
+                        "",
+                        text(warning).size(12.0).style(common::warning).into(),
+                    ));
+                }
+            }
+            AliasKind::Regex => {
+                body = body.push(field_row(
+                    crate::i18n::ts!("editor-regex"),
+                    text_input(
+                        crate::i18n::ts!("editor-example-alias-pattern"),
+                        &self.alias_draft.regex_source,
+                    )
+                    .on_input(Message::SetAliasPattern)
+                    .size(14.0)
+                    .into(),
+                ));
+            }
+        }
+        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-command"), "", true));
+        body = body.push(self.matching_options(alias.priority, alias.fallthrough, None));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
         body = body.push(self.code_editor(alias.language));
         if let Some(bar) = self.save_bar(
@@ -1295,14 +1420,16 @@ impl AutomationsWindow {
         pane_scroll(body)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn view_trigger_editor<'a>(
         &'a self,
         state: &'a EditorState,
         enabled: bool,
         language: ScriptLang,
+        prompt: bool,
         priority: i32,
         fallthrough: bool,
-        rows: &'a [(PatternKind, String)],
+        rows: &'a [TriggerRow],
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
         let title = if create {
@@ -1317,7 +1444,7 @@ impl AutomationsWindow {
         );
         let any_invalid = rows
             .iter()
-            .any(|(_, p)| !p.is_empty() && regex::Regex::new(p).is_err());
+            .any(|row| !row.source.trim().is_empty() && row.compiled().is_err());
         let status = Self::editor_status(create, enabled, any_invalid);
 
         let mut body = column![self.scene_header_with_aside(
@@ -1347,31 +1474,59 @@ impl AutomationsWindow {
                 .into(),
         ));
 
-        // The unified pattern list.
+        // The unified matcher row list: role + syntax dropdowns, the source
+        // field, its status dot against the test line, and (Pattern syntax)
+        // the anchor checkboxes on a second line.
+        let raw_subject = raw_of(&self.test_input);
+        let plain_subject = plain_of(&raw_subject);
         let mut patterns = Column::new().spacing(6.0);
-        for (i, (kind, pattern)) in rows.iter().enumerate() {
-            let valid = if pattern.is_empty() {
-                NodeStatus::Disabled
-            } else if regex::Regex::new(pattern).is_err() {
-                NodeStatus::Error
-            } else if !self.test_input.is_empty()
-                && regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&self.test_input))
-                    .unwrap_or(false)
-            {
-                NodeStatus::Ok
+        for (i, trigger_row) in rows.iter().enumerate() {
+            let subject = if trigger_row.role == PatternKind::Raw {
+                raw_subject.as_str()
             } else {
-                NodeStatus::Disabled
+                plain_subject.as_str()
             };
-            patterns = patterns.push(
+            let valid = if trigger_row.source.trim().is_empty() {
+                NodeStatus::Disabled
+            } else {
+                match trigger_row.compiled().map(|s| regex::Regex::new(&s)) {
+                    Err(_) | Ok(Err(_)) => NodeStatus::Error,
+                    Ok(Ok(re)) if !self.test_input.is_empty() && re.is_match(subject) => {
+                        // A matching exception is what BLOCKS the trigger.
+                        if trigger_row.role == PatternKind::Anti {
+                            NodeStatus::Error
+                        } else {
+                            NodeStatus::Ok
+                        }
+                    }
+                    Ok(Ok(_)) => NodeStatus::Disabled,
+                }
+            };
+            let mut row_column = Column::new().spacing(4.0).push(
                 row![
-                    pick_list(PatternKind::ALL.to_vec(), Some(*kind), move |k| {
-                        Message::SetPatternKind(i, k)
-                    }),
-                    text_input("\\bpattern\\b", pattern)
-                        .on_input(move |v| Message::SetPatternText(i, v))
-                        .size(14.0)
-                        .width(Length::Fill),
+                    pick_list(
+                        SyntaxChoice::ALL.to_vec(),
+                        Some(SyntaxChoice(trigger_row.syntax)),
+                        move |s| { Message::SetRowSyntax(i, s.0) }
+                    )
+                    .text_size(13.0),
+                    pick_list(
+                        PatternKind::ALL.to_vec(),
+                        Some(trigger_row.role),
+                        move |k| { Message::SetPatternKind(i, k) }
+                    )
+                    .text_size(13.0),
+                    text_input(
+                        if trigger_row.syntax == MatcherSyntax::Pattern {
+                            crate::i18n::ts!("editor-example-trigger-pattern")
+                        } else {
+                            "\\bpattern\\b"
+                        },
+                        &trigger_row.source
+                    )
+                    .on_input(move |v| Message::SetPatternText(i, v))
+                    .size(14.0)
+                    .width(Length::Fill),
                     container(common::status_dot(valid)).padding(Padding {
                         top: 0.0,
                         bottom: 0.0,
@@ -1390,6 +1545,24 @@ impl AutomationsWindow {
                 .spacing(8.0)
                 .align_y(Vertical::Center),
             );
+            if trigger_row.syntax == MatcherSyntax::Pattern {
+                row_column = row_column.push(
+                    row![
+                        checkbox(!trigger_row.anchor_start)
+                            .label(crate::i18n::ts!("editor-allow-before"))
+                            .on_toggle(move |_| Message::ToggleRowAnchorStart(i))
+                            .size(14.0)
+                            .text_size(12.0),
+                        checkbox(!trigger_row.anchor_end)
+                            .label(crate::i18n::ts!("editor-allow-after"))
+                            .on_toggle(move |_| Message::ToggleRowAnchorEnd(i))
+                            .size(14.0)
+                            .text_size(12.0),
+                    ]
+                    .spacing(16.0),
+                );
+            }
+            patterns = patterns.push(row_column);
         }
         patterns = patterns.push(
             button(
@@ -1411,7 +1584,7 @@ impl AutomationsWindow {
         ));
 
         body = body.push(self.tester_box(crate::i18n::ts!("editor-test-line"), "", false));
-        body = body.push(self.matching_options(priority, fallthrough));
+        body = body.push(self.matching_options(priority, fallthrough, Some(prompt)));
         body = body.push(field_row("Behavior", self.behavior_radios(language)));
         body = body.push(self.code_editor(language));
         if let Some(bar) = self.save_bar(
@@ -1428,11 +1601,174 @@ impl AutomationsWindow {
         pane_scroll(body)
     }
 
-    /// The live tester box. `alias` true → single-pattern verdict (matches what
-    /// you type); false → trigger verdict over the open trigger's rows.
-    fn tester_box<'a>(&self, label: &str, alias_pattern: &str, alias: bool) -> Elem<'a> {
+    /// The three alias type cards. Selection is the draft's kind; every kind's
+    /// buffers survive a switch.
+    fn alias_kind_cards<'a>(&self) -> Elem<'a> {
+        let card = |label: &str, kind: AliasKind| {
+            let selected = self.alias_draft.kind == kind;
+            button(text(label.to_string()).size(13.0))
+                .style(if selected {
+                    button_style::primary
+                } else {
+                    button_style::secondary
+                })
+                .on_press(Message::SetAliasKind(kind))
+                .padding([6, 12])
+        };
+        row![
+            card(crate::i18n::ts!("editor-kind-command"), AliasKind::Command),
+            card(crate::i18n::ts!("editor-kind-pattern"), AliasKind::Pattern),
+            card(crate::i18n::ts!("editor-kind-regex"), AliasKind::Regex),
+        ]
+        .spacing(8.0)
+        .into()
+    }
+
+    /// The Command kind's field block: name + mode, the argument rows, the
+    /// generated usage line, and (Advanced only) the parsing picker.
+    fn alias_command_fields<'a>(
+        &'a self,
+        mut body: Column<'a, Message, Theme>,
+    ) -> Column<'a, Message, Theme> {
+        let draft = &self.alias_draft;
+        body = body.push(field_row(
+            crate::i18n::ts!("editor-command"),
+            row![
+                text_input(crate::i18n::ts!("editor-example-command"), &draft.command)
+                    .on_input(Message::SetCommandName)
+                    .size(14.0)
+                    .width(Length::Fill),
+                radio(
+                    crate::i18n::ts!("editor-cmd-simple"),
+                    CmdMode::Simple,
+                    Some(draft.cmd_mode),
+                    Message::SetCmdMode,
+                )
+                .size(14.0)
+                .text_size(13.0),
+                radio(
+                    crate::i18n::ts!("editor-cmd-advanced"),
+                    CmdMode::Advanced,
+                    Some(draft.cmd_mode),
+                    Message::SetCmdMode,
+                )
+                .size(14.0)
+                .text_size(13.0),
+            ]
+            .spacing(12.0)
+            .align_y(Vertical::Center)
+            .into(),
+        ));
+
+        let mut args = Column::new().spacing(6.0);
+        let last = draft.args.len().saturating_sub(1);
+        for (i, arg) in draft.args.iter().enumerate() {
+            let mut arg_row = row![
+                text_input(crate::i18n::ts!("editor-example-arg-name"), &arg.name)
+                    .on_input(move |v| Message::SetArgName(i, v))
+                    .size(14.0)
+                    .width(Length::Fill),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center);
+            if draft.cmd_mode == CmdMode::Advanced {
+                // Rest of line is offered only on the last row.
+                let options: Vec<ArgKindChoice> = if i == last {
+                    vec![
+                        ArgKindChoice(ArgKind::Required),
+                        ArgKindChoice(ArgKind::Optional),
+                        ArgKindChoice(ArgKind::Rest),
+                    ]
+                } else {
+                    vec![
+                        ArgKindChoice(ArgKind::Required),
+                        ArgKindChoice(ArgKind::Optional),
+                    ]
+                };
+                arg_row = arg_row.push(
+                    pick_list(options, Some(ArgKindChoice(arg.kind)), move |choice| {
+                        Message::SetArgKind(i, choice.0)
+                    })
+                    .text_size(13.0),
+                );
+            }
+            arg_row = arg_row.push(
+                button(
+                    text(bootstrap_icons::TRASH_3)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(14.0),
+                )
+                .style(button_style::secondary)
+                .on_press(Message::RemoveArg(i))
+                .padding(8),
+            );
+            args = args.push(arg_row);
+        }
+        args = args.push(
+            button(
+                row![
+                    text(bootstrap_icons::PLUS_LG)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(12.0),
+                    text(crate::i18n::t!("editor-add-argument")).size(13.0),
+                ]
+                .spacing(6.0)
+                .align_y(Vertical::Center),
+            )
+            .style(button_style::secondary)
+            .on_press(Message::AddArg),
+        );
+        body = body.push(field_row(crate::i18n::ts!("editor-arguments"), args.into()));
+
+        // The Usage row (label included) is omitted while the name is empty.
+        if !draft.command.trim().is_empty() {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-usage"),
+                column![
+                    text(matchers::usage_line(draft.command.trim(), &draft.args))
+                        .size(13.0)
+                        .font(fonts::GEIST_MONO_VF),
+                    text(crate::i18n::t!("editor-command-completion-note"))
+                        .size(12.0)
+                        .style(common::muted),
+                ]
+                .spacing(4.0)
+                .into(),
+            ));
+        }
+        if draft.cmd_mode == CmdMode::Advanced {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-parsing"),
+                pick_list(
+                    ParseModeChoice::ALL.to_vec(),
+                    Some(ParseModeChoice(draft.parse)),
+                    |choice| Message::SetParseMode(choice.0),
+                )
+                .text_size(13.0)
+                .into(),
+            ));
+        }
+        body
+    }
+
+    /// The non-blocking matches-every-line warning for the Pattern kind.
+    fn alias_pattern_warning(&self) -> Option<String> {
+        let draft = &self.alias_draft;
+        let compiled =
+            matchers::compile_pattern(&draft.pattern_source, draft.anchor_start, draft.anchor_end);
+        (compiled.errors.is_empty()
+            && compiled
+                .warnings
+                .contains(&matchers::PatternWarning::MatchesEveryLine)
+            && !draft.pattern_source.trim().is_empty())
+        .then(|| crate::i18n::t!("editor-matches-every-line"))
+    }
+
+    /// The live tester box. `alias` true → verdict for the open alias's draft
+    /// (kind-aware); false → trigger verdict over the open trigger's rows.
+    fn tester_box<'a>(&self, label: &str, _unused: &str, alias: bool) -> Elem<'a> {
         let (verdict, status): (String, NodeStatus) = if alias {
-            alias_verdict(alias_pattern, &self.test_input)
+            self.alias_draft_verdict()
         } else {
             self.trigger_verdict()
         };
@@ -1463,6 +1799,105 @@ impl AutomationsWindow {
         field_row("", body.into())
     }
 
+    /// The alias tester's verdict, per the draft's kind.
+    fn alias_draft_verdict(&self) -> (String, NodeStatus) {
+        let draft = &self.alias_draft;
+        let sample = &self.test_input;
+        match draft.kind {
+            AliasKind::Regex => alias_verdict(&draft.regex_source, sample),
+            AliasKind::Pattern => {
+                if draft.pattern_source.trim().is_empty() {
+                    return (
+                        crate::i18n::t!("editor-enter-pattern"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                let compiled = matchers::compile_pattern(
+                    &draft.pattern_source,
+                    draft.anchor_start,
+                    draft.anchor_end,
+                );
+                if let Some(error) = compiled.errors.first() {
+                    return (pattern_error_text(error), NodeStatus::Error);
+                }
+                if sample.is_empty() {
+                    return (
+                        crate::i18n::t!("editor-enter-command"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                match compiled.regex.and_then(|re| {
+                    re.captures(sample).map(|captures| {
+                        re.capture_names()
+                            .skip(1)
+                            .enumerate()
+                            .filter_map(|(i, name)| {
+                                let value = captures.get(i + 1)?;
+                                Some(match name {
+                                    Some(name) => format!("{name}={}", value.as_str()),
+                                    None => format!("${}={}", i + 1, value.as_str()),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                }) {
+                    Some(captures) if captures.is_empty() => {
+                        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+                    }
+                    Some(captures) => (
+                        crate::i18n::t!("editor-fires-with", "captures" => captures.join("  ")),
+                        NodeStatus::Ok,
+                    ),
+                    None => (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled),
+                }
+            }
+            AliasKind::Command => {
+                let name = draft.command.trim();
+                if name.is_empty() {
+                    return (
+                        crate::i18n::t!("editor-command-name-empty"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                if sample.is_empty() {
+                    return (
+                        crate::i18n::t!("editor-enter-command"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                let spec = CommandSpec {
+                    name: name.to_string(),
+                    args: draft.args.clone(),
+                    parse: draft.parse,
+                };
+                match matchers::assign(sample, &spec.name, &spec.args, spec.parse) {
+                    CommandOutcome::Fired { args } => {
+                        let captures: Vec<String> = args
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value.as_ref().map(|v| format!("{name}={v}"))
+                            })
+                            .collect();
+                        if captures.is_empty() {
+                            (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+                        } else {
+                            (
+                                crate::i18n::t!(
+                                    "editor-fires-with", "captures" => captures.join("  ")
+                                ),
+                                NodeStatus::Ok,
+                            )
+                        }
+                    }
+                    CommandOutcome::NotFired(miss) => command_miss_verdict(name, &miss),
+                }
+            }
+        }
+    }
+
+    /// The trigger tester's verdict: exceptions veto against each phase's own
+    /// subject, then raw rows in order, then normal rows — first hit wins,
+    /// one fire per line (the runtime's semantics, told truthfully).
     fn trigger_verdict(&self) -> (String, NodeStatus) {
         let rows = match &self.pane {
             Pane::Editor(EditorState {
@@ -1474,33 +1909,75 @@ impl AutomationsWindow {
             }
         };
         let line = &self.test_input;
-        let mut any = false;
-        for (kind, pattern) in rows {
-            if pattern.is_empty() {
-                continue;
-            }
-            any = true;
-            let re = match regex::Regex::new(pattern) {
-                Ok(re) => re,
-                Err(_) => {
-                    return (crate::i18n::t!("editor-invalid-pattern"), NodeStatus::Error);
-                }
-            };
-            let matches = re.is_match(line);
-            match kind {
-                PatternKind::Match | PatternKind::Raw if !matches => {
-                    return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
-                }
-                PatternKind::Anti if matches => {
-                    return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
-                }
-                _ => {}
-            }
-        }
-        if !any || line.is_empty() {
+        let filled: Vec<(usize, &TriggerRow)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.source.trim().is_empty())
+            .collect();
+        if filled.is_empty() || line.is_empty() {
             return (crate::i18n::t!("editor-enter-line"), NodeStatus::Disabled);
         }
-        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+
+        let raw_subject = raw_of(line);
+        let plain_subject = plain_of(&raw_subject);
+        let compile = |row: &TriggerRow| -> Result<regex::Regex, String> {
+            let source = row.compiled()?;
+            regex::Regex::new(&source)
+                .map_err(|e| crate::i18n::t!("editor-invalid-regex", "error" => e.to_string()))
+        };
+
+        // Any compile error surfaces first, verbatim.
+        for (_, row) in &filled {
+            if let Err(message) = row.compiled() {
+                return (message, NodeStatus::Error);
+            }
+        }
+
+        let blocked_in = |subject: &str| -> Option<usize> {
+            filled
+                .iter()
+                .filter(|(_, row)| row.role == PatternKind::Anti)
+                .enumerate()
+                .find_map(|(nth, (_, row))| compile(row).ok()?.is_match(subject).then_some(nth + 1))
+        };
+
+        let mut first_block = None;
+        for role in [PatternKind::Raw, PatternKind::Match] {
+            let subject = if role == PatternKind::Raw {
+                raw_subject.as_str()
+            } else {
+                plain_subject.as_str()
+            };
+            let phase: Vec<&TriggerRow> = filled
+                .iter()
+                .filter(|(_, row)| row.role == role)
+                .map(|(_, row)| *row)
+                .collect();
+            if phase.is_empty() {
+                continue;
+            }
+            if let Some(nth) = blocked_in(subject) {
+                first_block.get_or_insert(nth);
+                continue;
+            }
+            for (nth, row) in phase.iter().enumerate() {
+                if compile(row).is_ok_and(|re| re.is_match(subject)) {
+                    let key = if role == PatternKind::Raw {
+                        crate::i18n::t!("editor-fires-on-raw", "n" => (nth + 1).to_string())
+                    } else {
+                        crate::i18n::t!("editor-fires-on-match", "n" => (nth + 1).to_string())
+                    };
+                    return (key, NodeStatus::Ok);
+                }
+            }
+        }
+        if let Some(nth) = first_block {
+            return (
+                crate::i18n::t!("editor-blocked-by", "n" => nth.to_string()),
+                NodeStatus::Error,
+            );
+        }
+        (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled)
     }
 
     // ---- folder + module views --------------------------------------------
@@ -1873,6 +2350,50 @@ fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style 
         NodeStatus::Warning => common::warning,
         NodeStatus::Disabled => common::muted,
     }
+}
+
+/// The Try-it verdict for a Command miss, in the deck's words.
+fn command_miss_verdict(name: &str, miss: &matchers::CommandMiss) -> (String, NodeStatus) {
+    use matchers::{CommandMiss, TokenizeError};
+    match miss {
+        CommandMiss::Empty => (
+            crate::i18n::t!("editor-enter-command"),
+            NodeStatus::Disabled,
+        ),
+        CommandMiss::WrongFirstWord => (
+            crate::i18n::t!("editor-wrong-first-word", "name" => name),
+            NodeStatus::Disabled,
+        ),
+        CommandMiss::MissingRequired { name } => (
+            crate::i18n::t!("editor-missing-arg", "name" => name.clone()),
+            NodeStatus::Error,
+        ),
+        CommandMiss::Unclaimed { text } => (
+            crate::i18n::t!("editor-unclaimed", "text" => text.clone()),
+            NodeStatus::Disabled,
+        ),
+        CommandMiss::Tokenize(TokenizeError::UnterminatedQuote) => (
+            crate::i18n::t!("editor-unterminated-quote"),
+            NodeStatus::Error,
+        ),
+        CommandMiss::Tokenize(TokenizeError::UnbalancedBraces) => (
+            crate::i18n::t!("editor-unbalanced-braces"),
+            NodeStatus::Error,
+        ),
+    }
+}
+
+/// The Try-it field's raw-line simulation: `\e` means the ESC byte, so escape
+/// sequences can be typed into the tester (`matching-logic.md` §6).
+fn raw_of(test: &str) -> String {
+    test.replace("\\e", "\x1b")
+}
+
+/// The ANSI-stripped subject normal matchers see.
+fn plain_of(raw: &str) -> String {
+    static ANSI: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new("\x1b\\[[0-9;]*[A-Za-z]").unwrap());
+    ANSI.replace_all(raw, "").into_owned()
 }
 
 fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {

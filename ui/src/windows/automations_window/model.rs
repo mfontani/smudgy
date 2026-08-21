@@ -177,14 +177,15 @@ pub enum NodeStatus {
     Disabled,
 }
 
-/// The per-row pattern type in the unified trigger pattern list.
+/// The per-row matcher role in the unified trigger row list (`MatcherRole` in
+/// the persisted sidecar; `Anti` renders as "Exceptions" in the UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternKind {
-    /// A regex that must match the line for the trigger to fire.
+    /// Must match the line for the trigger to fire.
     Match,
-    /// A regex that must *not* match (inverts).
+    /// A veto: any match prevents the trigger from firing.
     Anti,
-    /// A raw (verbatim) regex pattern.
+    /// Matched against the raw line, color codes included (regex only).
     Raw,
 }
 
@@ -198,6 +199,22 @@ impl PatternKind {
             PatternKind::Raw => crate::i18n::ts!("pattern-kind-raw"),
         }
     }
+
+    fn role(self) -> matchers::MatcherRole {
+        match self {
+            PatternKind::Match => matchers::MatcherRole::Match,
+            PatternKind::Anti => matchers::MatcherRole::Anti,
+            PatternKind::Raw => matchers::MatcherRole::Raw,
+        }
+    }
+
+    fn from_role(role: matchers::MatcherRole) -> Self {
+        match role {
+            matchers::MatcherRole::Match => PatternKind::Match,
+            matchers::MatcherRole::Anti => PatternKind::Anti,
+            matchers::MatcherRole::Raw => PatternKind::Raw,
+        }
+    }
 }
 
 impl std::fmt::Display for PatternKind {
@@ -206,41 +223,379 @@ impl std::fmt::Display for PatternKind {
     }
 }
 
-/// Flattens a trigger's three pattern vectors into the unified, ordered row list
-/// the editor edits (Match rows first, then Anti, then Raw).
-pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<(PatternKind, String)> {
+use smudgy_core::models::matchers::{
+    self, AliasMatcherSource, ArgKind, ArgSpec, CmdMode, MatcherSyntax, ParseMode,
+    TriggerMatcherSource,
+};
+
+/// A `MatcherSyntax` wrapper carrying the pick-list `Display`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxChoice(pub MatcherSyntax);
+
+impl SyntaxChoice {
+    pub const ALL: [SyntaxChoice; 2] = [
+        SyntaxChoice(MatcherSyntax::Pattern),
+        SyntaxChoice(MatcherSyntax::Regex),
+    ];
+}
+
+impl std::fmt::Display for SyntaxChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            MatcherSyntax::Pattern => crate::i18n::ts!("editor-syntax-pattern"),
+            MatcherSyntax::Regex => crate::i18n::ts!("editor-syntax-regex"),
+        })
+    }
+}
+
+/// An `ArgKind` wrapper carrying the pick-list `Display`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArgKindChoice(pub ArgKind);
+
+impl std::fmt::Display for ArgKindChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            ArgKind::Required => crate::i18n::ts!("editor-arg-required"),
+            ArgKind::Optional => crate::i18n::ts!("editor-arg-optional"),
+            ArgKind::Rest => crate::i18n::ts!("editor-arg-rest"),
+        })
+    }
+}
+
+/// A `ParseMode` wrapper carrying the pick-list `Display` (label only; the
+/// prototype's two-line example rows are the deferred overlay-picker design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseModeChoice(pub ParseMode);
+
+impl ParseModeChoice {
+    pub const ALL: [ParseModeChoice; 5] = [
+        ParseModeChoice(ParseMode::Spaces),
+        ParseModeChoice(ParseMode::Quotes),
+        ParseModeChoice(ParseMode::Braces),
+        ParseModeChoice(ParseMode::All),
+        ParseModeChoice(ParseMode::Raw),
+    ];
+}
+
+impl std::fmt::Display for ParseModeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            ParseMode::Spaces => crate::i18n::ts!("editor-parse-spaces"),
+            ParseMode::Quotes => crate::i18n::ts!("editor-parse-quotes"),
+            ParseMode::Braces => crate::i18n::ts!("editor-parse-braces"),
+            ParseMode::All => crate::i18n::ts!("editor-parse-all"),
+            ParseMode::Raw => crate::i18n::ts!("editor-parse-raw"),
+        })
+    }
+}
+
+/// The alias editor's matcher kind (the three type cards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasKind {
+    Command,
+    Pattern,
+    Regex,
+}
+
+/// The alias editor's matcher draft: the selected kind plus every kind's
+/// buffers, so switching type cards never destroys work. Lives on the window
+/// (like the hotkey capture state) and is seeded on open/create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasMatcherDraft {
+    pub kind: AliasKind,
+    pub command: String,
+    pub args: Vec<ArgSpec>,
+    pub parse: ParseMode,
+    pub cmd_mode: CmdMode,
+    pub pattern_source: String,
+    pub anchor_start: bool,
+    pub anchor_end: bool,
+    pub regex_source: String,
+    /// A stale sidecar degraded this matcher to Regex on load — the stored
+    /// pattern was edited by hand, and the hand edit wins.
+    pub degraded: bool,
+}
+
+impl Default for AliasMatcherDraft {
+    fn default() -> Self {
+        Self {
+            // Command is the default for NEW aliases; opening an existing one
+            // reseeds via `from_definition`.
+            kind: AliasKind::Command,
+            command: String::new(),
+            args: Vec::new(),
+            parse: ParseMode::All,
+            cmd_mode: CmdMode::Simple,
+            pattern_source: String::new(),
+            anchor_start: true,
+            anchor_end: true,
+            regex_source: String::new(),
+            degraded: false,
+        }
+    }
+}
+
+impl AliasMatcherDraft {
+    /// Seed the draft from a stored definition. The sidecar drives the editor
+    /// only while it still compiles to the stored pattern; on a mismatch (a
+    /// hand-edited `pattern`, or a lying package sidecar) the matcher degrades
+    /// to Regex showing the stored pattern verbatim — the hand edit wins.
+    pub fn from_definition(alias: &aliases::AliasDefinition) -> Self {
+        let mut draft = Self {
+            kind: AliasKind::Regex,
+            regex_source: alias.pattern.clone(),
+            ..Self::default()
+        };
+        let Some(source) = &alias.matcher else {
+            return draft;
+        };
+        let fresh = matchers::alias_pattern(source).is_ok_and(|derived| derived == alias.pattern);
+        if !fresh {
+            draft.degraded = true;
+            return draft;
+        }
+        match source {
+            AliasMatcherSource::Command {
+                name,
+                args,
+                parse,
+                mode,
+            } => {
+                draft.kind = AliasKind::Command;
+                draft.command.clone_from(name);
+                draft.args.clone_from(args);
+                draft.parse = *parse;
+                draft.cmd_mode = *mode;
+            }
+            AliasMatcherSource::Pattern {
+                source,
+                anchor_start,
+                anchor_end,
+            } => {
+                draft.kind = AliasKind::Pattern;
+                draft.pattern_source.clone_from(source);
+                draft.anchor_start = *anchor_start;
+                draft.anchor_end = *anchor_end;
+            }
+        }
+        draft
+    }
+
+    /// The sidecar this draft saves (`None` for the Regex kind — an absent
+    /// sidecar IS the Regex kind).
+    pub fn to_matcher(&self) -> Option<AliasMatcherSource> {
+        match self.kind {
+            AliasKind::Regex => None,
+            AliasKind::Command => Some(AliasMatcherSource::Command {
+                name: self.command.trim().to_string(),
+                args: self.args.clone(),
+                parse: self.parse,
+                mode: self.cmd_mode,
+            }),
+            AliasKind::Pattern => Some(AliasMatcherSource::Pattern {
+                source: self.pattern_source.clone(),
+                anchor_start: self.anchor_start,
+                anchor_end: self.anchor_end,
+            }),
+        }
+    }
+
+    /// The stored pattern this draft saves, or a display-ready error.
+    pub fn to_pattern(&self) -> Result<String, String> {
+        if self.kind == AliasKind::Command && self.command.trim().is_empty() {
+            return Err(crate::i18n::t!("editor-command-name-empty"));
+        }
+        match self.to_matcher() {
+            None => Ok(self.regex_source.clone()),
+            Some(matcher) => {
+                matchers::alias_pattern(&matcher).map_err(|errors| pattern_error_text(&errors[0]))
+            }
+        }
+    }
+
+    /// README §2 invariants on the argument rows, applied after every args
+    /// mutation: `Rest` only in the last position (earlier ones demote to
+    /// `Optional`), and Simple mode forces every argument `Optional` with the
+    /// last one `Rest`.
+    pub fn normalize_args(&mut self) {
+        let len = self.args.len();
+        for (i, arg) in self.args.iter_mut().enumerate() {
+            if arg.kind == ArgKind::Rest && i + 1 != len {
+                arg.kind = ArgKind::Optional;
+            }
+        }
+        if self.cmd_mode == CmdMode::Simple {
+            for (i, arg) in self.args.iter_mut().enumerate() {
+                arg.kind = if i + 1 == len {
+                    ArgKind::Rest
+                } else {
+                    ArgKind::Optional
+                };
+            }
+        }
+    }
+}
+
+/// A display string for one pattern-compilation error.
+pub fn pattern_error_text(error: &matchers::PatternError) -> String {
+    match error {
+        matchers::PatternError::NumberedHole { body } => {
+            crate::i18n::t!("editor-numbered-hole", "body" => body.clone())
+        }
+        matchers::PatternError::UnknownHoleType { body } => {
+            crate::i18n::t!("editor-unknown-hole-type", "body" => body.clone())
+        }
+        matchers::PatternError::Engine { message } => {
+            crate::i18n::t!("editor-invalid-regex", "error" => message.clone())
+        }
+    }
+}
+
+/// One trigger matcher row in the editor: role, syntax, source, and the
+/// Pattern-syntax anchor checkboxes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerRow {
+    pub role: PatternKind,
+    pub syntax: MatcherSyntax,
+    pub source: String,
+    pub anchor_start: bool,
+    pub anchor_end: bool,
+}
+
+impl TriggerRow {
+    pub fn new(role: PatternKind) -> Self {
+        Self {
+            role,
+            syntax: MatcherSyntax::Regex,
+            source: String::new(),
+            anchor_start: true,
+            anchor_end: true,
+        }
+    }
+
+    /// The stored regex this row derives to, or a display-ready error.
+    pub fn compiled(&self) -> Result<String, String> {
+        match self.syntax {
+            MatcherSyntax::Pattern => {
+                let compiled =
+                    matchers::compile_pattern(&self.source, self.anchor_start, self.anchor_end);
+                match compiled.errors.first() {
+                    None => Ok(compiled.source),
+                    Some(error) => Err(pattern_error_text(error)),
+                }
+            }
+            MatcherSyntax::Regex => {
+                let source = if self.role == PatternKind::Raw {
+                    matchers::translate_esc(&self.source)
+                } else {
+                    self.source.clone()
+                };
+                regex::Regex::new(&source).map_err(
+                    |e| crate::i18n::t!("editor-invalid-regex", "error" => e.to_string()),
+                )?;
+                Ok(source)
+            }
+        }
+    }
+}
+
+/// Builds the editor's row list from a stored trigger. A fresh sidecar drives
+/// the rows; an absent or stale one (the stored vectors were hand-edited)
+/// degrades every row to Regex syntax showing the stored regexes verbatim.
+pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<TriggerRow> {
+    if let Some(sidecar) = &trigger.matchers {
+        let fresh = matchers::trigger_patterns(sidecar).is_ok_and(|derived| {
+            let stored = |v: &Option<Vec<String>>| v.clone().unwrap_or_default();
+            derived.patterns == stored(&trigger.patterns)
+                && derived.anti_patterns == stored(&trigger.anti_patterns)
+                && derived.raw_patterns == stored(&trigger.raw_patterns)
+        });
+        if fresh {
+            return sidecar
+                .iter()
+                .map(|m| TriggerRow {
+                    role: PatternKind::from_role(m.role),
+                    syntax: m.syntax,
+                    source: m.source.clone(),
+                    anchor_start: m.anchor_start,
+                    anchor_end: m.anchor_end,
+                })
+                .collect();
+        }
+    }
     let mut rows = Vec::new();
     if let Some(patterns) = &trigger.patterns {
-        rows.extend(patterns.iter().map(|p| (PatternKind::Match, p.clone())));
+        rows.extend(patterns.iter().map(|p| TriggerRow {
+            source: p.clone(),
+            ..TriggerRow::new(PatternKind::Match)
+        }));
     }
     if let Some(anti) = &trigger.anti_patterns {
-        rows.extend(anti.iter().map(|p| (PatternKind::Anti, p.clone())));
+        rows.extend(anti.iter().map(|p| TriggerRow {
+            source: p.clone(),
+            ..TriggerRow::new(PatternKind::Anti)
+        }));
     }
     if let Some(raw) = &trigger.raw_patterns {
-        rows.extend(raw.iter().map(|p| (PatternKind::Raw, p.clone())));
+        rows.extend(raw.iter().map(|p| TriggerRow {
+            source: p.clone(),
+            ..TriggerRow::new(PatternKind::Raw)
+        }));
     }
     if rows.is_empty() {
-        rows.push((PatternKind::Match, String::new()));
+        rows.push(TriggerRow::new(PatternKind::Match));
     }
     rows
 }
 
-/// Rebuilds a trigger's three pattern vectors from the unified row list.
+/// Rebuilds a trigger's three pattern vectors (and its sidecar) from the row
+/// list — the save path. The sidecar is written only when it carries real
+/// authoring intent: a Pattern-syntax row, or a Raw row whose stored form
+/// differs from what was typed (`\e` translation); pure hand-written-regex
+/// triggers stay sidecar-free, exactly like files from older clients.
+///
+/// # Errors
+///
+/// Returns the first failing row's `(index, display error)`.
 pub fn rows_into_trigger(
-    rows: &[(PatternKind, String)],
+    rows: &[TriggerRow],
     trigger: &mut triggers::TriggerDefinition,
-) {
-    let collect = |kind: PatternKind| -> Option<Vec<String>> {
-        let v: Vec<String> = rows
-            .iter()
-            .filter(|(k, _)| *k == kind)
-            .map(|(_, s)| s.clone())
-            .collect();
-        if v.is_empty() { None } else { Some(v) }
-    };
-    trigger.patterns = collect(PatternKind::Match);
-    trigger.anti_patterns = collect(PatternKind::Anti);
-    trigger.raw_patterns = collect(PatternKind::Raw);
+) -> Result<(), (usize, String)> {
+    let mut patterns = Vec::new();
+    let mut anti_patterns = Vec::new();
+    let mut raw_patterns = Vec::new();
+    let mut wants_sidecar = false;
+
+    for (i, row) in rows.iter().enumerate() {
+        if row.source.trim().is_empty() {
+            continue;
+        }
+        let compiled = row.compiled().map_err(|e| (i, e))?;
+        wants_sidecar |= row.syntax == MatcherSyntax::Pattern || compiled != row.source;
+        match row.role {
+            PatternKind::Match => patterns.push(compiled),
+            PatternKind::Anti => anti_patterns.push(compiled),
+            PatternKind::Raw => raw_patterns.push(compiled),
+        }
+    }
+
+    let some = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
+    trigger.patterns = some(patterns);
+    trigger.anti_patterns = some(anti_patterns);
+    trigger.raw_patterns = some(raw_patterns);
+    trigger.matchers = wants_sidecar.then(|| {
+        rows.iter()
+            .filter(|row| !row.source.trim().is_empty())
+            .map(|row| TriggerMatcherSource {
+                role: row.role.role(),
+                syntax: row.syntax,
+                source: row.source.clone(),
+                anchor_start: row.anchor_start,
+                anchor_end: row.anchor_end,
+            })
+            .collect()
+    });
+    Ok(())
 }
 
 /// The client-side package dependency graph, derived from the lockfile plus
@@ -600,6 +955,173 @@ pub fn is_installed(installed: &[LockedPackage], owner: &str, name: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::{DepEdge, PackageGraph};
+
+    mod matcher_drafts {
+        use super::super::*;
+
+        fn alias(pattern: &str, matcher: Option<AliasMatcherSource>) -> aliases::AliasDefinition {
+            aliases::AliasDefinition {
+                pattern: pattern.to_string(),
+                script: None,
+                package: None,
+                enabled: true,
+                priority: 0,
+                fallthrough: true,
+                language: smudgy_core::models::ScriptLang::Plaintext,
+                matcher,
+            }
+        }
+
+        #[test]
+        fn fresh_pattern_sidecar_drives_the_draft_and_round_trips() {
+            let source = AliasMatcherSource::Pattern {
+                source: "greet {person}".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+            };
+            let stored = matchers::alias_pattern(&source).unwrap();
+            let draft = AliasMatcherDraft::from_definition(&alias(&stored, Some(source.clone())));
+            assert_eq!(draft.kind, AliasKind::Pattern);
+            assert_eq!(draft.pattern_source, "greet {person}");
+            assert!(!draft.degraded);
+            // save(compile(sidecar)) == stored, and the sidecar re-emerges.
+            assert_eq!(draft.to_pattern().unwrap(), stored);
+            assert_eq!(draft.to_matcher(), Some(source));
+        }
+
+        #[test]
+        fn stale_sidecar_degrades_to_regex_showing_the_hand_edit() {
+            let source = AliasMatcherSource::Pattern {
+                source: "greet {person}".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+            };
+            let draft =
+                AliasMatcherDraft::from_definition(&alias(r"^greetz\s+(.*)$", Some(source)));
+            assert_eq!(draft.kind, AliasKind::Regex);
+            assert!(draft.degraded);
+            assert_eq!(draft.regex_source, r"^greetz\s+(.*)$");
+            // Saving keeps the hand edit and drops the lying sidecar.
+            assert_eq!(draft.to_pattern().unwrap(), r"^greetz\s+(.*)$");
+            assert_eq!(draft.to_matcher(), None);
+        }
+
+        #[test]
+        fn simple_mode_normalizes_args_to_optional_then_rest() {
+            let mut draft = AliasMatcherDraft {
+                kind: AliasKind::Command,
+                command: "greet".to_string(),
+                args: vec![
+                    ArgSpec {
+                        name: "a".to_string(),
+                        kind: ArgKind::Required,
+                    },
+                    ArgSpec {
+                        name: "b".to_string(),
+                        kind: ArgKind::Required,
+                    },
+                ],
+                ..AliasMatcherDraft::default()
+            };
+            draft.normalize_args();
+            assert_eq!(draft.args[0].kind, ArgKind::Optional);
+            assert_eq!(draft.args[1].kind, ArgKind::Rest);
+
+            // Advanced mode: only the rest-only-last invariant applies.
+            draft.cmd_mode = CmdMode::Advanced;
+            draft.args[0].kind = ArgKind::Rest;
+            draft.normalize_args();
+            assert_eq!(draft.args[0].kind, ArgKind::Optional);
+            assert_eq!(draft.args[1].kind, ArgKind::Rest);
+        }
+
+        #[test]
+        fn trigger_rows_round_trip_through_the_sidecar() {
+            let rows = vec![
+                TriggerRow {
+                    role: PatternKind::Match,
+                    syntax: MatcherSyntax::Pattern,
+                    source: "You are {state}.".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                },
+                TriggerRow {
+                    role: PatternKind::Raw,
+                    syntax: MatcherSyntax::Regex,
+                    source: r"\e\[31m".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                },
+            ];
+            let mut trigger = triggers::TriggerDefinition::default();
+            rows_into_trigger(&rows, &mut trigger).unwrap();
+            assert_eq!(
+                trigger.patterns.as_deref(),
+                Some(&[r"^You\s+are\s+(?<state>.*?)\.$".to_string()][..])
+            );
+            // The raw row stores the translated form; the sidecar keeps `\e`.
+            assert_eq!(
+                trigger.raw_patterns.as_deref(),
+                Some(&[r"\x1b\[31m".to_string()][..])
+            );
+            assert!(trigger.matchers.is_some());
+            assert_eq!(trigger_rows(&trigger), rows);
+        }
+
+        #[test]
+        fn pure_regex_rows_stay_sidecar_free() {
+            let rows = vec![TriggerRow {
+                source: "^ready$".to_string(),
+                ..TriggerRow::new(PatternKind::Match)
+            }];
+            let mut trigger = triggers::TriggerDefinition::default();
+            rows_into_trigger(&rows, &mut trigger).unwrap();
+            assert!(
+                trigger.matchers.is_none(),
+                "no authoring intent, no sidecar"
+            );
+            assert_eq!(
+                trigger.patterns.as_deref(),
+                Some(&["^ready$".to_string()][..])
+            );
+        }
+
+        #[test]
+        fn hand_edited_vectors_degrade_sidecar_rows_to_regex() {
+            let rows = vec![TriggerRow {
+                role: PatternKind::Match,
+                syntax: MatcherSyntax::Pattern,
+                source: "You are {state}.".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+            }];
+            let mut trigger = triggers::TriggerDefinition::default();
+            rows_into_trigger(&rows, &mut trigger).unwrap();
+            // A hand edit to the stored vector makes the sidecar stale.
+            trigger.patterns = Some(vec!["^edited$".to_string()]);
+            let degraded = trigger_rows(&trigger);
+            assert_eq!(degraded.len(), 1);
+            assert_eq!(degraded[0].syntax, MatcherSyntax::Regex);
+            assert_eq!(degraded[0].source, "^edited$");
+        }
+
+        #[test]
+        fn invalid_rows_report_their_index() {
+            let rows = vec![
+                TriggerRow {
+                    source: "fine".to_string(),
+                    ..TriggerRow::new(PatternKind::Match)
+                },
+                TriggerRow {
+                    source: "[unclosed".to_string(),
+                    ..TriggerRow::new(PatternKind::Match)
+                },
+            ];
+            let mut trigger = triggers::TriggerDefinition::default();
+            let (index, _) = rows_into_trigger(&rows, &mut trigger).unwrap_err();
+            assert_eq!(index, 1);
+        }
+    }
 
     /// A directly-installed package: present in the lockfile (so in `direct`) with its own
     /// enable intent — exactly what `rebuild_graph` seeds for each installed entry.

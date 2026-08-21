@@ -127,8 +127,8 @@ pub enum EditNode {
         priority: i32,
         fallthrough: bool,
         package: Option<String>,
-        /// The unified, ordered pattern list (Match/Anti/Raw per row).
-        rows: Vec<(PatternKind, String)>,
+        /// The unified, ordered matcher row list (role + syntax per row).
+        rows: Vec<model::TriggerRow>,
     },
 }
 
@@ -280,6 +280,19 @@ pub enum Message {
     // ---- editor fields -----------------------------------------------------
     SetName(String),
     SetAliasPattern(String),
+    // alias matcher draft
+    SetAliasKind(model::AliasKind),
+    SetCommandName(String),
+    SetArgName(usize, String),
+    SetArgKind(usize, smudgy_core::models::matchers::ArgKind),
+    AddArg,
+    RemoveArg(usize),
+    SetCmdMode(smudgy_core::models::matchers::CmdMode),
+    SetParseMode(smudgy_core::models::matchers::ParseMode),
+    SetPatternSource(String),
+    ToggleAnchorStart,
+    ToggleAnchorEnd,
+    TogglePrompt,
     /// Move the open script to a folder (`None` = top level). Also dispatched by
     /// the palette's "Move to…" group for the selected script.
     SetScriptFolder(Option<String>),
@@ -295,6 +308,9 @@ pub enum Message {
     RemovePattern(usize),
     SetPatternKind(usize, PatternKind),
     SetPatternText(usize, String),
+    SetRowSyntax(usize, smudgy_core::models::matchers::MatcherSyntax),
+    ToggleRowAnchorStart(usize),
+    ToggleRowAnchorEnd(usize),
 
     // ---- save bar ----------------------------------------------------------
     Save,
@@ -575,6 +591,9 @@ pub struct AutomationsWindow {
     // ---- shared editor buffers --------------------------------------------
     pub(super) editor_content: text_editor::Content,
     pub(super) hotkey_state: Vec<MaybePhysicalKey>,
+    /// The alias editor's matcher draft (kind + every kind's buffers), seeded
+    /// on open/create like `hotkey_state` and consumed at save.
+    pub(super) alias_draft: model::AliasMatcherDraft,
     pub(super) test_input: String,
     pub(super) dirty: bool,
     pub(super) pending_nav: Option<Box<Message>>,
@@ -806,6 +825,7 @@ impl AutomationsWindow {
             new_menu_open: false,
             editor_content: text_editor::Content::new(),
             hotkey_state: Vec::new(),
+            alias_draft: model::AliasMatcherDraft::default(),
             test_input: String::new(),
             dirty: false,
             pending_nav: None,
@@ -1138,10 +1158,77 @@ impl AutomationsWindow {
                 Update::none()
             }
             Message::SetAliasPattern(pattern) => {
-                if let Pane::Editor(state) = &mut self.pane
-                    && let EditNode::Alias(alias) = &mut state.node
+                // The Regex kind's source buffer; `pattern` on the definition is
+                // written from the draft at save time.
+                self.alias_draft.regex_source = pattern;
+                Update::none()
+            }
+            Message::SetAliasKind(kind) => {
+                self.alias_draft.kind = kind;
+                Update::none()
+            }
+            Message::SetCommandName(name) => {
+                self.alias_draft.command = name;
+                Update::none()
+            }
+            Message::SetArgName(i, name) => {
+                if let Some(arg) = self.alias_draft.args.get_mut(i) {
+                    arg.name = name;
+                }
+                Update::none()
+            }
+            Message::SetArgKind(i, kind) => {
+                if let Some(arg) = self.alias_draft.args.get_mut(i) {
+                    arg.kind = kind;
+                    self.alias_draft.normalize_args();
+                }
+                Update::none()
+            }
+            Message::AddArg => {
+                self.alias_draft
+                    .args
+                    .push(smudgy_core::models::matchers::ArgSpec {
+                        name: format!("arg{}", self.alias_draft.args.len() + 1),
+                        kind: smudgy_core::models::matchers::ArgKind::Required,
+                    });
+                self.alias_draft.normalize_args();
+                Update::none()
+            }
+            Message::RemoveArg(i) => {
+                if i < self.alias_draft.args.len() {
+                    self.alias_draft.args.remove(i);
+                    self.alias_draft.normalize_args();
+                }
+                Update::none()
+            }
+            Message::SetCmdMode(mode) => {
+                self.alias_draft.cmd_mode = mode;
+                self.alias_draft.normalize_args();
+                Update::none()
+            }
+            Message::SetParseMode(parse) => {
+                self.alias_draft.parse = parse;
+                Update::none()
+            }
+            Message::SetPatternSource(source) => {
+                self.alias_draft.pattern_source = source;
+                Update::none()
+            }
+            Message::ToggleAnchorStart => {
+                self.alias_draft.anchor_start = !self.alias_draft.anchor_start;
+                Update::none()
+            }
+            Message::ToggleAnchorEnd => {
+                self.alias_draft.anchor_end = !self.alias_draft.anchor_end;
+                Update::none()
+            }
+            Message::TogglePrompt => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { prompt, .. },
+                    ..
+                }) = &mut self.pane
                 {
-                    alias.pattern = pattern;
+                    *prompt = !*prompt;
                 }
                 Update::none()
             }
@@ -1201,7 +1288,7 @@ impl AutomationsWindow {
                     ..
                 }) = &mut self.pane
                 {
-                    rows.push((PatternKind::Match, String::new()));
+                    rows.push(model::TriggerRow::new(PatternKind::Match));
                 }
                 Update::none()
             }
@@ -1223,7 +1310,11 @@ impl AutomationsWindow {
                 }) = &mut self.pane
                     && let Some(row) = rows.get_mut(i)
                 {
-                    row.0 = kind;
+                    row.role = kind;
+                    // Raw implies Regex syntax (the invariant, applied forward).
+                    if kind == PatternKind::Raw {
+                        row.syntax = smudgy_core::models::matchers::MatcherSyntax::Regex;
+                    }
                 }
                 Update::none()
             }
@@ -1234,7 +1325,46 @@ impl AutomationsWindow {
                 }) = &mut self.pane
                     && let Some(row) = rows.get_mut(i)
                 {
-                    row.1 = text;
+                    row.source = text;
+                }
+                Update::none()
+            }
+            Message::SetRowSyntax(i, syntax) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    row.syntax = syntax;
+                    // Raw implies Regex: choosing Pattern demotes the role.
+                    if syntax == smudgy_core::models::matchers::MatcherSyntax::Pattern
+                        && row.role == PatternKind::Raw
+                    {
+                        row.role = PatternKind::Match;
+                    }
+                }
+                Update::none()
+            }
+            Message::ToggleRowAnchorStart(i) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    row.anchor_start = !row.anchor_start;
+                }
+                Update::none()
+            }
+            Message::ToggleRowAnchorEnd(i) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    row.anchor_end = !row.anchor_end;
                 }
                 Update::none()
             }
