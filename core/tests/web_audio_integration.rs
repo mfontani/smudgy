@@ -14,7 +14,9 @@ use smudgy_audio::{
     AudioSessionId,
     test_support::{TestDriverConfig, start_test_mixer},
 };
-use smudgy_audio_web::{ApplicationAudioOwner, SessionAudioRegistration};
+use smudgy_audio_web::{
+    ApplicationAudioOwner, SessionAudioRegistration, UnavailableAudioOutputCause,
+};
 use smudgy_core::session::runtime::{RuntimeAction, join_runtime_threads};
 use smudgy_core::session::{
     BufferUpdate, SessionEvent, SessionId, SessionParams, registry, spawn, spawn_with_audio,
@@ -160,6 +162,105 @@ async fn trusted_smudgy_script_can_render_and_close_web_audio() {
     join_runtime_threads();
     drop(registration);
     assert!(service.shutdown().clean);
+}
+
+#[tokio::test]
+async fn unavailable_session_keeps_none_joinable_and_rejects_default_without_mixer() {
+    let _guard = AUDIO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+    let server = "WebAudioUnavailable";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).expect("create module directory");
+    std::fs::create_dir_all(home_path.join(server).join("logs")).expect("create log directory");
+    std::fs::write(
+        modules_dir.join("unavailable.ts"),
+        r#"
+        import { echo } from "smudgy:core";
+        try {
+          new AudioContext({ sampleRate: 48_000 });
+          echo("UNAVAILABLE_DEFAULT_MISSED");
+        } catch (error) {
+          echo(`UNAVAILABLE_DEFAULT:${String(error)}`);
+        }
+        const silent = new AudioContext({ sampleRate: 48_000, sinkId: "none" });
+        await silent.close();
+        echo("UNAVAILABLE_NONE_OK");
+        "#,
+    )
+    .expect("write unavailable probe");
+    let session_id = 7_408;
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(session_id),
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+    let application = ApplicationAudioOwner::new(
+        deno_audio::AudioHostLimits::unlimited()
+            .max_online_contexts(Some(8))
+            .max_live_audio_bytes(Some(32 * 1024 * 1024)),
+    );
+    let baseline = application.usage();
+    let registration = application
+        .registrar()
+        .register_unavailable_session(
+            AudioSessionId(u64::from(session_id)),
+            UnavailableAudioOutputCause::new("deterministic no-default-device cause"),
+        )
+        .expect("mixer-free session registration succeeds");
+    let scope = registration.scope();
+    let mut events = Box::pin(
+        spawn_with_audio(params, scope.clone()).expect("unavailable scope matches core session"),
+    );
+    let mut runtime_tx = None;
+    let mut saw_default = false;
+    let mut saw_none = false;
+    let mut transcript = Vec::new();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while runtime_tx.is_none() || !saw_default || !saw_none {
+            let event = events.next().await.expect("unavailable session stays live");
+            match event.event {
+                SessionEvent::RuntimeReady(tx) => runtime_tx = Some(tx),
+                SessionEvent::UpdateBuffer(updates) => {
+                    for update in updates.iter() {
+                        if let BufferUpdate::Append(line) = update {
+                            transcript.push(line.text.clone());
+                            assert_ne!(line.text, "UNAVAILABLE_DEFAULT_MISSED");
+                            saw_default |= line.text.starts_with("UNAVAILABLE_DEFAULT:")
+                                && line.text.contains("deterministic no-default-device cause");
+                            saw_none |= line.text == "UNAVAILABLE_NONE_OK";
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("unavailable Web Audio timed out: {transcript:#?}"));
+
+    assert_eq!(application.usage(), baseline);
+    runtime_tx
+        .expect("RuntimeReady precedes unavailable probe")
+        .send(RuntimeAction::Shutdown)
+        .ok();
+    drop(events);
+    join_runtime_threads();
+    drop(scope);
+    let receipt = registration.retire();
+    assert_eq!(receipt.session_id(), u64::from(session_id));
+    assert_eq!(application.usage(), baseline);
 }
 
 #[tokio::test]

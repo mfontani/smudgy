@@ -161,6 +161,52 @@ impl std::error::Error for SystemOutputError {}
 /// Failure returned while starting [`SystemMixerService`].
 pub type SystemMixerStartError = MixerStartError<SystemOutputError>;
 
+/// Exact, cloneable cause for a physical mixer that was unavailable during
+/// application startup.
+///
+/// This value is diagnostic only. In particular,
+/// [`MixerStartError::CleanupUncertain`] preserves the fact that the failed
+/// physical startup did not prove cleanup; it must never be interpreted as a
+/// successful physical shutdown or retried in-process.
+#[derive(Debug, Clone)]
+pub struct SystemMixerUnavailable(Arc<SystemMixerStartError>);
+
+impl SystemMixerUnavailable {
+    /// Returns the exact failed startup result, including platform source and
+    /// any cleanup-uncertain primary cause.
+    #[must_use]
+    pub fn error(&self) -> &SystemMixerStartError {
+        &self.0
+    }
+
+    /// Whether the failed startup reported proven physical cleanup.
+    #[must_use]
+    pub fn cleanup_proven(&self) -> bool {
+        !matches!(
+            &*self.0,
+            MixerStartError::CleanupUncertain(_) | MixerStartError::OwnerStopped
+        )
+    }
+}
+
+impl fmt::Display for SystemMixerUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SystemMixerUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
+
+impl From<SystemMixerStartError> for SystemMixerUnavailable {
+    fn from(error: SystemMixerStartError) -> Self {
+        Self(Arc::new(error))
+    }
+}
+
 /// One non-generic process system-output service.
 ///
 /// The value is thread-affine because the contained mixer service is

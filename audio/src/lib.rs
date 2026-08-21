@@ -17,8 +17,8 @@ mod system;
 
 #[cfg(feature = "physical-output")]
 pub use system::{
-    SystemMixerService, SystemMixerStartError, SystemOutputError, SystemOutputErrorKind,
-    SystemOutputOperation,
+    SystemMixerService, SystemMixerStartError, SystemMixerUnavailable, SystemOutputError,
+    SystemOutputErrorKind, SystemOutputOperation,
 };
 
 use std::{

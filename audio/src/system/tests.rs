@@ -671,6 +671,42 @@ fn host_failures_and_panics_have_stable_operations() {
     }
 }
 
+#[test]
+fn unavailable_cause_preserves_exact_start_error_and_cleanup_truth() {
+    let thread = SystemMixerUnavailable::from(MixerStartError::Thread(
+        std::io::Error::from_raw_os_error(5),
+    ));
+    assert!(thread.cleanup_proven());
+    match thread.error() {
+        MixerStartError::Thread(error) => assert_eq!(error.raw_os_error(), Some(5)),
+        other => panic!("exact thread cause was not retained: {other:?}"),
+    }
+
+    let protocol = SystemOutputError::new(
+        SystemOutputErrorKind::Protocol,
+        SystemOutputOperation::Build,
+        "deterministic protocol failure",
+    );
+    let uncertain = SystemMixerUnavailable::from(MixerStartError::CleanupUncertain(
+        MixerStartupFailure::Backend(protocol),
+    ));
+    assert!(!uncertain.cleanup_proven());
+    assert!(matches!(
+        uncertain.error(),
+        MixerStartError::CleanupUncertain(MixerStartupFailure::Backend(error))
+            if error.kind() == SystemOutputErrorKind::Protocol
+                && error.operation() == SystemOutputOperation::Build
+                && error.detail() == "deterministic protocol failure"
+    ));
+
+    let owner_stopped = SystemMixerUnavailable::from(MixerStartError::OwnerStopped);
+    assert!(!owner_stopped.cleanup_proven());
+    assert!(matches!(
+        owner_stopped.error(),
+        MixerStartError::OwnerStopped
+    ));
+}
+
 fn cleanup_uncertain_backend(error: MixerStartError<SystemOutputError>) -> SystemOutputError {
     match error {
         MixerStartError::CleanupUncertain(MixerStartupFailure::Backend(error)) => error,

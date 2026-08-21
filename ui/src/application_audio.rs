@@ -15,11 +15,12 @@ use std::thread::{self, JoinHandle};
 use futures::executor::block_on;
 use smudgy_audio::{
     AudioSessionId, MixerControlError, MixerSessionRegistrar, MixerSessionRetirementError,
-    MixerShutdown, SystemMixerService, SystemMixerStartError,
+    MixerShutdown, SystemMixerService, SystemMixerUnavailable,
 };
 use smudgy_audio_web::{
     ApplicationAudioOwner, ApplicationAudioRegistrar, AudioHostLimits, SessionAudioRegistration,
-    SessionAudioRegistrationError, SessionAudioScope,
+    SessionAudioRegistrationError, SessionAudioScope, UnavailableAudioOutputCause,
+    UnavailableSessionAudioRegistration, UnavailableSessionAudioRetirement,
 };
 use smudgy_core::session::runtime::{
     RuntimeAction, RuntimeThreadJoinOutcome, RuntimeThreadPublicationFailure,
@@ -48,23 +49,24 @@ fn join_runtime(session_id: SessionId) -> RuntimeThreadJoinOutcome {
 /// Stable startup failure for the outer application coordinator.
 #[derive(Debug)]
 pub enum ApplicationAudioStartError {
-    System(SystemMixerStartError),
     Worker {
         source: std::io::Error,
-        output_cleanup: MixerShutdown,
+        cleanup: ApplicationAudioStartCleanup,
     },
+}
+
+#[derive(Debug)]
+pub enum ApplicationAudioStartCleanup {
+    Physical(MixerShutdown),
+    Unavailable(SystemMixerUnavailable),
 }
 
 impl fmt::Display for ApplicationAudioStartError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::System(error) => write!(formatter, "Web Audio startup failed: {error}"),
-            Self::Worker {
-                source,
-                output_cleanup,
-            } => write!(
+            Self::Worker { source, cleanup } => write!(
                 formatter,
-                "Web Audio lifecycle worker could not start: {source}; physical cleanup: {output_cleanup:?}"
+                "Web Audio lifecycle worker could not start: {source}; startup cleanup evidence: {cleanup:?}"
             ),
         }
     }
@@ -73,8 +75,23 @@ impl fmt::Display for ApplicationAudioStartError {
 impl std::error::Error for ApplicationAudioStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::System(error) => Some(error),
             Self::Worker { source, .. } => Some(source),
+        }
+    }
+}
+
+impl ApplicationAudioStartError {
+    #[must_use]
+    pub fn cleanup_is_clean(&self) -> bool {
+        match self {
+            Self::Worker {
+                cleanup: ApplicationAudioStartCleanup::Physical(shutdown),
+                ..
+            } => shutdown.clean && shutdown.failure.is_none(),
+            Self::Worker {
+                cleanup: ApplicationAudioStartCleanup::Unavailable(cause),
+                ..
+            } => cause.cleanup_proven(),
         }
     }
 }
@@ -83,6 +100,7 @@ impl std::error::Error for ApplicationAudioStartError {
 pub enum ApplicationAudioOpenError {
     ApplicationSealed,
     DuplicateSession,
+    SessionCapacity,
     CoordinatorStopped,
     Mixer(MixerControlError),
     Registration(SessionAudioRegistrationError),
@@ -97,6 +115,9 @@ impl fmt::Display for ApplicationAudioOpenError {
         match self {
             Self::ApplicationSealed => formatter.write_str("application audio is shutting down"),
             Self::DuplicateSession => formatter.write_str("the session already owns audio"),
+            Self::SessionCapacity => {
+                formatter.write_str("the application audio session capacity is full")
+            }
             Self::CoordinatorStopped => {
                 formatter.write_str("the application audio coordinator stopped")
             }
@@ -146,7 +167,23 @@ pub struct SessionAudioCloseResult {
     pub shutdown: RuntimeShutdownRequest,
     pub runtime: RuntimeThreadJoinOutcome,
     pub publication_failure: Option<RuntimeThreadPublicationFailure>,
-    pub retirement: Result<(), MixerSessionRetirementError>,
+    pub retirement: SessionAudioRetirementResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAudioRetirementResult {
+    Physical(Result<(), MixerSessionRetirementError>),
+    MixerFree(UnavailableSessionAudioRetirement),
+}
+
+impl SessionAudioRetirementResult {
+    #[must_use]
+    pub fn is_clean_for(self, session_id: SessionId) -> bool {
+        match self {
+            Self::Physical(result) => result.is_ok(),
+            Self::MixerFree(receipt) => receipt.session_id() == u64::from(u32::from(session_id)),
+        }
+    }
 }
 
 impl SessionAudioCloseResult {
@@ -160,7 +197,7 @@ impl SessionAudioCloseResult {
                 == RuntimeThreadJoinOutcome::Clean {
                     session_id: self.session_id,
                 }
-            && self.retirement.is_ok()
+            && self.retirement.is_clean_for(self.session_id)
     }
 }
 
@@ -173,7 +210,23 @@ pub struct ApplicationAudioShutdownReport {
     pub coordinator_joined: bool,
     pub lifecycle_worker_joined: bool,
     pub lifecycle_transport_clean: bool,
-    pub output: MixerShutdown,
+    pub output: ApplicationAudioOutputShutdown,
+}
+
+#[derive(Debug)]
+pub enum ApplicationAudioOutputShutdown {
+    Physical(MixerShutdown),
+    Unavailable(SystemMixerUnavailable),
+}
+
+impl ApplicationAudioOutputShutdown {
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        match self {
+            Self::Physical(shutdown) => shutdown.clean && shutdown.failure.is_none(),
+            Self::Unavailable(cause) => cause.cleanup_proven(),
+        }
+    }
 }
 
 impl ApplicationAudioShutdownReport {
@@ -186,8 +239,7 @@ impl ApplicationAudioShutdownReport {
             && self.io_quiesce_clean
             && self.sessions.iter().all(|result| result.is_clean())
             && self.unowned_runtime_joins.is_empty()
-            && self.output.clean
-            && self.output.failure.is_none()
+            && self.output.is_clean()
     }
 }
 
@@ -195,7 +247,7 @@ impl fmt::Display for ApplicationAudioShutdownReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "session results={:?}; unowned runtime joins={:?}; I/O quiesce attempted={}; I/O quiesce clean={}; coordinator joined={}; lifecycle worker joined={}; lifecycle transport clean={}; physical cleanup={}; operational failure={:?}",
+            "session results={:?}; unowned runtime joins={:?}; I/O quiesce attempted={}; I/O quiesce clean={}; coordinator joined={}; lifecycle worker joined={}; lifecycle transport clean={}; output shutdown={:?}",
             self.sessions,
             self.unowned_runtime_joins,
             self.io_quiesce_attempted,
@@ -203,8 +255,7 @@ impl fmt::Display for ApplicationAudioShutdownReport {
             self.coordinator_joined,
             self.lifecycle_worker_joined,
             self.lifecycle_transport_clean,
-            self.output.clean,
-            self.output.failure
+            self.output
         )
     }
 }
@@ -214,7 +265,39 @@ struct LifecycleJob {
     shutdown: RuntimeShutdownRequest,
     runtime: Option<RuntimeThreadJoinOutcome>,
     publication_failure: Option<RuntimeThreadPublicationFailure>,
-    registration: SessionAudioRegistration,
+    registration: CoordinatedSessionAudio,
+}
+
+enum CoordinatedSessionAudio {
+    Physical(SessionAudioRegistration),
+    Unavailable(UnavailableSessionAudioRegistration),
+}
+
+impl CoordinatedSessionAudio {
+    fn scope(&self) -> SessionAudioScope {
+        match self {
+            Self::Physical(registration) => registration.scope(),
+            Self::Unavailable(registration) => registration.scope(),
+        }
+    }
+
+    fn seal(&mut self) -> bool {
+        match self {
+            Self::Physical(registration) => registration.seal(),
+            Self::Unavailable(registration) => registration.seal(),
+        }
+    }
+
+    fn retire(self) -> SessionAudioRetirementResult {
+        match self {
+            Self::Physical(registration) => {
+                SessionAudioRetirementResult::Physical(block_on(registration.retire()))
+            }
+            Self::Unavailable(registration) => {
+                SessionAudioRetirementResult::MixerFree(registration.retire())
+            }
+        }
+    }
 }
 
 enum LifecycleCommand {
@@ -226,7 +309,7 @@ fn finish_job(job: LifecycleJob, runtime_join: &RuntimeJoin) -> SessionAudioClos
     // Load-bearing order: the exact runtime cannot touch its scope after this
     // join before mixer retirement starts.
     let runtime = job.runtime.unwrap_or_else(|| runtime_join(job.session_id));
-    let retirement = block_on(job.registration.retire());
+    let retirement = job.registration.retire();
     SessionAudioCloseResult {
         session_id: job.session_id,
         shutdown: job.shutdown,
@@ -238,7 +321,7 @@ fn finish_job(job: LifecycleJob, runtime_join: &RuntimeJoin) -> SessionAudioClos
 
 struct CoordinatorState {
     open: bool,
-    registrations: BTreeMap<SessionId, SessionAudioRegistration>,
+    registrations: BTreeMap<SessionId, CoordinatedSessionAudio>,
     closing: BTreeSet<SessionId>,
     submitted: BTreeSet<SessionId>,
     completed: Vec<SessionAudioCloseResult>,
@@ -457,9 +540,43 @@ fn registration_failure(
     }
 }
 
+#[derive(Clone)]
+enum SessionRegistrationSource {
+    Physical(MixerSessionRegistrar),
+    Unavailable(SystemMixerUnavailable),
+}
+
+impl SessionRegistrationSource {
+    fn register(
+        &self,
+        application: &ApplicationAudioRegistrar,
+        session_id: SessionId,
+    ) -> Result<CoordinatedSessionAudio, ApplicationAudioOpenError> {
+        let id = AudioSessionId(u64::from(u32::from(session_id)));
+        match self {
+            Self::Physical(mixer) => {
+                let owner = mixer
+                    .add_session(id)
+                    .map_err(ApplicationAudioOpenError::Mixer)?;
+                application
+                    .register_session(owner)
+                    .map(CoordinatedSessionAudio::Physical)
+                    .map_err(registration_failure)
+            }
+            Self::Unavailable(cause) => application
+                .register_unavailable_session(
+                    id,
+                    UnavailableAudioOutputCause::new(cause.to_string()),
+                )
+                .map(CoordinatedSessionAudio::Unavailable)
+                .map_err(ApplicationAudioOpenError::Registration),
+        }
+    }
+}
+
 fn open_registration(
     state: &Mutex<CoordinatorState>,
-    mixer: &MixerSessionRegistrar,
+    source: &SessionRegistrationSource,
     application: &ApplicationAudioRegistrar,
     session_id: SessionId,
 ) -> Result<SessionAudioScope, ApplicationAudioOpenError> {
@@ -471,29 +588,33 @@ fn open_registration(
         if state.registrations.contains_key(&session_id) || state.closing.contains(&session_id) {
             return Err(ApplicationAudioOpenError::DuplicateSession);
         }
+        if matches!(source, SessionRegistrationSource::Unavailable(_))
+            && state.registrations.len() + state.closing.len() >= smudgy_audio::MAX_SESSIONS
+        {
+            return Err(ApplicationAudioOpenError::SessionCapacity);
+        }
     }
-    let owner = mixer
-        .add_session(AudioSessionId(u64::from(u32::from(session_id))))
-        .map_err(ApplicationAudioOpenError::Mixer)?;
-    let registration = application
-        .register_session(owner)
-        .map_err(registration_failure)?;
+    let registration = source.register(application, session_id)?;
     let scope = registration.scope();
     let mut state = lock_state(state);
     if !state.open {
         drop(state);
-        let retirement = block_on(registration.retire());
-        return Err(retirement.map_or_else(
-            |retirement| ApplicationAudioOpenError::RegistrationRollback {
-                registration: SessionAudioRegistrationError::ApplicationSealed,
-                retirement,
-            },
-            |()| ApplicationAudioOpenError::ApplicationSealed,
-        ));
+        return Err(match registration.retire() {
+            SessionAudioRetirementResult::Physical(Err(retirement)) => {
+                ApplicationAudioOpenError::RegistrationRollback {
+                    registration: SessionAudioRegistrationError::ApplicationSealed,
+                    retirement,
+                }
+            }
+            SessionAudioRetirementResult::Physical(Ok(()))
+            | SessionAudioRetirementResult::MixerFree(_) => {
+                ApplicationAudioOpenError::ApplicationSealed
+            }
+        });
     }
     if state.registrations.contains_key(&session_id) || state.closing.contains(&session_id) {
         drop(state);
-        let _ = block_on(registration.retire());
+        let _ = registration.retire();
         return Err(ApplicationAudioOpenError::DuplicateSession);
     }
     state.registrations.insert(session_id, registration);
@@ -642,7 +763,7 @@ fn quiesce_io_once(state: &Mutex<CoordinatorState>, io_quiesce: &IoQuiesce) {
 fn run_coordinator(
     commands: mpsc::Receiver<CoordinatorCommand>,
     state: Arc<Mutex<CoordinatorState>>,
-    mixer: MixerSessionRegistrar,
+    source: SessionRegistrationSource,
     application: ApplicationAudioRegistrar,
     runtime_shutdown: RuntimeShutdown,
     runtime_join: RuntimeJoin,
@@ -653,7 +774,7 @@ fn run_coordinator(
         drain_completed(&state);
         match command {
             CoordinatorCommand::Open { session_id, reply } => {
-                let _ = reply.send(open_registration(&state, &mixer, &application, session_id));
+                let _ = reply.send(open_registration(&state, &source, &application, session_id));
             }
             CoordinatorCommand::Close { session_id, reply } => {
                 let result = take_close_job(&state, &runtime_shutdown, session_id);
@@ -741,9 +862,16 @@ impl ProcessMixer for smudgy_audio::MixerService {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum ApplicationAudioAvailability {
+    Physical,
+    Unavailable(SystemMixerUnavailable),
+}
+
 /// Unique outer application authority, retained on `run`'s stack beyond iced.
 pub struct ApplicationAudio<S = SystemMixerService> {
     service: Option<S>,
+    availability: ApplicationAudioAvailability,
     owner: Option<ApplicationAudioOwner>,
     controller: ApplicationAudioController,
     state: Arc<Mutex<CoordinatorState>>,
@@ -758,21 +886,41 @@ pub struct ApplicationAudio<S = SystemMixerService> {
 
 impl ApplicationAudio<SystemMixerService> {
     pub fn start() -> Result<Self, ApplicationAudioStartError> {
-        let service = SystemMixerService::start(PHYSICAL_SAMPLE_RATE)
-            .map_err(ApplicationAudioStartError::System)?;
-        match Self::with_service_and_runtime(
-            service,
-            production_limits(),
-            Arc::new(request_runtime_shutdown),
-            Arc::new(join_runtime),
-            Arc::new(smudgy_core::session::runtime::join_all_runtime_threads),
-            Arc::new(smudgy_core::session::connection::shutdown_io_runtime),
-        ) {
-            Ok(application) => Ok(application),
-            Err((source, service)) => Err(ApplicationAudioStartError::Worker {
-                source,
-                output_cleanup: service.shutdown(),
-            }),
+        let runtime_shutdown: RuntimeShutdown = Arc::new(request_runtime_shutdown);
+        let runtime_join: RuntimeJoin = Arc::new(join_runtime);
+        let runtime_join_all: RuntimeJoinAll =
+            Arc::new(smudgy_core::session::runtime::join_all_runtime_threads);
+        let io_quiesce: IoQuiesce = Arc::new(smudgy_core::session::connection::shutdown_io_runtime);
+        match SystemMixerService::start(PHYSICAL_SAMPLE_RATE) {
+            Ok(service) => match Self::with_service_and_runtime(
+                service,
+                production_limits(),
+                runtime_shutdown,
+                runtime_join,
+                runtime_join_all,
+                io_quiesce,
+            ) {
+                Ok(application) => Ok(application),
+                Err((source, service)) => Err(ApplicationAudioStartError::Worker {
+                    source,
+                    cleanup: ApplicationAudioStartCleanup::Physical(service.shutdown()),
+                }),
+            },
+            Err(error) => {
+                let cause = SystemMixerUnavailable::from(error);
+                Self::with_unavailable_and_runtime(
+                    cause.clone(),
+                    production_limits(),
+                    runtime_shutdown,
+                    runtime_join,
+                    runtime_join_all,
+                    io_quiesce,
+                )
+                .map_err(|source| ApplicationAudioStartError::Worker {
+                    source,
+                    cleanup: ApplicationAudioStartCleanup::Unavailable(cause),
+                })
+            }
         }
     }
 }
@@ -786,12 +934,66 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
         runtime_join_all: RuntimeJoinAll,
         io_quiesce: IoQuiesce,
     ) -> Result<Self, (std::io::Error, S)> {
-        let mixer = service.session_registrar();
+        let source = SessionRegistrationSource::Physical(service.session_registrar());
+        Self::with_source_and_runtime(
+            Some(service),
+            source,
+            ApplicationAudioAvailability::Physical,
+            limits,
+            runtime_shutdown,
+            runtime_join,
+            runtime_join_all,
+            io_quiesce,
+        )
+        .map_err(|(error, service)| {
+            (
+                error,
+                service.expect("physical coordinator construction returns its service"),
+            )
+        })
+    }
+
+    fn with_unavailable_and_runtime(
+        cause: SystemMixerUnavailable,
+        limits: AudioHostLimits,
+        runtime_shutdown: RuntimeShutdown,
+        runtime_join: RuntimeJoin,
+        runtime_join_all: RuntimeJoinAll,
+        io_quiesce: IoQuiesce,
+    ) -> Result<Self, std::io::Error> {
+        Self::with_source_and_runtime(
+            None,
+            SessionRegistrationSource::Unavailable(cause.clone()),
+            ApplicationAudioAvailability::Unavailable(cause),
+            limits,
+            runtime_shutdown,
+            runtime_join,
+            runtime_join_all,
+            io_quiesce,
+        )
+        .map_err(|(error, service)| {
+            debug_assert!(service.is_none());
+            error
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_source_and_runtime(
+        service: Option<S>,
+        source: SessionRegistrationSource,
+        availability: ApplicationAudioAvailability,
+        limits: AudioHostLimits,
+        runtime_shutdown: RuntimeShutdown,
+        runtime_join: RuntimeJoin,
+        runtime_join_all: RuntimeJoinAll,
+        io_quiesce: IoQuiesce,
+    ) -> Result<Self, (std::io::Error, Option<S>)> {
         let owner = ApplicationAudioOwner::new(limits);
         let application = owner.registrar();
         let (commands_tx, commands_rx) = mpsc::sync_channel(COORDINATOR_QUEUE_CAPACITY);
-        // The registration map is capped by the mixer (32 sessions), so this
-        // ownership channel is intrinsically bounded by live authorities. An
+        // The coordinator enforces the same 32-session application bound in
+        // both physical and unavailable modes, so this ownership channel is
+        // intrinsically bounded by live authorities. An
         // unbounded transport keeps iced Close responsive when an earlier
         // exact runtime join is deliberately slow.
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
@@ -839,7 +1041,7 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
                 run_coordinator(
                     commands_rx,
                     coordinator_state,
-                    mixer,
+                    source,
                     application,
                     coordinator_shutdown,
                     coordinator_join,
@@ -855,7 +1057,8 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
             }
         };
         Ok(Self {
-            service: Some(service),
+            service,
+            availability,
             owner: Some(owner),
             controller: ApplicationAudioController {
                 commands: commands_tx,
@@ -875,6 +1078,11 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
     #[must_use]
     pub fn controller(&self) -> ApplicationAudioController {
         self.controller.clone()
+    }
+
+    #[must_use]
+    pub fn availability(&self) -> ApplicationAudioAvailability {
+        self.availability.clone()
     }
 
     fn recover_coordinator_failure(&self) -> CoordinatorFinish {
@@ -945,11 +1153,17 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
             .take()
             .is_some_and(|worker| worker.join().is_ok());
         let unowned_runtime_joins = (self.runtime_join_all)();
-        let output = self
-            .service
-            .take()
-            .expect("application audio service shuts down exactly once")
-            .shutdown();
+        let output = match self.service.take() {
+            Some(service) => ApplicationAudioOutputShutdown::Physical(service.shutdown()),
+            None => match self.availability {
+                ApplicationAudioAvailability::Unavailable(cause) => {
+                    ApplicationAudioOutputShutdown::Unavailable(cause)
+                }
+                ApplicationAudioAvailability::Physical => {
+                    unreachable!("physical application audio retains its service until shutdown")
+                }
+            },
+        };
         self.owner.take();
         ApplicationAudioShutdownReport {
             sessions: finish.sessions,
@@ -1065,8 +1279,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use smudgy_audio::MixerService;
     use smudgy_audio::test_support::{TestDriverConfig, TestDriverProbe, start_test_mixer};
+    use smudgy_audio::{
+        MixerOutputFailure, MixerService, MixerStartError, MixerStartupFailure, SystemOutputError,
+    };
 
     use super::*;
 
@@ -1121,6 +1337,207 @@ mod tests {
         (application, probe)
     }
 
+    fn test_unavailable_application(
+        cause: SystemMixerUnavailable,
+    ) -> ApplicationAudio<MixerService> {
+        ApplicationAudio::<MixerService>::with_unavailable_and_runtime(
+            cause,
+            production_limits(),
+            Arc::new(|_| false),
+            Arc::new(|session_id| RuntimeThreadJoinOutcome::Clean { session_id }),
+            Arc::new(Vec::new),
+            Arc::new(|| {}),
+        )
+        .expect("mixer-free lifecycle workers start")
+    }
+
+    fn clean_unavailable_cause() -> SystemMixerUnavailable {
+        SystemMixerUnavailable::from(MixerStartError::<SystemOutputError>::InvalidSampleRate)
+    }
+
+    #[test]
+    fn optional_start_cleanup_truth_table_is_fail_closed() {
+        let worker = |cleanup| ApplicationAudioStartError::Worker {
+            source: std::io::Error::other("deterministic lifecycle worker failure"),
+            cleanup,
+        };
+        assert!(
+            worker(ApplicationAudioStartCleanup::Physical(MixerShutdown {
+                clean: true,
+                failure: None,
+            }))
+            .cleanup_is_clean()
+        );
+        assert!(
+            !worker(ApplicationAudioStartCleanup::Physical(MixerShutdown {
+                clean: false,
+                failure: None,
+            }))
+            .cleanup_is_clean()
+        );
+        assert!(
+            !worker(ApplicationAudioStartCleanup::Physical(MixerShutdown {
+                clean: true,
+                failure: Some(MixerOutputFailure::BackendFailure),
+            }))
+            .cleanup_is_clean()
+        );
+        assert!(
+            worker(ApplicationAudioStartCleanup::Unavailable(
+                clean_unavailable_cause()
+            ))
+            .cleanup_is_clean()
+        );
+        let uncertain =
+            SystemMixerUnavailable::from(MixerStartError::CleanupUncertain(MixerStartupFailure::<
+                SystemOutputError,
+            >::DriverFailed(
+                MixerOutputFailure::BackendFailure,
+            )));
+        assert!(!worker(ApplicationAudioStartCleanup::Unavailable(uncertain)).cleanup_is_clean());
+        let owner_stopped =
+            SystemMixerUnavailable::from(MixerStartError::<SystemOutputError>::OwnerStopped);
+        assert!(
+            !worker(ApplicationAudioStartCleanup::Unavailable(owner_stopped)).cleanup_is_clean()
+        );
+    }
+
+    #[test]
+    fn unavailable_coordinator_opens_siblings_rolls_back_and_shuts_down_without_mixer_proof() {
+        let cause = clean_unavailable_cause();
+        let application = test_unavailable_application(cause.clone());
+        assert!(matches!(
+            application.availability(),
+            ApplicationAudioAvailability::Unavailable(ref retained)
+                if matches!(retained.error(), MixerStartError::InvalidSampleRate)
+        ));
+        let controller = application.controller();
+
+        let first_id = SessionId::from(70);
+        let first = controller.begin_session(first_id).unwrap();
+        assert_eq!(first.scope().session_id(), 70);
+        first.commit();
+        let second_id = SessionId::from(71);
+        let second = controller.begin_session(second_id).unwrap();
+        assert_eq!(second.scope().session_id(), 71);
+        second.commit();
+        assert_eq!(
+            controller.close_session(first_id),
+            SessionAudioCloseDisposition::Requested
+        );
+
+        // Closing one mixer-free generation does not disturb a live sibling,
+        // and a fresh staged registration can still be rolled back exactly.
+        let rollback_id = SessionId::from(72);
+        let rollback = controller.begin_session(rollback_id).unwrap();
+        assert_eq!(rollback.scope().session_id(), 72);
+        assert_eq!(rollback.abort(), SessionAudioCloseDisposition::Requested);
+
+        let report = application.shutdown();
+        assert_eq!(report.sessions.len(), 3);
+        for result in &report.sessions {
+            assert_eq!(
+                result.runtime,
+                RuntimeThreadJoinOutcome::Clean {
+                    session_id: result.session_id
+                }
+            );
+            match result.retirement {
+                SessionAudioRetirementResult::MixerFree(receipt) => {
+                    assert_eq!(
+                        receipt.session_id(),
+                        u64::from(u32::from(result.session_id))
+                    );
+                    assert_ne!(receipt.generation(), 0);
+                }
+                SessionAudioRetirementResult::Physical(_) => {
+                    panic!("unavailable session fabricated mixer retirement")
+                }
+            }
+            assert!(result.is_clean());
+        }
+        assert!(matches!(
+            report.output,
+            ApplicationAudioOutputShutdown::Unavailable(ref retained)
+                if matches!(retained.error(), MixerStartError::InvalidSampleRate)
+        ));
+        assert!(
+            report.is_clean(),
+            "clean unavailability is not shutdown failure"
+        );
+    }
+
+    #[test]
+    fn unavailable_seal_rejects_open_and_uncertain_startup_never_reports_clean() {
+        let mut sealed = test_unavailable_application(clean_unavailable_cause());
+        let controller = sealed.controller();
+        sealed.seal_application_for_test();
+        assert!(matches!(
+            controller.begin_session(SessionId::from(73)),
+            Err(ApplicationAudioOpenError::Registration(
+                SessionAudioRegistrationError::ApplicationSealed
+            ))
+        ));
+        let sealed_report = sealed.shutdown();
+        assert!(sealed_report.sessions.is_empty());
+        assert!(sealed_report.is_clean());
+
+        let uncertain =
+            SystemMixerUnavailable::from(MixerStartError::<SystemOutputError>::OwnerStopped);
+        let uncertain_report = test_unavailable_application(uncertain).shutdown();
+        assert!(matches!(
+            uncertain_report.output,
+            ApplicationAudioOutputShutdown::Unavailable(ref retained)
+                if matches!(retained.error(), MixerStartError::OwnerStopped)
+                    && !retained.cleanup_proven()
+        ));
+        assert!(
+            !uncertain_report.is_clean(),
+            "lost physical startup proof cannot become clean shutdown"
+        );
+    }
+
+    #[test]
+    fn unavailable_registration_keeps_session_bound_and_reuses_exact_close_capacity() {
+        let application = test_unavailable_application(clean_unavailable_cause());
+        let controller = application.controller();
+        for id in 100..100 + smudgy_audio::MAX_SESSIONS as u32 {
+            controller
+                .begin_session(SessionId::from(id))
+                .expect("bounded mixer-free registration")
+                .commit();
+        }
+        assert!(matches!(
+            controller.begin_session(SessionId::from(999)),
+            Err(ApplicationAudioOpenError::SessionCapacity)
+        ));
+        assert_eq!(
+            controller.close_session(SessionId::from(100)),
+            SessionAudioCloseDisposition::Requested
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let replacement = loop {
+            match controller.begin_session(SessionId::from(999)) {
+                Ok(pending) => break pending,
+                Err(ApplicationAudioOpenError::SessionCapacity) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "exact close did not return capacity"
+                    );
+                    thread::yield_now();
+                }
+                Err(other) => panic!("unexpected replacement rejection: {other:?}"),
+            }
+        };
+        replacement.commit();
+
+        let report = application.shutdown();
+        assert_eq!(report.sessions.len(), smudgy_audio::MAX_SESSIONS + 1);
+        assert!(report.sessions.iter().all(|result| result.is_clean()));
+        assert!(report.is_clean());
+    }
+
     #[test]
     fn exact_clean_join_is_authoritative_when_shutdown_sender_is_already_absent() {
         let session_id = SessionId::from(6);
@@ -1131,12 +1548,13 @@ mod tests {
             publication_failure: None,
             retirement,
         };
+        let physical = SessionAudioRetirementResult::Physical;
 
         assert!(
             result(
                 RuntimeShutdownRequest::AlreadyClosed,
                 RuntimeThreadJoinOutcome::Clean { session_id },
-                Ok(())
+                physical(Ok(()))
             )
             .is_clean(),
             "an exact clean join proves an already-stopped runtime"
@@ -1145,7 +1563,7 @@ mod tests {
             result(
                 RuntimeShutdownRequest::Requested,
                 RuntimeThreadJoinOutcome::Clean { session_id },
-                Ok(())
+                physical(Ok(()))
             )
             .is_clean()
         );
@@ -1155,7 +1573,7 @@ mod tests {
                 RuntimeThreadJoinOutcome::Clean {
                     session_id: SessionId::from(7),
                 },
-                Ok(()),
+                physical(Ok(())),
             )
             .is_clean(),
             "a clean join for another id is not this session's proof"
@@ -1166,7 +1584,7 @@ mod tests {
             RuntimeThreadJoinOutcome::SpawnFailed { session_id },
         ] {
             assert!(
-                !result(RuntimeShutdownRequest::Requested, runtime, Ok(())).is_clean(),
+                !result(RuntimeShutdownRequest::Requested, runtime, physical(Ok(()))).is_clean(),
                 "a shutdown send cannot promote {runtime:?} into proof"
             );
         }
@@ -1174,7 +1592,7 @@ mod tests {
             !result(
                 RuntimeShutdownRequest::Requested,
                 RuntimeThreadJoinOutcome::Clean { session_id },
-                Err(MixerSessionRetirementError::CleanupFailed),
+                physical(Err(MixerSessionRetirementError::CleanupFailed)),
             )
             .is_clean(),
             "runtime proof cannot hide failed audio retirement"
@@ -1253,7 +1671,7 @@ mod tests {
             result.runtime,
             RuntimeThreadJoinOutcome::Clean { session_id }
         );
-        assert!(result.retirement.is_ok());
+        assert!(result.retirement.is_clean_for(session_id));
         assert!(
             !result.is_clean(),
             "cleanup proof cannot erase startup failure"
@@ -1510,9 +1928,9 @@ mod tests {
                 report
                     .sessions
                     .iter()
-                    .all(|result| result.retirement.is_ok())
+                    .all(|result| result.retirement.is_clean_for(result.session_id))
             );
-            assert!(report.output.clean, "physical output still shut down");
+            assert!(report.output.is_clean(), "physical output still shut down");
             assert!(!report.is_clean(), "the quiesce panic remains visible");
             let events = events.lock().unwrap();
             let io = events.iter().position(|event| event == "io:panic").unwrap();
@@ -1584,7 +2002,11 @@ mod tests {
             let report = shutdown_while_rendering(application, probe);
             assert_eq!(report.sessions.len(), 1);
             assert_eq!(report.sessions[0].runtime, outcome);
-            assert!(report.sessions[0].retirement.is_ok());
+            assert!(
+                report.sessions[0]
+                    .retirement
+                    .is_clean_for(report.sessions[0].session_id)
+            );
             assert!(!report.is_clean(), "spawn failure/panic must stay visible");
             let events = events.lock().unwrap();
             assert_eq!(events[0], "shutdown:40");

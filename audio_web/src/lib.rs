@@ -245,6 +245,58 @@ impl ApplicationAudioRegistrar {
             scope,
         })
     }
+
+    /// Publishes one real Web Audio session scope without a physical mixer.
+    ///
+    /// The exact system-start cause is retained by the default-sink factory.
+    /// `sinkId: "none"` remains a joinable system-silent endpoint; no mixer
+    /// session, bus, slot, or physical format is created by this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable registration error when application admission is
+    /// sealed or the non-wrapping scope identity space is exhausted.
+    pub fn register_unavailable_session(
+        &self,
+        session_id: AudioSessionId,
+        cause: UnavailableAudioOutputCause,
+    ) -> Result<UnavailableSessionAudioRegistration, SessionAudioRegistrationError> {
+        let app_gate = lock_gate(&self.state.gate);
+        if !app_gate.open {
+            return Err(SessionAudioRegistrationError::ApplicationSealed);
+        }
+
+        let session_gate = Arc::new(Mutex::new(LifecycleGate::new()));
+        let permissions: Arc<dyn AudioPermissions> = Arc::new(SessionAudioPermissions {
+            app: Arc::clone(&self.state),
+            session: Arc::clone(&session_gate),
+        });
+        let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedUnavailableAudioOutputFactory {
+            app: Arc::clone(&self.state),
+            session: Arc::clone(&session_gate),
+            delegate: UnavailableSessionAudioOutputFactory::new(cause),
+        });
+        let Ok(generation) =
+            NEXT_SCOPE_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+        else {
+            return Err(SessionAudioRegistrationError::GenerationExhausted);
+        };
+        let scope = SessionAudioScope {
+            inner: Arc::new(SessionAudioScopeInner {
+                session_id,
+                generation,
+                app: Arc::clone(&self.state),
+                session_gate,
+                permissions,
+                output,
+            }),
+        };
+        drop(app_gate);
+
+        Ok(UnavailableSessionAudioRegistration { scope })
+    }
 }
 
 struct SessionAudioScopeInner {
@@ -375,6 +427,78 @@ impl Drop for SessionAudioRegistration {
     }
 }
 
+/// Unique mixer-free lifetime owner for one unavailable session generation.
+pub struct UnavailableSessionAudioRegistration {
+    scope: SessionAudioScope,
+}
+
+impl fmt::Debug for UnavailableSessionAudioRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnavailableSessionAudioRegistration")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact logical close receipt for a session that never owned mixer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnavailableSessionAudioRetirement {
+    session_id: u64,
+    generation: u64,
+}
+
+impl UnavailableSessionAudioRetirement {
+    /// The exact mixer-free session identity whose admission was sealed.
+    #[must_use]
+    pub const fn session_id(self) -> u64 {
+        self.session_id
+    }
+
+    /// Exact non-wrapping registration generation that was sealed.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+impl UnavailableSessionAudioRegistration {
+    /// Cloneable opaque authority for this exact mixer-free generation.
+    #[must_use]
+    pub fn scope(&self) -> SessionAudioScope {
+        self.scope.clone()
+    }
+
+    /// Absorbingly rejects new online output preparation for this session.
+    pub fn seal(&mut self) -> bool {
+        self.seal_session()
+    }
+
+    /// Seals this exact mixer-free generation and returns its logical receipt.
+    #[must_use]
+    pub fn retire(mut self) -> UnavailableSessionAudioRetirement {
+        let _ = self.seal();
+        UnavailableSessionAudioRetirement {
+            session_id: self.scope.session_id(),
+            generation: self.scope.inner.generation,
+        }
+    }
+
+    fn seal_session(&self) -> bool {
+        let _app_gate = lock_gate(&self.scope.inner.app.gate);
+        let mut session_gate = lock_gate(&self.scope.inner.session_gate);
+        let was_open = session_gate.open;
+        session_gate.open = false;
+        was_open
+    }
+}
+
+impl Drop for UnavailableSessionAudioRegistration {
+    fn drop(&mut self) {
+        let _ = self.seal();
+    }
+}
+
 struct SessionAudioPermissions {
     app: Arc<ApplicationAudioState>,
     session: Arc<Mutex<LifecycleGate>>,
@@ -404,6 +528,93 @@ struct GatedSessionAudioOutputFactory {
     app: Arc<ApplicationAudioState>,
     session: Arc<Mutex<LifecycleGate>>,
     delegate: SessionAudioOutputFactory,
+}
+
+struct GatedUnavailableAudioOutputFactory {
+    app: Arc<ApplicationAudioState>,
+    session: Arc<Mutex<LifecycleGate>>,
+    delegate: UnavailableSessionAudioOutputFactory,
+}
+
+impl AudioOutputFactory for GatedUnavailableAudioOutputFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        let app = lock_gate(&self.app.gate);
+        let session = lock_gate(&self.session);
+        if !app.open || !session.open {
+            return Err(output_error(
+                AudioOutputErrorKind::Shutdown,
+                "Smudgy Web Audio playback admission is closed",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .app
+            .prepare_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook.entered.wait();
+            hook.release.wait();
+        }
+        self.delegate.prepare(request)
+    }
+}
+
+/// Hardware-neutral diagnostic retained by a mixer-free default-sink route.
+#[derive(Clone, Debug)]
+pub struct UnavailableAudioOutputCause(Arc<str>);
+
+impl UnavailableAudioOutputCause {
+    #[must_use]
+    pub fn new(detail: impl Into<Arc<str>>) -> Self {
+        Self(detail.into())
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UnavailableSessionAudioOutputFactory {
+    cause: UnavailableAudioOutputCause,
+    silent: SystemAudioOutput,
+}
+
+impl UnavailableSessionAudioOutputFactory {
+    const fn new(cause: UnavailableAudioOutputCause) -> Self {
+        Self {
+            cause,
+            silent: SystemAudioOutput::new(),
+        }
+    }
+}
+
+impl AudioOutputFactory for UnavailableSessionAudioOutputFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        match request.sink_id() {
+            "none" => self.silent.prepare(request),
+            "" => Err(AudioOutputError::new(
+                AudioOutputErrorKind::DeviceUnavailable,
+                format!(
+                    "Smudgy physical audio is unavailable until restart: {}",
+                    self.cause.detail()
+                ),
+            )),
+            _ => Err(output_error(
+                AudioOutputErrorKind::NotSupported,
+                "Smudgy Web Audio supports only the default and none output sinks",
+            )),
+        }
+    }
 }
 
 impl AudioOutputFactory for GatedSessionAudioOutputFactory {

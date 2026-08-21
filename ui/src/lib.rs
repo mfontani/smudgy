@@ -97,6 +97,8 @@ pub(crate) const DOWNLOAD_URL: &str = "https://www.smudgy.org/download";
 
 // Main application state
 struct Smudgy {
+    #[cfg(feature = "web-audio-cpal")]
+    audio_status: AudioBootStatus,
     account: CloudAccount,
     /// Discord Rich Presence ("Playing smudgy — on <server>"), mirrored from
     /// `settings.discord_rich_presence`. Re-derived from the session store on
@@ -187,6 +189,40 @@ struct Smudgy {
     /// while the fsync-bearing write coalesces per layout name off-thread.
     /// Dropping it at exit flushes what is still pending, best-effort.
     layout_saver: workspace::layouts::DebouncedSaver,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Debug)]
+enum AudioBootStatus {
+    Physical,
+    Unavailable(Arc<str>),
+    Disabled(Arc<str>),
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl AudioBootStatus {
+    fn from_availability(availability: &application_audio::ApplicationAudioAvailability) -> Self {
+        match availability {
+            application_audio::ApplicationAudioAvailability::Physical => Self::Physical,
+            application_audio::ApplicationAudioAvailability::Unavailable(cause) => {
+                Self::Unavailable(cause.to_string().into())
+            }
+        }
+    }
+
+    fn banner(&self) -> Option<String> {
+        match self {
+            Self::Physical => None,
+            Self::Unavailable(cause) => Some(i18n::t!(
+                "audio-output-unavailable",
+                "cause" => cause.as_ref()
+            )),
+            Self::Disabled(cause) => Some(i18n::t!(
+                "audio-web-disabled",
+                "cause" => cause.as_ref()
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -411,7 +447,8 @@ where
 }
 
 fn init(
-    #[cfg(feature = "web-audio-cpal")] audio: application_audio::ApplicationAudioController,
+    #[cfg(feature = "web-audio-cpal")] audio: Option<application_audio::ApplicationAudioController>,
+    #[cfg(feature = "web-audio-cpal")] audio_status: AudioBootStatus,
 ) -> (Smudgy, Task<Message>) {
     // Seed the hot prefs snapshot before any window renders, and load the
     // per-area enable/disable preferences (migrating a legacy disabled-only
@@ -465,8 +502,12 @@ fn init(
 
     let (ui_command_bus, ui_commands) = smudgy_core::session::ui_command::channel();
     #[cfg(feature = "web-audio-cpal")]
-    let sessions =
-        SessionStore::with_ui_commands_and_audio(account.handles(), ui_command_bus, audio);
+    let sessions = match audio {
+        Some(audio) => {
+            SessionStore::with_ui_commands_and_audio(account.handles(), ui_command_bus, audio)
+        }
+        None => SessionStore::with_ui_commands(account.handles(), ui_command_bus),
+    };
     #[cfg(not(feature = "web-audio-cpal"))]
     let sessions = SessionStore::with_ui_commands(account.handles(), ui_command_bus);
     let discord = DiscordPresence::new(settings.discord_rich_presence);
@@ -500,6 +541,8 @@ fn init(
 
     (
         Smudgy {
+            #[cfg(feature = "web-audio-cpal")]
+            audio_status,
             account,
             discord,
             sessions,
@@ -587,12 +630,35 @@ pub fn run() -> anyhow::Result<()> {
     i18n::activate(&startup_settings.locale);
 
     #[cfg(feature = "web-audio-cpal")]
-    let application_audio = application_audio::ApplicationAudio::start()?;
+    let (application_audio, audio_controller, audio_status, audio_start_error) =
+        match application_audio::ApplicationAudio::start() {
+            Ok(application) => {
+                let status = AudioBootStatus::from_availability(&application.availability());
+                let controller = application.controller();
+                (Some(application), Some(controller), status, None)
+            }
+            Err(error) => {
+                let status = AudioBootStatus::Disabled(error.to_string().into());
+                (None, None, status, Some(error))
+            }
+        };
     #[cfg(feature = "web-audio-cpal")]
-    let audio_controller = application_audio.controller();
+    match &audio_status {
+        AudioBootStatus::Physical => {}
+        AudioBootStatus::Unavailable(cause) => {
+            log::warn!("physical audio unavailable for this launch; restart to retry: {cause}");
+        }
+        AudioBootStatus::Disabled(cause) => {
+            log::error!("Web Audio disabled for this launch; restart to retry: {cause}");
+        }
+    }
 
     #[cfg(feature = "web-audio-cpal")]
-    let daemon = iced::daemon(move || init(audio_controller.clone()), update, view);
+    let daemon = iced::daemon(
+        move || init(audio_controller.clone(), audio_status.clone()),
+        update,
+        view,
+    );
     #[cfg(not(feature = "web-audio-cpal"))]
     let daemon = iced::daemon(init, update, view);
 
@@ -663,10 +729,32 @@ pub fn run() -> anyhow::Result<()> {
 
     #[cfg(feature = "web-audio-cpal")]
     {
-        // Always consume the proof-bearing audio shutdown path, including
-        // when iced itself failed. Keep the two failure domains visible.
-        let audio_report = application_audio.shutdown();
-        finish_run_with_audio(iced_result, audio_report)?;
+        if let Some(application_audio) = application_audio {
+            // Always consume the proof-bearing audio shutdown path, including
+            // when iced itself failed. Keep the two failure domains visible.
+            let audio_report = application_audio.shutdown();
+            finish_run_with_audio(iced_result, audio_report)?;
+        } else {
+            // Lifecycle-worker construction failed. Fall back to the legacy
+            // audio-free runtime for this launch, but retain any physical
+            // cleanup uncertainty through terminal shutdown instead of
+            // silently discarding it.
+            smudgy_core::session::connection::shutdown_io_runtime();
+            smudgy_core::session::runtime::join_runtime_threads();
+            let audio = audio_start_error.expect("disabled audio retains its startup failure");
+            match (iced_result, audio.cleanup_is_clean()) {
+                (Ok(()), true) => {}
+                (Ok(()), false) => {
+                    anyhow::bail!("Web Audio startup cleanup failed: {audio}")
+                }
+                (Err(iced), true) => return Err(iced.into()),
+                (Err(iced), false) => {
+                    anyhow::bail!(
+                        "iced failed: {iced}; Web Audio startup cleanup also failed: {audio}"
+                    )
+                }
+            }
+        }
     }
 
     Ok(())
@@ -5299,11 +5387,26 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
                 .filter(|hover| hover.window == id)
                 .and_then(|hover| hover.target.as_ref()),
         };
-        let content = center(
-            window
-                .view(&smudgy.sessions, drag)
-                .map(move |message| Message::SmudgyWindowMessage(id, message)),
-        );
+        let window_content = window
+            .view(&smudgy.sessions, drag)
+            .map(move |message| Message::SmudgyWindowMessage(id, message));
+        #[cfg(feature = "web-audio-cpal")]
+        let window_content: Element<'_, Message> =
+            if let Some(status) = smudgy.audio_status.banner() {
+                iced::widget::column![
+                    iced::widget::container(text(status).size(13))
+                        .width(iced::Length::Fill)
+                        .padding([6, 12])
+                        .style(theme::builtins::container::modal_title_bar),
+                    window_content,
+                ]
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .into()
+            } else {
+                window_content
+            };
+        let content = center(window_content);
         return if client_rounded_frame() {
             // The window surface is transparent and this container paints the
             // actual window frame: rounded top corners + hairline border
@@ -5445,8 +5548,8 @@ mod tests {
             first_result.runtime,
             smudgy_core::session::runtime::RuntimeThreadJoinOutcome::Clean { session_id: first }
         );
-        assert!(first_result.retirement.is_ok());
-        assert!(report.output.clean, "physical output still shuts down");
+        assert!(first_result.retirement.is_clean_for(first));
+        assert!(report.output.is_clean(), "physical output still shuts down");
     }
 
     #[cfg(feature = "web-audio-cpal")]

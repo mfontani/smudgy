@@ -132,6 +132,7 @@ fn public_factory_and_dependency_boundary_compile() {
     assert_clone_send_sync::<SessionAudioScope>();
     assert_send_sync::<ApplicationAudioOwner>();
     assert_send_sync::<SessionAudioRegistration>();
+    assert_send_sync::<UnavailableSessionAudioRegistration>();
 }
 
 fn authority_limits(max_online_contexts: usize) -> AudioHostLimits {
@@ -286,6 +287,83 @@ fn sealed_application_rejects_registration_without_consuming_owner() {
 }
 
 #[test]
+fn unavailable_registration_routes_without_mixer_state_and_retires_logically() {
+    let mut application = ApplicationAudioOwner::new(authority_limits(4));
+    let baseline = application.usage();
+    let registrar = application.registrar();
+    let cause = UnavailableAudioOutputCause::new(
+        "physical output Enumerate failed (DeviceUnavailable): no default device",
+    );
+    let mut first = registrar
+        .register_unavailable_session(AudioSessionId(220), cause.clone())
+        .expect("mixer-free session registers");
+    let second = registrar
+        .register_unavailable_session(AudioSessionId(221), cause)
+        .expect("a mixer-free sibling registers independently");
+    let first_scope = first.scope();
+    let second_scope = second.scope();
+
+    let default = scoped_context(&first_scope, "").expect_err("default needs physical output");
+    assert_eq!(
+        default.output_error().map(AudioOutputError::kind),
+        Some(AudioOutputErrorKind::DeviceUnavailable)
+    );
+    assert!(
+        default
+            .output_error()
+            .expect("default rejection retains its cause")
+            .message()
+            .contains("no default device")
+    );
+    assert_eq!(
+        application.usage(),
+        baseline,
+        "failed default is non-mutating"
+    );
+
+    let named = scoped_context(&first_scope, "named-device")
+        .expect_err("named output stays unsupported even without a device");
+    assert_eq!(
+        named.output_error().map(AudioOutputError::kind),
+        Some(AudioOutputErrorKind::NotSupported)
+    );
+    assert_eq!(
+        application.usage(),
+        baseline,
+        "failed named sink is non-mutating"
+    );
+
+    let silent = scoped_context(&first_scope, "none").expect("none stays joinable");
+    silent.close_sync();
+    assert_eq!(application.usage(), baseline);
+
+    assert!(first.seal());
+    assert!(!first.seal());
+    assert!(scoped_context(&first_scope, "none").is_err());
+    let first_retirement = first.retire();
+    assert_eq!(first_retirement.session_id(), 220);
+    assert_ne!(first_retirement.generation(), 0);
+
+    let sibling = scoped_context(&second_scope, "none").expect("sibling remains live");
+    sibling.close_sync();
+    let second_retirement = second.retire();
+    assert_eq!(second_retirement.session_id(), 221);
+    assert_ne!(
+        first_retirement.generation(),
+        second_retirement.generation()
+    );
+    assert!(application.seal());
+    assert!(matches!(
+        registrar.register_unavailable_session(
+            AudioSessionId(222),
+            UnavailableAudioOutputCause::new("still unavailable")
+        ),
+        Err(SessionAudioRegistrationError::ApplicationSealed)
+    ));
+    assert_eq!(application.usage(), baseline);
+}
+
+#[test]
 fn stale_same_id_scope_is_inert_after_replacement_generation() {
     let (service, owner, probe) = service(204);
     let application = ApplicationAudioOwner::new(authority_limits(4));
@@ -410,6 +488,60 @@ fn prepare_and_application_seal_are_totally_ordered_at_delegate_boundary() {
     assert!(scoped_context(&scope, "none").is_err());
     drop(registration);
     assert!(service.shutdown().clean);
+}
+
+#[test]
+fn unavailable_none_prepare_and_session_seal_are_totally_ordered() {
+    let application = ApplicationAudioOwner::new(authority_limits(4));
+    let mut registration = application
+        .registrar()
+        .register_unavailable_session(
+            AudioSessionId(207),
+            UnavailableAudioOutputCause::new("deterministic test device failure"),
+        )
+        .unwrap();
+    let scope = registration.scope();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    *application
+        .state
+        .prepare_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(TestPrepareHook {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    }));
+
+    let prepare_scope = scope.clone();
+    let prepare = thread::spawn(move || scoped_context(&prepare_scope, "none"));
+    entered.wait();
+    let seal = thread::spawn(move || {
+        let first = registration.seal();
+        let second = registration.seal();
+        (registration, first, second)
+    });
+    assert!(
+        !seal.is_finished(),
+        "mixer-free sealing crossed an admitted none transaction"
+    );
+    release.wait();
+    let context = prepare
+        .join()
+        .unwrap()
+        .expect("admitted mixer-free none preparation completes");
+    let (registration, first, second) = seal.join().unwrap();
+    assert!(first);
+    assert!(!second);
+    context.close_sync();
+
+    *application
+        .state
+        .prepare_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    assert!(scoped_context(&scope, "none").is_err());
+    let receipt = registration.retire();
+    assert_eq!(receipt.session_id(), 207);
 }
 
 fn composite_context(
