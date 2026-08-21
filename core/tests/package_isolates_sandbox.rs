@@ -11,16 +11,23 @@
 //! Covers boundary/coexistence, cross-isolate depth-first ordering, and function isolation across
 //! isolates, plus singleton dedupe across isolates and versions.
 
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+#[cfg(feature = "web-audio")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "web-audio")]
+use std::thread;
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use smudgy_core::models::shared_packages::{self, UpdateMode};
-use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::runtime::{RuntimeAction, join_runtime_threads};
+#[cfg(feature = "web-audio")]
+use smudgy_core::session::spawn_with_package_provider_and_audio;
 use smudgy_core::session::{
     BufferUpdate, PackageProviderFactory, SessionEvent, SessionId, SessionParams,
-    spawn_with_package_provider,
+    TaggedSessionEvent, spawn_with_package_provider,
 };
 use smudgy_script::{
     InMemoryPackageProvider, PackageKey, PackageManifest, PackageModuleSource, PackagePermissions,
@@ -29,6 +36,11 @@ use smudgy_script::{
 
 /// Time the collector waits for the next buffer event before declaring the session idle.
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
+
+// V8 snapshot deserialization is not safe when this Windows test binary starts several session
+// runtimes concurrently. Every runtime helper holds this through stream teardown and the runtime
+// thread join, so no isolate destruction can overlap the next snapshot deserialize.
+static PACKAGE_ISOLATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// One `smudgy://owner/name` test package: its version and module sources (entry is `index.js`).
 struct TestPackage {
@@ -74,6 +86,60 @@ async fn run_scenario(
     gate_count: usize,
     input: &str,
 ) -> Vec<String> {
+    run_scenario_inner(
+        session_id,
+        server,
+        local_modules,
+        packages,
+        gate,
+        gate_count,
+        input,
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "web-audio")]
+#[allow(clippy::too_many_arguments)]
+async fn run_scenario_with_audio(
+    session_id: u32,
+    server: &str,
+    local_modules: &[(&str, &str)],
+    packages: Vec<TestPackage>,
+    gate: &str,
+    gate_count: usize,
+    input: &str,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Vec<String> {
+    run_scenario_inner(
+        session_id,
+        server,
+        local_modules,
+        packages,
+        gate,
+        gate_count,
+        input,
+        Some(audio_scope),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn run_scenario_inner(
+    session_id: u32,
+    server: &str,
+    local_modules: &[(&str, &str)],
+    packages: Vec<TestPackage>,
+    gate: &str,
+    gate_count: usize,
+    input: &str,
+    #[cfg(feature = "web-audio")] audio_scope: Option<smudgy_audio_web::SessionAudioScope>,
+    #[cfg(not(feature = "web-audio"))] _audio_scope: Option<()>,
+) -> Vec<String> {
+    let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     // The smudgy home override is a process-global `OnceLock` (first setter in the binary wins),
     // so re-read it after setting and scope everything under a unique server name per test.
     let home = tempfile::tempdir().expect("create temp home");
@@ -151,7 +217,21 @@ async fn run_scenario(
         on_engine_rebuild: None,
     });
 
-    let mut events = Box::pin(spawn_with_package_provider(params, factory));
+    let mut events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = {
+        #[cfg(feature = "web-audio")]
+        if let Some(audio_scope) = audio_scope {
+            Box::pin(
+                spawn_with_package_provider_and_audio(params, factory, audio_scope)
+                    .expect("audio scope matches package session"),
+            )
+        } else {
+            Box::pin(spawn_with_package_provider(params, factory))
+        }
+        #[cfg(not(feature = "web-audio"))]
+        {
+            Box::pin(spawn_with_package_provider(params, factory))
+        }
+    };
     // Collect from the very first event: engine notices (e.g. "[package] X failed to load") are
     // emitted during construction, before `RuntimeReady`, so they'd otherwise be consumed by the
     // wait loop and lost.
@@ -203,6 +283,9 @@ async fn run_scenario(
         }
     }
     tx.send(RuntimeAction::Shutdown).ok();
+    drop(tx);
+    drop(events);
+    join_runtime_threads();
 
     assert!(
         sent,
@@ -262,8 +345,8 @@ async fn coexists_across_main_and_sandboxed_isolate() {
 }
 
 /// Accessibility packages run in sandboxed isolates, so Web Audio is installed there as a
-/// first-class web API rather than being limited to the trusted main isolate. The silent sink
-/// exercises the complete hosted render/lifecycle path without depending on CI audio hardware.
+/// first-class web API rather than being limited to the trusted main isolate. Both contexts use
+/// their scoped default Script route into one fake physical mixer, without CI audio hardware.
 #[cfg(feature = "web-audio")]
 #[tokio::test]
 async fn sandboxed_package_can_render_web_audio() {
@@ -274,7 +357,10 @@ async fn sandboxed_package_can_render_web_audio() {
         r#"
         import { echo } from "smudgy:core";
 
-        const context = new AudioContext({ sampleRate: 48_000, sinkId: "none" });
+        const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+        if (globalThis.__main_audio_context !== undefined) {
+          echo("SANDBOX_AUDIO_CONTEXT_LEAK");
+        }
         const oscillator = context.createOscillator();
         const gain = context.createGain();
         gain.gain.value = 0.05;
@@ -289,21 +375,91 @@ async fn sandboxed_package_can_render_web_audio() {
         "#,
     );
 
-    let lines = run_scenario(
-        9_211,
+    let session_id = 9_211;
+    let (service, probe) = smudgy_audio::test_support::start_test_mixer(
+        48_000,
+        smudgy_audio::test_support::TestDriverConfig::default(),
+    )
+    .expect("headless process mixer starts");
+    let mixer_owner = service
+        .add_session(smudgy_audio::AudioSessionId(u64::from(session_id)))
+        .expect("package session joins process mixer");
+    let application = smudgy_audio_web::ApplicationAudioOwner::new(
+        deno_audio::AudioHostLimits::unlimited()
+            .max_online_contexts(Some(4))
+            .max_live_audio_bytes(Some(32 * 1024 * 1024))
+            .max_graph_nodes(Some(512))
+            .max_graph_connections(Some(512))
+            .max_scheduled_sources(Some(256))
+            .max_automation_events(Some(1_024))
+            .max_queued_control_commands(Some(256))
+            .max_queued_events(Some(256))
+            .max_decode_jobs(Some(2))
+            .max_offline_render_jobs(Some(2)),
+    );
+    let registration = application
+        .registrar()
+        .register_session(mixer_owner)
+        .expect("package session audio registration succeeds");
+    let render_done = Arc::new(AtomicBool::new(false));
+    let render_thread = {
+        let render_done = Arc::clone(&render_done);
+        let probe = probe.clone();
+        thread::spawn(move || {
+            let mut output = [0.0; 256];
+            while !render_done.load(Ordering::Acquire) {
+                let _ = probe.render(&mut output, 2);
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let lines = run_scenario_with_audio(
+        session_id,
         "pi_sandbox_web_audio",
-        &[],
+        &[(
+            "trusted-web-audio.ts",
+            r#"
+            import { echo } from "smudgy:core";
+            const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+            globalThis.__main_audio_context = context;
+            const oscillator = context.createOscillator();
+            oscillator.onended = async () => {
+              await context.close();
+              echo("MAIN_WEB_AUDIO_OK");
+            };
+            oscillator.connect(context.destination);
+            oscillator.start();
+            oscillator.stop(context.currentTime + 0.02);
+            "#,
+        )],
         vec![pkg],
         "SANDBOX_WEB_AUDIO_OK",
         1,
         "noop",
+        registration.scope(),
     )
     .await;
+    render_done.store(true, Ordering::Release);
+    render_thread.join().expect("fake physical renderer joins");
 
     assert!(
         lines.iter().any(|line| line == "SANDBOX_WEB_AUDIO_OK"),
         "sandboxed accessibility package must render and close Web Audio; transcript:\n{lines:#?}"
     );
+    assert!(
+        lines.iter().any(|line| line == "MAIN_WEB_AUDIO_OK"),
+        "trusted and sandboxed isolates must receive distinct contexts from the same scope; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line == "SANDBOX_AUDIO_CONTEXT_LEAK"),
+        "a sandboxed context must not share its graph brand or heap with main; transcript:\n{lines:#?}"
+    );
+    assert_eq!(probe.start_count(), 1);
+    assert_eq!(probe.play_count(), 1);
+    drop(registration);
+    assert!(service.shutdown().clean);
 }
 
 /// Cross-isolate depth-first ordering with a real second isolate: a main-isolate alias
@@ -674,6 +830,10 @@ async fn run_with_factory(
     gate_count: usize,
     input: &str,
 ) -> Vec<String> {
+    let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
     std::mem::forget(home);
@@ -760,6 +920,9 @@ async fn run_with_factory(
         }
     }
     tx.send(RuntimeAction::Shutdown).ok();
+    drop(tx);
+    drop(events);
+    join_runtime_threads();
 
     assert!(
         sent,

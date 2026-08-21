@@ -254,6 +254,22 @@ pub type EngineResetHook = Arc<dyn Fn() + Send + Sync>;
 pub type PackageProviderFactory =
     Arc<dyn Fn() -> std::rc::Rc<dyn smudgy_script::PackageProvider> + Send + Sync>;
 
+#[cfg(feature = "web-audio")]
+pub(crate) type RuntimeAudioScope = smudgy_audio_web::SessionAudioScope;
+#[cfg(not(feature = "web-audio"))]
+pub(crate) type RuntimeAudioScope = ();
+
+/// An explicit audio scope did not belong to the session being spawned.
+#[cfg(feature = "web-audio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("session {session_id} cannot use audio scope for session {audio_session_id}")]
+pub struct SessionAudioScopeMismatch {
+    /// Core session requested by the caller.
+    pub session_id: SessionId,
+    /// Numeric mixer session carried by the opaque audio scope.
+    pub audio_session_id: u64,
+}
+
 pub struct SessionParams {
     pub session_id: SessionId,
     pub server_name: Arc<String>,
@@ -350,7 +366,22 @@ pub enum BufferUpdate {
 }
 
 pub fn spawn(params: Arc<SessionParams>) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, None, None)
+    spawn_inner(&params, None, None, None)
+}
+
+/// Spawn a session with one exact application-owned Web Audio scope.
+///
+/// # Errors
+///
+/// Rejects a session-id mismatch before constructing or publishing a runtime
+/// thread. The scope is reused unchanged by replacement engine generations.
+#[cfg(feature = "web-audio")]
+pub fn spawn_with_audio(
+    params: Arc<SessionParams>,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent>, SessionAudioScopeMismatch> {
+    validate_audio_scope(&params, &audio_scope)?;
+    Ok(spawn_inner(&params, None, None, Some(audio_scope)))
 }
 
 /// Like [`spawn`], but resolves `smudgy://` packages through `package_provider` instead of
@@ -361,7 +392,27 @@ pub fn spawn_with_package_provider(
     params: Arc<SessionParams>,
     package_provider: PackageProviderFactory,
 ) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, Some(package_provider), None)
+    spawn_inner(&params, Some(package_provider), None, None)
+}
+
+/// Like [`spawn_with_package_provider`], with one exact Web Audio scope.
+///
+/// # Errors
+///
+/// Rejects a session-id mismatch before runtime-thread publication.
+#[cfg(feature = "web-audio")]
+pub fn spawn_with_package_provider_and_audio(
+    params: Arc<SessionParams>,
+    package_provider: PackageProviderFactory,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent>, SessionAudioScopeMismatch> {
+    validate_audio_scope(&params, &audio_scope)?;
+    Ok(spawn_inner(
+        &params,
+        Some(package_provider),
+        None,
+        Some(audio_scope),
+    ))
 }
 
 /// Spawn a session attached to the UI daemon's ordered command bus.
@@ -372,14 +423,51 @@ pub fn spawn_with_ui_commands(
     params: Arc<SessionParams>,
     ui_commands: ui_command::UiCommandBus,
 ) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, None, Some(ui_commands))
+    spawn_inner(&params, None, Some(ui_commands), None)
+}
+
+/// Like [`spawn_with_ui_commands`], with one exact Web Audio scope.
+///
+/// # Errors
+///
+/// Rejects a session-id mismatch before runtime-thread publication.
+#[cfg(feature = "web-audio")]
+pub fn spawn_with_ui_commands_and_audio(
+    params: Arc<SessionParams>,
+    ui_commands: ui_command::UiCommandBus,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent>, SessionAudioScopeMismatch> {
+    validate_audio_scope(&params, &audio_scope)?;
+    Ok(spawn_inner(
+        &params,
+        None,
+        Some(ui_commands),
+        Some(audio_scope),
+    ))
+}
+
+#[cfg(feature = "web-audio")]
+fn validate_audio_scope(
+    params: &SessionParams,
+    audio_scope: &smudgy_audio_web::SessionAudioScope,
+) -> Result<(), SessionAudioScopeMismatch> {
+    let session_id = u32::from(params.session_id);
+    if u64::from(session_id) == audio_scope.session_id() {
+        Ok(())
+    } else {
+        Err(SessionAudioScopeMismatch {
+            session_id: params.session_id,
+            audio_session_id: audio_scope.session_id(),
+        })
+    }
 }
 
 fn spawn_inner(
-    params: Arc<SessionParams>,
+    params: &SessionParams,
     package_provider_override: Option<PackageProviderFactory>,
     ui_commands: Option<ui_command::UiCommandBus>,
-) -> impl Stream<Item = TaggedSessionEvent> {
+    audio_scope: Option<RuntimeAudioScope>,
+) -> impl Stream<Item = TaggedSessionEvent> + use<> {
     let (mut ui_tx, ui_rx) = futures::channel::mpsc::channel::<TaggedSessionEvent>(1024);
 
     if let Err(e) = ui_tx.try_send(TaggedSessionEvent {
@@ -401,6 +489,7 @@ fn spawn_inner(
         package_provider_override,
         params.extra_script_extensions.clone(),
         params.on_engine_rebuild.clone(),
+        audio_scope,
         ui_tx,
         ui_commands,
     );

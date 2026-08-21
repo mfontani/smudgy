@@ -1,9 +1,10 @@
-//! Hosted Web Audio output adapter for Smudgy's shared script mixer bus.
+//! Hosted Web Audio authorities and output adapter for Smudgy's shared mixer.
 
+use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, MutexGuard, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 #[cfg(test)]
 use std::sync::{Barrier, mpsc};
@@ -11,20 +12,418 @@ use std::sync::{Barrier, mpsc};
 use std::thread::{self, ThreadId};
 
 use deno_audio::{
-    AudioOutputConfig, AudioOutputDeathReason, AudioOutputEndpointShutdown, AudioOutputError,
-    AudioOutputErrorKind, AudioOutputEventSink, AudioOutputFactory, AudioOutputRequest,
-    AudioOutputStartFailure, AudioRenderCallback, AudioRenderFormat, AudioRenderStatus,
+    AudioExtensionOptions, AudioHost, AudioHostLimits, AudioHostUsage, AudioOutputConfig,
+    AudioOutputDeathReason, AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind,
+    AudioOutputEventSink, AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure,
+    AudioPermissions, AudioRenderCallback, AudioRenderFormat, AudioRenderStatus,
     PreparedAudioOutput, RunningAudioOutput, SystemAudioOutput,
 };
+use deno_error::JsErrorBox;
 use smudgy_audio::{
-    MixerControlError, MixerFailureObserver, MixerFrame, MixerInput, MixerInputReservation,
-    MixerInputShutdown, MixerInputStartFailure, MixerInputStatus, MixerOutputFailure,
-    MixerRetirementError, MixerScriptBusHandle, RunningMixerInput,
+    AudioSessionId, MixerControlError, MixerFailureObserver, MixerFrame, MixerInput,
+    MixerInputReservation, MixerInputShutdown, MixerInputStartFailure, MixerInputStatus,
+    MixerNativeBusHandle, MixerOutputFailure, MixerRetirementError, MixerScriptBusHandle,
+    MixerSessionOwner, MixerSessionRetirement, MixerSpeechBusHandle, RunningMixerInput,
 };
 
 const CHANNELS: usize = 2;
 const FRAMES: usize = 128;
 const INTERLEAVED_SAMPLES: usize = CHANNELS * FRAMES;
+
+static NEXT_SCOPE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct LifecycleGate {
+    open: bool,
+}
+
+impl LifecycleGate {
+    const fn new() -> Self {
+        Self { open: true }
+    }
+}
+
+fn lock_gate(gate: &Mutex<LifecycleGate>) -> MutexGuard<'_, LifecycleGate> {
+    gate.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct ApplicationAudioState {
+    host: Arc<AudioHost>,
+    gate: Mutex<LifecycleGate>,
+    #[cfg(test)]
+    prepare_hook: Mutex<Option<Arc<TestPrepareHook>>>,
+}
+
+impl fmt::Debug for ApplicationAudioState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationAudioState")
+            .field("host", &self.host)
+            .field("open", &lock_gate(&self.gate).open)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Unique owner of application-wide Web Audio admission.
+///
+/// The owner is deliberately not cloneable. Its cloneable registrar can mint
+/// session authorities while this owner remains open; sealing or dropping the
+/// owner rejects later registration and audible online-context preparation.
+pub struct ApplicationAudioOwner {
+    state: Arc<ApplicationAudioState>,
+}
+
+impl fmt::Debug for ApplicationAudioOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationAudioOwner")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApplicationAudioOwner {
+    /// Creates one bounded application accounting and lifecycle domain.
+    #[must_use]
+    pub fn new(limits: AudioHostLimits) -> Self {
+        Self {
+            state: Arc::new(ApplicationAudioState {
+                host: Arc::new(AudioHost::new(limits)),
+                gate: Mutex::new(LifecycleGate::new()),
+                #[cfg(test)]
+                prepare_hook: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Returns a cloneable session registrar sharing this exact host and gate.
+    #[must_use]
+    pub fn registrar(&self) -> ApplicationAudioRegistrar {
+        ApplicationAudioRegistrar {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Returns a point-in-time, non-authoritative aggregate usage snapshot.
+    #[must_use]
+    pub fn usage(&self) -> AudioHostUsage {
+        self.state.host.usage()
+    }
+
+    /// Absorbingly rejects new sessions and online output preparation.
+    ///
+    /// Returns `true` only for the transition from open to sealed.
+    pub fn seal(&mut self) -> bool {
+        let mut gate = lock_gate(&self.state.gate);
+        let was_open = gate.open;
+        gate.open = false;
+        was_open
+    }
+}
+
+impl Drop for ApplicationAudioOwner {
+    fn drop(&mut self) {
+        self.seal();
+    }
+}
+
+/// Cloneable authority that registers exact mixer sessions with one app host.
+#[derive(Clone)]
+pub struct ApplicationAudioRegistrar {
+    state: Arc<ApplicationAudioState>,
+}
+
+impl fmt::Debug for ApplicationAudioRegistrar {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationAudioRegistrar")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stable classification for a rejected session registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SessionAudioRegistrationError {
+    /// The unique application owner has sealed registration.
+    ApplicationSealed,
+    /// The process-wide non-wrapping scope identity space is exhausted.
+    GenerationExhausted,
+}
+
+/// Registration failure that returns the unconsumed mixer-session owner.
+pub struct SessionAudioRegistrationFailure {
+    error: SessionAudioRegistrationError,
+    owner: MixerSessionOwner,
+}
+
+impl fmt::Debug for SessionAudioRegistrationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAudioRegistrationFailure")
+            .field("error", &self.error)
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+impl SessionAudioRegistrationFailure {
+    /// Stable reason registration was rejected.
+    #[must_use]
+    pub const fn error(&self) -> SessionAudioRegistrationError {
+        self.error
+    }
+
+    /// Returns the exact unconsumed mixer-session owner.
+    #[must_use]
+    pub fn into_owner(self) -> MixerSessionOwner {
+        self.owner
+    }
+}
+
+impl ApplicationAudioRegistrar {
+    /// Consumes one exact mixer session and publishes its scoped authorities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the owner unchanged when application admission is sealed.
+    pub fn register_session(
+        &self,
+        owner: MixerSessionOwner,
+    ) -> Result<SessionAudioRegistration, SessionAudioRegistrationFailure> {
+        let app_gate = lock_gate(&self.state.gate);
+        if !app_gate.open {
+            return Err(SessionAudioRegistrationFailure {
+                error: SessionAudioRegistrationError::ApplicationSealed,
+                owner,
+            });
+        }
+
+        let session_id = owner.session_id();
+        let script = owner.script_bus();
+        let native = owner.native_bus();
+        let speech = owner.speech_bus();
+        let session_gate = Arc::new(Mutex::new(LifecycleGate::new()));
+        let permissions: Arc<dyn AudioPermissions> = Arc::new(SessionAudioPermissions {
+            app: Arc::clone(&self.state),
+            session: Arc::clone(&session_gate),
+        });
+        let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
+            app: Arc::clone(&self.state),
+            session: Arc::clone(&session_gate),
+            delegate: SessionAudioOutputFactory::new(script),
+        });
+        let Ok(generation) =
+            NEXT_SCOPE_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+        else {
+            return Err(SessionAudioRegistrationFailure {
+                error: SessionAudioRegistrationError::GenerationExhausted,
+                owner,
+            });
+        };
+        let scope = SessionAudioScope {
+            inner: Arc::new(SessionAudioScopeInner {
+                session_id,
+                generation,
+                app: Arc::clone(&self.state),
+                session_gate,
+                permissions,
+                output,
+            }),
+        };
+        drop(app_gate);
+
+        Ok(SessionAudioRegistration {
+            owner: Some(owner),
+            native,
+            speech,
+            scope,
+        })
+    }
+}
+
+struct SessionAudioScopeInner {
+    session_id: AudioSessionId,
+    generation: u64,
+    app: Arc<ApplicationAudioState>,
+    session_gate: Arc<Mutex<LifecycleGate>>,
+    permissions: Arc<dyn AudioPermissions>,
+    output: Arc<dyn AudioOutputFactory>,
+}
+
+/// Opaque cloneable session audio authority passed to script runtimes.
+///
+/// Clones share one application host, one exact session generation and its
+/// playback gate. They cannot retire the mixer session or access Native/Speech
+/// buses. `OfflineAudioContext` is still governed by shared and per-isolate
+/// quotas but is device-free and does not consult lifecycle permissions in the
+/// pinned `deno_audio` revision.
+#[derive(Clone)]
+pub struct SessionAudioScope {
+    inner: Arc<SessionAudioScopeInner>,
+}
+
+impl fmt::Debug for SessionAudioScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAudioScope")
+            .field("session_id", &self.inner.session_id)
+            .field("generation", &self.inner.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionAudioScope {
+    /// Stable numeric session id used by core before thread publication.
+    #[must_use]
+    pub fn session_id(&self) -> u64 {
+        self.inner.session_id.0
+    }
+
+    /// Builds fresh isolate options over this scope's unchanged authorities.
+    #[must_use]
+    pub fn extension_options(&self) -> AudioExtensionOptions {
+        AudioExtensionOptions::new(Arc::clone(&self.inner.app.host))
+            .permissions(Arc::clone(&self.inner.permissions))
+            .output_factory(Arc::clone(&self.inner.output))
+    }
+}
+
+/// Unique lifetime owner for one registered mixer-session generation.
+pub struct SessionAudioRegistration {
+    owner: Option<MixerSessionOwner>,
+    native: MixerNativeBusHandle,
+    speech: MixerSpeechBusHandle,
+    scope: SessionAudioScope,
+}
+
+impl fmt::Debug for SessionAudioRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAudioRegistration")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionAudioRegistration {
+    /// Cloneable opaque authority for this exact session generation.
+    #[must_use]
+    pub fn scope(&self) -> SessionAudioScope {
+        self.scope.clone()
+    }
+
+    /// Exact Native-bus authority retained for the UI/application owner.
+    #[must_use]
+    pub fn native_bus(&self) -> MixerNativeBusHandle {
+        self.native.clone()
+    }
+
+    /// Exact Speech-bus authority retained for the UI/application owner.
+    #[must_use]
+    pub fn speech_bus(&self) -> MixerSpeechBusHandle {
+        self.speech.clone()
+    }
+
+    /// Seals online preparation before beginning exact mixer retirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the registration's private unique-owner invariant was
+    /// corrupted inside this crate.
+    #[must_use = "session retirement is complete only after awaiting this receipt"]
+    pub fn retire(mut self) -> MixerSessionRetirement {
+        self.seal_session();
+        self.owner
+            .take()
+            .expect("session audio registration retires exactly once")
+            .retire()
+    }
+
+    fn seal_session(&self) {
+        lock_gate(&self.scope.inner.session_gate).open = false;
+    }
+}
+
+impl Drop for SessionAudioRegistration {
+    fn drop(&mut self) {
+        self.seal_session();
+        // MixerSessionOwner::drop begins cancellation-independent retirement.
+        self.owner.take();
+    }
+}
+
+struct SessionAudioPermissions {
+    app: Arc<ApplicationAudioState>,
+    session: Arc<Mutex<LifecycleGate>>,
+}
+
+impl AudioPermissions for SessionAudioPermissions {
+    fn check_playback(&self, api_name: &'static str) -> Result<(), JsErrorBox> {
+        let app = lock_gate(&self.app.gate);
+        let session = lock_gate(&self.session);
+        if app.open && session.open {
+            Ok(())
+        } else {
+            Err(JsErrorBox::generic(format!(
+                "InvalidStateError: {api_name} playback admission is closed"
+            )))
+        }
+    }
+
+    fn check_capture(&self, api_name: &'static str) -> Result<(), JsErrorBox> {
+        Err(JsErrorBox::generic(format!(
+            "NotAllowedError: {api_name} audio capture is not permitted"
+        )))
+    }
+}
+
+struct GatedSessionAudioOutputFactory {
+    app: Arc<ApplicationAudioState>,
+    session: Arc<Mutex<LifecycleGate>>,
+    delegate: SessionAudioOutputFactory,
+}
+
+impl AudioOutputFactory for GatedSessionAudioOutputFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        let app = lock_gate(&self.app.gate);
+        let session = lock_gate(&self.session);
+        if !app.open || !session.open {
+            return Err(output_error(
+                AudioOutputErrorKind::Shutdown,
+                "Smudgy Web Audio playback admission is closed",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .app
+            .prepare_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook.entered.wait();
+            hook.release.wait();
+        }
+        // Keep both guards across the last check and delegate preparation so
+        // application/session sealing cannot pass the permission check and
+        // race mixer mutation.
+        self.delegate.prepare(request)
+    }
+}
+
+#[cfg(test)]
+struct TestPrepareHook {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
 
 /// Routes one session's Web Audio contexts to its shared Script bus or to a
 /// private silent endpoint.

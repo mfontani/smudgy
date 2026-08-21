@@ -343,6 +343,17 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 /// waits for indefinitely when the runtime's last owner is simply dropped.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Consume the session's last Tokio-runtime owner after all runtime-bound state has dropped.
+fn shutdown_tokio_runtime(runtime: Rc<tokio::runtime::Runtime>) {
+    let runtime = Rc::try_unwrap(runtime).unwrap_or_else(|runtime| {
+        panic!(
+            "session Tokio runtime still has {} owners after Inner teardown",
+            Rc::strong_count(&runtime)
+        )
+    });
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+}
+
 /// Capacity of the per-session automation broadcast. Each message is one coalesced
 /// per-drain batch (not per-automation), so a small buffer is ample; a lagging window
 /// skips intermediate batches and gets a fresh reset when it re-subscribes.
@@ -374,6 +385,9 @@ impl Runtime {
         // Embedder reset for engine-generation-coupled state (see `EngineResetHook`), invoked
         // on the session thread before every `ScriptEngine::new` below.
         on_engine_rebuild: Option<crate::session::EngineResetHook>,
+        // Opaque application/session Web Audio authority. `None` preserves the
+        // legacy no-audio runtime even when the feature is compiled.
+        audio_scope: Option<crate::session::RuntimeAudioScope>,
         ui_tx: Sender<TaggedSessionEvent>,
         ui_commands: Option<UiCommandBus>,
     ) -> Self {
@@ -562,6 +576,7 @@ impl Runtime {
                 extra_script_extensions: extra_script_extensions.clone(),
                 tokio_runtime: runtime.clone(),
                 automation_registry: automation_registry.clone(),
+                audio_scope: audio_scope.clone(),
             });
 
             // Seed runtime-relevant settings from disk; the UI live-updates
@@ -735,9 +750,60 @@ impl Runtime {
                     }
                 }
 
+                // Seal this exact engine generation before disposing its isolates. Every
+                // audio-enabled main/package extension shares the paired registrar, so the
+                // receipt below covers all online contexts admitted by this generation.
+                #[cfg(feature = "web-audio")]
+                let audio_retirement = inner.script_engine.retire_audio_generation();
+
                 runtime.block_on(async move {
                     drop(inner);
                 });
+
+                // Native audio shutdown is acknowledged out-of-band after isolate disposal.
+                // Await that exact generation before constructing its replacement: otherwise
+                // a bounded application host can reject the replacement's first AudioContext
+                // while a predecessor observer still owns the permit.
+                #[cfg(feature = "web-audio")]
+                if let Some(retirement) = audio_retirement
+                    && let Err(error) = runtime.block_on(retirement)
+                {
+                    error!("Web Audio generation retirement failed during reload: {error}");
+
+                    let message = format!(
+                        "[audio] Script reload stopped because the previous Web Audio generation could not shut down safely: {error}"
+                    );
+                    let mut failure_ui_tx = local_ui_tx.clone();
+                    let failure_event = TaggedSessionEvent {
+                        session_id,
+                        event: SessionEvent::UpdateBuffer(Arc::new(vec![
+                            BufferUpdate::Append(Arc::new(StyledLine::from_warn_str(&message))),
+                            BufferUpdate::EnsureNewLine,
+                        ])),
+                    };
+                    if let Err(send_error) = runtime.block_on(failure_ui_tx.send(failure_event)) {
+                        warn!("Failed to report Web Audio retirement failure: {send_error:?}");
+                    }
+
+                    // These values were extracted only to survive a successful rebuild. On a
+                    // failed retirement, dispose them before the Tokio runtime they may use.
+                    drop((
+                        old_open_line,
+                        old_connection,
+                        old_pending_send_on_connect,
+                        old_send_on_connect_armed,
+                        old_window_size,
+                        old_raw_wanted,
+                        old_gmcp,
+                        old_msdp,
+                        old_mssp_producer,
+                        old_session_runtime_rx,
+                    ));
+                    registry::unregister_session(session_id);
+                    shutdown_tokio_runtime(runtime);
+                    info!("Runtime thread shutting down after failed Web Audio retirement");
+                    return;
+                }
 
                 // Discard anything scripts left behind in the spawned-action
                 // queue; the engine they came from is gone.
@@ -846,6 +912,7 @@ impl Runtime {
                     extra_script_extensions: extra_script_extensions.clone(),
                     tokio_runtime: runtime.clone(),
                     automation_registry: automation_registry.clone(),
+                    audio_scope: audio_scope.clone(),
                 });
 
                 // The engine constructor blocked until every isolate's
@@ -963,13 +1030,7 @@ impl Runtime {
             // `join_runtime_threads()` hang after the main window is already gone.
             // A bounded shutdown cancels async work immediately and caps the wait for
             // blocking Deno resources/ops.
-            let runtime = Rc::try_unwrap(runtime).unwrap_or_else(|runtime| {
-                panic!(
-                    "session Tokio runtime still has {} owners after Inner teardown",
-                    Rc::strong_count(&runtime)
-                )
-            });
-            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+            shutdown_tokio_runtime(runtime);
 
             info!("Runtime thread shutting down");
         });

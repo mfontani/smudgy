@@ -61,14 +61,16 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [dev-dependencies]
 tempfile = "3"
+deno_audio = { workspace = true }
 
 [features]
-# Build the published deno_audio extension into Smudgy's startup snapshot.
-# Runtime state is still supplied separately for every isolate by smudgy_core.
+# Build an additional startup snapshot containing the published deno_audio
+# schema. The base snapshot remains embedded for explicit no-audio runtimes;
+# runtime state is supplied separately for every audio isolate by smudgy_core.
 web-audio = ["dep:deno_audio"]
 
 # build.rs creates the V8 startup snapshot (deno_runtime base extension set) at
-# compile time and emits the residual lazy-source table; see build.rs. Resolved
+# compile time and emits the residual lazy-source tables; see build.rs. Resolved
 # for the HOST (resolver 2 keeps its features separate from the target graph).
 [build-dependencies]
 deno_runtime = { version = "0.265", features = ["snapshot"] }

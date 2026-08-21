@@ -92,28 +92,6 @@ fn inspector_config() -> Option<InspectorConfig> {
     }
 }
 
-/// Bounded aggregate audio accounting for one session-engine generation.
-///
-/// Each isolate retains `deno_audio`'s stricter per-isolate defaults. These shared limits let
-/// roughly four busy isolates coexist while preventing an unbounded number of sandboxed packages
-/// from multiplying those defaults. S3 moves this same policy to application ownership so the
-/// final accounting domain spans sessions as well.
-#[cfg(feature = "web-audio")]
-fn session_audio_host() -> Arc<deno_audio::AudioHost> {
-    let limits = deno_audio::AudioHostLimits::unlimited()
-        .max_online_contexts(Some(24))
-        .max_live_audio_bytes(Some(256 * 1024 * 1024))
-        .max_graph_nodes(Some(4_096))
-        .max_graph_connections(Some(1_024))
-        .max_scheduled_sources(Some(2_048))
-        .max_automation_events(Some(16_384))
-        .max_queued_control_commands(Some(1_024))
-        .max_queued_events(Some(1_024))
-        .max_decode_jobs(Some(8))
-        .max_offline_render_jobs(Some(4));
-    Arc::new(deno_audio::AudioHost::new(limits))
-}
-
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq, Hash, Into)]
 pub struct ScriptId(usize);
 
@@ -200,6 +178,15 @@ pub struct ScriptEngineParams<'a> {
     /// `OpState` so the `get`/`list`/`exists` ops read the live automation set without crossing
     /// into the (non-`OpState`) `Manager`.
     pub automation_registry: SharedAutomationRegistry,
+    /// Opaque application/session authority cloned unchanged across reloads.
+    #[cfg_attr(
+        not(feature = "web-audio"),
+        allow(
+            dead_code,
+            reason = "the feature-disabled placeholder preserves constructor shape"
+        )
+    )]
+    pub audio_scope: Option<crate::session::RuntimeAudioScope>,
 }
 
 /// Shared "which isolates have a pending wakeup" set for the per-isolate waker demux
@@ -342,6 +329,11 @@ pub struct ScriptEngine<'a> {
     ui_tx: Sender<TaggedSessionEvent>,
     #[allow(dead_code)]
     mapper: Option<Mapper>,
+    /// Unique lifecycle authority for every Web Audio extension in this exact engine
+    /// generation. The runtime consumes it before reload teardown so the replacement cannot
+    /// contend with a still-draining predecessor for application host permits.
+    #[cfg(feature = "web-audio")]
+    audio_lifecycle_owner: Option<deno_audio::AudioLifecycleOwner>,
     /// Per-isolate waker demux (`EVENT-LOOP-READINESS-DEMUX.md`): ids of isolates whose
     /// `DemuxWaker` has fired (a completed op/timer) or that were seeded (on insert, or after
     /// synchronous dispatch) since the last pump. `poll_event_loop` drains this and polls ONLY
@@ -1011,11 +1003,17 @@ impl<'a> ScriptEngine<'a> {
         let pane_input_callbacks = params.pane_input_callbacks.clone();
         let mapper = params.mapper.clone();
         let extra_extensions = params.extra_script_extensions.clone();
-        // One accounting domain per session engine generation. Every isolate receives the
-        // Web Audio API: accessibility packages are a primary consumer. Per-isolate limits
-        // remain independent, while this shared host enforces aggregate session ceilings.
+        // Explicit application/session authority. Absence is intentional:
+        // legacy constructors install no Web Audio extension or fallback.
         #[cfg(feature = "web-audio")]
-        let audio_host = session_audio_host();
+        let audio_scope = params.audio_scope.clone();
+        #[cfg(feature = "web-audio")]
+        let (audio_lifecycle_owner, audio_lifecycle_registrar) = if audio_scope.is_some() {
+            let (owner, registrar) = deno_audio::AudioLifecycleOwner::new();
+            (Some(owner), Some(registrar))
+        } else {
+            (None, None)
+        };
         let current_line_for_ext = current_line.clone();
         // The same introspection mirror the `Manager` writes; bound into every isolate's ops.
         let automation_registry = params.automation_registry.clone();
@@ -1116,10 +1114,15 @@ impl<'a> ScriptEngine<'a> {
                 // Register native state and embedded JS sources now; smudgy_script evaluates
                 // the entry point only after deno_runtime bootstrap installs URL/Event globals.
                 #[cfg(feature = "web-audio")]
-                {
-                    let mut extension = deno_audio::deno_audio::init(
-                        deno_audio::AudioExtensionOptions::new(Arc::clone(&audio_host)),
-                    );
+                if let Some(audio_scope) = audio_scope.as_ref() {
+                    let lifecycle_registrar = audio_lifecycle_registrar
+                        .as_ref()
+                        .expect("an audio-enabled engine generation must own its registrar")
+                        .clone();
+                    let options = audio_scope
+                        .extension_options()
+                        .lifecycle_registrar(lifecycle_registrar);
+                    let mut extension = deno_audio::deno_audio::init(options);
                     smudgy_script::prepare_deferred_web_audio_extension(&mut extension);
                     extensions.push(extension);
                 }
@@ -2027,9 +2030,22 @@ impl<'a> ScriptEngine<'a> {
             pending_line_operations: params.pending_line_operations,
             current_line,
             mapper: params.mapper,
+            #[cfg(feature = "web-audio")]
+            audio_lifecycle_owner,
             ready,
             parent,
         }
+    }
+
+    /// Seal this exact engine generation against new online contexts and return its drain
+    /// receipt. The caller must drop every isolate before awaiting the receipt.
+    #[cfg(feature = "web-audio")]
+    pub(super) fn retire_audio_generation(
+        &mut self,
+    ) -> Option<deno_audio::AudioLifecycleRetirement> {
+        self.audio_lifecycle_owner
+            .take()
+            .map(deno_audio::AudioLifecycleOwner::retire)
     }
 
     /// Deliver a host-native (`sys:`/`map:`) event to its subscribers: one `CallJavascriptFunction`

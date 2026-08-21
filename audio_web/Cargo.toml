@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 deno_audio = { workspace = true }
+deno_error = { workspace = true }
 smudgy_audio = { workspace = true }
 
 [dev-dependencies]

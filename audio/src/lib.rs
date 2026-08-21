@@ -3198,6 +3198,25 @@ impl fmt::Debug for MixerSessionOwner {
 }
 
 impl MixerSessionOwner {
+    /// Stable logical session id carried by this exact owner.
+    ///
+    /// The generation remains encapsulated by the owner and its scoped bus
+    /// handles. Callers may use this id to reject accidental cross-session
+    /// assembly before moving the unique owner into a higher-level authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the owner's private unique-lifetime invariant was
+    /// corrupted inside this crate.
+    #[must_use]
+    pub fn session_id(&self) -> AudioSessionId {
+        self.session
+            .as_ref()
+            .expect("retired session owner was used again")
+            .key
+            .id
+    }
+
     fn bus(&self, bus: SessionBus) -> MixerBusHandle {
         MixerBusHandle {
             control: self.control.clone(),

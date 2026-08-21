@@ -2313,7 +2313,7 @@ dependencies = [
 [[package]]
 name = "deno_audio"
 version = "0.1.0-alpha.1"
-source = "git+https://github.com/smudgy-mud/deno_audio.git?rev=a5890dd08904724ef6c65d43d8fcc4068fbbb5a3#a5890dd08904724ef6c65d43d8fcc4068fbbb5a3"
+source = "git+https://github.com/smudgy-mud/deno_audio.git?rev=2998104e06b1e6021855902a65427df85ba5d8f3#2998104e06b1e6021855902a65427df85ba5d8f3"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -10988,6 +10988,7 @@ version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "deno_audio",
+ "deno_error",
  "futures",
  "smudgy_audio",
  "web-audio-api",
@@ -11084,6 +11085,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "simplelog",
+ "smudgy_audio",
+ "smudgy_audio_web",
  "smudgy_cloud",
  "smudgy_script",
  "tempfile",

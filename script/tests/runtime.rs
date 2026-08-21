@@ -121,6 +121,104 @@ fn custom_extension_layers_on_startup_snapshot() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "web-audio")]
+fn deferred_audio_extension() -> deno_core::Extension {
+    let mut extension = deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
+    smudgy_script::prepare_deferred_web_audio_extension(&mut extension);
+    extension
+}
+
+#[cfg(feature = "web-audio")]
+fn runtime_with_extensions(
+    data_dir: &Path,
+    extensions: Vec<deno_core::Extension>,
+) -> Result<(Rc<tokio::runtime::Runtime>, ScriptRuntime)> {
+    let tokio = tokio_runtime();
+    let runtime = ScriptRuntime::new(ScriptRuntimeOptions {
+        extensions,
+        data_dir: data_dir.to_path_buf(),
+        webstorage_dir: None,
+        module_policy: ModulePolicy {
+            allow_https: true,
+            import_policy: ImportPolicy::Any,
+        },
+        inspector: None,
+        tokio: tokio.clone(),
+        package_provider: None,
+        permissions: None,
+        broadcast_channel: None,
+    })?;
+    Ok((tokio, runtime))
+}
+
+#[cfg(feature = "web-audio")]
+#[test]
+fn compiled_web_audio_feature_keeps_base_runtime_audio_free() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut runtime) = runtime_with_extensions(temp.path(), Vec::new())?;
+    assert!(eval_bool_in_tokio(
+        &tokio,
+        &mut runtime,
+        "typeof globalThis.AudioContext === 'undefined'",
+    )?);
+    Ok(())
+}
+
+#[cfg(feature = "web-audio")]
+#[test]
+fn exact_audio_extension_selects_audio_snapshot_and_installs_globals() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut runtime) =
+        runtime_with_extensions(temp.path(), vec![deferred_audio_extension()])?;
+    assert!(eval_bool_in_tokio(
+        &tokio,
+        &mut runtime,
+        "typeof globalThis.AudioContext === 'function' && typeof globalThis.OfflineAudioContext === 'function'",
+    )?);
+    Ok(())
+}
+
+#[cfg(feature = "web-audio")]
+#[test]
+fn wrong_audio_extension_order_is_rejected_by_preflight() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let error = runtime_with_extensions(
+        temp.path(),
+        vec![
+            smudgy_snapshot_layering_test::init(),
+            deferred_audio_extension(),
+        ],
+    );
+    let error = match error {
+        Ok(_) => panic!("mispositioned deno_audio extension bypassed preflight"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "invalid deno_audio extension layout: expected zero instances or exactly one at custom-extension index 0; found positions [1]"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "web-audio")]
+#[test]
+fn duplicate_audio_extension_is_rejected_by_preflight() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let error = runtime_with_extensions(
+        temp.path(),
+        vec![deferred_audio_extension(), deferred_audio_extension()],
+    );
+    let error = match error {
+        Ok(_) => panic!("duplicate deno_audio extensions bypassed preflight"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "invalid deno_audio extension layout: expected zero instances or exactly one at custom-extension index 0; found positions [0, 1]"
+    );
+    Ok(())
+}
+
 #[test]
 fn broadcast_channel_backend_is_shared_only_when_explicitly_reused() -> Result<()> {
     let temp = tempfile::tempdir()?;

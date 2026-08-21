@@ -124,8 +124,274 @@ fn retire_reservations(reservations: Vec<smudgy_audio::MixerInputReservation>) {
 #[test]
 fn public_factory_and_dependency_boundary_compile() {
     fn assert_factory<T: AudioOutputFactory + Clone + Send + Sync>() {}
+    fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
     assert_factory::<ScriptBusAudioOutputFactory>();
     assert_factory::<SessionAudioOutputFactory>();
+    assert_clone_send_sync::<ApplicationAudioRegistrar>();
+    assert_clone_send_sync::<SessionAudioScope>();
+    assert_send_sync::<ApplicationAudioOwner>();
+    assert_send_sync::<SessionAudioRegistration>();
+}
+
+fn authority_limits(max_online_contexts: usize) -> AudioHostLimits {
+    AudioHostLimits::unlimited()
+        .max_online_contexts(Some(max_online_contexts))
+        .max_live_audio_bytes(Some(16 * 1024 * 1024))
+        .max_graph_nodes(Some(256))
+        .max_graph_connections(Some(256))
+        .max_scheduled_sources(Some(128))
+        .max_automation_events(Some(512))
+        .max_queued_control_commands(Some(128))
+        .max_queued_events(Some(128))
+        .max_decode_jobs(Some(2))
+        .max_offline_render_jobs(Some(2))
+}
+
+fn scoped_context(
+    scope: &SessionAudioScope,
+    sink_id: &str,
+) -> Result<AudioContext, web_audio_api::context::AudioContextBuildError> {
+    AudioContext::builder(Arc::clone(&scope.inner.output))
+        .options(AudioContextOptions {
+            sample_rate: Some(TEST_RATE_F32),
+            sink_id: sink_id.into(),
+            ..AudioContextOptions::default()
+        })
+        .number_of_channels(CHANNELS)
+        .build()
+}
+
+fn await_session_retirement(
+    retirement: &mut smudgy_audio::MixerSessionRetirement,
+    probe: &RenderProbe,
+) {
+    let wake = Waker::from(Arc::new(WakeProbe::default()));
+    let mut context = Context::from_waker(&wake);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Poll::Ready(result) = Pin::new(&mut *retirement).poll(&mut context) {
+            result.expect("the registered mixer session retires exactly");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registered session retirement was not acknowledged"
+        );
+        let _ = probe.render();
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn application_and_session_authorities_share_only_the_intended_scope() {
+    let (service, first_owner, probe) = service(201);
+    let second_owner = service.add_session(AudioSessionId(202)).unwrap();
+    let first_script = first_owner.script_bus();
+    let second_script = second_owner.script_bus();
+    first_script.set_gain(0.5).unwrap();
+    second_script.set_gain(1.0).unwrap();
+    let mut application = ApplicationAudioOwner::new(authority_limits(4));
+    let registrar = application.registrar();
+    let first = registrar.register_session(first_owner).unwrap();
+    let second = registrar.clone().register_session(second_owner).unwrap();
+    let first_scope = first.scope();
+    let second_scope = second.scope();
+
+    assert_eq!(first_scope.session_id(), 201);
+    assert_eq!(second_scope.session_id(), 202);
+    assert_ne!(first_scope.inner.generation, second_scope.inner.generation);
+    assert!(!Arc::ptr_eq(
+        &first_scope.inner.session_gate,
+        &second_scope.inner.session_gate
+    ));
+    first_scope
+        .inner
+        .permissions
+        .check_playback("AudioContext")
+        .unwrap();
+    second_scope
+        .inner
+        .permissions
+        .check_playback("AudioContext")
+        .unwrap();
+    assert!(
+        first_scope
+            .inner
+            .permissions
+            .check_capture("MediaStreamAudioSourceNode")
+            .unwrap_err()
+            .to_string()
+            .contains("capture is not permitted")
+    );
+
+    // Each registered scope's default route reaches its own exact Script bus,
+    // while the process mixer combines both on the one fake physical output.
+    let first_default = scoped_context(&first_scope, "").unwrap();
+    let second_default = scoped_context(&second_scope, "").unwrap();
+    let _first_graph = attach_constant(&first_default, 0.125, 1.0);
+    let _second_graph = attach_constant(&second_default, 0.25, 1.0);
+    // The unequal per-bus gains make a wrong same-session factory pairing
+    // observable: 0.125 * 0.5 + 0.25 * 1.0 = 0.3125.
+    render_until(&probe, 0.3125);
+    control_while_rendering(&probe, &first_default, AudioContext::close_sync);
+    render_until(&probe, 0.25);
+    control_while_rendering(&probe, &second_default, AudioContext::close_sync);
+    render_until(&probe, 0.0);
+
+    let first_none = scoped_context(&first_scope, "none").unwrap();
+    let second_none = scoped_context(&second_scope, "none").unwrap();
+    first_none.close_sync();
+    second_none.close_sync();
+
+    drop(first);
+    assert!(
+        first_scope
+            .inner
+            .permissions
+            .check_playback("AudioContext")
+            .is_err()
+    );
+    assert!(scoped_context(&first_scope, "none").is_err());
+    assert!(scoped_context(&second_scope, "none").is_ok());
+
+    assert!(application.seal());
+    assert!(
+        second_scope
+            .inner
+            .permissions
+            .check_playback("AudioContext")
+            .is_err()
+    );
+    assert!(scoped_context(&second_scope, "none").is_err());
+    drop(second);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn sealed_application_rejects_registration_without_consuming_owner() {
+    let (service, owner, _probe) = service(203);
+    let mut application = ApplicationAudioOwner::new(authority_limits(1));
+    let registrar = application.registrar();
+    assert!(application.seal());
+    let failure = registrar
+        .register_session(owner)
+        .expect_err("sealed app rejects an exact session owner");
+    assert_eq!(
+        failure.error(),
+        SessionAudioRegistrationError::ApplicationSealed
+    );
+    assert_eq!(failure.into_owner().session_id(), AudioSessionId(203));
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn stale_same_id_scope_is_inert_after_replacement_generation() {
+    let (service, owner, probe) = service(204);
+    let application = ApplicationAudioOwner::new(authority_limits(4));
+    let registrar = application.registrar();
+    let registration = registrar.register_session(owner).unwrap();
+    let stale = registration.scope();
+    let stale_generation = stale.inner.generation;
+    let mut retirement = registration.retire();
+    assert!(scoped_context(&stale, "none").is_err());
+    await_session_retirement(&mut retirement, &probe);
+
+    let replacement_owner = service.add_session(AudioSessionId(204)).unwrap();
+    let replacement = registrar.register_session(replacement_owner).unwrap();
+    let current = replacement.scope();
+    assert_eq!(current.session_id(), stale.session_id());
+    assert_ne!(current.inner.generation, stale_generation);
+    assert!(scoped_context(&stale, "none").is_err());
+    let context = scoped_context(&current, "none").unwrap();
+    context.close_sync();
+    drop(replacement);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn prepare_and_session_seal_are_totally_ordered_at_delegate_boundary() {
+    let (service, owner, _probe) = service(205);
+    let application = ApplicationAudioOwner::new(authority_limits(4));
+    let registrar = application.registrar();
+    let registration = registrar.register_session(owner).unwrap();
+    let scope = registration.scope();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    *application
+        .state
+        .prepare_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(TestPrepareHook {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    }));
+
+    let prepare_scope = scope.clone();
+    let prepare = thread::spawn(move || scoped_context(&prepare_scope, "none"));
+    entered.wait();
+    let seal = thread::spawn(move || drop(registration));
+    assert!(
+        !seal.is_finished(),
+        "session sealing crossed an admitted factory transaction"
+    );
+    release.wait();
+    let context = prepare
+        .join()
+        .unwrap()
+        .expect("prepare admitted before seal completes");
+    seal.join().unwrap();
+    context.close_sync();
+
+    *application
+        .state
+        .prepare_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    assert!(scoped_context(&scope, "none").is_err());
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn prepare_and_application_seal_are_totally_ordered_at_delegate_boundary() {
+    let (service, owner, _probe) = service(206);
+    let application = ApplicationAudioOwner::new(authority_limits(4));
+    let registrar = application.registrar();
+    let registration = registrar.register_session(owner).unwrap();
+    let scope = registration.scope();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    *application
+        .state
+        .prepare_hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(TestPrepareHook {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    }));
+
+    let prepare_scope = scope.clone();
+    let prepare = thread::spawn(move || scoped_context(&prepare_scope, "none"));
+    entered.wait();
+    let seal = thread::spawn(move || {
+        let mut application = application;
+        application.seal()
+    });
+    assert!(
+        !seal.is_finished(),
+        "application sealing crossed an admitted factory transaction"
+    );
+    release.wait();
+    let context = prepare
+        .join()
+        .unwrap()
+        .expect("prepare admitted before application seal completes");
+    assert!(seal.join().unwrap());
+    context.close_sync();
+
+    assert!(scoped_context(&scope, "none").is_err());
+    drop(registration);
+    assert!(service.shutdown().clean);
 }
 
 fn composite_context(
