@@ -1,10 +1,11 @@
 //! Hosted Web Audio authorities and output adapter for Smudgy's shared mixer.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 #[cfg(test)]
 use std::sync::{Barrier, mpsc};
@@ -32,7 +33,19 @@ const CHANNELS: usize = 2;
 const FRAMES: usize = 128;
 const INTERLEAVED_SAMPLES: usize = CHANNELS * FRAMES;
 
+/// Maximum number of versionless sandbox-root gain scopes retained by one
+/// exact session registration.
+///
+/// Successfully committed entries are never evicted or reused during the
+/// registration lifetime; a failed pending bind is rolled back. A package
+/// version reload therefore finds the same root entry, while this fixed
+/// 256-root metadata bound prevents package identity state from growing without
+/// limit. It is deliberately independent from the mixer's 32 simultaneous
+/// Script inputs: a root costs no input until it opens a context.
+pub const MAX_PACKAGE_AUDIO_SCOPES: usize = 256;
+
 static NEXT_SCOPE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_PACKAGE_SCOPE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct LifecycleGate {
@@ -166,6 +179,427 @@ pub struct SessionAudioControlKey {
     generation: u64,
 }
 
+/// Remembered and effective gain for one sandbox-root package scope.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PackageAudioGainState {
+    linear: f32,
+    muted: bool,
+}
+
+impl PackageAudioGainState {
+    /// Remembered finite linear gain in `0..=1`.
+    #[must_use]
+    pub const fn linear(self) -> f32 {
+        self.linear
+    }
+
+    /// Whether this package scope is muted.
+    #[must_use]
+    pub const fn is_muted(self) -> bool {
+        self.muted
+    }
+
+    /// Gain applied between the Web Audio graph and the session Script bus.
+    #[must_use]
+    pub const fn effective_linear(self) -> f32 {
+        if self.muted { 0.0 } else { self.linear }
+    }
+}
+
+impl Default for PackageAudioGainState {
+    fn default() -> Self {
+        Self {
+            linear: 1.0,
+            muted: false,
+        }
+    }
+}
+
+/// Stable failure to bind one sandbox-root package output scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PackageAudioScopeError {
+    /// The owner or package name was empty.
+    InvalidIdentity,
+    /// The exact session registration has begun shutdown.
+    SessionClosed,
+    /// The bounded versionless root registry is full.
+    Capacity,
+    /// This root already has an uncommitted isolate construction.
+    AlreadyBinding,
+    /// The process-wide non-wrapping root-generation space is exhausted.
+    GenerationExhausted,
+}
+
+/// Stable package-control lookup or mutation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PackageAudioControlError {
+    /// No sandbox root with this versionless identity was bound.
+    UnknownPackage,
+    /// The key belongs to another exact session registration.
+    StaleSession,
+    /// The root entry generation no longer matches the key.
+    StalePackage,
+    /// The exact session registration has begun shutdown.
+    SessionClosed,
+    /// The requested linear value was non-finite or outside `0..=1`.
+    InvalidGain,
+    /// The shared physical output has failed.
+    OutputFailed,
+}
+
+/// Opaque identity for one versionless sandbox-root entry in an exact session.
+///
+/// The private non-wrapping root generation prevents a delayed controller from
+/// reaching a replacement if the bounded registry ever gains reclamation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageAudioControlKey {
+    session: SessionAudioControlKey,
+    owner: Arc<str>,
+    name: Arc<str>,
+    root_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PackageAudioRoot {
+    owner: Arc<str>,
+    name: Arc<str>,
+}
+
+impl PackageAudioRoot {
+    fn new(owner: &str, name: &str) -> Result<Self, PackageAudioScopeError> {
+        if owner.is_empty() || name.is_empty() {
+            return Err(PackageAudioScopeError::InvalidIdentity);
+        }
+        Ok(Self {
+            owner: Arc::from(owner.to_ascii_lowercase()),
+            name: Arc::from(name.to_ascii_lowercase()),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PackageGainState {
+    remembered: Mutex<PackageAudioGainState>,
+    effective_bits: AtomicU32,
+}
+
+impl PackageGainState {
+    fn new() -> Self {
+        let state = PackageAudioGainState::default();
+        Self {
+            remembered: Mutex::new(state),
+            effective_bits: AtomicU32::new(state.effective_linear().to_bits()),
+        }
+    }
+
+    fn effective_linear(&self) -> f32 {
+        f32::from_bits(self.effective_bits.load(Ordering::Relaxed))
+    }
+
+    fn update_linear(
+        &self,
+        linear: f32,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let linear = validate_package_gain(linear)?;
+        let mut state = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.linear = linear;
+        self.effective_bits
+            .store(state.effective_linear().to_bits(), Ordering::Release);
+        Ok(*state)
+    }
+
+    fn update_muted(&self, muted: bool) -> PackageAudioGainState {
+        let mut state = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.muted = muted;
+        self.effective_bits
+            .store(state.effective_linear().to_bits(), Ordering::Release);
+        *state
+    }
+}
+
+fn validate_package_gain(linear: f32) -> Result<f32, PackageAudioControlError> {
+    if !linear.is_finite() || !(0.0..=1.0).contains(&linear) {
+        return Err(PackageAudioControlError::InvalidGain);
+    }
+    Ok(if linear == 0.0 { 0.0 } else { linear })
+}
+
+#[derive(Debug)]
+struct PackageAudioEntry {
+    gain: Arc<PackageGainState>,
+    active_generation: Option<u64>,
+    pending_generation: Option<u64>,
+    ever_committed: bool,
+}
+
+#[derive(Debug)]
+struct PackageAudioRegistry {
+    session: SessionAudioControlKey,
+    bus: MixerScriptBusHandle,
+    app: Arc<ApplicationAudioState>,
+    session_gate: Arc<Mutex<LifecycleGate>>,
+    entries: Mutex<BTreeMap<PackageAudioRoot, PackageAudioEntry>>,
+}
+
+impl PackageAudioRegistry {
+    #[cfg(test)]
+    fn bind(
+        self: &Arc<Self>,
+        owner: &str,
+        name: &str,
+    ) -> Result<(Arc<PackageGainState>, PackageAudioScopeBinding), PackageAudioScopeError> {
+        let root = PackageAudioRoot::new(owner, name)?;
+        self.bind_root(root)
+    }
+
+    fn bind_root(
+        self: &Arc<Self>,
+        root: PackageAudioRoot,
+    ) -> Result<(Arc<PackageGainState>, PackageAudioScopeBinding), PackageAudioScopeError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.contains_key(&root) && entries.len() >= MAX_PACKAGE_AUDIO_SCOPES {
+            return Err(PackageAudioScopeError::Capacity);
+        }
+        if entries
+            .get(&root)
+            .is_some_and(|entry| entry.pending_generation.is_some())
+        {
+            return Err(PackageAudioScopeError::AlreadyBinding);
+        }
+        let Ok(generation) = NEXT_PACKAGE_SCOPE_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        ) else {
+            return Err(PackageAudioScopeError::GenerationExhausted);
+        };
+        let entry = entries
+            .entry(root.clone())
+            .or_insert_with(|| PackageAudioEntry {
+                gain: Arc::new(PackageGainState::new()),
+                active_generation: None,
+                pending_generation: None,
+                ever_committed: false,
+            });
+        entry.pending_generation = Some(generation);
+        let gain = Arc::clone(&entry.gain);
+        drop(entries);
+        Ok((
+            gain,
+            PackageAudioScopeBinding {
+                registry: Arc::clone(self),
+                root,
+                generation,
+                committed: false,
+            },
+        ))
+    }
+
+    fn commit(
+        &self,
+        root: &PackageAudioRoot,
+        generation: u64,
+    ) -> Result<(), PackageAudioScopeError> {
+        let app = lock_gate(&self.app.gate);
+        let session = lock_gate(&self.session_gate);
+        if !app.open || !session.open {
+            return Err(PackageAudioScopeError::SessionClosed);
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = entries
+            .get_mut(root)
+            .expect("a live package binding retains its registry entry");
+        assert_eq!(
+            entry.pending_generation,
+            Some(generation),
+            "a package binding commits its own pending generation"
+        );
+        entry.pending_generation = None;
+        entry.active_generation = Some(generation);
+        entry.ever_committed = true;
+        drop(entries);
+        drop(session);
+        drop(app);
+        Ok(())
+    }
+
+    fn release(&self, root: &PackageAudioRoot, generation: u64, committed: bool) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = entries.get_mut(root) else {
+            return;
+        };
+        if committed {
+            if entry.active_generation == Some(generation) {
+                entry.active_generation = None;
+            }
+        } else if entry.pending_generation == Some(generation) {
+            entry.pending_generation = None;
+        }
+        if !entry.ever_committed
+            && entry.active_generation.is_none()
+            && entry.pending_generation.is_none()
+        {
+            entries.remove(root);
+        }
+    }
+
+    fn control_key(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<PackageAudioControlKey, PackageAudioControlError> {
+        let root = PackageAudioRoot::new(owner, name)
+            .map_err(|_| PackageAudioControlError::UnknownPackage)?;
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = entries
+            .get(&root)
+            .ok_or(PackageAudioControlError::UnknownPackage)?;
+        let root_generation = entry
+            .active_generation
+            .ok_or(PackageAudioControlError::UnknownPackage)?;
+        Ok(PackageAudioControlKey {
+            session: self.session,
+            owner: root.owner,
+            name: root.name,
+            root_generation,
+        })
+    }
+
+    fn validate_entry<'a>(
+        &'a self,
+        entries: &'a mut BTreeMap<PackageAudioRoot, PackageAudioEntry>,
+        key: &PackageAudioControlKey,
+    ) -> Result<&'a mut PackageAudioEntry, PackageAudioControlError> {
+        if key.session != self.session {
+            return Err(PackageAudioControlError::StaleSession);
+        }
+        let root = PackageAudioRoot {
+            owner: Arc::clone(&key.owner),
+            name: Arc::clone(&key.name),
+        };
+        let entry = entries
+            .get_mut(&root)
+            .ok_or(PackageAudioControlError::UnknownPackage)?;
+        if entry.active_generation != Some(key.root_generation) {
+            return Err(PackageAudioControlError::StalePackage);
+        }
+        Ok(entry)
+    }
+
+    fn update_linear(
+        &self,
+        key: &PackageAudioControlKey,
+        linear: f32,
+        mut output_failed: impl FnMut() -> bool,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = Self::validate_entry(self, &mut entries, key)?;
+        if output_failed() {
+            return Err(PackageAudioControlError::OutputFailed);
+        }
+        let state = entry.gain.update_linear(linear)?;
+        if output_failed() {
+            Err(PackageAudioControlError::OutputFailed)
+        } else {
+            Ok(state)
+        }
+    }
+
+    fn update_muted(
+        &self,
+        key: &PackageAudioControlKey,
+        muted: bool,
+        mut output_failed: impl FnMut() -> bool,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = Self::validate_entry(self, &mut entries, key)?;
+        if output_failed() {
+            return Err(PackageAudioControlError::OutputFailed);
+        }
+        let state = entry.gain.update_muted(muted);
+        if output_failed() {
+            Err(PackageAudioControlError::OutputFailed)
+        } else {
+            Ok(state)
+        }
+    }
+}
+
+/// Exact active lease for one sandbox-root isolate construction.
+///
+/// Core commits this lease only after the package entry loads successfully and
+/// retains it with that isolate. Dropping a failed pending lease rolls back its
+/// never-committed entry. Dropping a committed lease only deactivates its exact
+/// generation; remembered state stays bounded to the session registration so a
+/// successful version/reload replacement can reuse it.
+pub struct PackageAudioScopeBinding {
+    registry: Arc<PackageAudioRegistry>,
+    root: PackageAudioRoot,
+    generation: u64,
+    committed: bool,
+}
+
+impl fmt::Debug for PackageAudioScopeBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackageAudioScopeBinding")
+            .field("owner", &self.root.owner)
+            .field("name", &self.root.name)
+            .field("generation", &self.generation)
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PackageAudioScopeBinding {
+    /// Publishes this exact root generation as controllable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageAudioScopeError::SessionClosed`] without publishing
+    /// the root if application/session admission sealed during construction.
+    pub fn commit(&mut self) -> Result<(), PackageAudioScopeError> {
+        if !self.committed {
+            self.registry.commit(&self.root, self.generation)?;
+            self.committed = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PackageAudioScopeBinding {
+    fn drop(&mut self) {
+        self.registry
+            .release(&self.root, self.generation, self.committed);
+    }
+}
+
 /// Registration failure that returns the unconsumed mixer-session owner.
 pub struct SessionAudioRegistrationFailure {
     error: SessionAudioRegistrationError,
@@ -220,15 +654,6 @@ impl ApplicationAudioRegistrar {
         let native = owner.native_bus();
         let speech = owner.speech_bus();
         let session_gate = Arc::new(Mutex::new(LifecycleGate::new()));
-        let permissions: Arc<dyn AudioPermissions> = Arc::new(SessionAudioPermissions {
-            app: Arc::clone(&self.state),
-            session: Arc::clone(&session_gate),
-        });
-        let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
-            app: Arc::clone(&self.state),
-            session: Arc::clone(&session_gate),
-            delegate: SessionAudioOutputFactory::new(script),
-        });
         let Ok(generation) =
             NEXT_SCOPE_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 generation.checked_add(1)
@@ -239,6 +664,26 @@ impl ApplicationAudioRegistrar {
                 owner,
             });
         };
+        let session_key = SessionAudioControlKey {
+            session_id,
+            generation,
+        };
+        let permissions: Arc<dyn AudioPermissions> = Arc::new(SessionAudioPermissions {
+            app: Arc::clone(&self.state),
+            session: Arc::clone(&session_gate),
+        });
+        let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
+            app: Arc::clone(&self.state),
+            session: Arc::clone(&session_gate),
+            delegate: SessionAudioOutputFactory::new(script.clone()),
+        });
+        let package_audio = Arc::new(PackageAudioRegistry {
+            session: session_key,
+            bus: script,
+            app: Arc::clone(&self.state),
+            session_gate: Arc::clone(&session_gate),
+            entries: Mutex::new(BTreeMap::new()),
+        });
         let scope = SessionAudioScope {
             inner: Arc::new(SessionAudioScopeInner {
                 session_id,
@@ -247,6 +692,7 @@ impl ApplicationAudioRegistrar {
                 session_gate,
                 permissions,
                 output,
+                package_audio: Some(package_audio),
             }),
         };
         drop(app_gate);
@@ -305,6 +751,7 @@ impl ApplicationAudioRegistrar {
                 session_gate,
                 permissions,
                 output,
+                package_audio: None,
             }),
         };
         drop(app_gate);
@@ -320,6 +767,7 @@ struct SessionAudioScopeInner {
     session_gate: Arc<Mutex<LifecycleGate>>,
     permissions: Arc<dyn AudioPermissions>,
     output: Arc<dyn AudioOutputFactory>,
+    package_audio: Option<Arc<PackageAudioRegistry>>,
 }
 
 /// Opaque cloneable session audio authority passed to script runtimes.
@@ -357,6 +805,47 @@ impl SessionAudioScope {
         AudioExtensionOptions::new(Arc::clone(&self.inner.app.host))
             .permissions(Arc::clone(&self.inner.permissions))
             .output_factory(Arc::clone(&self.inner.output))
+    }
+
+    /// Builds isolate options bound to one versionless sandbox root.
+    ///
+    /// The returned lease must be committed only after the sandbox entry loads
+    /// successfully and then retained for the exact isolate lifetime. Physical
+    /// sessions receive a package-gained Script-bus factory; mixer-free
+    /// unavailable sessions return their unchanged truthful factory and no
+    /// package state or lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, lifecycle, or bounded-capacity failure. It
+    /// never falls back to the Main/session factory for a physical sandbox.
+    pub fn extension_options_for_sandbox_root(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<(AudioExtensionOptions, Option<PackageAudioScopeBinding>), PackageAudioScopeError>
+    {
+        let app = lock_gate(&self.inner.app.gate);
+        let session = lock_gate(&self.inner.session_gate);
+        if !app.open || !session.open {
+            return Err(PackageAudioScopeError::SessionClosed);
+        }
+        let root = PackageAudioRoot::new(owner, name)?;
+        let Some(registry) = &self.inner.package_audio else {
+            return Ok((self.extension_options(), None));
+        };
+        let (gain, binding) = registry.bind_root(root)?;
+        let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
+            app: Arc::clone(&self.inner.app),
+            session: Arc::clone(&self.inner.session_gate),
+            delegate: SessionAudioOutputFactory::with_package_gain(registry.bus.clone(), gain),
+        });
+        let options = AudioExtensionOptions::new(Arc::clone(&self.inner.app.host))
+            .permissions(Arc::clone(&self.inner.permissions))
+            .output_factory(output);
+        drop(session);
+        drop(app);
+        Ok((options, Some(binding)))
     }
 }
 
@@ -406,6 +895,84 @@ impl SessionAudioRegistration {
     /// authority to the application or script runtime.
     pub fn set_gain_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
         self.gain.set_muted(muted)
+    }
+
+    /// Looks up the exact active controller identity for one sandbox root.
+    ///
+    /// Package identities are ASCII-folded and versionless. A committed entry
+    /// remains remembered across reload, but is controllable only while its
+    /// exact isolate-generation lease is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed closed-session or unknown/inactive-package result.
+    pub fn package_control_key(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<PackageAudioControlKey, PackageAudioControlError> {
+        let app_gate = lock_gate(&self.scope.inner.app.gate);
+        let session_gate = lock_gate(&self.scope.inner.session_gate);
+        if !app_gate.open || !session_gate.open {
+            return Err(PackageAudioControlError::SessionClosed);
+        }
+        self.scope
+            .inner
+            .package_audio
+            .as_ref()
+            .ok_or(PackageAudioControlError::UnknownPackage)?
+            .control_key(owner, name)
+    }
+
+    /// Applies a remembered linear gain to one exact active sandbox root.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed stale/closed/invalid/failure outcomes without mutating a
+    /// different session or root generation.
+    pub fn set_package_gain_linear(
+        &self,
+        key: &PackageAudioControlKey,
+        linear: f32,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let linear = validate_package_gain(linear)?;
+        let app_gate = lock_gate(&self.scope.inner.app.gate);
+        let session_gate = lock_gate(&self.scope.inner.session_gate);
+        if !app_gate.open || !session_gate.open {
+            return Err(PackageAudioControlError::SessionClosed);
+        }
+        let registry = self
+            .scope
+            .inner
+            .package_audio
+            .as_ref()
+            .ok_or(PackageAudioControlError::UnknownPackage)?;
+        registry.update_linear(key, linear, || self.gain.output_failure().is_some())
+    }
+
+    /// Applies mute independently from remembered linear gain for one root.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed stale/closed/failure outcomes without mutating a
+    /// different session or root generation.
+    pub fn set_package_gain_muted(
+        &self,
+        key: &PackageAudioControlKey,
+        muted: bool,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let app_gate = lock_gate(&self.scope.inner.app.gate);
+        let session_gate = lock_gate(&self.scope.inner.session_gate);
+        if !app_gate.open || !session_gate.open {
+            return Err(PackageAudioControlError::SessionClosed);
+        }
+        let registry = self
+            .scope
+            .inner
+            .package_audio
+            .as_ref()
+            .ok_or(PackageAudioControlError::UnknownPackage)?;
+        registry.update_muted(key, muted, || self.gain.output_failure().is_some())
     }
 
     /// Exact first-writer process-output failure observed by this authority.
@@ -735,6 +1302,13 @@ impl SessionAudioOutputFactory {
             silent: SystemAudioOutput::new(),
         }
     }
+
+    fn with_package_gain(bus: MixerScriptBusHandle, gain: Arc<PackageGainState>) -> Self {
+        Self {
+            script: ScriptBusAudioOutputFactory::with_package_gain(bus, gain),
+            silent: SystemAudioOutput::new(),
+        }
+    }
 }
 
 impl AudioOutputFactory for SessionAudioOutputFactory {
@@ -760,6 +1334,7 @@ impl AudioOutputFactory for SessionAudioOutputFactory {
 #[derive(Clone, Debug)]
 pub struct ScriptBusAudioOutputFactory {
     bus: MixerScriptBusHandle,
+    package_gain: Option<Arc<PackageGainState>>,
     #[cfg(test)]
     render_hook: Option<Arc<TestRenderHook>>,
     #[cfg(test)]
@@ -772,6 +1347,18 @@ impl ScriptBusAudioOutputFactory {
     pub const fn new(bus: MixerScriptBusHandle) -> Self {
         Self {
             bus,
+            package_gain: None,
+            #[cfg(test)]
+            render_hook: None,
+            #[cfg(test)]
+            panic_start: false,
+        }
+    }
+
+    fn with_package_gain(bus: MixerScriptBusHandle, package_gain: Arc<PackageGainState>) -> Self {
+        Self {
+            bus,
+            package_gain: Some(package_gain),
             #[cfg(test)]
             render_hook: None,
             #[cfg(test)]
@@ -783,6 +1370,7 @@ impl ScriptBusAudioOutputFactory {
     fn with_render_hook(bus: MixerScriptBusHandle, render_hook: Arc<TestRenderHook>) -> Self {
         Self {
             bus,
+            package_gain: None,
             render_hook: Some(render_hook),
             panic_start: false,
         }
@@ -792,6 +1380,7 @@ impl ScriptBusAudioOutputFactory {
     fn with_start_panic(bus: MixerScriptBusHandle, render_hook: Arc<TestRenderHook>) -> Self {
         Self {
             bus,
+            package_gain: None,
             render_hook: Some(render_hook),
             panic_start: true,
         }
@@ -801,6 +1390,7 @@ impl ScriptBusAudioOutputFactory {
     fn preboxed_input(&self) -> Box<CallbackMixerInput> {
         Box::new(CallbackMixerInput::with_render_hook(
             self.render_hook.clone(),
+            self.package_gain.clone(),
         ))
     }
 
@@ -857,7 +1447,7 @@ impl ScriptBusAudioOutputFactory {
         #[cfg(test)]
         let input = self.preboxed_input();
         #[cfg(not(test))]
-        let input = Box::new(CallbackMixerInput::new());
+        let input = Box::new(CallbackMixerInput::new(self.package_gain.clone()));
         let mut prepared = Box::new(ScriptBusPreparedOutput {
             config,
             reservation: None,
@@ -1010,28 +1600,34 @@ struct CallbackMixerInput {
     callback: Option<AudioRenderCallback>,
     events: Arc<OutputFailureReporter>,
     scratch: [f32; INTERLEAVED_SAMPLES],
+    package_gain: Option<Arc<PackageGainState>>,
     #[cfg(test)]
     render_hook: Option<Arc<TestRenderHook>>,
 }
 
 impl CallbackMixerInput {
     #[cfg(not(test))]
-    fn new() -> Self {
+    fn new(package_gain: Option<Arc<PackageGainState>>) -> Self {
         Self {
             callback: None,
             events: Arc::new(OutputFailureReporter::new()),
             scratch: [0.0; INTERLEAVED_SAMPLES],
+            package_gain,
             #[cfg(test)]
             render_hook: None,
         }
     }
 
     #[cfg(test)]
-    fn with_render_hook(render_hook: Option<Arc<TestRenderHook>>) -> Self {
+    fn with_render_hook(
+        render_hook: Option<Arc<TestRenderHook>>,
+        package_gain: Option<Arc<PackageGainState>>,
+    ) -> Self {
         Self {
             callback: None,
             events: Arc::new(OutputFailureReporter::new()),
             scratch: [0.0; INTERLEAVED_SAMPLES],
+            package_gain,
             render_hook,
         }
     }
@@ -1089,9 +1685,14 @@ impl MixerInput for CallbackMixerInput {
             return MixerInputStatus::Finished;
         };
         let events = &self.events;
+        let package_gain = self
+            .package_gain
+            .as_ref()
+            .map_or(1.0, |gain| gain.effective_linear());
         let status = render_fixed(
             output,
             &mut self.scratch,
+            package_gain,
             |scratch| callback.render_interleaved_f32(scratch),
             |reason| {
                 events.report(reason);
@@ -1137,6 +1738,7 @@ struct TestRenderHook {
 fn render_fixed(
     output: &mut [MixerFrame],
     scratch: &mut [f32; INTERLEAVED_SAMPLES],
+    effective_gain: f32,
     mut render: impl FnMut(&mut [f32]) -> AudioRenderStatus,
     mut report_death: impl FnMut(AudioOutputDeathReason),
 ) -> MixerInputStatus {
@@ -1149,11 +1751,18 @@ fn render_fixed(
     let sample_count = output.len() * CHANNELS;
     match panic::catch_unwind(AssertUnwindSafe(|| render(&mut scratch[..sample_count]))) {
         Ok(AudioRenderStatus::Continue) => {
-            for (frame, samples) in output
-                .iter_mut()
-                .zip(scratch[..sample_count].chunks_exact(2))
-            {
-                *frame = MixerFrame::new(samples[0], samples[1]);
+            if effective_gain == 0.0 {
+                // The callback still advances, but mute must dominate hostile
+                // non-finite graph samples (`NaN * 0` is not silent).
+                output.fill(MixerFrame::ZERO);
+            } else {
+                for (frame, samples) in output
+                    .iter_mut()
+                    .zip(scratch[..sample_count].chunks_exact(2))
+                {
+                    *frame =
+                        MixerFrame::new(samples[0] * effective_gain, samples[1] * effective_gain);
+                }
             }
             MixerInputStatus::Active
         }

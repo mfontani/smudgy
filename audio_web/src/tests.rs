@@ -603,6 +603,207 @@ fn composite_context(
         .build()
 }
 
+fn bind_package_factory(
+    scope: &SessionAudioScope,
+    owner: &str,
+    name: &str,
+) -> (SessionAudioOutputFactory, PackageAudioScopeBinding) {
+    let registry = scope
+        .inner
+        .package_audio
+        .as_ref()
+        .expect("physical scope owns package metadata");
+    let (gain, mut binding) = registry.bind(owner, name).expect("package root binds");
+    binding.commit().unwrap();
+    (
+        SessionAudioOutputFactory::with_package_gain(registry.bus.clone(), gain),
+        binding,
+    )
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // exact atomic snapshots are part of the gain contract
+fn package_scopes_compose_isolate_remember_and_stale_exact_generations() {
+    let (service, session, probe) = service(212);
+    let mut application = ApplicationAudioOwner::new(authority_limits(8));
+    let registration = application.registrar().register_session(session).unwrap();
+    let scope = registration.scope();
+    let main = scoped_context(&scope, "").unwrap();
+    let (alpha_factory, alpha_binding) = bind_package_factory(&scope, "Owner", "Alpha");
+    let (beta_factory, beta_binding) = bind_package_factory(&scope, "owner", "beta");
+    let alpha_first = composite_context(&alpha_factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let beta = composite_context(&beta_factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let _main_graph = attach_constant(&main, 0.1, 1.0);
+    let _alpha_first_graph = attach_constant(&alpha_first, 0.2, 1.0);
+    let _beta_graph = attach_constant(&beta, 0.4, 1.0);
+
+    let alpha_key = registration
+        .package_control_key("owner", "ALPHA")
+        .expect("package identity is ASCII-folded and versionless");
+    let beta_key = registration.package_control_key("OWNER", "BETA").unwrap();
+    assert_eq!(
+        registration
+            .set_package_gain_linear(&alpha_key, 0.5)
+            .unwrap()
+            .effective_linear(),
+        0.5
+    );
+    registration
+        .set_package_gain_linear(&beta_key, 0.25)
+        .unwrap();
+
+    // A context constructed after the mutation shares the same preallocated
+    // atomic snapshot as its predecessor and the dependency closure would.
+    let alpha_second = composite_context(&alpha_factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let _alpha_second_graph = attach_constant(&alpha_second, 0.1, 1.0);
+    render_until(&probe, 0.35);
+
+    let muted = registration
+        .set_package_gain_muted(&alpha_key, true)
+        .unwrap();
+    assert!(muted.is_muted());
+    assert_eq!(muted.linear(), 0.5);
+    render_until(&probe, 0.2);
+    let remembered = registration
+        .set_package_gain_linear(&alpha_key, 0.25)
+        .unwrap();
+    assert!(remembered.is_muted());
+    assert_eq!(remembered.effective_linear(), 0.0);
+    render_until(&probe, 0.2);
+    registration
+        .set_package_gain_muted(&alpha_key, false)
+        .unwrap();
+    render_until(&probe, 0.275);
+
+    for context in [&main, &alpha_first, &alpha_second, &beta] {
+        control_while_rendering(&probe, context, AudioContext::close_sync);
+    }
+    drop(alpha_binding);
+    assert_eq!(
+        registration.set_package_gain_muted(&alpha_key, false),
+        Err(PackageAudioControlError::StalePackage)
+    );
+    let (replacement_factory, replacement_binding) = bind_package_factory(&scope, "OWNER", "alpha");
+    let replacement_key = registration.package_control_key("owner", "alpha").unwrap();
+    assert_ne!(alpha_key, replacement_key);
+    assert_eq!(
+        registration
+            .set_package_gain_muted(&replacement_key, false)
+            .unwrap()
+            .linear(),
+        0.25,
+        "a successful version/root reload reuses remembered state"
+    );
+    let replacement = composite_context(&replacement_factory, "", TEST_RATE_F32, CHANNELS).unwrap();
+    let _replacement_graph = attach_constant(&replacement, 0.4, 1.0);
+    render_until(&probe, 0.1);
+    control_while_rendering(&probe, &replacement, AudioContext::close_sync);
+    drop(replacement_binding);
+    drop(beta_binding);
+
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+    application.seal();
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn package_scope_capacity_is_independent_bounded_and_failed_bindings_rollback() {
+    let (service, session, probe) = service(213);
+    let application = ApplicationAudioOwner::new(authority_limits(1));
+    let registration = application.registrar().register_session(session).unwrap();
+    let scope = registration.scope();
+
+    let (_, pending) = scope
+        .extension_options_for_sandbox_root("pending", "root")
+        .unwrap();
+    assert!(matches!(
+        scope.extension_options_for_sandbox_root("PENDING", "ROOT"),
+        Err(PackageAudioScopeError::AlreadyBinding)
+    ));
+    drop(pending);
+    assert!(
+        scope
+            .inner
+            .package_audio
+            .as_ref()
+            .unwrap()
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+
+    let mut bindings = Vec::with_capacity(MAX_PACKAGE_AUDIO_SCOPES);
+    for index in 0..MAX_PACKAGE_AUDIO_SCOPES {
+        let (_, binding) = scope
+            .extension_options_for_sandbox_root("bounded", &format!("root-{index}"))
+            .unwrap();
+        let mut binding = binding.expect("physical sandbox receives an exact lease");
+        binding.commit().unwrap();
+        bindings.push(binding);
+    }
+    assert!(matches!(
+        scope.extension_options_for_sandbox_root("bounded", "overflow"),
+        Err(PackageAudioScopeError::Capacity)
+    ));
+    drop(bindings);
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn unavailable_sandbox_binding_allocates_no_package_state_or_capacity() {
+    let mut application = ApplicationAudioOwner::new(authority_limits(1));
+    let registration = application
+        .registrar()
+        .register_unavailable_session(
+            AudioSessionId(214),
+            UnavailableAudioOutputCause::new("no device"),
+        )
+        .unwrap();
+    let scope = registration.scope();
+    for index in 0..=MAX_PACKAGE_AUDIO_SCOPES {
+        let (_, binding) = scope
+            .extension_options_for_sandbox_root("unavailable", &format!("root-{index}"))
+            .unwrap();
+        assert!(binding.is_none());
+    }
+    assert!(scope.inner.package_audio.is_none());
+    application.seal();
+    drop(registration);
+}
+
+#[test]
+fn pending_package_scope_cannot_publish_after_exact_session_seal() {
+    let (service, session, probe) = service(215);
+    let application = ApplicationAudioOwner::new(authority_limits(1));
+    let mut registration = application.registrar().register_session(session).unwrap();
+    let scope = registration.scope();
+    let (_, binding) = scope
+        .extension_options_for_sandbox_root("closing", "root")
+        .unwrap();
+    let mut binding = binding.unwrap();
+    assert!(registration.seal());
+    assert_eq!(binding.commit(), Err(PackageAudioScopeError::SessionClosed));
+    drop(binding);
+    assert!(
+        scope
+            .inner
+            .package_audio
+            .as_ref()
+            .unwrap()
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+    assert!(service.shutdown().clean);
+}
+
 #[test]
 fn composite_none_is_slot_free_while_default_owns_the_only_available_slot() {
     let (service, session, probe) = service(114);
@@ -901,6 +1102,7 @@ fn validation_precedes_capacity_and_prepared_abort_or_drop_restores_it() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one callback lifecycle keeps all fail-closed phases ordered
 fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() {
     let mut output = [MixerFrame::ZERO; FRAMES];
     let mut scratch = [0.0; INTERLEAVED_SAMPLES];
@@ -910,6 +1112,7 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
         render_fixed(
             &mut output,
             &mut scratch,
+            1.0,
             |samples| {
                 for frame in samples.chunks_exact_mut(2) {
                     frame[0] = 0.25;
@@ -931,6 +1134,7 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
         render_fixed(
             &mut output,
             &mut scratch,
+            1.0,
             |samples| {
                 samples.fill(0.125);
                 AudioRenderStatus::Continue
@@ -943,11 +1147,30 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
         (frame.left() - 0.125).abs() < f32::EPSILON && (frame.right() - 0.125).abs() < f32::EPSILON
     }));
 
+    let muted_callbacks = AtomicUsize::new(0);
+    let status = assert_no_alloc::assert_no_alloc(|| {
+        render_fixed(
+            &mut output,
+            &mut scratch,
+            0.0,
+            |samples| {
+                muted_callbacks.fetch_add(1, Ordering::Relaxed);
+                samples.fill(f32::NAN);
+                AudioRenderStatus::Continue
+            },
+            |_| {},
+        )
+    });
+    assert_eq!(status, MixerInputStatus::Active);
+    assert_eq!(muted_callbacks.load(Ordering::Relaxed), 1);
+    assert!(output.iter().all(|frame| *frame == MixerFrame::ZERO));
+
     output.fill(MixerFrame::from_mono(1.0));
     let status = assert_no_alloc::assert_no_alloc(|| {
         render_fixed(
             &mut output,
             &mut scratch,
+            1.0,
             |samples| {
                 samples.fill(1.0);
                 AudioRenderStatus::Stop
@@ -963,6 +1186,7 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
         render_fixed(
             &mut output,
             &mut scratch,
+            1.0,
             |_| panic_any(HostilePayload),
             |_| {
                 deaths.fetch_add(1, Ordering::Relaxed);
@@ -977,6 +1201,7 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
         render_fixed(
             &mut oversized,
             &mut scratch,
+            1.0,
             |_| AudioRenderStatus::Continue,
             |_| {
                 deaths.fetch_add(1, Ordering::Relaxed);
@@ -989,6 +1214,7 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
         render_fixed(
             &mut [],
             &mut scratch,
+            1.0,
             |_| AudioRenderStatus::Continue,
             |_| {
                 deaths.fetch_add(1, Ordering::Relaxed);
@@ -1007,6 +1233,7 @@ fn valid_short_quantum_is_fully_copied() {
         render_fixed(
             &mut short,
             &mut scratch,
+            1.0,
             |samples| {
                 samples.fill(0.75);
                 AudioRenderStatus::Continue

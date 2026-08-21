@@ -19,7 +19,8 @@ use smudgy_audio::{
     SystemMixerService, SystemMixerUnavailable,
 };
 use smudgy_audio_web::{
-    ApplicationAudioOwner, ApplicationAudioRegistrar, AudioHostLimits, SessionAudioControlKey,
+    ApplicationAudioOwner, ApplicationAudioRegistrar, AudioHostLimits, PackageAudioControlError,
+    PackageAudioControlKey, PackageAudioGainState, SessionAudioControlKey,
     SessionAudioRegistration, SessionAudioRegistrationError, SessionAudioScope,
     UnavailableAudioOutputCause, UnavailableSessionAudioRegistration,
     UnavailableSessionAudioRetirement,
@@ -168,6 +169,10 @@ pub enum ApplicationAudioControlError {
     SessionClosing,
     /// The key names an older registration than the currently live session.
     StaleSession,
+    /// No active sandbox-root audio scope has this versionless identity.
+    UnknownPackage,
+    /// The key names an older active lease for this sandbox root.
+    StalePackage,
     /// The lower mixer's independently bounded owner queue is currently full.
     MixerQueueSaturated,
     /// The lower mixer owner stopped without a retained output-failure cause.
@@ -197,6 +202,11 @@ impl fmt::Display for ApplicationAudioControlError {
             Self::StaleSession => {
                 formatter.write_str("the audio session control belongs to an older generation")
             }
+            Self::UnknownPackage => {
+                formatter.write_str("the sandbox package audio scope is not active")
+            }
+            Self::StalePackage => formatter
+                .write_str("the sandbox package control belongs to an older isolate generation"),
             Self::MixerQueueSaturated => formatter.write_str("the mixer control queue is full"),
             Self::MixerWorkerStopped => formatter.write_str("the mixer owner stopped"),
             Self::OutputFailed(failure) => {
@@ -392,6 +402,39 @@ impl CoordinatedSessionAudio {
         }
     }
 
+    fn package_control_key(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<PackageAudioControlKey, PackageAudioControlError> {
+        match self {
+            Self::Physical(registration) => registration.package_control_key(owner, name),
+            Self::Unavailable(_) => {
+                unreachable!("mixer-free registration has no package gain state")
+            }
+        }
+    }
+
+    fn update_package_gain(
+        &self,
+        key: &PackageAudioControlKey,
+        update: ApplicationAudioGainUpdate,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        match self {
+            Self::Physical(registration) => match update {
+                ApplicationAudioGainUpdate::Linear(linear) => {
+                    registration.set_package_gain_linear(key, linear)
+                }
+                ApplicationAudioGainUpdate::Muted(muted) => {
+                    registration.set_package_gain_muted(key, muted)
+                }
+            },
+            Self::Unavailable(_) => {
+                unreachable!("mixer-free registration has no package gain state")
+            }
+        }
+    }
+
     fn retire(self) -> SessionAudioRetirementResult {
         match self {
             Self::Physical(registration) => {
@@ -467,6 +510,22 @@ enum CoordinatorCommand {
         update: ApplicationAudioGainUpdate,
         reply: mpsc::SyncSender<Result<MixerGainState, ApplicationAudioControlError>>,
     },
+    #[allow(dead_code)]
+    ResolvePackageGain {
+        session_id: SessionId,
+        session_key: SessionAudioControlKey,
+        owner: Arc<str>,
+        name: Arc<str>,
+        reply: mpsc::SyncSender<Result<PackageAudioControlKey, ApplicationAudioControlError>>,
+    },
+    #[allow(dead_code)]
+    UpdatePackageGain {
+        session_id: SessionId,
+        session_key: SessionAudioControlKey,
+        package_key: PackageAudioControlKey,
+        update: ApplicationAudioGainUpdate,
+        reply: mpsc::SyncSender<Result<PackageAudioGainState, ApplicationAudioControlError>>,
+    },
     Finish {
         reply: mpsc::SyncSender<CoordinatorFinish>,
     },
@@ -502,6 +561,66 @@ impl ApplicationAudioController {
         response: mpsc::Receiver<Result<MixerGainState, ApplicationAudioControlError>>,
     ) -> Result<MixerGainState, ApplicationAudioControlError> {
         match self.commands.try_send(command) {
+            Ok(()) => response
+                .recv()
+                .unwrap_or(Err(ApplicationAudioControlError::CoordinatorStopped)),
+            Err(mpsc::TrySendError::Full(_)) => {
+                Err(ApplicationAudioControlError::CoordinatorSaturated)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(ApplicationAudioControlError::CoordinatorStopped)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn resolve_package_gain(
+        &self,
+        session_id: SessionId,
+        session_key: SessionAudioControlKey,
+        owner: Arc<str>,
+        name: Arc<str>,
+    ) -> Result<PackageAudioControlKey, ApplicationAudioControlError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        match self
+            .commands
+            .try_send(CoordinatorCommand::ResolvePackageGain {
+                session_id,
+                session_key,
+                owner,
+                name,
+                reply,
+            }) {
+            Ok(()) => response
+                .recv()
+                .unwrap_or(Err(ApplicationAudioControlError::CoordinatorStopped)),
+            Err(mpsc::TrySendError::Full(_)) => {
+                Err(ApplicationAudioControlError::CoordinatorSaturated)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(ApplicationAudioControlError::CoordinatorStopped)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn update_package_gain(
+        &self,
+        session_id: SessionId,
+        session_key: SessionAudioControlKey,
+        package_key: PackageAudioControlKey,
+        update: ApplicationAudioGainUpdate,
+    ) -> Result<PackageAudioGainState, ApplicationAudioControlError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        match self
+            .commands
+            .try_send(CoordinatorCommand::UpdatePackageGain {
+                session_id,
+                session_key,
+                package_key,
+                update,
+                reply,
+            }) {
             Ok(()) => response
                 .recv()
                 .unwrap_or(Err(ApplicationAudioControlError::CoordinatorStopped)),
@@ -651,6 +770,82 @@ impl ApplicationAudioSessionController {
 
     /// Applies this exact session's mute state in coordinator order.
     pub fn set_muted(&self, muted: bool) -> Result<MixerGainState, ApplicationAudioControlError> {
+        self.update(ApplicationAudioGainUpdate::Muted(muted))
+    }
+
+    /// Resolves one active versionless sandbox root under this exact session.
+    ///
+    /// Trusted packages share Main and therefore never produce this controller.
+    pub fn package(
+        &self,
+        owner: impl Into<Arc<str>>,
+        name: impl Into<Arc<str>>,
+    ) -> Result<ApplicationAudioPackageController, ApplicationAudioControlError> {
+        let package_key = self.controller.resolve_package_gain(
+            self.session_id,
+            self.key,
+            owner.into(),
+            name.into(),
+        )?;
+        Ok(ApplicationAudioPackageController {
+            controller: self.controller.clone(),
+            session_id: self.session_id,
+            session_key: self.key,
+            package_key,
+        })
+    }
+}
+
+/// Opaque application-side controller for one exact active sandbox-root lease.
+///
+/// It contains no output factory, mixer bus, isolate handle, or script-visible
+/// capability. A full engine reload or session replacement stales this exact
+/// key; callers resolve a new controller while remembered gain persists.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct ApplicationAudioPackageController {
+    controller: ApplicationAudioController,
+    session_id: SessionId,
+    session_key: SessionAudioControlKey,
+    package_key: PackageAudioControlKey,
+}
+
+impl fmt::Debug for ApplicationAudioPackageController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationAudioPackageController")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)]
+impl ApplicationAudioPackageController {
+    fn update(
+        &self,
+        update: ApplicationAudioGainUpdate,
+    ) -> Result<PackageAudioGainState, ApplicationAudioControlError> {
+        self.controller.update_package_gain(
+            self.session_id,
+            self.session_key,
+            self.package_key.clone(),
+            update,
+        )
+    }
+
+    /// Applies this root's remembered linear gain in coordinator order.
+    pub fn set_linear(
+        &self,
+        linear: f32,
+    ) -> Result<PackageAudioGainState, ApplicationAudioControlError> {
+        self.update(ApplicationAudioGainUpdate::Linear(linear))
+    }
+
+    /// Applies this root's mute without discarding remembered linear gain.
+    pub fn set_muted(
+        &self,
+        muted: bool,
+    ) -> Result<PackageAudioGainState, ApplicationAudioControlError> {
         self.update(ApplicationAudioGainUpdate::Muted(muted))
     }
 }
@@ -945,6 +1140,95 @@ fn update_session_gain(
     result.map_err(|error| map_gain_error(error, output_failure))
 }
 
+fn map_package_gain_error(
+    error: PackageAudioControlError,
+    output_failure: Option<MixerOutputFailure>,
+) -> ApplicationAudioControlError {
+    match error {
+        PackageAudioControlError::UnknownPackage => ApplicationAudioControlError::UnknownPackage,
+        PackageAudioControlError::StaleSession => ApplicationAudioControlError::StaleSession,
+        PackageAudioControlError::StalePackage => ApplicationAudioControlError::StalePackage,
+        PackageAudioControlError::SessionClosed => ApplicationAudioControlError::SessionClosing,
+        PackageAudioControlError::InvalidGain => ApplicationAudioControlError::InvalidGain,
+        PackageAudioControlError::OutputFailed => output_failure.map_or(
+            ApplicationAudioControlError::MixerWorkerStopped,
+            ApplicationAudioControlError::OutputFailed,
+        ),
+        _ => ApplicationAudioControlError::MixerWorkerStopped,
+    }
+}
+
+fn resolve_package_gain(
+    state: &Mutex<CoordinatorState>,
+    source: &SessionRegistrationSource,
+    session_id: SessionId,
+    session_key: SessionAudioControlKey,
+    owner: &str,
+    name: &str,
+) -> Result<PackageAudioControlKey, ApplicationAudioControlError> {
+    let state = lock_state(state);
+    if !state.open {
+        return Err(ApplicationAudioControlError::ApplicationSealed);
+    }
+    let Some(registration) = state.registrations.get(&session_id) else {
+        return Err(if state.closing.contains(&session_id) {
+            ApplicationAudioControlError::SessionClosing
+        } else {
+            ApplicationAudioControlError::UnknownSession
+        });
+    };
+    let registration = lock_registration(registration);
+    let Some(registration) = registration.as_ref() else {
+        return Err(ApplicationAudioControlError::SessionClosing);
+    };
+    if registration.control_key() != session_key {
+        return Err(ApplicationAudioControlError::StaleSession);
+    }
+    if let SessionRegistrationSource::Unavailable(cause) = source {
+        return Err(ApplicationAudioControlError::NotApplicable(cause.clone()));
+    }
+    let key = registration
+        .package_control_key(owner, name)
+        .map_err(|error| map_package_gain_error(error, registration.gain_output_failure()))?;
+    if let Some(failure) = registration.gain_output_failure() {
+        return Err(ApplicationAudioControlError::OutputFailed(failure));
+    }
+    Ok(key)
+}
+
+fn update_package_gain(
+    state: &Mutex<CoordinatorState>,
+    source: &SessionRegistrationSource,
+    session_id: SessionId,
+    session_key: SessionAudioControlKey,
+    package_key: &PackageAudioControlKey,
+    update: ApplicationAudioGainUpdate,
+) -> Result<PackageAudioGainState, ApplicationAudioControlError> {
+    let state = lock_state(state);
+    if !state.open {
+        return Err(ApplicationAudioControlError::ApplicationSealed);
+    }
+    let Some(registration) = state.registrations.get(&session_id) else {
+        return Err(if state.closing.contains(&session_id) {
+            ApplicationAudioControlError::SessionClosing
+        } else {
+            ApplicationAudioControlError::UnknownSession
+        });
+    };
+    let registration = lock_registration(registration);
+    let Some(registration) = registration.as_ref() else {
+        return Err(ApplicationAudioControlError::SessionClosing);
+    };
+    if registration.control_key() != session_key {
+        return Err(ApplicationAudioControlError::StaleSession);
+    }
+    if let SessionRegistrationSource::Unavailable(cause) = source {
+        return Err(ApplicationAudioControlError::NotApplicable(cause.clone()));
+    }
+    let result = registration.update_package_gain(package_key, update);
+    result.map_err(|error| map_package_gain_error(error, registration.gain_output_failure()))
+}
+
 fn update_master_gain(
     state: &Mutex<CoordinatorState>,
     source: &SessionRegistrationSource,
@@ -1154,6 +1438,38 @@ fn run_coordinator(
             } => {
                 let _ = reply.send(update_session_gain(
                     &state, &source, session_id, key, update,
+                ));
+            }
+            CoordinatorCommand::ResolvePackageGain {
+                session_id,
+                session_key,
+                owner,
+                name,
+                reply,
+            } => {
+                let _ = reply.send(resolve_package_gain(
+                    &state,
+                    &source,
+                    session_id,
+                    session_key,
+                    &owner,
+                    &name,
+                ));
+            }
+            CoordinatorCommand::UpdatePackageGain {
+                session_id,
+                session_key,
+                package_key,
+                update,
+                reply,
+            } => {
+                let _ = reply.send(update_package_gain(
+                    &state,
+                    &source,
+                    session_id,
+                    session_key,
+                    &package_key,
+                    update,
                 ));
             }
             CoordinatorCommand::Finish { reply } => {
@@ -1852,6 +2168,11 @@ mod tests {
                     if matches!(retained.error(), MixerStartError::InvalidSampleRate)
             ));
         }
+        assert!(matches!(
+            session.package("sandbox", "earcon"),
+            Err(ApplicationAudioControlError::NotApplicable(ref retained))
+                if matches!(retained.error(), MixerStartError::InvalidSampleRate)
+        ));
 
         let report = application.shutdown();
         assert_eq!(report.sessions.len(), 1);
@@ -1905,6 +2226,55 @@ mod tests {
     }
 
     #[test]
+    fn package_controller_routes_exact_root_generation_and_preserves_reload_state() {
+        let (application, probe) = test_application(Arc::new(Mutex::new(Vec::new())));
+        let controller = application.controller();
+        let pending = controller.begin_session(SessionId::from(79)).unwrap();
+        let scope = pending.scope();
+        let (_, binding) = scope
+            .extension_options_for_sandbox_root("Owner", "Earcon")
+            .unwrap();
+        let mut binding = binding.expect("physical sandbox gets an exact binding");
+        binding.commit().unwrap();
+        let session = pending.commit();
+        let package = session
+            .package("owner", "EARCON")
+            .expect("folded active root resolves through the coordinator");
+        assert_eq!(package.set_linear(0.4).unwrap().linear(), 0.4);
+        assert_eq!(package.set_muted(true).unwrap().effective_linear(), 0.0);
+
+        // A successful full-engine replacement publishes a new exact lease
+        // over the same remembered versionless state.
+        let (_, replacement_binding) = scope
+            .extension_options_for_sandbox_root("OWNER", "earcon")
+            .unwrap();
+        let mut replacement_binding = replacement_binding.unwrap();
+        replacement_binding.commit().unwrap();
+        assert!(matches!(
+            package.set_muted(false),
+            Err(ApplicationAudioControlError::StalePackage)
+        ));
+        let replacement = session.package("owner", "earcon").unwrap();
+        let restored = replacement.set_muted(false).unwrap();
+        assert_eq!(restored.linear(), 0.4);
+        assert!(!restored.is_muted());
+
+        // Dropping the predecessor lease cannot deactivate its replacement.
+        drop(binding);
+        assert_eq!(replacement.set_linear(0.25).unwrap().linear(), 0.25);
+        drop(replacement_binding);
+        assert!(matches!(
+            replacement.set_muted(true),
+            Err(ApplicationAudioControlError::StalePackage)
+        ));
+
+        let report = shutdown_while_rendering(application, probe);
+        assert_eq!(report.sessions.len(), 1);
+        assert!(report.sessions[0].is_clean());
+        assert!(report.is_clean(), "{report}");
+    }
+
+    #[test]
     fn exact_session_control_reports_closing_unknown_then_stale_after_reuse() {
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let release = Arc::new(std::sync::Barrier::new(2));
@@ -1925,10 +2295,15 @@ mod tests {
         );
         let renderer = TestAudioRenderer::start(probe);
         let controller = application.controller();
-        let old = controller
-            .begin_session(SessionId::from(77))
-            .unwrap()
-            .commit();
+        let old_pending = controller.begin_session(SessionId::from(77)).unwrap();
+        let (_, old_package_binding) = old_pending
+            .scope()
+            .extension_options_for_sandbox_root("stale", "root")
+            .unwrap();
+        let mut old_package_binding = old_package_binding.unwrap();
+        old_package_binding.commit().unwrap();
+        let old = old_pending.commit();
+        let old_package = old.package("stale", "root").unwrap();
         assert_eq!(
             controller.close_session(SessionId::from(77)),
             SessionAudioCloseDisposition::Requested
@@ -1938,7 +2313,12 @@ mod tests {
             old.set_linear(0.5),
             Err(ApplicationAudioControlError::SessionClosing)
         ));
+        assert!(matches!(
+            old_package.set_linear(0.5),
+            Err(ApplicationAudioControlError::SessionClosing)
+        ));
         release.wait();
+        drop(old_package_binding);
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -1952,15 +2332,28 @@ mod tests {
             }
         }
 
-        let replacement = controller
+        let replacement_pending = controller
             .begin_session(SessionId::from(77))
-            .expect("exact retirement permits same-id replacement")
-            .commit();
+            .expect("exact retirement permits same-id replacement");
+        let (_, replacement_package_binding) = replacement_pending
+            .scope()
+            .extension_options_for_sandbox_root("stale", "root")
+            .unwrap();
+        let mut replacement_package_binding = replacement_package_binding.unwrap();
+        replacement_package_binding.commit().unwrap();
+        let replacement = replacement_pending.commit();
+        let replacement_package = replacement.package("stale", "root").unwrap();
         assert!(matches!(
             old.set_muted(true),
             Err(ApplicationAudioControlError::StaleSession)
         ));
         assert_eq!(replacement.set_linear(0.625).unwrap().linear(), 0.625);
+        assert!(matches!(
+            old_package.set_muted(true),
+            Err(ApplicationAudioControlError::StaleSession)
+        ));
+        assert_eq!(replacement_package.set_linear(0.75).unwrap().linear(), 0.75);
+        drop(replacement_package_binding);
 
         let report = application.shutdown();
         drop(renderer);
@@ -2006,12 +2399,18 @@ mod tests {
     fn output_death_is_retained_by_master_and_session_controls_then_joined() {
         let (application, probe) = test_application(Arc::new(Mutex::new(Vec::new())));
         let controller = application.controller();
-        let session = controller
-            .begin_session(SessionId::from(78))
-            .unwrap()
-            .commit();
+        let pending = controller.begin_session(SessionId::from(78)).unwrap();
+        let (_, package_binding) = pending
+            .scope()
+            .extension_options_for_sandbox_root("output", "failure")
+            .unwrap();
+        let mut package_binding = package_binding.unwrap();
+        package_binding.commit().unwrap();
+        let session = pending.commit();
+        let package = session.package("output", "failure").unwrap();
         assert_eq!(controller.set_master_linear(0.5).unwrap().linear(), 0.5);
         assert_eq!(session.set_linear(0.5).unwrap().linear(), 0.5);
+        assert_eq!(package.set_linear(0.5).unwrap().linear(), 0.5);
         assert!(probe.fail_output());
         assert!(matches!(
             controller.set_master_muted(true),
@@ -2025,6 +2424,13 @@ mod tests {
                 MixerOutputFailure::BackendFailure
             ))
         ));
+        assert!(matches!(
+            package.set_muted(true),
+            Err(ApplicationAudioControlError::OutputFailed(
+                MixerOutputFailure::BackendFailure
+            ))
+        ));
+        drop(package_binding);
 
         let report = application.shutdown();
         assert!(report.coordinator_joined);

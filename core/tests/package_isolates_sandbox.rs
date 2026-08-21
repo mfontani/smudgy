@@ -14,7 +14,7 @@
 use std::pin::Pin;
 use std::rc::Rc;
 #[cfg(feature = "web-audio")]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "web-audio")]
 use std::thread;
@@ -307,6 +307,7 @@ struct TestPackage {
     name: &'static str,
     version: &'static str,
     modules: Vec<(&'static str, String)>,
+    dependencies: Vec<&'static str>,
     /// Whether the lock entry is installed enabled. A disabled install is still *resolvable* (it
     /// stays in the in-memory provider) but the engine must skip it when building the isolate set.
     enabled: bool,
@@ -319,8 +320,25 @@ impl TestPackage {
             name,
             version,
             modules: vec![("index.js", entry.to_string())],
+            dependencies: Vec::new(),
             enabled: true,
         }
+    }
+
+    #[cfg(feature = "web-audio")]
+    fn dependency(mut self, specifier: &'static str) -> Self {
+        self.dependencies.push(specifier);
+        self
+    }
+
+    fn manifest(&self) -> PackageManifest {
+        PackageManifest::parse(&format!(
+            "{{ \"name\": {:?}, \"version\": {:?}, \"dependencies\": {} }}",
+            self.name,
+            self.version,
+            serde_json::to_string(&self.dependencies).expect("static dependencies serialize")
+        ))
+        .expect("valid test package manifest")
     }
 
     /// Mark this package installed-but-disabled (the user's "install, don't enable" choice).
@@ -446,11 +464,7 @@ async fn run_scenario_inner(
                     name: pkg.name.to_string(),
                 },
                 resolved_version: pkg.version.to_string(),
-                manifest: PackageManifest::parse(&format!(
-                    "{{ \"name\": \"{}\", \"version\": \"{}\" }}",
-                    pkg.name, pkg.version
-                ))
-                .expect("valid manifest"),
+                manifest: pkg.manifest(),
                 integrity: format!("test-{}-{}", pkg.name, pkg.version),
                 modules: pkg
                     .modules
@@ -608,36 +622,46 @@ async fn coexists_across_main_and_sandboxed_isolate() {
     );
 }
 
-/// Accessibility packages run in sandboxed isolates, so Web Audio is installed there as a
-/// first-class web API rather than being limited to the trusted main isolate. Both contexts use
-/// their scoped default Script route into one fake physical mixer, without CI audio hardware.
+/// Main, two sandbox roots, and one imported dependency render constant signals
+/// into one fake physical mixer. The exact numeric composition proves that the
+/// dependency inherits its importer's versionless root gain, the sibling root
+/// is isolated, and Main bypasses package gain while retaining session gain.
 #[cfg(feature = "web-audio")]
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one numeric probe keeps all composition phases on one mixer
 async fn sandboxed_package_can_render_web_audio() {
-    let pkg = TestPackage::new(
+    let constant_source = |label: &str| {
+        r#"
+        import { echo } from "smudgy:core";
+        const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
+        const buffer = context.createBuffer(2, 128, 48_000);
+        buffer.getChannelData(0).fill(0.1);
+        buffer.getChannelData(1).fill(0.1);
+        const source = context.createBufferSource();
+        source.buffer = buffer;
+        source.loop = true;
+        source.connect(context.destination);
+        source.start();
+        globalThis.__retained_package_audio = { context, source };
+        echo("PACKAGE_AUDIO_SCOPE_READY:" + "__LABEL__");
+        "#
+        .replace("__LABEL__", label)
+    };
+    let helper = TestPackage::new("a11y", "helper", "3.0.0", &constant_source("HELPER")).disabled();
+    let alpha = TestPackage::new(
         "a11y",
         "earcon",
         "1.0.0",
-        r#"
-        import { echo } from "smudgy:core";
-
-        const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
-        if (globalThis.__main_audio_context !== undefined) {
-          echo("SANDBOX_AUDIO_CONTEXT_LEAK");
-        }
-        const oscillator = context.createOscillator();
-        const gain = context.createGain();
-        gain.gain.value = 0.05;
-        oscillator.connect(gain);
-        gain.connect(context.destination);
-        oscillator.onended = async () => {
-            await context.close();
-            echo("SANDBOX_WEB_AUDIO_OK");
-        };
-        oscillator.start();
-        oscillator.stop(context.currentTime + 0.02);
+        &format!(
+            r#"
+        import "smudgy://a11y/helper";
+        {}
         "#,
-    );
+            constant_source("ALPHA")
+        ),
+    )
+    .dependency("smudgy://a11y/helper");
+    let beta = TestPackage::new("sound", "beta", "7.4.0", &constant_source("BETA"));
 
     let session_id = 9_211;
     let (service, probe) = smudgy_audio::test_support::start_test_mixer(
@@ -648,9 +672,10 @@ async fn sandboxed_package_can_render_web_audio() {
     let mixer_owner = service
         .add_session(smudgy_audio::AudioSessionId(u64::from(session_id)))
         .expect("package session joins process mixer");
+    let master_gain = service.master_gain_authority();
     let application = smudgy_audio_web::ApplicationAudioOwner::new(
         deno_audio::AudioHostLimits::unlimited()
-            .max_online_contexts(Some(4))
+            .max_online_contexts(Some(8))
             .max_live_audio_bytes(Some(32 * 1024 * 1024))
             .max_graph_nodes(Some(512))
             .max_graph_connections(Some(512))
@@ -666,18 +691,34 @@ async fn sandboxed_package_can_render_web_audio() {
         .register_session(mixer_owner)
         .expect("package session audio registration succeeds");
     let render_done = Arc::new(AtomicBool::new(false));
+    let expected_bits = Arc::new(AtomicU32::new(f32::NAN.to_bits()));
+    let expected_epoch = Arc::new(AtomicUsize::new(0));
+    let observed_epoch = Arc::new(AtomicUsize::new(0));
     let render_thread = {
         let render_done = Arc::clone(&render_done);
+        let expected_bits = Arc::clone(&expected_bits);
+        let expected_epoch = Arc::clone(&expected_epoch);
+        let observed_epoch = Arc::clone(&observed_epoch);
         let probe = probe.clone();
         thread::spawn(move || {
             let mut output = [0.0; 256];
             while !render_done.load(Ordering::Acquire) {
                 let _ = probe.render(&mut output, 2);
+                let epoch = expected_epoch.load(Ordering::Acquire);
+                let expected = f32::from_bits(expected_bits.load(Ordering::Acquire));
+                if epoch != 0
+                    && expected.is_finite()
+                    && output
+                        .iter()
+                        .all(|sample| (*sample - expected).abs() < 1.0e-4)
+                {
+                    observed_epoch.store(epoch, Ordering::Release);
+                }
                 thread::sleep(Duration::from_millis(1));
             }
         })
     };
-    let lines = run_scenario_with_audio(
+    let mut scenario = Box::pin(run_scenario_with_audio(
         session_id,
         "pi_sandbox_web_audio",
         &[(
@@ -686,39 +727,76 @@ async fn sandboxed_package_can_render_web_audio() {
             import { echo } from "smudgy:core";
             const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
             globalThis.__main_audio_context = context;
-            const oscillator = context.createOscillator();
-            oscillator.onended = async () => {
-              await context.close();
-              echo("MAIN_WEB_AUDIO_OK");
-            };
-            oscillator.connect(context.destination);
-            oscillator.start();
-            oscillator.stop(context.currentTime + 0.02);
+            const buffer = context.createBuffer(2, 128, 48_000);
+            buffer.getChannelData(0).fill(0.1);
+            buffer.getChannelData(1).fill(0.1);
+            const source = context.createBufferSource();
+            source.buffer = buffer;
+            source.loop = true;
+            source.connect(context.destination);
+            source.start();
+            globalThis.__retained_main_audio = { context, source };
+            echo("PACKAGE_AUDIO_SCOPE_READY:MAIN");
             "#,
         )],
-        vec![pkg],
-        "SANDBOX_WEB_AUDIO_OK",
+        vec![alpha, helper, beta],
+        "PACKAGE_AUDIO_SCOPE_READY:MAIN",
         1,
         "noop",
         registration.scope(),
-    )
-    .await;
+    ));
+    let mut controls_applied = false;
+    let mut composition_phase = 0_u8;
+    let lines = loop {
+        tokio::select! {
+            lines = &mut scenario => break lines,
+            () = tokio::time::sleep(Duration::from_millis(5)), if composition_phase < 2 => {
+                if !controls_applied {
+                    let alpha = registration.package_control_key("A11Y", "EARCON");
+                    let beta = registration.package_control_key("sound", "beta");
+                    if let (Ok(alpha), Ok(beta)) = (alpha, beta) {
+                        assert_eq!(
+                            registration.package_control_key("a11y", "helper"),
+                            Err(smudgy_audio_web::PackageAudioControlError::UnknownPackage),
+                            "an imported dependency inherits the root scope rather than registering one"
+                        );
+                        registration.set_package_gain_linear(&alpha, 0.5).unwrap();
+                        registration.set_package_gain_linear(&beta, 0.25).unwrap();
+                        // Main: .1; alpha root + dependency: (.1 + .1) * .5;
+                        // beta: .1 * .25. A dependency-local or shared-root bug
+                        // produces a different exact mix.
+                        expected_bits.store(0.225_f32.to_bits(), Ordering::Release);
+                        expected_epoch.store(1, Ordering::Release);
+                        controls_applied = true;
+                    }
+                } else if composition_phase == 0
+                    && observed_epoch.load(Ordering::Acquire) >= 1
+                {
+                        registration.set_gain_linear(0.5).unwrap();
+                        expected_bits.store(0.1125_f32.to_bits(), Ordering::Release);
+                        expected_epoch.store(2, Ordering::Release);
+                        composition_phase = 1;
+                } else if composition_phase == 1
+                    && observed_epoch.load(Ordering::Acquire) >= 2
+                {
+                        master_gain.set_linear(0.5).unwrap();
+                        expected_bits.store(0.05625_f32.to_bits(), Ordering::Release);
+                        expected_epoch.store(3, Ordering::Release);
+                        composition_phase = 2;
+                }
+            }
+        }
+    };
     render_done.store(true, Ordering::Release);
     render_thread.join().expect("fake physical renderer joins");
 
     assert!(
-        lines.iter().any(|line| line == "SANDBOX_WEB_AUDIO_OK"),
-        "sandboxed accessibility package must render and close Web Audio; transcript:\n{lines:#?}"
+        controls_applied,
+        "sandbox-root controls never became active; transcript:\n{lines:#?}"
     );
     assert!(
-        lines.iter().any(|line| line == "MAIN_WEB_AUDIO_OK"),
-        "trusted and sandboxed isolates must receive distinct contexts from the same scope; transcript:\n{lines:#?}"
-    );
-    assert!(
-        !lines
-            .iter()
-            .any(|line| line == "SANDBOX_AUDIO_CONTEXT_LEAK"),
-        "a sandboxed context must not share its graph brand or heap with main; transcript:\n{lines:#?}"
+        composition_phase == 2 && observed_epoch.load(Ordering::Acquire) >= 3,
+        "master x session x package composition never reached every exact phase; phase={composition_phase}; transcript:\n{lines:#?}"
     );
     assert_eq!(probe.start_count(), 1);
     assert_eq!(probe.play_count(), 1);
@@ -733,6 +811,7 @@ async fn sandboxed_package_can_render_web_audio() {
 #[cfg(feature = "web-audio")]
 #[tokio::test]
 #[allow(clippy::await_holding_lock, clippy::too_many_lines)]
+#[allow(clippy::float_cmp)] // exact package-control snapshots are the reload contract
 async fn repeated_full_session_reload_returns_exact_audio_baseline() {
     let _test_guard = PACKAGE_ISOLATE_TEST_LOCK
         .lock()
@@ -835,11 +914,7 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
                     name: package.name.to_string(),
                 },
                 resolved_version: package.version.to_string(),
-                manifest: PackageManifest::parse(&format!(
-                    "{{ \"name\": \"{}\", \"version\": \"{}\" }}",
-                    package.name, package.version
-                ))
-                .expect("valid reload package manifest"),
+                manifest: package.manifest(),
                 integrity: format!("reload-{}-{}", package.name, package.version),
                 modules: package
                     .modules
@@ -993,6 +1068,7 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
     let mut transcript = Vec::new();
     let mut loaded_baseline = None;
     let mut cross_reload_render_threshold = None;
+    let mut previous_alpha_key: Option<smudgy_audio_web::PackageAudioControlKey> = None;
 
     for cycle in 1..=4 {
         let expected = labels
@@ -1037,6 +1113,30 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
         assert_eq!(rebuild_count.load(Ordering::Acquire), cycle);
         assert_eq!(format!("{reload_scope:?}"), scope_debug);
         assert_eq!(reload_scope.session_id(), u64::from(reload_numeric_id));
+
+        let alpha_key = reload_registration
+            .package_control_key("RELOAD", "alpha")
+            .expect("the successfully loaded folded sandbox root is controllable");
+        if let Some(previous) = previous_alpha_key.replace(alpha_key.clone()) {
+            assert_eq!(
+                reload_registration.set_package_gain_muted(&previous, false),
+                Err(smudgy_audio_web::PackageAudioControlError::StalePackage),
+                "a full RuntimeAction::Reload must stale the old root lease"
+            );
+            let restored = reload_registration
+                .set_package_gain_muted(&alpha_key, false)
+                .expect("the replacement root lease is active");
+            assert_eq!(
+                restored.linear(),
+                0.25,
+                "versionless package gain survives the complete engine reload"
+            );
+        } else {
+            let applied = reload_registration
+                .set_package_gain_linear(&alpha_key, 0.25)
+                .expect("first sandbox-root gain applies");
+            assert_eq!(applied.linear(), 0.25);
+        }
 
         let loaded = wait_for_quiescent_audio_usage(
             &application,
@@ -1158,6 +1258,16 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
         RuntimeThreadJoinOutcome::Clean {
             session_id: reload_id
         }
+    );
+    assert_eq!(
+        reload_registration.set_package_gain_muted(
+            previous_alpha_key
+                .as_ref()
+                .expect("the final generation published a package key"),
+            false,
+        ),
+        Err(smudgy_audio_web::PackageAudioControlError::StalePackage),
+        "dropping the final sandbox isolate deactivates its exact lease"
     );
     wait_for_exact_audio_usage(
         &application,
@@ -1386,11 +1496,7 @@ async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
                     name: package.name.to_string(),
                 },
                 resolved_version: package.version.to_string(),
-                manifest: PackageManifest::parse(&format!(
-                    "{{ \"name\": \"{}\", \"version\": \"{}\" }}",
-                    package.name, package.version
-                ))
-                .expect("valid S4c package manifest"),
+                manifest: package.manifest(),
                 integrity: format!("s4c-{}-{}", package.name, package.version),
                 modules: package
                     .modules
