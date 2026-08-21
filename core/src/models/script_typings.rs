@@ -51,6 +51,11 @@ const SMUDGY_MAPPER_DTS: &str = include_str!("script_typings/smudgy-mapper.d.ts"
 /// `.tsx` authoring type-checks). Embedded at build time, rewritten on session start.
 const SMUDGY_WIDGETS_DTS: &str = include_str!("script_typings/smudgy-widgets.d.ts");
 
+/// The managed online Web Audio declarations. This file is written only for a
+/// session whose engine received an explicit audio scope; feature compilation
+/// alone is not runtime availability.
+const SMUDGY_WEB_AUDIO_DTS: &str = include_str!("script_typings/smudgy-web-audio.d.ts");
+
 /// The vendored Deno runtime lib (`Deno` namespace + web globals like `fetch`/`Response`),
 /// with the `/// <reference>` directives stripped so they're plain ambient declarations.
 /// Materialized to `<server>/.smudgy/types/deno/` (covered by the user tsconfig's
@@ -544,12 +549,31 @@ pub fn ensure_script_tsconfig_with_packages(
     server_name: &str,
     packages: &[InstalledPackageTypes],
 ) -> Result<()> {
+    ensure_script_tsconfig_with_packages_and_web_audio(server_name, packages, false)
+}
+
+/// Refreshes the managed project using actual engine authority rather than the
+/// Cargo feature as the Web Audio availability signal.
+pub(crate) fn ensure_script_tsconfig_with_packages_and_web_audio(
+    server_name: &str,
+    packages: &[InstalledPackageTypes],
+    web_audio_available: bool,
+) -> Result<()> {
     let server_dir = get_smudgy_home()?.join(server_name);
-    ensure_script_tsconfig_in(&server_dir, packages)
+    ensure_script_tsconfig_in_with_web_audio(&server_dir, packages, web_audio_available)
 }
 
 /// [`ensure_script_tsconfig_with_packages`] against an explicit server directory (test seam).
+#[cfg(test)]
 fn ensure_script_tsconfig_in(server_dir: &Path, packages: &[InstalledPackageTypes]) -> Result<()> {
+    ensure_script_tsconfig_in_with_web_audio(server_dir, packages, false)
+}
+
+fn ensure_script_tsconfig_in_with_web_audio(
+    server_dir: &Path,
+    packages: &[InstalledPackageTypes],
+    web_audio_available: bool,
+) -> Result<()> {
     let managed_dir = server_dir.join(".smudgy");
     let types_dir = managed_dir.join("types");
     fs::create_dir_all(&types_dir).with_context(|| format!("create {}", types_dir.display()))?;
@@ -563,6 +587,14 @@ fn ensure_script_tsconfig_in(server_dir: &Path, packages: &[InstalledPackageType
     write_if_changed(&types_dir.join("smudgy-params.d.ts"), SMUDGY_PARAMS_DTS)?;
     write_if_changed(&types_dir.join("smudgy-mapper.d.ts"), SMUDGY_MAPPER_DTS)?;
     write_if_changed(&types_dir.join("smudgy-widgets.d.ts"), SMUDGY_WIDGETS_DTS)?;
+    let web_audio_types = types_dir.join("smudgy-web-audio.d.ts");
+    if web_audio_available {
+        write_if_changed(&web_audio_types, SMUDGY_WEB_AUDIO_DTS)?;
+    } else if let Err(error) = fs::remove_file(&web_audio_types)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error).with_context(|| format!("remove {}", web_audio_types.display()));
+    }
     write_if_changed(
         &types_dir.join("installed-events.d.ts"),
         &installed_events_barrel(packages),
@@ -702,6 +734,10 @@ mod tests {
         assert!(dir.join(".smudgy/types/smudgy-params.d.ts").is_file());
         assert!(dir.join(".smudgy/types/smudgy-mapper.d.ts").is_file());
         assert!(dir.join(".smudgy/types/smudgy-widgets.d.ts").is_file());
+        assert!(
+            !dir.join(".smudgy/types/smudgy-web-audio.d.ts").exists(),
+            "an audio-free engine must not advertise Web Audio"
+        );
         assert!(dir.join(".smudgy/README.md").is_file());
 
         let core = fs::read_to_string(dir.join(".smudgy/types/smudgy-core.d.ts")).unwrap();
@@ -753,6 +789,107 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn web_audio_typings_follow_session_authority_and_remove_stale_surface() {
+        let dir = temp_server_dir("web-audio-authority");
+        let declaration = dir.join(".smudgy/types/smudgy-web-audio.d.ts");
+
+        ensure_script_tsconfig_in_with_web_audio(&dir, &[], true)
+            .expect("audio-scoped engine writes Web Audio declarations");
+        assert_eq!(
+            fs::read_to_string(&declaration).unwrap(),
+            SMUDGY_WEB_AUDIO_DTS
+        );
+
+        ensure_script_tsconfig_in_with_web_audio(&dir, &[], false)
+            .expect("audio-free engine removes stale Web Audio declarations");
+        assert!(!declaration.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn public_web_audio_examples_compile_against_the_narrow_hosted_surface() {
+        use std::collections::BTreeMap;
+
+        let manifest_text =
+            include_str!("../../../examples/web_audio_a11y_package/smudgy.package.json");
+        smudgy_script::PackageManifest::parse(manifest_text)
+            .expect("the complete public package manifest must remain valid for Smudgy");
+        let package_manifest: serde_json::Value = serde_json::from_str(manifest_text)
+            .expect("the complete public package manifest must remain valid JSON");
+        assert_eq!(package_manifest["entry"], "index.ts");
+        assert!(package_manifest["permissions"].get("audio").is_none());
+
+        let mut ambient = BTreeMap::new();
+        // The declaration emitter normally uses lib.esnext.full (including DOM).
+        // Suppress that default here and add only ESNext plus the Deno event seam,
+        // so a browser's much wider Web Audio declarations cannot mask drift.
+        ambient.insert(
+            "000-runtime.d.ts".to_string(),
+            "/// <reference no-default-lib=\"true\" />\n\
+             /// <reference lib=\"esnext\" />\n\
+             interface Event {}\n\
+             interface EventTarget {}\n"
+                .to_string(),
+        );
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-web-audio.d.ts".to_string(),
+            SMUDGY_WEB_AUDIO_DTS.to_string(),
+        );
+
+        let mut examples = BTreeMap::new();
+        examples.insert(
+            "web_audio_earcon.ts".to_string(),
+            include_str!("../../../examples/web_audio_earcon.ts").to_string(),
+        );
+        examples.insert(
+            "web_audio_a11y_package.ts".to_string(),
+            include_str!("../../../examples/web_audio_a11y_package/index.ts").to_string(),
+        );
+        let output = smudgy_script::dts::generate_declarations(&examples, &ambient)
+            .expect("compile public examples against hosted declarations");
+        assert!(
+            output.diagnostics.is_empty(),
+            "public Web Audio examples drifted from hosted declarations:\n{:#?}",
+            output.diagnostics
+        );
+
+        let mut unsupported = BTreeMap::new();
+        unsupported.insert(
+            "unsupported.ts".to_string(),
+            "const context = new AudioContext({ sinkId: \"none\" });\n\
+             context.createBuffer(1, 128, 48_000);\n\
+             context.createGain().gain.setValueAtTime(0.5, 0);\n\
+             new OfflineAudioContext(1, 128, 48_000);\n\
+             new BiquadFilterNode(context);\n\
+             context.createOscillator().type = \"custom\";\n"
+                .to_string(),
+        );
+        let output = smudgy_script::dts::generate_declarations(&unsupported, &ambient)
+            .expect("unsupported surface produces ordinary diagnostics");
+        assert_eq!(
+            output.diagnostics.len(),
+            5,
+            "only the five deliberate unsupported uses should diagnose: {:#?}",
+            output.diagnostics
+        );
+        for expected in [
+            "Property 'createBuffer' does not exist on type 'AudioContext'.",
+            "Property 'setValueAtTime' does not exist on type 'AudioParam'.",
+            "Cannot find name 'OfflineAudioContext'.",
+            "Cannot find name 'BiquadFilterNode'.",
+            "Type '\"custom\"' is not assignable to type 'OscillatorType'.",
+        ] {
+            assert!(
+                output.diagnostics.iter().any(|actual| actual == expected),
+                "missing exact diagnostic {expected:?}: {:#?}",
+                output.diagnostics
+            );
+        }
     }
 
     #[test]

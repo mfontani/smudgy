@@ -663,15 +663,18 @@ impl<'a> ScriptEngine<'a> {
     /// becomes its own sandboxed isolate. Trust is the per-profile `LockedPackage::trusted`
     /// flag (default `false` — sandboxed until the user trusts it). Loading itself is done by
     /// [`ScriptRuntime::load_modules`] into each target isolate.
-    fn build_isolate_plan(server_name: &str) -> IsolatePlan {
+    fn build_isolate_plan(server_name: &str, web_audio_available: bool) -> IsolatePlan {
         // Best-effort: refresh the managed VS Code TypeScript project so authors get
         // `smudgy:core` types — plus the `.d.ts` shipped by installed `smudgy://` packages —
         // in their editor. Pure-disk; never blocks session start.
         let installed_typings = materialize_installed_typings(server_name);
-        if let Err(e) = crate::models::script_typings::ensure_script_tsconfig_with_packages(
-            server_name,
-            &installed_typings,
-        ) {
+        if let Err(e) =
+            crate::models::script_typings::ensure_script_tsconfig_with_packages_and_web_audio(
+                server_name,
+                &installed_typings,
+                web_audio_available,
+            )
+        {
             warn!("Failed to write script tsconfig for {server_name}: {e:#}");
         }
 
@@ -1008,6 +1011,10 @@ impl<'a> ScriptEngine<'a> {
         #[cfg(feature = "web-audio")]
         let audio_scope = params.audio_scope.clone();
         #[cfg(feature = "web-audio")]
+        let web_audio_available = audio_scope.is_some();
+        #[cfg(not(feature = "web-audio"))]
+        let web_audio_available = false;
+        #[cfg(feature = "web-audio")]
         let (audio_lifecycle_owner, audio_lifecycle_registrar) = if audio_scope.is_some() {
             let (owner, registrar) = deno_audio::AudioLifecycleOwner::new();
             (Some(owner), Some(registrar))
@@ -1044,7 +1051,7 @@ impl<'a> ScriptEngine<'a> {
         // which every isolate's ops receive and which must be complete before ANY module
         // evaluates (a trusted package's top-level `set()` passes the home gate only if its
         // entry is already registered).
-        let plan = Self::build_isolate_plan(params.server_name.as_str());
+        let plan = Self::build_isolate_plan(params.server_name.as_str(), web_audio_available);
         let home_registry: crate::session::runtime::store::HomeRegistry =
             Rc::new(std::cell::RefCell::new(plan.homes));
 

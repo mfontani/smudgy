@@ -103,10 +103,13 @@ winapi = { workspace = true, features = [
 ] }
 
 [features]
-# Development gate for trying Web Audio from user scripts and sandboxed accessibility packages. Use the
-# CPAL variant for speakers; the base feature keeps `sinkId: "none"` available
-# to deterministic tests and headless environments.
+# Hardware-independent integration for explicit audio-scoped test/embedding paths. It keeps
+# `sinkId: "none"` available without acquiring a device; by itself it does not make ordinary
+# desktop sessions audio-scoped.
 web-audio = ["smudgy_core/web-audio"]
+# Opt-in desktop coordinator and direct CPAL output (WASAPI/ALSA/CoreAudio) through
+# `smudgy_audio/physical-output`. Production packaging intentionally does not select this yet:
+# accessible master/session/package controls are the release gate.
 web-audio-cpal = [
     "web-audio",
     "dep:futures",

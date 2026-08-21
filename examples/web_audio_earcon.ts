@@ -1,5 +1,6 @@
-// Build Smudgy with `--features web-audio-cpal`, copy this file into a
-// server's `modules/` directory, connect, and enter `/earcon`.
+// This source-build preview needs `--features web-audio-cpal`. Copy this file
+// into a server's `modules/` directory, connect, and enter `/earcon`. Official
+// release builds do not enable physical Web Audio yet; see WEB_AUDIO.md.
 //
 // The same module can be the entry point of a sandboxed accessibility package.
 // Such a package needs Smudgy `aliases` and `echo` capabilities, but no network,
@@ -9,7 +10,7 @@ import { createAlias, echo } from "smudgy:core";
 
 let activeContext: AudioContext | undefined;
 
-createAlias("^/earcon$", async () => {
+async function playEarcon() {
   if (activeContext && activeContext.state !== "closed") {
     await activeContext.close();
   }
@@ -32,6 +33,10 @@ createAlias("^/earcon$", async () => {
 
   oscillator.start();
   oscillator.stop(context.currentTime + 0.12);
+}
+
+createAlias("^/earcon$", () => {
+  void playEarcon();
 });
 
 echo("Web Audio earcon loaded; enter /earcon to play it.");

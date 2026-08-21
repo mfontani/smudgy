@@ -2,7 +2,7 @@ import { createAlias, echo } from "smudgy:core";
 
 let activeContext: AudioContext | undefined;
 
-createAlias("^/a11y-earcon$", async () => {
+async function playEarcon() {
   if (activeContext && activeContext.state !== "closed") {
     await activeContext.close();
   }
@@ -25,6 +25,10 @@ createAlias("^/a11y-earcon$", async () => {
 
   oscillator.start();
   oscillator.stop(context.currentTime + 0.12);
+}
+
+createAlias("^/a11y-earcon$", () => {
+  void playEarcon();
 });
 
 echo("Sandboxed Web Audio a11y package loaded; enter /a11y-earcon.");

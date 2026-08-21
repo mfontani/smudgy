@@ -355,14 +355,18 @@ impl MixerInput for ConstantInput {
     }
 }
 
-fn install_constant(service: &MixerService, value: f32) -> crate::RunningMixerInput {
+fn install_constant(
+    service: &MixerService,
+    value: f32,
+) -> (crate::MixerSessionOwner, crate::RunningMixerInput) {
     let session = service.add_session(AudioSessionId(1)).unwrap();
-    session
+    let running = session
         .script_bus()
         .try_reserve_input()
         .unwrap()
         .start_preboxed(Box::new(ConstantInput(value)))
-        .unwrap()
+        .unwrap();
+    (session, running)
 }
 
 #[test]
@@ -467,7 +471,7 @@ fn every_supported_pcm_encoding_renders_non_hint_sizes() {
             )],
             ..FakeConfig::default()
         });
-        let running = install_constant(&service, 0.25);
+        let (session, running) = install_constant(&service, 0.25);
         match format {
             DriverSampleFormat::F32 => {
                 let output = state.invoke_f32(514, 9.0);
@@ -500,6 +504,7 @@ fn every_supported_pcm_encoding_renders_non_hint_sizes() {
             DriverSampleFormat::Other => unreachable!(),
         }
         assert!(block_on(shutdown).unwrap().is_clean());
+        drop(session);
         assert!(service.shutdown().clean);
     }
 }
@@ -600,7 +605,7 @@ fn raw_cpal_dispatch_latches_wrong_format_without_typed_expect() {
 #[test]
 fn maximum_valid_callback_is_allocation_free() {
     let (service, state) = start_fake(FakeConfig::default());
-    let running = install_constant(&service, 0.125);
+    let (session, running) = install_constant(&service, 0.125);
     let mut output = vec![9.0; PHYSICAL_SCRATCH_SAMPLES];
     let mut callback = state.callbacks.lock().unwrap().data.take().unwrap();
     assert_no_alloc::assert_no_alloc(|| callback(Some(OutputBuffer::F32(&mut output))));
@@ -609,6 +614,7 @@ fn maximum_valid_callback_is_allocation_free() {
     let shutdown = running.shutdown();
     drop(state.invoke_f32(2, 9.0));
     assert!(block_on(shutdown).unwrap().is_clean());
+    drop(session);
     assert!(service.shutdown().clean);
 }
 
