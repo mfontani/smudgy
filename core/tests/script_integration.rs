@@ -295,6 +295,174 @@ async fn regexp_flags_are_honored() {
     );
 }
 
+/// A module exercising the `pattern` tagged template end to end: anchor
+/// forms, escaped interpolation, raw-string islands, the display side
+/// properties, compile-error throwing, and a lockstep probe that echoes the
+/// JS compiler's output for shapes the Rust compiler
+/// (`models::matchers::compile_pattern`) owns.
+const PATTERN_TAG_TS: &str = r#"
+import { createAlias, echo, pattern } from "smudgy:core";
+
+createAlias(pattern`greet {person}`, (m) => { echo("TAG_GREET who=" + m.person); });
+createAlias(pattern.contains`buy`, () => { echo("TAG_CONTAINS"); });
+
+// Interpolation is escaped: metacharacters in the value are literal text.
+const target = "a.b*c";
+createAlias(pattern`kill ${target}`, () => { echo("TAG_ESCAPED"); });
+
+// Raw strings: an island's backslash survives to the engine.
+createAlias(pattern`lvl /\d+/`, () => { echo("TAG_ISLAND"); });
+
+const p = pattern`greet {person}`;
+echo("TAG_PROPS anchors=" + (p as any).patternAnchors + " src=" + (p as any).patternSource
+    + " enum=" + JSON.stringify(Object.keys(p)));
+
+try {
+    pattern`hit {1}`;
+    echo("TAG_ERR_MISSED");
+} catch (e) {
+    echo("TAG_ERR " + String((e as Error).message).startsWith("Write {} instead of {1}."));
+}
+
+const shapes: RegExp[] = [
+    pattern`greet {person}`,
+    pattern`greet {person} warmly`,
+    pattern`greet {person?}`,
+    pattern`hit {} for {}`,
+    pattern`you gain {n:number} exp`,
+    pattern`/\s*/{person} bows`,
+    pattern`greet {not a name}`,
+    pattern`you are *`,
+    pattern.startsWith`You are`,
+    pattern.endsWith`is hungry.`,
+    pattern.contains`is hun`,
+];
+shapes.forEach((s, i) => echo("TAGSRC " + i + " " + s.source));
+"#;
+
+/// Drive `PATTERN_TAG_TS`: tag-built aliases fire with the pattern grammar's
+/// semantics, and the JS compiler's output is byte-identical to the Rust
+/// compiler's for every probed shape.
+#[tokio::test]
+async fn pattern_tag_end_to_end() {
+    use smudgy_core::models::matchers::compile_pattern;
+
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "PatternTag";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules_dir.join("tag.ts"), PATTERN_TAG_TS).unwrap();
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(7017),
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    for input in [
+        "greet Mira Bob",
+        "please buy now",
+        "kill a.b*c",
+        "kill aXbYc",
+        "lvl 42",
+        "lvl xx",
+    ] {
+        tx.send(RuntimeAction::Send(Arc::new(input.to_string())))
+            .unwrap();
+    }
+
+    let mut lines = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            for update in updates.iter() {
+                if let BufferUpdate::Append(line) = update {
+                    lines.push(line.text.clone());
+                }
+            }
+        }
+    }
+
+    tx.send(RuntimeAction::Shutdown).ok();
+
+    let transcript = lines.join("\n");
+    let has = |needle: &str| lines.iter().any(|l| l == needle);
+    assert!(
+        has("TAG_GREET who=Mira Bob"),
+        "a tag alias fires with wildcard-hole semantics.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("TAG_CONTAINS"),
+        "pattern.contains matches anywhere.\nTranscript:\n{transcript}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.as_str() == "TAG_ESCAPED").count(),
+        1,
+        "interpolation is literal text: `a.b*c` fires, `aXbYc` does not.\nTranscript:\n{transcript}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.as_str() == "TAG_ISLAND").count(),
+        1,
+        "an island's \\d survives the raw-string tag.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("TAG_PROPS anchors=both src=greet {person} enum=[]"),
+        "side properties are present and non-enumerable.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("TAG_ERR true"),
+        "a numbered hole throws the editor's message.\nTranscript:\n{transcript}"
+    );
+
+    // The two compilers must agree byte for byte.
+    let expected = [
+        compile_pattern("greet {person}", true, true),
+        compile_pattern("greet {person} warmly", true, true),
+        compile_pattern("greet {person?}", true, true),
+        compile_pattern("hit {} for {}", true, true),
+        compile_pattern("you gain {n:number} exp", true, true),
+        compile_pattern(r"/\s*/{person} bows", true, true),
+        compile_pattern("greet {not a name}", true, true),
+        compile_pattern("you are *", true, true),
+        compile_pattern("You are", true, false),
+        compile_pattern("is hungry.", false, true),
+        compile_pattern("is hun", false, false),
+    ];
+    for (i, compiled) in expected.iter().enumerate() {
+        assert!(
+            compiled.errors.is_empty(),
+            "probe {i} failed to compile in Rust"
+        );
+        let needle = format!("TAGSRC {i} {}", compiled.source);
+        assert!(
+            has(&needle),
+            "JS and Rust compilers disagree on probe {i}: wanted {needle:?}.\nTranscript:\n{transcript}"
+        );
+    }
+}
+
 /// One alias, two patterns. Sending `first x` fires pattern one, where `a`
 /// participates, `opt` (an optional group of the fired pattern) does not, and
 /// `b` belongs to the pattern that did not fire. The handler reports what each

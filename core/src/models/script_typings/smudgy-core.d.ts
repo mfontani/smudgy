@@ -1751,6 +1751,49 @@ declare module "smudgy:core" {
    */
   type Pattern = string | RegExp;
 
+  /**
+   * The `pattern` tagged template: friendly pattern syntax that evaluates to
+   * a `RegExp`, so it slots anywhere a {@link Pattern} goes. Four forms — one
+   * per anchor combination:
+   *
+   * ```ts
+   * pattern`You are {state}.`            // the whole line
+   * pattern.startsWith`You are`          // anchored at the front
+   * pattern.endsWith`is hungry.`         // anchored at the end
+   * pattern.contains`is hun`             // anywhere in the line
+   * ```
+   *
+   * Syntax, matching the editor's Simple patterns exactly: plain text matches
+   * itself, case-sensitively, with any run of spaces matching any run of
+   * spaces. `{name}` is a wildcard hole (lazy; greedy when it ends the
+   * pattern), so `You are {state}.` matches `You are very hungry.` whole.
+   * `{name...}` takes the rest of the line, `{name?}` is an optional word,
+   * `{name:word}` exactly one word, `{name:number}` a number. `{}` (and
+   * `{...}`, `{?}`) are the same, anonymous — every hole takes the next group
+   * number in the order written; there are no `{1}`-style numbered holes.
+   * `*` matches anything without capturing, and `/…/` is a raw regex island
+   * inserted verbatim. Backslashes reach the pattern uncooked, so `/\d+/` in
+   * an island means the regex digit class.
+   *
+   * Interpolated `${values}` are always **literal text**, never syntax — the
+   * reason to prefer the tag over string concatenation, and what makes it
+   * safe to build patterns from game data. A body that fails to compile
+   * throws at evaluation time.
+   *
+   * What was written rides along for display on two non-enumerable
+   * properties: `patternSource` (the tag body) and `patternAnchors`
+   * (`"both" | "start" | "end" | "none"`).
+   */
+  export const pattern: PatternTag;
+
+  /** The four anchor forms of the {@link pattern} tag. */
+  interface PatternTag {
+    (strings: TemplateStringsArray, ...values: unknown[]): RegExp;
+    startsWith(strings: TemplateStringsArray, ...values: unknown[]): RegExp;
+    endsWith(strings: TemplateStringsArray, ...values: unknown[]): RegExp;
+    contains(strings: TemplateStringsArray, ...values: unknown[]): RegExp;
+  }
+
   /** The three pattern lists a trigger can match with. Most triggers set only
    *  `patterns`. */
   export type TriggerPatterns = {
@@ -2389,6 +2432,7 @@ declare module "smudgy:core" {
     echo(text: TemplateStringsArray, ...values: unknown[]): void;
     readonly style: StyleBuilder;
     readonly link: typeof link;
+    readonly pattern: PatternTag;
     send(command: string): void;
     sendRaw(text: string): void;
     reload(): void;
