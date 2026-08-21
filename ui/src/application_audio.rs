@@ -21,8 +21,10 @@ use smudgy_audio_web::{
     ApplicationAudioOwner, ApplicationAudioRegistrar, AudioHostLimits, SessionAudioRegistration,
     SessionAudioRegistrationError, SessionAudioScope,
 };
-use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome};
-use smudgy_core::session::{SessionId, registry};
+use smudgy_core::session::runtime::{
+    RuntimeAction, RuntimeThreadJoinOutcome, RuntimeThreadPublicationFailure,
+};
+use smudgy_core::session::{AudioSessionSpawnError, SessionId, registry};
 
 /// Smudgy's one fixed logical and physical output rate.
 pub const PHYSICAL_SAMPLE_RATE: u32 = 48_000;
@@ -126,21 +128,34 @@ pub enum SessionAudioCloseDisposition {
     Requested,
     AlreadyClosing,
     UnknownSession,
+    InvalidRuntimeProof,
     CoordinatorStopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeShutdownRequest {
+    /// A shutdown action was queued to the live runtime.
+    Requested,
+    /// No live sender remained, or exact pre-start cleanup already joined it.
+    AlreadyClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAudioCloseResult {
     pub session_id: SessionId,
-    pub shutdown_requested: bool,
+    pub shutdown: RuntimeShutdownRequest,
     pub runtime: RuntimeThreadJoinOutcome,
+    pub publication_failure: Option<RuntimeThreadPublicationFailure>,
     pub retirement: Result<(), MixerSessionRetirementError>,
 }
 
 impl SessionAudioCloseResult {
     #[must_use]
     pub fn is_clean(self) -> bool {
-        self.shutdown_requested
+        // The shutdown disposition is diagnostic: a runtime may already have
+        // stopped and left the live registry. The still-owned exact join is
+        // the authoritative lifecycle proof.
+        self.publication_failure.is_none()
             && self.runtime
                 == RuntimeThreadJoinOutcome::Clean {
                     session_id: self.session_id,
@@ -196,7 +211,9 @@ impl fmt::Display for ApplicationAudioShutdownReport {
 
 struct LifecycleJob {
     session_id: SessionId,
-    shutdown_requested: bool,
+    shutdown: RuntimeShutdownRequest,
+    runtime: Option<RuntimeThreadJoinOutcome>,
+    publication_failure: Option<RuntimeThreadPublicationFailure>,
     registration: SessionAudioRegistration,
 }
 
@@ -208,12 +225,13 @@ enum LifecycleCommand {
 fn finish_job(job: LifecycleJob, runtime_join: &RuntimeJoin) -> SessionAudioCloseResult {
     // Load-bearing order: the exact runtime cannot touch its scope after this
     // join before mixer retirement starts.
-    let runtime = runtime_join(job.session_id);
+    let runtime = job.runtime.unwrap_or_else(|| runtime_join(job.session_id));
     let retirement = block_on(job.registration.retire());
     SessionAudioCloseResult {
         session_id: job.session_id,
-        shutdown_requested: job.shutdown_requested,
+        shutdown: job.shutdown,
         runtime,
+        publication_failure: job.publication_failure,
         retirement,
     }
 }
@@ -237,6 +255,12 @@ enum CoordinatorCommand {
     },
     Close {
         session_id: SessionId,
+        reply: mpsc::SyncSender<SessionAudioCloseDisposition>,
+    },
+    ClosePrejoined {
+        session_id: SessionId,
+        failure: RuntimeThreadPublicationFailure,
+        cleanup: RuntimeThreadJoinOutcome,
         reply: mpsc::SyncSender<SessionAudioCloseDisposition>,
     },
     Finish {
@@ -299,6 +323,30 @@ impl ApplicationAudioController {
             .recv()
             .unwrap_or(SessionAudioCloseDisposition::CoordinatorStopped)
     }
+
+    fn close_prejoined_runtime(
+        &self,
+        session_id: SessionId,
+        failure: RuntimeThreadPublicationFailure,
+        cleanup: RuntimeThreadJoinOutcome,
+    ) -> SessionAudioCloseDisposition {
+        let (reply, response) = mpsc::sync_channel(1);
+        if self
+            .commands
+            .send(CoordinatorCommand::ClosePrejoined {
+                session_id,
+                failure,
+                cleanup,
+                reply,
+            })
+            .is_err()
+        {
+            return SessionAudioCloseDisposition::CoordinatorStopped;
+        }
+        response
+            .recv()
+            .unwrap_or(SessionAudioCloseDisposition::CoordinatorStopped)
+    }
 }
 
 /// Rollback guard spanning audio registration through exact runtime spawn and
@@ -309,6 +357,14 @@ pub struct PendingSessionAudio {
     session_id: SessionId,
     scope: SessionAudioScope,
     committed: bool,
+}
+
+pub(crate) enum AbortedSessionSpawnError {
+    Runtime(AudioSessionSpawnError),
+    Publication {
+        session_id: SessionId,
+        failure: RuntimeThreadPublicationFailure,
+    },
 }
 
 impl PendingSessionAudio {
@@ -324,6 +380,43 @@ impl PendingSessionAudio {
     pub fn abort(mut self) -> SessionAudioCloseDisposition {
         self.committed = true;
         self.controller.close_session(self.session_id)
+    }
+
+    pub(crate) fn abort_spawn_error(
+        self,
+        error: AudioSessionSpawnError,
+    ) -> AbortedSessionSpawnError {
+        match error {
+            AudioSessionSpawnError::RuntimePublication(error) => {
+                let (session_id, failure, cleanup) = error.into_parts();
+                let _ = self.abort_prejoined_parts(session_id, failure, cleanup);
+                AbortedSessionSpawnError::Publication {
+                    session_id,
+                    failure,
+                }
+            }
+            other => {
+                let _ = self.abort();
+                AbortedSessionSpawnError::Runtime(other)
+            }
+        }
+    }
+
+    fn abort_prejoined_parts(
+        mut self,
+        session_id: SessionId,
+        failure: RuntimeThreadPublicationFailure,
+        cleanup: RuntimeThreadJoinOutcome,
+    ) -> SessionAudioCloseDisposition {
+        if session_id != self.session_id || cleanup.session_id() != self.session_id {
+            // Leave the guard armed: returning the typed rejection invokes the
+            // ordinary close path from Drop, so a forged/mismatched proof can
+            // never suppress exact lifecycle cleanup.
+            return SessionAudioCloseDisposition::InvalidRuntimeProof;
+        }
+        self.committed = true;
+        self.controller
+            .close_prejoined_runtime(session_id, failure, cleanup)
     }
 }
 
@@ -427,7 +520,44 @@ fn take_close_job(
     registration.seal();
     Ok(LifecycleJob {
         session_id,
-        shutdown_requested: runtime_shutdown(session_id),
+        shutdown: if runtime_shutdown(session_id) {
+            RuntimeShutdownRequest::Requested
+        } else {
+            RuntimeShutdownRequest::AlreadyClosed
+        },
+        runtime: None,
+        publication_failure: None,
+        registration,
+    })
+}
+
+fn take_prejoined_close_job(
+    state: &Mutex<CoordinatorState>,
+    session_id: SessionId,
+    failure: RuntimeThreadPublicationFailure,
+    cleanup: RuntimeThreadJoinOutcome,
+) -> Result<LifecycleJob, SessionAudioCloseDisposition> {
+    if cleanup.session_id() != session_id {
+        return Err(SessionAudioCloseDisposition::InvalidRuntimeProof);
+    }
+    let mut registration = {
+        let mut state = lock_state(state);
+        let Some(registration) = state.registrations.remove(&session_id) else {
+            return Err(if state.closing.contains(&session_id) {
+                SessionAudioCloseDisposition::AlreadyClosing
+            } else {
+                SessionAudioCloseDisposition::UnknownSession
+            });
+        };
+        state.closing.insert(session_id);
+        registration
+    };
+    registration.seal();
+    Ok(LifecycleJob {
+        session_id,
+        shutdown: RuntimeShutdownRequest::AlreadyClosed,
+        runtime: Some(cleanup),
+        publication_failure: Some(failure),
         registration,
     })
 }
@@ -527,6 +657,22 @@ fn run_coordinator(
             }
             CoordinatorCommand::Close { session_id, reply } => {
                 let result = take_close_job(&state, &runtime_shutdown, session_id);
+                let disposition = match result {
+                    Ok(job) => {
+                        submit_job(&state, &lifecycle, &runtime_join, job);
+                        SessionAudioCloseDisposition::Requested
+                    }
+                    Err(disposition) => disposition,
+                };
+                let _ = reply.send(disposition);
+            }
+            CoordinatorCommand::ClosePrejoined {
+                session_id,
+                failure,
+                cleanup,
+                reply,
+            } => {
+                let result = take_prejoined_close_job(&state, session_id, failure, cleanup);
                 let disposition = match result {
                     Ok(job) => {
                         submit_job(&state, &lifecycle, &runtime_join, job);
@@ -916,7 +1062,7 @@ fn production_limits() -> AudioHostLimits {
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use smudgy_audio::MixerService;
@@ -973,6 +1119,189 @@ mod tests {
         )
         .unwrap_or_else(|(error, _)| panic!("test lifecycle workers start: {error}"));
         (application, probe)
+    }
+
+    #[test]
+    fn exact_clean_join_is_authoritative_when_shutdown_sender_is_already_absent() {
+        let session_id = SessionId::from(6);
+        let result = |shutdown, runtime, retirement| SessionAudioCloseResult {
+            session_id,
+            shutdown,
+            runtime,
+            publication_failure: None,
+            retirement,
+        };
+
+        assert!(
+            result(
+                RuntimeShutdownRequest::AlreadyClosed,
+                RuntimeThreadJoinOutcome::Clean { session_id },
+                Ok(())
+            )
+            .is_clean(),
+            "an exact clean join proves an already-stopped runtime"
+        );
+        assert!(
+            result(
+                RuntimeShutdownRequest::Requested,
+                RuntimeThreadJoinOutcome::Clean { session_id },
+                Ok(())
+            )
+            .is_clean()
+        );
+        assert!(
+            !result(
+                RuntimeShutdownRequest::Requested,
+                RuntimeThreadJoinOutcome::Clean {
+                    session_id: SessionId::from(7),
+                },
+                Ok(()),
+            )
+            .is_clean(),
+            "a clean join for another id is not this session's proof"
+        );
+        for runtime in [
+            RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined { session_id },
+            RuntimeThreadJoinOutcome::Panicked { session_id },
+            RuntimeThreadJoinOutcome::SpawnFailed { session_id },
+        ] {
+            assert!(
+                !result(RuntimeShutdownRequest::Requested, runtime, Ok(())).is_clean(),
+                "a shutdown send cannot promote {runtime:?} into proof"
+            );
+        }
+        assert!(
+            !result(
+                RuntimeShutdownRequest::Requested,
+                RuntimeThreadJoinOutcome::Clean { session_id },
+                Err(MixerSessionRetirementError::CleanupFailed),
+            )
+            .is_clean(),
+            "runtime proof cannot hide failed audio retirement"
+        );
+    }
+
+    #[test]
+    fn coordinator_reports_already_stopped_runtime_clean_from_exact_join() {
+        let (service, probe) =
+            start_test_mixer(PHYSICAL_SAMPLE_RATE, TestDriverConfig::default()).unwrap();
+        let application = ApplicationAudio::with_service_and_runtime(
+            service,
+            production_limits(),
+            Arc::new(|_| false),
+            Arc::new(|session_id| RuntimeThreadJoinOutcome::Clean { session_id }),
+            Arc::new(Vec::new),
+            Arc::new(|| {}),
+        )
+        .unwrap_or_else(|(error, _)| panic!("test lifecycle workers start: {error}"));
+        let controller = application.controller();
+        controller
+            .begin_session(SessionId::from(7))
+            .unwrap()
+            .commit();
+        assert_eq!(
+            controller.close_session(SessionId::from(7)),
+            SessionAudioCloseDisposition::Requested
+        );
+
+        let report = shutdown_while_rendering(application, probe);
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(
+            report.sessions[0].shutdown,
+            RuntimeShutdownRequest::AlreadyClosed
+        );
+        assert!(report.sessions[0].is_clean());
+        assert!(report.is_clean(), "{report}");
+    }
+
+    #[test]
+    fn prejoined_publication_failure_retires_without_double_join_or_unowned_handle() {
+        let joins = Arc::new(AtomicUsize::new(0));
+        let join_calls = Arc::clone(&joins);
+        let (application, probe) = test_application_with_join(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(move |session_id| {
+                join_calls.fetch_add(1, Ordering::AcqRel);
+                RuntimeThreadJoinOutcome::Clean { session_id }
+            }),
+        );
+        let session_id = SessionId::from(8);
+        let pending = application.controller().begin_session(session_id).unwrap();
+        assert_eq!(
+            pending.abort_prejoined_parts(
+                session_id,
+                RuntimeThreadPublicationFailure::PublicationUnwound,
+                RuntimeThreadJoinOutcome::Clean { session_id },
+            ),
+            SessionAudioCloseDisposition::Requested
+        );
+
+        let report = shutdown_while_rendering(application, probe);
+        assert_eq!(
+            joins.load(Ordering::Acquire),
+            0,
+            "exact join is not repeated"
+        );
+        assert!(report.unowned_runtime_joins.is_empty());
+        assert_eq!(report.sessions.len(), 1);
+        let result = report.sessions[0];
+        assert_eq!(
+            result.publication_failure,
+            Some(RuntimeThreadPublicationFailure::PublicationUnwound)
+        );
+        assert_eq!(
+            result.runtime,
+            RuntimeThreadJoinOutcome::Clean { session_id }
+        );
+        assert!(result.retirement.is_ok());
+        assert!(
+            !result.is_clean(),
+            "cleanup proof cannot erase startup failure"
+        );
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn mismatched_prejoined_proof_falls_back_to_ordinary_exact_join() {
+        let joins = Arc::new(AtomicUsize::new(0));
+        let join_calls = Arc::clone(&joins);
+        let (application, probe) = test_application_with_join(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(move |session_id| {
+                join_calls.fetch_add(1, Ordering::AcqRel);
+                RuntimeThreadJoinOutcome::Clean { session_id }
+            }),
+        );
+        let session_id = SessionId::from(9);
+        let pending = application.controller().begin_session(session_id).unwrap();
+        assert_eq!(
+            pending.abort_prejoined_parts(
+                session_id,
+                RuntimeThreadPublicationFailure::PublicationUnwound,
+                RuntimeThreadJoinOutcome::Clean {
+                    session_id: SessionId::from(10),
+                },
+            ),
+            SessionAudioCloseDisposition::InvalidRuntimeProof
+        );
+
+        let report = shutdown_while_rendering(application, probe);
+        assert_eq!(
+            joins.load(Ordering::Acquire),
+            1,
+            "rejected proof leaves the rollback guard armed for exact join"
+        );
+        assert!(report.unowned_runtime_joins.is_empty());
+        assert_eq!(report.sessions.len(), 1);
+        let result = report.sessions[0];
+        assert_eq!(result.shutdown, RuntimeShutdownRequest::Requested);
+        assert_eq!(result.publication_failure, None);
+        assert_eq!(
+            result.runtime,
+            RuntimeThreadJoinOutcome::Clean { session_id }
+        );
+        assert!(result.is_clean());
+        assert!(report.is_clean(), "{report}");
     }
 
     fn shutdown_while_rendering(

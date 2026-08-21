@@ -5437,7 +5437,10 @@ mod tests {
             .iter()
             .find(|result| result.session_id == first)
             .expect("rolled-back physical session has an exact result");
-        assert!(first_result.shutdown_requested);
+        assert_eq!(
+            first_result.shutdown,
+            application_audio::RuntimeShutdownRequest::Requested
+        );
         assert_eq!(
             first_result.runtime,
             smudgy_core::session::runtime::RuntimeThreadJoinOutcome::Clean { session_id: first }

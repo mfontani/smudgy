@@ -62,7 +62,8 @@ use tokio::sync::mpsc::{self};
 
 #[cfg(feature = "web-audio-cpal")]
 use crate::application_audio::{
-    ApplicationAudioController, ApplicationAudioOpenError, SessionAudioCloseDisposition,
+    AbortedSessionSpawnError, ApplicationAudioController, ApplicationAudioOpenError,
+    SessionAudioCloseDisposition,
 };
 
 #[cfg(feature = "web-audio-cpal")]
@@ -101,6 +102,11 @@ pub enum SessionOpenError {
     #[cfg(feature = "web-audio-cpal")]
     Runtime(smudgy_core::session::AudioSessionSpawnError),
     #[cfg(feature = "web-audio-cpal")]
+    RuntimePublication {
+        session_id: SessionId,
+        failure: smudgy_core::session::runtime::RuntimeThreadPublicationFailure,
+    },
+    #[cfg(feature = "web-audio-cpal")]
     RuntimeConstructionPanicked,
 }
 
@@ -112,6 +118,14 @@ impl std::fmt::Display for SessionOpenError {
             Self::Audio(error) => write!(formatter, "Web Audio session setup failed: {error}"),
             #[cfg(feature = "web-audio-cpal")]
             Self::Runtime(error) => write!(formatter, "session runtime setup failed: {error}"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::RuntimePublication {
+                session_id,
+                failure,
+            } => write!(
+                formatter,
+                "session {session_id} runtime publication failed: {failure:?}"
+            ),
             #[cfg(feature = "web-audio-cpal")]
             Self::RuntimeConstructionPanicked => {
                 formatter.write_str("session runtime setup panicked before publication")
@@ -1049,10 +1063,22 @@ impl ManagedSession {
                 match spawned {
                     Ok(Ok(stream)) => Some(Box::pin(stream)),
                     Ok(Err(error)) => {
-                        if let Some(pending) = pending_audio.take() {
-                            let _ = pending.abort();
-                        }
-                        return Err(SessionOpenError::Runtime(error));
+                        let open_error = match pending_audio.take() {
+                            Some(pending) => match pending.abort_spawn_error(error) {
+                                AbortedSessionSpawnError::Runtime(error) => {
+                                    SessionOpenError::Runtime(error)
+                                }
+                                AbortedSessionSpawnError::Publication {
+                                    session_id,
+                                    failure,
+                                } => SessionOpenError::RuntimePublication {
+                                    session_id,
+                                    failure,
+                                },
+                            },
+                            None => SessionOpenError::Runtime(error),
+                        };
+                        return Err(open_error);
                     }
                     Err(payload) => {
                         // Panic payload destructors are arbitrary. The typed

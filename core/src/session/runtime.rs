@@ -312,8 +312,12 @@ pub struct Runtime {
     pub(crate) pane_input_callbacks: SharedPaneInputCallbacks,
     /// The worker waits on this one-shot gate until the fully-constructed
     /// runtime has been inserted into the global session registry.
-    start_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    start_tx: Mutex<Option<std::sync::mpsc::Sender<std::sync::mpsc::Receiver<()>>>>,
 }
+
+/// Second phase of runtime publication. The worker has received this permit's
+/// paired receiver but cannot construct scripts until registration commits it.
+pub(crate) struct RuntimeStartPermit(std::sync::mpsc::Sender<()>);
 
 /// The exact runtime thread could not be created after its session id was
 /// reserved. The reservation remains as a result-bearing `SpawnFailed`
@@ -324,6 +328,79 @@ pub struct RuntimeThreadSpawnError {
     pub session_id: SessionId,
     #[source]
     pub source: std::io::Error,
+}
+
+/// Primary reason a spawned runtime could not be transactionally published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeThreadPublicationFailure {
+    /// The live session map already contained this id.
+    DuplicateSession,
+    /// A contained panic interrupted post-insert publication work.
+    PublicationUnwound,
+    /// The worker disappeared before reaching the second barrier.
+    StartGateClosed,
+    /// A `created` send unwound; attempted targets received tombstones.
+    CreatedBroadcastUnwound,
+    /// The worker disappeared after `created` but before script admission.
+    CommitGateClosed,
+}
+
+/// Publication failure paired with the result of its synchronous cleanup
+/// attempt. Only a matching clean join proves worker rollback; absence or a
+/// failed join remains an unclean report.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "runtime publication failed for session {session_id}: {failure:?}; exact worker cleanup: {cleanup:?}"
+)]
+pub struct RuntimeThreadPublicationError {
+    session_id: SessionId,
+    failure: RuntimeThreadPublicationFailure,
+    cleanup: RuntimeThreadJoinOutcome,
+}
+
+impl RuntimeThreadPublicationError {
+    pub(crate) const fn new(
+        session_id: SessionId,
+        failure: RuntimeThreadPublicationFailure,
+        cleanup: RuntimeThreadJoinOutcome,
+    ) -> Self {
+        Self {
+            session_id,
+            failure,
+            cleanup,
+        }
+    }
+
+    /// Session whose publication failed.
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Primary publication failure, independent of worker cleanup.
+    #[must_use]
+    pub const fn failure(&self) -> RuntimeThreadPublicationFailure {
+        self.failure
+    }
+
+    /// Read-only result of the one-shot worker cleanup attempt.
+    #[must_use]
+    pub const fn cleanup(&self) -> RuntimeThreadJoinOutcome {
+        self.cleanup
+    }
+
+    /// Consume the publication error and transfer its one-shot cleanup report.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        SessionId,
+        RuntimeThreadPublicationFailure,
+        RuntimeThreadJoinOutcome,
+    ) {
+        (self.session_id, self.failure, self.cleanup)
+    }
 }
 
 /// Exact, non-panicking result of consuming one runtime-thread join authority.
@@ -725,6 +802,15 @@ impl RuntimeThreadRegistry {
             self.changed.notify_all();
         }
     }
+
+    #[cfg(test)]
+    fn contains(&self, session_id: SessionId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .contains_key(&session_id)
+    }
 }
 
 impl RuntimeThreadReservation {
@@ -835,6 +921,11 @@ pub fn join_runtime_threads() {
     if let Some(failure) = outcomes.into_iter().find(|outcome| !outcome.is_clean()) {
         panic!("runtime thread did not stop cleanly: {failure:?}");
     }
+}
+
+#[cfg(test)]
+pub(super) fn runtime_thread_is_tracked(session_id: SessionId) -> bool {
+    runtime_threads().contains(session_id)
 }
 
 #[cfg(test)]
@@ -1313,7 +1404,7 @@ impl Runtime {
         let local_pane_size_mirror = Arc::clone(&pane_size_mirror);
         let local_input_word_sets = Arc::clone(&input_word_sets);
         let local_pane_input_callbacks = Arc::clone(&pane_input_callbacks);
-        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<std::sync::mpsc::Receiver<()>>();
 
         // Reserve the exact id before the OS thread can start. Exact and
         // drain-all joins wait on this state until handle publication or an
@@ -1329,7 +1420,10 @@ impl Runtime {
             // handle, but script top-level code may consult that registry.
             // Do not construct/evaluate the engine until registration opens
             // this gate.
-            if start_rx.recv().is_err() {
+            let Ok(commit_rx) = start_rx.recv() else {
+                return;
+            };
+            if commit_rx.recv().is_err() {
                 return;
             }
             let pending_line_operations = Rc::new(RefCell::new(Vec::new()));
@@ -1963,11 +2057,39 @@ impl Runtime {
         })
     }
 
-    /// Allow the worker to begin engine construction after registry insertion.
-    pub(crate) fn start(&self) {
-        if let Some(start_tx) = self.start_tx.lock().unwrap().take() {
-            let _ = start_tx.send(());
-        }
+    /// Move the worker to the second publication barrier without admitting
+    /// engine construction.
+    pub(crate) fn prepare_start(&self) -> Option<RuntimeStartPermit> {
+        let start_tx = self
+            .start_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let start_tx = start_tx?;
+        let (commit_tx, commit_rx) = std::sync::mpsc::channel();
+        start_tx
+            .send(commit_rx)
+            .is_ok()
+            .then_some(RuntimeStartPermit(commit_tx))
+    }
+
+    /// Open the prepared second-phase barrier after the `created` lifecycle
+    /// occurrence has been attempted for every staged target.
+    pub(crate) fn commit_start(permit: RuntimeStartPermit) -> bool {
+        let RuntimeStartPermit(commit_tx) = permit;
+        commit_tx.send(()).is_ok()
+    }
+
+    /// Cancel a staged worker without admitting engine construction. Dropping
+    /// the one-shot sender wakes `start_rx` into the worker's clean pre-script
+    /// return path.
+    pub(crate) fn cancel_start(&self) {
+        drop(
+            self.start_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
     }
 
     #[must_use]

@@ -772,11 +772,9 @@ fn op_server_name(state: &OpState) -> String {
 /// deliver an older captured snapshot after a newer one. Delivery is best-effort during shutdown.
 fn sync_user_automations_for_server(state: &mut OpState, server: &str) {
     let own = *state.borrow::<SessionId>();
-    if let Ok(sessions) = registry::get_registry().lock() {
-        for (id, runtime) in sessions.iter() {
-            if *id != own && runtime.server_name.as_str() == server {
-                let _ = runtime.tx.send(RuntimeAction::SyncUserAutomations);
-            }
+    for runtime in registry::get_runtimes_for_server(server) {
+        if runtime.session_id != own {
+            let _ = runtime.tx.send(RuntimeAction::SyncUserAutomations);
         }
     }
     queue_own_action(state, RuntimeAction::SyncUserAutomations);

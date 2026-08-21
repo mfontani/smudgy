@@ -273,11 +273,25 @@ pub struct SessionAudioScopeMismatch {
 /// Typed failure for the UI's transactional audio-session spawn boundary.
 #[cfg(feature = "web-audio")]
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AudioSessionSpawnError {
+    /// The supplied Web Audio scope belongs to another session.
     #[error(transparent)]
     Scope(#[from] SessionAudioScopeMismatch),
+    /// The operating system refused to create the runtime thread.
     #[error(transparent)]
     RuntimeThread(#[from] runtime::RuntimeThreadSpawnError),
+    /// The spawned worker could not be published and carries its cleanup result.
+    #[error(transparent)]
+    RuntimePublication(#[from] runtime::RuntimeThreadPublicationError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SessionRuntimeSpawnError {
+    #[error(transparent)]
+    Thread(#[from] runtime::RuntimeThreadSpawnError),
+    #[error(transparent)]
+    Publication(#[from] runtime::RuntimeThreadPublicationError),
 }
 
 pub struct SessionParams {
@@ -464,8 +478,11 @@ pub fn spawn_with_ui_commands_and_audio(
 /// # Errors
 ///
 /// Returns [`AudioSessionSpawnError::Scope`] when the supplied audio scope is
-/// not bound to this session, or [`AudioSessionSpawnError::RuntimeThread`]
-/// when the operating system refuses the runtime thread.
+/// not bound to this session, [`AudioSessionSpawnError::RuntimeThread`] when
+/// the operating system refuses the runtime thread, or
+/// [`AudioSessionSpawnError::RuntimePublication`] when the worker was spawned
+/// but could not be published. The publication error owns its one-shot cleanup
+/// report and must be consumed by the lifecycle coordinator.
 #[cfg(feature = "web-audio")]
 pub fn try_spawn_with_ui_commands_and_audio(
     params: &Arc<SessionParams>,
@@ -473,7 +490,13 @@ pub fn try_spawn_with_ui_commands_and_audio(
     audio_scope: smudgy_audio_web::SessionAudioScope,
 ) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, AudioSessionSpawnError> {
     validate_audio_scope(params, &audio_scope)?;
-    try_spawn_inner(params, None, Some(ui_commands), Some(audio_scope)).map_err(Into::into)
+    try_spawn_inner(params, None, Some(ui_commands), Some(audio_scope)).map_err(|error| match error
+    {
+        SessionRuntimeSpawnError::Thread(error) => AudioSessionSpawnError::RuntimeThread(error),
+        SessionRuntimeSpawnError::Publication(error) => {
+            AudioSessionSpawnError::RuntimePublication(error)
+        }
+    })
 }
 
 #[cfg(feature = "web-audio")]
@@ -507,7 +530,7 @@ fn try_spawn_inner(
     package_provider_override: Option<PackageProviderFactory>,
     ui_commands: Option<ui_command::UiCommandBus>,
     audio_scope: Option<RuntimeAudioScope>,
-) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, runtime::RuntimeThreadSpawnError> {
+) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, SessionRuntimeSpawnError> {
     let (mut ui_tx, ui_rx) = futures::channel::mpsc::channel::<TaggedSessionEvent>(1024);
 
     if let Err(e) = ui_tx.try_send(TaggedSessionEvent {
@@ -536,10 +559,61 @@ fn try_spawn_inner(
     let shutdown_tx = runtime.tx();
 
     // Register the runtime in the global registry
-    registry::register_session(params.session_id, runtime.into());
+    registry::try_register_session(params.session_id, runtime.into())?;
 
     Ok(SessionEventStream {
         events: ui_rx,
         shutdown_tx,
     })
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn try_spawn_returns_exact_joined_publication_unwind_without_evaluating_scripts() {
+        let session_id = SessionId::from(92_500);
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let rebuild_count = Arc::clone(&rebuilds);
+        let params = SessionParams {
+            session_id,
+            server_name: Arc::new("publication-unwind".to_string()),
+            profile_name: Arc::new("test".to_string()),
+            profile_subtext: Arc::new(String::new()),
+            mapper: None,
+            package_client: None,
+            extra_script_extensions: Arc::new(Vec::new),
+            on_engine_rebuild: Some(Arc::new(move || {
+                rebuild_count.fetch_add(1, Ordering::AcqRel);
+            })),
+        };
+
+        registry::inject_next_publication_unwind();
+        let result = try_spawn_inner(&params, None, None, None);
+        let SessionRuntimeSpawnError::Publication(error) = result
+            .err()
+            .expect("injected registration unwind rejects spawn")
+        else {
+            panic!("registration unwind returned the wrong spawn error");
+        };
+        assert_eq!(
+            error.failure(),
+            runtime::RuntimeThreadPublicationFailure::PublicationUnwound
+        );
+        assert_eq!(
+            error.cleanup(),
+            runtime::RuntimeThreadJoinOutcome::Clean { session_id }
+        );
+        assert_eq!(rebuilds.load(Ordering::Acquire), 0, "scripts never built");
+        assert!(registry::get_runtime(session_id).is_none());
+        assert!(!runtime::runtime_thread_is_tracked(session_id));
+        assert_eq!(
+            runtime::join_runtime_thread(session_id),
+            runtime::RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined { session_id },
+            "the publication transaction consumed the exact join once"
+        );
+    }
 }
