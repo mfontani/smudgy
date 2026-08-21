@@ -2545,7 +2545,7 @@ fn output_death_between_install_and_open_preserves_exact_cause_and_observer() {
 }
 
 #[test]
-fn output_death_after_live_open_snapshot_preserves_exact_broadcast_cause() {
+fn output_death_after_live_open_snapshot_rejects_before_running_publication() {
     let probe = RenderProbe::default();
     let service =
         MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
@@ -2578,22 +2578,66 @@ fn output_death_after_live_open_snapshot_preserves_exact_broadcast_cause() {
         .recv_timeout(Duration::from_secs(2))
         .unwrap();
     assert!(probe.fail_output());
+    eventually(|| service.driver_status.failure().is_some());
     release.wait();
-    let running = opening
+    let open_failure = opening
         .join()
         .unwrap()
-        .expect("start linearized by the coherent live snapshot");
+        .expect_err("the final driver snapshot rejects the doomed endpoint");
+    assert_eq!(open_failure.error, MixerControlError::OwnerStopped);
 
     assert_eq!(
         received.recv_timeout(Duration::from_secs(2)).unwrap(),
         MixerOutputFailure::BackendFailure
     );
     assert_eq!(observer.calls.load(Ordering::Acquire), 1);
-    eventually(|| running.is_failed());
     let shutdown = service.shutdown();
     assert!(shutdown.clean);
     assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
-    let retirement = block_on(running.shutdown()).unwrap();
+    let retirement = block_on(open_failure.shutdown()).unwrap();
+    assert!(retirement.failed_before_retirement);
+    assert_eq!(
+        retirement.output_failure,
+        Some(MixerOutputFailure::BackendFailure)
+    );
+}
+
+#[test]
+fn output_death_after_final_snapshot_is_classified_as_owner_stopped() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let session = service.add_session(AudioSessionId(911)).unwrap();
+    let reservation = session.script_bus().try_reserve_input().unwrap();
+    let (input, _, _) = constant(0.25);
+    let Ok(installed) = reservation.install_preboxed(input) else {
+        panic!("live reservation must install");
+    };
+    let (entered, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.open_publish_hook) = Some(Arc::new(OpenSnapshotHook {
+        entered,
+        release: Arc::clone(&release),
+        armed: AtomicBool::new(true),
+    }));
+
+    let opening = thread::spawn(move || installed.open());
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(probe.fail_output());
+    eventually(|| service.driver_status.failure().is_some());
+    release.wait();
+    let open_failure = opening
+        .join()
+        .unwrap()
+        .expect_err("device death must prevent Running publication");
+    assert_eq!(open_failure.error, MixerControlError::OwnerStopped);
+
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    let retirement = block_on(open_failure.shutdown()).unwrap();
     assert!(retirement.failed_before_retirement);
     assert_eq!(
         retirement.output_failure,

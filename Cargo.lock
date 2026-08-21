@@ -2313,7 +2313,7 @@ dependencies = [
 [[package]]
 name = "deno_audio"
 version = "0.1.0-alpha.1"
-source = "git+https://github.com/smudgy-mud/deno_audio.git?rev=2998104e06b1e6021855902a65427df85ba5d8f3#2998104e06b1e6021855902a65427df85ba5d8f3"
+source = "git+https://github.com/smudgy-mud/deno_audio.git?rev=bee0b39235f6d907f00faa491a8ed81417c2dcb0#bee0b39235f6d907f00faa491a8ed81417c2dcb0"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -13858,7 +13858,7 @@ dependencies = [
 [[package]]
 name = "web-audio-api"
 version = "1.7.0"
-source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=06bcc862de63edb8de6f6b8a38b04f8b5249cf1a#06bcc862de63edb8de6f6b8a38b04f8b5249cf1a"
+source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=cb1d7a03f8f0805b0c974f90116eb57735630660#cb1d7a03f8f0805b0c974f90116eb57735630660"
 dependencies = [
  "almost",
  "arc-swap",

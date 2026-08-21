@@ -162,6 +162,9 @@ pub enum Event {
     /// runtime shutdown, grid cleanup across all windows, the empty-window
     /// rule — is the daemon's job.
     CloseSession(SessionId),
+    /// A focused command input invoked the reserved audio-panel shortcut.
+    #[cfg(feature = "web-audio-cpal")]
+    OpenAudioPanel,
     /// The user clicked a pane's title-bar eyeball. The window already
     /// flipped its local state optimistically; the daemon reports the toggle
     /// to the pane's session runtime (`PaneUserHidden`), which owns the def —
@@ -653,6 +656,10 @@ fn target_overlay_rects(target: Option<&ClassifiedTarget>) -> Vec<drag_overlay::
 }
 
 impl SmudgyWindow {
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn has_modal(&self) -> bool {
+        self.modal.is_some()
+    }
     pub fn new(window_id: window::Id, cloud: CloudHandles) -> Self {
         Self {
             window_id,
@@ -3027,6 +3034,10 @@ impl SmudgyWindow {
                 }
 
                 match msg {
+                    #[cfg(feature = "web-audio-cpal")]
+                    session_store::Message::OpenAudioPanel => {
+                        Update::new(Task::none(), Some(Event::OpenAudioPanel))
+                    }
                     session_store::Message::SetMapperCurrentLocation(area_id, room_number) => {
                         // Keep the session's own map widgets in step, and bubble
                         // up for the standalone map editor windows.

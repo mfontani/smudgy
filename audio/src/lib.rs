@@ -143,6 +143,7 @@ impl Default for MixerGainState {
 enum MixerGainUpdate {
     Linear(f32),
     Muted(bool),
+    State(MixerGainState),
 }
 
 impl MixerGainUpdate {
@@ -150,6 +151,7 @@ impl MixerGainUpdate {
         match self {
             Self::Linear(linear) => MixerGainState { linear, ..current },
             Self::Muted(muted) => MixerGainState { muted, ..current },
+            Self::State(state) => state,
         }
     }
 }
@@ -1153,8 +1155,10 @@ struct DriverStatus {
     word: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
     panic_owner: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     open_snapshot_hook: Mutex<Option<Arc<OpenSnapshotHook>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    open_publish_hook: Mutex<Option<Arc<OpenSnapshotHook>>>,
     #[cfg(test)]
     retirement_scan_hook: Mutex<Option<Arc<RetirementScanHook>>>,
     #[cfg(test)]
@@ -1167,7 +1171,7 @@ struct DriverSnapshot {
     failure: Option<MixerOutputFailure>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct OpenSnapshotHook {
     entered: SyncSender<()>,
     release: Arc<std::sync::Barrier>,
@@ -1187,8 +1191,10 @@ impl DriverStatus {
             word: AtomicU64::new(DriverPhase::Provisional as u64),
             #[cfg(any(test, feature = "test-support"))]
             panic_owner: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             open_snapshot_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            open_publish_hook: Mutex::new(None),
             #[cfg(test)]
             retirement_scan_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1295,9 +1301,20 @@ impl DriverStatus {
         .flatten()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn pause_after_open_snapshot(&self) {
         let hook = lock_recover(&self.open_snapshot_hook).clone();
+        if let Some(hook) = hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            let _ = hook.entered.send(());
+            hook.release.wait();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn pause_before_input_publish(&self) {
+        let hook = lock_recover(&self.open_publish_hook).clone();
         if let Some(hook) = hook
             && hook.armed.swap(false, Ordering::AcqRel)
         {
@@ -2892,7 +2909,8 @@ impl MixerInputReservation {
     ///
     /// Returns [`MixerInputStartFailure::Rejected`] with the unchanged source
     /// and reservation when admission fails. A structural post-install failure
-    /// returns [`MixerInputStartFailure::Cleanup`] with sole cleanup ownership.
+    /// returns [`MixerInputStartFailure::Cleanup`] with its stable cause and
+    /// sole cleanup ownership.
     pub fn start_preboxed(
         self,
         source: Box<dyn MixerInput>,
@@ -2900,7 +2918,10 @@ impl MixerInputReservation {
         self.install_preboxed(source)
             .map_err(MixerInputStartFailure::Rejected)?
             .open()
-            .map_err(|failure| MixerInputStartFailure::Cleanup(failure.shutdown()))
+            .map_err(|failure| {
+                let (error, shutdown) = failure.into_parts();
+                MixerInputStartFailure::Cleanup { error, shutdown }
+            })
     }
 }
 
@@ -2970,14 +2991,22 @@ pub enum MixerInputStartFailure {
     /// Admission failed before the callback became renderable.
     Rejected(MixerInputInstallFailure),
     /// A structural post-install failure owns the committed cleanup future.
-    Cleanup(MixerInputShutdown),
+    Cleanup {
+        /// Stable cause of the failed post-install open.
+        error: MixerControlError,
+        /// Sole cleanup ownership for the closed installed source.
+        shutdown: MixerInputShutdown,
+    },
 }
 
 impl fmt::Debug for MixerInputStartFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected(failure) => formatter.debug_tuple("Rejected").field(failure).finish(),
-            Self::Cleanup(_) => formatter.debug_tuple("Cleanup").finish_non_exhaustive(),
+            Self::Cleanup { error, .. } => formatter
+                .debug_struct("Cleanup")
+                .field("error", error)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -3017,22 +3046,40 @@ impl InstalledMixerInput {
         let driver_status = Arc::clone(&self.driver_status);
         let session = Arc::clone(&self.session);
         let live_control = control.upgrade();
-        let driver_snapshot = Some(driver_status.snapshot());
-        #[cfg(test)]
+        let initial_driver_snapshot = driver_status.snapshot();
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(control) = live_control.as_ref() {
             control.driver_status.pause_after_open_snapshot();
         }
-        let driver_live = driver_snapshot.is_some_and(|snapshot| {
-            snapshot.phase == DriverPhase::Live && snapshot.failure.is_none()
-        });
+        // The first snapshot is diagnostic only. Admission remains held while
+        // a fresh snapshot linearizes physical publication, so a failure that
+        // arrives during validation cannot turn a synchronous start rejection
+        // into an already-doomed Running endpoint.
+        let driver_snapshot = driver_status.snapshot();
+        #[cfg(any(test, feature = "test-support"))]
+        driver_status.pause_before_input_publish();
+        let publish_snapshot = driver_status.snapshot();
+        let driver_live = matches!(initial_driver_snapshot.phase, DriverPhase::Live)
+            && initial_driver_snapshot.failure.is_none()
+            && matches!(driver_snapshot.phase, DriverPhase::Live)
+            && driver_snapshot.failure.is_none()
+            && matches!(publish_snapshot.phase, DriverPhase::Live)
+            && publish_snapshot.failure.is_none();
         if !driver_live || !slot.open(generation) {
-            let output_failure = driver_snapshot
-                .and_then(|snapshot| snapshot.failure)
+            let output_failure = publish_snapshot
+                .failure
+                .or(driver_snapshot.failure)
+                .or(initial_driver_snapshot.failure)
                 .or_else(|| {
                     live_control
                         .as_ref()
                         .and_then(|control| control.driver_status.failure())
                 });
+            let error = if output_failure.is_some() || !driver_live {
+                MixerControlError::OwnerStopped
+            } else {
+                MixerControlError::InternalInvariant
+            };
             if let Some(failure) = output_failure {
                 let _ = slot.close_after_output_failure(generation, failure);
             } else {
@@ -3041,6 +3088,7 @@ impl InstalledMixerInput {
             self.admission.take();
             std::mem::forget(self);
             return Err(MixerInputOpenFailure {
+                error,
                 owner: RunningMixerInput {
                     slot: ManuallyDrop::new(slot),
                     generation,
@@ -3083,11 +3131,17 @@ impl Drop for InstalledMixerInput {
 /// Structural open failure retaining exact cleanup ownership.
 #[derive(Debug)]
 struct MixerInputOpenFailure {
+    error: MixerControlError,
     owner: RunningMixerInput,
 }
 
 impl MixerInputOpenFailure {
-    /// Close and submit the failed installation for retirement.
+    /// Split the stable cause from exact cleanup ownership.
+    fn into_parts(self) -> (MixerControlError, MixerInputShutdown) {
+        (self.error, self.owner.shutdown())
+    }
+
+    #[cfg(test)]
     fn shutdown(self) -> MixerInputShutdown {
         self.owner.shutdown()
     }
@@ -3233,6 +3287,14 @@ impl MixerMasterGainAuthority {
         self.update(MixerGainUpdate::Muted(muted))
     }
 
+    /// Atomically set the remembered linear gain and independent mute state.
+    pub fn set_state(&self, linear: f32, muted: bool) -> Result<MixerGainState, MixerControlError> {
+        self.update(MixerGainUpdate::State(MixerGainState {
+            linear: validate_control_gain(linear)?,
+            muted,
+        }))
+    }
+
     /// Returns the first process-output failure observed by this authority.
     ///
     /// The diagnostic is read-only and does not retain the mixer service or
@@ -3304,6 +3366,24 @@ impl MixerSessionGainAuthority {
     /// error.
     pub fn set_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
         self.update(MixerGainUpdate::Muted(muted))
+    }
+
+    /// Atomically set the remembered linear gain and independent mute state.
+    ///
+    /// This is primarily useful when restoring a complete persisted policy:
+    /// the mixer owner publishes one coherent state instead of exposing an
+    /// intermediate linear-only or mute-only update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerControlError::InvalidGain`] before enqueueing for a
+    /// non-finite or out-of-range value. Other failures retain the same exact
+    /// lifecycle outcomes as [`Self::set_linear`] and [`Self::set_muted`].
+    pub fn set_state(&self, linear: f32, muted: bool) -> Result<MixerGainState, MixerControlError> {
+        self.update(MixerGainUpdate::State(MixerGainState {
+            linear: validate_control_gain(linear)?,
+            muted,
+        }))
     }
 
     /// Returns the first process-output failure observed by this authority.
@@ -3382,6 +3462,12 @@ impl MixerBusHandle {
             Ok(control.format)
         }
     }
+
+    fn output_failure(&self) -> Option<MixerOutputFailure> {
+        self.control
+            .upgrade()
+            .and_then(|control| control.driver_status.failure())
+    }
 }
 
 macro_rules! typed_bus_handle {
@@ -3424,6 +3510,13 @@ macro_rules! typed_bus_handle {
             /// service teardown.
             pub fn format(&self) -> Result<MixerFormat, MixerControlError> {
                 self.0.format()
+            }
+
+            /// Returns the retained first physical-output failure, if any.
+            /// This is read-only and does not retain the mixer owner.
+            #[must_use]
+            pub fn output_failure(&self) -> Option<MixerOutputFailure> {
+                self.0.output_failure()
             }
         }
     };

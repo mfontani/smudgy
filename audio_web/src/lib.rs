@@ -1,11 +1,12 @@
 //! Hosted Web Audio authorities and output adapter for Smudgy's shared mixer.
 
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 #[cfg(test)]
 use std::sync::{Barrier, mpsc};
@@ -18,7 +19,7 @@ use deno_audio::{
     AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind, AudioOutputEventSink,
     AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure, AudioPermissions,
     AudioRenderCallback, AudioRenderFormat, AudioRenderStatus, PreparedAudioOutput,
-    RunningAudioOutput, SystemAudioOutput,
+    RunningAudioOutput, SilentAudioOutput,
 };
 use deno_error::JsErrorBox;
 use smudgy_audio::{
@@ -227,8 +228,20 @@ pub enum PackageAudioScopeError {
     Capacity,
     /// This root already has an uncommitted isolate construction.
     AlreadyBinding,
+    /// The requested remembered gain was non-finite or outside `0..=1`.
+    InvalidGain,
     /// The process-wide non-wrapping root-generation space is exhausted.
     GenerationExhausted,
+}
+
+/// Failure while atomically staging a complete persisted session policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionAudioPolicyError {
+    /// The session mixer rejected the complete gain state.
+    Mixer(MixerControlError),
+    /// One sandbox-root identity or gain was invalid.
+    Package(PackageAudioScopeError),
 }
 
 /// Stable package-control lookup or mutation failure.
@@ -294,6 +307,20 @@ impl PackageGainState {
         }
     }
 
+    fn with_remembered(linear: f32, muted: bool) -> Result<Self, PackageAudioScopeError> {
+        if !linear.is_finite() || !(0.0..=1.0).contains(&linear) {
+            return Err(PackageAudioScopeError::InvalidGain);
+        }
+        let state = PackageAudioGainState {
+            linear: if linear == 0.0 { 0.0 } else { linear },
+            muted,
+        };
+        Ok(Self {
+            remembered: Mutex::new(state),
+            effective_bits: AtomicU32::new(state.effective_linear().to_bits()),
+        })
+    }
+
     fn effective_linear(&self) -> f32 {
         f32::from_bits(self.effective_bits.load(Ordering::Relaxed))
     }
@@ -323,6 +350,39 @@ impl PackageGainState {
             .store(state.effective_linear().to_bits(), Ordering::Release);
         *state
     }
+
+    fn update_state(
+        &self,
+        linear: f32,
+        muted: bool,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let linear = validate_package_gain(linear)?;
+        let mut state = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = PackageAudioGainState { linear, muted };
+        self.effective_bits
+            .store(state.effective_linear().to_bits(), Ordering::Release);
+        Ok(*state)
+    }
+
+    fn snapshot(&self) -> PackageAudioGainState {
+        *self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn restore(&self, state: PackageAudioGainState) {
+        let mut remembered = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *remembered = state;
+        self.effective_bits
+            .store(state.effective_linear().to_bits(), Ordering::Release);
+    }
 }
 
 fn validate_package_gain(linear: f32) -> Result<f32, PackageAudioControlError> {
@@ -349,7 +409,162 @@ struct PackageAudioRegistry {
     entries: Mutex<BTreeMap<PackageAudioRoot, PackageAudioEntry>>,
 }
 
+struct PreparedPackagePolicy {
+    updates: Vec<(PackageAudioRoot, f32, bool)>,
+}
+
+struct PackagePolicyRollback {
+    previous: Vec<(
+        PackageAudioRoot,
+        Arc<PackageGainState>,
+        PackageAudioGainState,
+    )>,
+    inserted: Vec<PackageAudioRoot>,
+}
+
 impl PackageAudioRegistry {
+    fn prepare_policy(
+        &self,
+        packages: impl IntoIterator<Item = (Arc<str>, Arc<str>, f32, bool)>,
+    ) -> Result<PreparedPackagePolicy, PackageAudioScopeError> {
+        let mut requested = BTreeMap::new();
+        for (owner, name, linear, muted) in packages {
+            let root = PackageAudioRoot::new(&owner, &name)?;
+            if !linear.is_finite() || !(0.0..=1.0).contains(&linear) {
+                return Err(PackageAudioScopeError::InvalidGain);
+            }
+            requested.insert(root, (if linear == 0.0 { 0.0 } else { linear }, muted));
+        }
+
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut available = MAX_PACKAGE_AUDIO_SCOPES.saturating_sub(entries.len());
+        let updates = requested
+            .into_iter()
+            .filter_map(|(root, (linear, muted))| {
+                if entries.contains_key(&root) {
+                    Some((root, linear, muted))
+                } else if linear == 1.0 && !muted {
+                    // Default policy needs no dormant metadata, but an
+                    // existing active/dormant root above still receives it
+                    // so a reload can reset a formerly non-default gain.
+                    None
+                } else if available > 0 {
+                    available -= 1;
+                    Some((root, linear, muted))
+                } else {
+                    // A full registry fails additional package scopes closed;
+                    // it never blocks the owning terminal session or reload.
+                    None
+                }
+            })
+            .collect();
+        Ok(PreparedPackagePolicy { updates })
+    }
+
+    fn apply_prepared_policy(&self, policy: PreparedPackagePolicy) -> PackagePolicyRollback {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut previous = Vec::new();
+        let mut inserted = Vec::new();
+        for (root, linear, muted) in policy.updates {
+            if let Some(entry) = entries.get_mut(&root) {
+                let state = entry.gain.snapshot();
+                previous.push((root, Arc::clone(&entry.gain), state));
+                entry
+                    .gain
+                    .update_state(linear, muted)
+                    .expect("prepared package gain is valid");
+            } else {
+                let gain = PackageGainState::with_remembered(linear, muted)
+                    .expect("prepared package gain is valid");
+                inserted.push(root.clone());
+                entries.insert(
+                    root,
+                    PackageAudioEntry {
+                        gain: Arc::new(gain),
+                        active_generation: None,
+                        pending_generation: None,
+                        ever_committed: false,
+                    },
+                );
+            }
+        }
+        PackagePolicyRollback { previous, inserted }
+    }
+
+    fn rollback_policy(&self, rollback: PackagePolicyRollback) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (root, expected_gain, state) in rollback.previous {
+            if let Some(entry) = entries.get(&root)
+                && Arc::ptr_eq(&entry.gain, &expected_gain)
+            {
+                entry.gain.restore(state);
+            }
+        }
+        for root in rollback.inserted {
+            if entries.get(&root).is_some_and(|entry| {
+                !entry.ever_committed
+                    && entry.active_generation.is_none()
+                    && entry.pending_generation.is_none()
+            }) {
+                entries.remove(&root);
+            }
+        }
+    }
+
+    /// Seed a dormant root before its isolate begins construction. A later
+    /// bind receives the already-effective snapshot, so top-level script code
+    /// cannot briefly render at the default gain.
+    fn seed(
+        &self,
+        owner: &str,
+        name: &str,
+        linear: f32,
+        muted: bool,
+    ) -> Result<PackageAudioGainState, PackageAudioScopeError> {
+        let root = PackageAudioRoot::new(owner, name)?;
+        let gain = PackageGainState::with_remembered(linear, muted)?;
+        let remembered = *gain
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.contains_key(&root) && entries.len() >= MAX_PACKAGE_AUDIO_SCOPES {
+            return Err(PackageAudioScopeError::Capacity);
+        }
+        match entries.get_mut(&root) {
+            Some(entry) => {
+                entry
+                    .gain
+                    .update_state(linear, muted)
+                    .map_err(|_| PackageAudioScopeError::InvalidGain)?;
+            }
+            None => {
+                entries.insert(
+                    root,
+                    PackageAudioEntry {
+                        gain: Arc::new(gain),
+                        active_generation: None,
+                        pending_generation: None,
+                        ever_committed: false,
+                    },
+                );
+            }
+        }
+        Ok(remembered)
+    }
+
     #[cfg(test)]
     fn bind(
         self: &Arc<Self>,
@@ -549,6 +764,29 @@ impl PackageAudioRegistry {
             Ok(state)
         }
     }
+
+    fn update_state(
+        &self,
+        key: &PackageAudioControlKey,
+        linear: f32,
+        muted: bool,
+        mut output_failed: impl FnMut() -> bool,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = Self::validate_entry(self, &mut entries, key)?;
+        if output_failed() {
+            return Err(PackageAudioControlError::OutputFailed);
+        }
+        let state = entry.gain.update_state(linear, muted)?;
+        if output_failed() {
+            Err(PackageAudioControlError::OutputFailed)
+        } else {
+            Ok(state)
+        }
+    }
 }
 
 /// Exact active lease for one sandbox-root isolate construction.
@@ -672,10 +910,14 @@ impl ApplicationAudioRegistrar {
             app: Arc::clone(&self.state),
             session: Arc::clone(&session_gate),
         });
+        let force_emulated = Arc::new(AtomicBool::new(false));
         let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
             app: Arc::clone(&self.state),
             session: Arc::clone(&session_gate),
-            delegate: SessionAudioOutputFactory::new(script.clone()),
+            delegate: SessionAudioOutputFactory::with_force_emulated(
+                script.clone(),
+                Arc::clone(&force_emulated),
+            ),
         });
         let package_audio = Arc::new(PackageAudioRegistry {
             session: session_key,
@@ -693,6 +935,7 @@ impl ApplicationAudioRegistrar {
                 permissions,
                 output,
                 package_audio: Some(package_audio),
+                force_emulated: Some(force_emulated),
             }),
         };
         drop(app_gate);
@@ -752,6 +995,7 @@ impl ApplicationAudioRegistrar {
                 permissions,
                 output,
                 package_audio: None,
+                force_emulated: None,
             }),
         };
         drop(app_gate);
@@ -768,6 +1012,7 @@ struct SessionAudioScopeInner {
     permissions: Arc<dyn AudioPermissions>,
     output: Arc<dyn AudioOutputFactory>,
     package_audio: Option<Arc<PackageAudioRegistry>>,
+    force_emulated: Option<Arc<AtomicBool>>,
 }
 
 /// Opaque cloneable session audio authority passed to script runtimes.
@@ -797,6 +1042,14 @@ impl SessionAudioScope {
     #[must_use]
     pub fn session_id(&self) -> u64 {
         self.inner.session_id.0
+    }
+
+    /// Permanently routes new default contexts in this exact scope to hosted
+    /// emulated output. Mixer-free scopes are already emulated.
+    pub fn force_emulated_output(&self) {
+        if let Some(force_emulated) = self.inner.force_emulated.as_ref() {
+            force_emulated.store(true, Ordering::Release);
+        }
     }
 
     /// Builds fresh isolate options over this scope's unchanged authorities.
@@ -838,7 +1091,16 @@ impl SessionAudioScope {
         let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
             app: Arc::clone(&self.inner.app),
             session: Arc::clone(&self.inner.session_gate),
-            delegate: SessionAudioOutputFactory::with_package_gain(registry.bus.clone(), gain),
+            delegate: SessionAudioOutputFactory::with_package_gain(
+                registry.bus.clone(),
+                gain,
+                Arc::clone(
+                    self.inner
+                        .force_emulated
+                        .as_ref()
+                        .expect("physical package scope shares the session emulation latch"),
+                ),
+            ),
         });
         let options = AudioExtensionOptions::new(Arc::clone(&self.inner.app.host))
             .permissions(Arc::clone(&self.inner.permissions))
@@ -868,6 +1130,17 @@ impl fmt::Debug for SessionAudioRegistration {
 }
 
 impl SessionAudioRegistration {
+    /// Permanently routes new default contexts in this exact unpublished/live
+    /// generation to hosted emulated output. Existing contexts are unchanged.
+    pub fn force_emulated_output(&self) {
+        self.scope
+            .inner
+            .force_emulated
+            .as_ref()
+            .expect("physical registration owns an emulation latch")
+            .store(true, Ordering::Release);
+    }
+
     /// Opaque application-control identity for this exact registration.
     #[must_use]
     pub fn control_key(&self) -> SessionAudioControlKey {
@@ -895,6 +1168,101 @@ impl SessionAudioRegistration {
     /// authority to the application or script runtime.
     pub fn set_gain_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
         self.gain.set_muted(muted)
+    }
+
+    /// Atomically replaces remembered linear gain and mute for this session.
+    pub fn set_gain_state(
+        &self,
+        linear: f32,
+        muted: bool,
+    ) -> Result<MixerGainState, MixerControlError> {
+        self.gain.set_state(linear, muted)
+    }
+
+    /// Atomically stage a complete persisted session and sandbox-root policy.
+    ///
+    /// Package identities and gains are preflighted before the mixer changes.
+    /// The session gain is published as one owner command. If a later output
+    /// failure is observed, package state and the previously acknowledged
+    /// session state are restored on a best-effort basis before the failure is
+    /// returned. Registry capacity rejects only excess package scopes; it does
+    /// not reject the owning terminal session.
+    pub fn stage_gain_policy(
+        &self,
+        linear: f32,
+        muted: bool,
+        previous_linear: f32,
+        previous_muted: bool,
+        packages: impl IntoIterator<Item = (Arc<str>, Arc<str>, f32, bool)>,
+    ) -> Result<(), SessionAudioPolicyError> {
+        let linear = validate_package_gain(linear)
+            .map_err(|_| SessionAudioPolicyError::Mixer(MixerControlError::InvalidGain))?;
+        let previous_linear = validate_package_gain(previous_linear)
+            .map_err(|_| SessionAudioPolicyError::Mixer(MixerControlError::InvalidGain))?;
+        let app_gate = lock_gate(&self.scope.inner.app.gate);
+        let session_gate = lock_gate(&self.scope.inner.session_gate);
+        if !app_gate.open || !session_gate.open {
+            return Err(SessionAudioPolicyError::Package(
+                PackageAudioScopeError::SessionClosed,
+            ));
+        }
+        let registry =
+            self.scope
+                .inner
+                .package_audio
+                .as_ref()
+                .ok_or(SessionAudioPolicyError::Package(
+                    PackageAudioScopeError::SessionClosed,
+                ))?;
+        let prepared = registry
+            .prepare_policy(packages)
+            .map_err(SessionAudioPolicyError::Package)?;
+        let state = self
+            .gain
+            .set_state(linear, muted)
+            .map_err(SessionAudioPolicyError::Mixer)?;
+        debug_assert_eq!(state.linear(), linear);
+        debug_assert_eq!(state.is_muted(), muted);
+        let rollback = registry.apply_prepared_policy(prepared);
+        if self.gain.output_failure().is_some() {
+            registry.rollback_policy(rollback);
+            let _ = self.gain.set_state(previous_linear, previous_muted);
+            Err(SessionAudioPolicyError::Mixer(
+                MixerControlError::OwnerStopped,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Seed one versionless sandbox root before runtime construction.
+    ///
+    /// The dormant entry consumes only bounded metadata. Its first output
+    /// factory observes this state before package top-level evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, capacity, lifecycle, or gain failure. The
+    /// Existing active/pending roots update their shared snapshot in place;
+    /// absent roots allocate dormant bounded metadata for their first bind.
+    pub fn seed_package_gain(
+        &self,
+        owner: &str,
+        name: &str,
+        linear: f32,
+        muted: bool,
+    ) -> Result<PackageAudioGainState, PackageAudioScopeError> {
+        let _app_gate = lock_gate(&self.scope.inner.app.gate);
+        let session_gate = lock_gate(&self.scope.inner.session_gate);
+        if !session_gate.open {
+            return Err(PackageAudioScopeError::SessionClosed);
+        }
+        self.scope
+            .inner
+            .package_audio
+            .as_ref()
+            .ok_or(PackageAudioScopeError::SessionClosed)?
+            .seed(owner, name, linear, muted)
     }
 
     /// Looks up the exact active controller identity for one sandbox root.
@@ -973,6 +1341,28 @@ impl SessionAudioRegistration {
             .as_ref()
             .ok_or(PackageAudioControlError::UnknownPackage)?;
         registry.update_muted(key, muted, || self.gain.output_failure().is_some())
+    }
+
+    /// Atomically replaces remembered linear gain and mute for one exact,
+    /// active sandbox-root generation.
+    pub fn set_package_gain_state(
+        &self,
+        key: &PackageAudioControlKey,
+        linear: f32,
+        muted: bool,
+    ) -> Result<PackageAudioGainState, PackageAudioControlError> {
+        let app_gate = lock_gate(&self.scope.inner.app.gate);
+        let session_gate = lock_gate(&self.scope.inner.session_gate);
+        if !app_gate.open || !session_gate.open {
+            return Err(PackageAudioControlError::SessionClosed);
+        }
+        let registry = self
+            .scope
+            .inner
+            .package_audio
+            .as_ref()
+            .ok_or(PackageAudioControlError::UnknownPackage)?;
+        registry.update_state(key, linear, muted, || self.gain.output_failure().is_some())
     }
 
     /// Exact first-writer process-output failure observed by this authority.
@@ -1208,15 +1598,15 @@ impl UnavailableAudioOutputCause {
 
 #[derive(Clone, Debug)]
 struct UnavailableSessionAudioOutputFactory {
-    cause: UnavailableAudioOutputCause,
-    silent: SystemAudioOutput,
+    _cause: UnavailableAudioOutputCause,
+    silent: SilentAudioOutput,
 }
 
 impl UnavailableSessionAudioOutputFactory {
     const fn new(cause: UnavailableAudioOutputCause) -> Self {
         Self {
-            cause,
-            silent: SystemAudioOutput::new(),
+            _cause: cause,
+            silent: SilentAudioOutput::new(),
         }
     }
 }
@@ -1227,14 +1617,7 @@ impl AudioOutputFactory for UnavailableSessionAudioOutputFactory {
         request: &AudioOutputRequest,
     ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
         match request.sink_id() {
-            "none" => self.silent.prepare(request),
-            "" => Err(AudioOutputError::new(
-                AudioOutputErrorKind::DeviceUnavailable,
-                format!(
-                    "Smudgy physical audio is unavailable until restart: {}",
-                    self.cause.detail()
-                ),
-            )),
+            "" | "none" => self.silent.prepare(request),
             _ => Err(output_error(
                 AudioOutputErrorKind::NotSupported,
                 "Smudgy Web Audio supports only the default and none output sinks",
@@ -1284,29 +1667,49 @@ struct TestPrepareHook {
 /// private silent endpoint.
 ///
 /// The default sink consumes one bounded Script-bus input. The exact `"none"`
-/// sink delegates to [`SystemAudioOutput`]'s joinable silent implementation and
+/// sink delegates to [`SilentAudioOutput`]'s joinable silent implementation and
 /// never mutates mixer capacity. Other sink identifiers are rejected before
 /// either delegate is invoked.
 #[derive(Clone, Debug)]
 pub struct SessionAudioOutputFactory {
     script: ScriptBusAudioOutputFactory,
-    silent: SystemAudioOutput,
+    silent: SilentAudioOutput,
+    force_emulated: Arc<AtomicBool>,
 }
 
 impl SessionAudioOutputFactory {
     /// Binds context construction to one session's scoped Script bus.
     #[must_use]
-    pub const fn new(bus: MixerScriptBusHandle) -> Self {
+    pub fn new(bus: MixerScriptBusHandle) -> Self {
+        Self::with_force_emulated(bus, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_force_emulated(bus: MixerScriptBusHandle, force_emulated: Arc<AtomicBool>) -> Self {
         Self {
             script: ScriptBusAudioOutputFactory::new(bus),
-            silent: SystemAudioOutput::new(),
+            silent: SilentAudioOutput::new(),
+            force_emulated,
         }
     }
 
-    fn with_package_gain(bus: MixerScriptBusHandle, gain: Arc<PackageGainState>) -> Self {
+    fn with_package_gain(
+        bus: MixerScriptBusHandle,
+        gain: Arc<PackageGainState>,
+        force_emulated: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             script: ScriptBusAudioOutputFactory::with_package_gain(bus, gain),
-            silent: SystemAudioOutput::new(),
+            silent: SilentAudioOutput::new(),
+            force_emulated,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_failure_hook(bus: MixerScriptBusHandle, hook: Arc<TestFailureHook>) -> Self {
+        Self {
+            script: ScriptBusAudioOutputFactory::with_failure_hook(bus, hook),
+            silent: SilentAudioOutput::new(),
+            force_emulated: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1317,13 +1720,132 @@ impl AudioOutputFactory for SessionAudioOutputFactory {
         request: &AudioOutputRequest,
     ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
         match request.sink_id() {
-            "" => self.script.prepare(request),
+            "" => {
+                // A generation forced emulated before construction has no
+                // audible hardware contract. Preserve the requested logical
+                // context rate instead of negotiating against the fixed
+                // 48 kHz process mixer. The later start-time latch check still
+                // covers a force transition after physical preparation.
+                if self.force_emulated.load(Ordering::Acquire) {
+                    return self.silent.prepare(request);
+                }
+                if self.script.output_failure().is_some() {
+                    return self.silent.prepare(request);
+                }
+                match self.script.prepare_parts(
+                    request.sink_id(),
+                    request.requested_sample_rate(),
+                    request.number_of_channels(),
+                ) {
+                    Ok(physical) => {
+                        let silent = self
+                            .silent
+                            .prepare_with_config(request, physical.config())?;
+                        Ok(Box::new(PhysicalOrEmulatedPreparedOutput {
+                            physical: Some(physical),
+                            silent: Some(silent),
+                            force_emulated: Arc::clone(&self.force_emulated),
+                        }))
+                    }
+                    Err(error) if error.kind() == AudioOutputErrorKind::DeviceUnavailable => {
+                        self.silent.prepare(request)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             "none" => self.silent.prepare(request),
             _ => Err(output_error(
                 AudioOutputErrorKind::NotSupported,
                 "Smudgy Web Audio supports only the default and none output sinks",
             )),
         }
+    }
+}
+
+/// A default-sink endpoint that prefers the session mixer but can hand the
+/// still-unpublished callback to the emulated endpoint when physical start
+/// loses its owner after successful preparation.
+struct PhysicalOrEmulatedPreparedOutput {
+    physical: Option<Box<ScriptBusPreparedOutput>>,
+    silent: Option<Box<dyn PreparedAudioOutput>>,
+    force_emulated: Arc<AtomicBool>,
+}
+
+impl PreparedAudioOutput for PhysicalOrEmulatedPreparedOutput {
+    fn config(&self) -> &AudioOutputConfig {
+        self.physical
+            .as_ref()
+            .expect("physical-or-emulated output is single-use")
+            .config()
+    }
+
+    fn start(
+        mut self: Box<Self>,
+        callback: AudioRenderCallback,
+        events: AudioOutputEventSink,
+    ) -> Result<Box<dyn RunningAudioOutput>, AudioOutputStartFailure> {
+        let physical = self
+            .physical
+            .take()
+            .expect("physical-or-emulated output owns one physical endpoint");
+        let silent = self
+            .silent
+            .take()
+            .expect("physical-or-emulated output owns one silent endpoint");
+        if self.force_emulated.load(Ordering::Acquire) {
+            let cleanup = physical.abort();
+            return match silent.start(callback, events) {
+                Ok(running) => Ok(Box::new(RunningWithPriorCleanup::new(running, cleanup))),
+                Err(failure) => {
+                    let (error, silent_cleanup) = failure.into_parts();
+                    Err(AudioOutputStartFailure::new(
+                        error,
+                        combine_endpoint_shutdown(cleanup, silent_cleanup),
+                    ))
+                }
+            };
+        }
+        match physical.start_recoverable(callback, events.clone()) {
+            RecoverablePhysicalStart::Running(running) => {
+                let unused_silent = silent.abort();
+                Ok(Box::new(RunningWithPriorCleanup::new(
+                    running,
+                    unused_silent,
+                )))
+            }
+            RecoverablePhysicalStart::DeviceUnavailable { callback, cleanup } => {
+                match silent.start(callback, events) {
+                    Ok(running) => Ok(Box::new(RunningWithPriorCleanup::new(running, cleanup))),
+                    Err(failure) => {
+                        let (error, silent_cleanup) = failure.into_parts();
+                        Err(AudioOutputStartFailure::new(
+                            error,
+                            combine_endpoint_shutdown(cleanup, silent_cleanup),
+                        ))
+                    }
+                }
+            }
+            RecoverablePhysicalStart::Failed(failure) => {
+                let unused_silent = silent.abort();
+                let (error, physical_cleanup) = failure.into_parts();
+                Err(AudioOutputStartFailure::new(
+                    error,
+                    combine_endpoint_shutdown(physical_cleanup, unused_silent),
+                ))
+            }
+        }
+    }
+
+    fn abort(mut self: Box<Self>) -> AudioOutputEndpointShutdown {
+        let physical = self
+            .physical
+            .take()
+            .expect("physical-or-emulated output owns one physical endpoint");
+        let silent = self
+            .silent
+            .take()
+            .expect("physical-or-emulated output owns one silent endpoint");
+        combine_endpoint_shutdown(physical.abort(), silent.abort())
     }
 }
 
@@ -1339,6 +1861,8 @@ pub struct ScriptBusAudioOutputFactory {
     render_hook: Option<Arc<TestRenderHook>>,
     #[cfg(test)]
     panic_start: bool,
+    #[cfg(test)]
+    failure_hook: Option<Arc<TestFailureHook>>,
 }
 
 impl ScriptBusAudioOutputFactory {
@@ -1352,7 +1876,13 @@ impl ScriptBusAudioOutputFactory {
             render_hook: None,
             #[cfg(test)]
             panic_start: false,
+            #[cfg(test)]
+            failure_hook: None,
         }
+    }
+
+    fn output_failure(&self) -> Option<MixerOutputFailure> {
+        self.bus.output_failure()
     }
 
     fn with_package_gain(bus: MixerScriptBusHandle, package_gain: Arc<PackageGainState>) -> Self {
@@ -1363,6 +1893,8 @@ impl ScriptBusAudioOutputFactory {
             render_hook: None,
             #[cfg(test)]
             panic_start: false,
+            #[cfg(test)]
+            failure_hook: None,
         }
     }
 
@@ -1373,6 +1905,7 @@ impl ScriptBusAudioOutputFactory {
             package_gain: None,
             render_hook: Some(render_hook),
             panic_start: false,
+            failure_hook: None,
         }
     }
 
@@ -1383,14 +1916,28 @@ impl ScriptBusAudioOutputFactory {
             package_gain: None,
             render_hook: Some(render_hook),
             panic_start: true,
+            failure_hook: None,
         }
     }
 
     #[cfg(test)]
-    fn preboxed_input(&self) -> Box<CallbackMixerInput> {
+    fn with_failure_hook(bus: MixerScriptBusHandle, hook: Arc<TestFailureHook>) -> Self {
+        Self {
+            bus,
+            package_gain: None,
+            render_hook: None,
+            panic_start: false,
+            failure_hook: Some(hook),
+        }
+    }
+
+    #[cfg(test)]
+    fn preboxed_input(&self, callback: Arc<RecoverableRenderCallback>) -> Box<CallbackMixerInput> {
         Box::new(CallbackMixerInput::with_render_hook(
+            callback,
             self.render_hook.clone(),
             self.package_gain.clone(),
+            self.failure_hook.clone(),
         ))
     }
 
@@ -1444,12 +1991,17 @@ impl ScriptBusAudioOutputFactory {
         // Every heap object, including the outer trait object, callback
         // scratch, and running owner, exists before the bounded reservation
         // mutates capacity. Reservation insertion is then infallible.
+        let callback = Arc::new(RecoverableRenderCallback::new());
         #[cfg(test)]
-        let input = self.preboxed_input();
+        let input = self.preboxed_input(Arc::clone(&callback));
         #[cfg(not(test))]
-        let input = Box::new(CallbackMixerInput::new(self.package_gain.clone()));
+        let input = Box::new(CallbackMixerInput::new(
+            Arc::clone(&callback),
+            self.package_gain.clone(),
+        ));
         let mut prepared = Box::new(ScriptBusPreparedOutput {
             config,
+            callback,
             reservation: None,
             input: Some(input),
             running: Some(Box::new(ScriptBusRunningOutput {
@@ -1482,6 +2034,7 @@ impl AudioOutputFactory for ScriptBusAudioOutputFactory {
 
 struct ScriptBusPreparedOutput {
     config: AudioOutputConfig,
+    callback: Arc<RecoverableRenderCallback>,
     reservation: Option<MixerInputReservation>,
     input: Option<Box<CallbackMixerInput>>,
     running: Option<Box<ScriptBusRunningOutput>>,
@@ -1495,10 +2048,56 @@ impl PreparedAudioOutput for ScriptBusPreparedOutput {
     }
 
     fn start(
-        mut self: Box<Self>,
+        self: Box<Self>,
         callback: AudioRenderCallback,
         events: AudioOutputEventSink,
     ) -> Result<Box<dyn RunningAudioOutput>, AudioOutputStartFailure> {
+        match self.start_inner(callback, events, false) {
+            RecoverablePhysicalStart::Running(running) => Ok(running),
+            RecoverablePhysicalStart::Failed(failure) => Err(failure),
+            RecoverablePhysicalStart::DeviceUnavailable { .. } => {
+                unreachable!("direct Script bus starts do not recover their callback")
+            }
+        }
+    }
+
+    fn abort(mut self: Box<Self>) -> AudioOutputEndpointShutdown {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("prepared output owns one reservation");
+        // This shell never received a callback, so its synchronous destruction
+        // is not part of the proof-bearing retirement.
+        self.input.take();
+        self.running.take();
+        endpoint_shutdown(reservation.abort())
+    }
+}
+
+enum RecoverablePhysicalStart {
+    Running(Box<dyn RunningAudioOutput>),
+    DeviceUnavailable {
+        callback: AudioRenderCallback,
+        cleanup: AudioOutputEndpointShutdown,
+    },
+    Failed(AudioOutputStartFailure),
+}
+
+impl ScriptBusPreparedOutput {
+    fn start_recoverable(
+        self: Box<Self>,
+        callback: AudioRenderCallback,
+        events: AudioOutputEventSink,
+    ) -> RecoverablePhysicalStart {
+        self.start_inner(callback, events, true)
+    }
+
+    fn start_inner(
+        mut self: Box<Self>,
+        callback: AudioRenderCallback,
+        events: AudioOutputEventSink,
+        recover_device_unavailable: bool,
+    ) -> RecoverablePhysicalStart {
         let reservation = self
             .reservation
             .take()
@@ -1511,12 +2110,15 @@ impl PreparedAudioOutput for ScriptBusPreparedOutput {
         debug_assert!(running.input.is_none());
         let expected = self.config.format();
         let actual = callback.format();
-        input.install(callback, events.clone());
+        self.callback.install(callback);
+        input.install(events.clone());
+        let reporter = Arc::clone(&input.events);
         let source: Box<dyn MixerInput> = input;
 
         if actual != expected {
+            reporter.disarm();
             let _ = events.report_endpoint_death(AudioOutputDeathReason::CallbackProtocolViolation);
-            return Err(abort_start(
+            return RecoverablePhysicalStart::Failed(abort_start(
                 output_error(
                     AudioOutputErrorKind::BackendSpecific,
                     "the Web Audio callback format did not match the prepared mixer endpoint",
@@ -1538,20 +2140,57 @@ impl PreparedAudioOutput for ScriptBusPreparedOutput {
             reservation.start_preboxed(source)
         }));
         match start {
-            Ok(Ok(input)) => Ok(publish_running(running, input)),
+            Ok(Ok(input)) => {
+                let running = publish_running(running, input);
+                if self.callback.try_activate() {
+                    reporter.arm();
+                    RecoverablePhysicalStart::Running(running)
+                } else if recover_device_unavailable {
+                    reporter.disarm();
+                    let cleanup = running.shutdown();
+                    let callback = self.callback.take_after_failed_start();
+                    RecoverablePhysicalStart::DeviceUnavailable { callback, cleanup }
+                } else {
+                    // Only the composite default route is authorized to move
+                    // an unpublished callback to emulated output.
+                    reporter.arm();
+                    RecoverablePhysicalStart::Running(running)
+                }
+            }
             Ok(Err(MixerInputStartFailure::Rejected(failure))) => {
                 let (error, reservation, source) = failure.into_parts();
+                if recover_device_unavailable && error == MixerControlError::OwnerStopped {
+                    reporter.disarm();
+                    let failure = abort_start(control_error(error), reservation, source);
+                    let (_, cleanup) = failure.into_parts();
+                    let callback = self.callback.take_after_failed_start();
+                    return RecoverablePhysicalStart::DeviceUnavailable { callback, cleanup };
+                }
                 let reason = if error == MixerControlError::OwnerStopped {
                     AudioOutputDeathReason::FactoryShutdown
                 } else {
                     AudioOutputDeathReason::BackendFailure
                 };
+                reporter.disarm();
                 let _ = events.report_endpoint_death(reason);
-                Err(abort_start(control_error(error), reservation, source))
+                RecoverablePhysicalStart::Failed(abort_start(
+                    control_error(error),
+                    reservation,
+                    source,
+                ))
             }
-            Ok(Err(MixerInputStartFailure::Cleanup(shutdown))) => {
+            Ok(Err(MixerInputStartFailure::Cleanup { error, shutdown })) => {
+                if recover_device_unavailable && error == MixerControlError::OwnerStopped {
+                    reporter.disarm();
+                    let callback = self.callback.take_after_failed_start();
+                    return RecoverablePhysicalStart::DeviceUnavailable {
+                        callback,
+                        cleanup: endpoint_shutdown(shutdown),
+                    };
+                }
+                reporter.disarm();
                 let _ = events.report_endpoint_death(AudioOutputDeathReason::BackendFailure);
-                Err(AudioOutputStartFailure::new(
+                RecoverablePhysicalStart::Failed(AudioOutputStartFailure::new(
                     output_error(
                         AudioOutputErrorKind::BackendSpecific,
                         "the mixer could not publish the installed Web Audio callback",
@@ -1561,15 +2200,19 @@ impl PreparedAudioOutput for ScriptBusPreparedOutput {
             }
             Err(payload) => {
                 std::mem::forget(payload);
+                reporter.disarm();
                 let _ = events.report_endpoint_death(AudioOutputDeathReason::BackendFailure);
                 if let Some((reservation, source)) = pending_start.take() {
-                    return Err(panicked_start_with_owned_cleanup(reservation, source));
+                    return RecoverablePhysicalStart::Failed(panicked_start_with_owned_cleanup(
+                        reservation,
+                        source,
+                    ));
                 }
                 // A panic after the authorities crossed into smudgy_audio can
                 // no longer recover their exact cleanup observer. Their Drop
                 // paths remain fail-closed, but this result must be explicitly
                 // unconfirmed.
-                Err(AudioOutputStartFailure::new(
+                RecoverablePhysicalStart::Failed(AudioOutputStartFailure::new(
                     output_error(
                         AudioOutputErrorKind::BackendSpecific,
                         "the mixer start transaction panicked",
@@ -1582,22 +2225,10 @@ impl PreparedAudioOutput for ScriptBusPreparedOutput {
             }
         }
     }
-
-    fn abort(mut self: Box<Self>) -> AudioOutputEndpointShutdown {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("prepared output owns one reservation");
-        // This shell never received a callback, so its synchronous destruction
-        // is not part of the proof-bearing retirement.
-        self.input.take();
-        self.running.take();
-        endpoint_shutdown(reservation.abort())
-    }
 }
 
 struct CallbackMixerInput {
-    callback: Option<AudioRenderCallback>,
+    callback: Arc<RecoverableRenderCallback>,
     events: Arc<OutputFailureReporter>,
     scratch: [f32; INTERLEAVED_SAMPLES],
     package_gain: Option<Arc<PackageGainState>>,
@@ -1607,10 +2238,14 @@ struct CallbackMixerInput {
 
 impl CallbackMixerInput {
     #[cfg(not(test))]
-    fn new(package_gain: Option<Arc<PackageGainState>>) -> Self {
+    fn new(
+        callback: Arc<RecoverableRenderCallback>,
+        package_gain: Option<Arc<PackageGainState>>,
+    ) -> Self {
+        let events = Arc::new(OutputFailureReporter::new(Arc::clone(&callback)));
         Self {
-            callback: None,
-            events: Arc::new(OutputFailureReporter::new()),
+            callback,
+            events,
             scratch: [0.0; INTERLEAVED_SAMPLES],
             package_gain,
             #[cfg(test)]
@@ -1620,35 +2255,173 @@ impl CallbackMixerInput {
 
     #[cfg(test)]
     fn with_render_hook(
+        callback: Arc<RecoverableRenderCallback>,
         render_hook: Option<Arc<TestRenderHook>>,
         package_gain: Option<Arc<PackageGainState>>,
+        failure_hook: Option<Arc<TestFailureHook>>,
     ) -> Self {
+        let events = Arc::new(OutputFailureReporter::new(
+            Arc::clone(&callback),
+            failure_hook,
+        ));
         Self {
-            callback: None,
-            events: Arc::new(OutputFailureReporter::new()),
+            callback,
+            events,
             scratch: [0.0; INTERLEAVED_SAMPLES],
             package_gain,
             render_hook,
         }
     }
 
-    fn install(&mut self, callback: AudioRenderCallback, events: AudioOutputEventSink) {
-        debug_assert!(self.callback.is_none());
-        self.callback = Some(callback);
+    fn install(&mut self, events: AudioOutputEventSink) {
         self.events.install(events);
     }
 }
 
-struct OutputFailureReporter {
-    events: OnceLock<AudioOutputEventSink>,
-    reported: AtomicBool,
+struct RecoverableRenderCallback {
+    callback: UnsafeCell<Option<AudioRenderCallback>>,
+    phase: AtomicU8,
 }
 
-impl OutputFailureReporter {
+const CALLBACK_EMPTY: u8 = 0;
+const CALLBACK_PENDING: u8 = 1;
+const CALLBACK_ACTIVE: u8 = 2;
+const CALLBACK_RECOVERABLE: u8 = 3;
+const CALLBACK_TAKEN: u8 = 4;
+
+impl RecoverableRenderCallback {
     const fn new() -> Self {
         Self {
+            callback: UnsafeCell::new(None),
+            phase: AtomicU8::new(CALLBACK_EMPTY),
+        }
+    }
+
+    fn install(&self, callback: AudioRenderCallback) {
+        // SAFETY: installation happens before the source can be published to
+        // the mixer. The cell begins empty and has one single-use owner.
+        let slot = unsafe { &mut *self.callback.get() };
+        assert!(
+            slot.replace(callback).is_none(),
+            "callback is installed once"
+        );
+        assert_eq!(
+            self.phase
+                .compare_exchange(
+                    CALLBACK_EMPTY,
+                    CALLBACK_PENDING,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .unwrap(),
+            CALLBACK_EMPTY,
+            "callback phase is installed once"
+        );
+    }
+
+    fn try_activate(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                CALLBACK_PENDING,
+                CALLBACK_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn mark_device_unavailable(&self) {
+        let _ = self.phase.compare_exchange(
+            CALLBACK_PENDING,
+            CALLBACK_RECOVERABLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn is_active(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == CALLBACK_ACTIVE
+    }
+
+    fn render_active(&self, output: &mut [f32]) -> AudioRenderStatus {
+        // SAFETY: only the uniquely borrowed MixerInput renders after a
+        // successful Pending -> Active publication. Recovery can only consume
+        // Pending or Recoverable, so it can never overlap this access.
+        unsafe { (&mut *self.callback.get()).as_mut() }
+            .map_or(AudioRenderStatus::Stop, |callback| {
+                callback.render_interleaved_f32(output)
+            })
+    }
+
+    fn take_after_failed_start(&self) -> AudioRenderCallback {
+        let mut phase = self.phase.load(Ordering::Acquire);
+        loop {
+            assert!(
+                matches!(phase, CALLBACK_PENDING | CALLBACK_RECOVERABLE),
+                "only an unpublished callback can be recovered"
+            );
+            match self.phase.compare_exchange_weak(
+                phase,
+                CALLBACK_TAKEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => phase = actual,
+            }
+        }
+        // SAFETY: the phase transition proves the callback was never Active.
+        // The physical source is synchronously closed before every caller
+        // consumes this single-owner value.
+        unsafe { (&mut *self.callback.get()).take() }
+            .expect("failed physical start retains the unpublished callback")
+    }
+}
+
+// SAFETY: access follows the exclusive lifecycle documented on each method:
+// installation precedes publication, render access belongs to the unique
+// MixerInput, and recovery is possible only after failed start closed it.
+unsafe impl Send for RecoverableRenderCallback {}
+// SAFETY: see the `Send` invariant above. External clones are recovery tokens,
+// not concurrent callback access authorities.
+unsafe impl Sync for RecoverableRenderCallback {}
+
+struct OutputFailureReporter {
+    events: OnceLock<AudioOutputEventSink>,
+    callback: Arc<RecoverableRenderCallback>,
+    state: AtomicU8,
+    #[cfg(test)]
+    failure_hook: Option<Arc<TestFailureHook>>,
+}
+
+const REPORT_PENDING: u8 = 0;
+const REPORT_PENDING_CALLBACK_PANICKED: u8 = 1;
+const REPORT_PENDING_PROTOCOL: u8 = 2;
+const REPORT_PENDING_BACKEND: u8 = 3;
+const REPORT_ARMED: u8 = 4;
+const REPORT_DISARMED: u8 = 5;
+const REPORT_REPORTED: u8 = 6;
+
+impl OutputFailureReporter {
+    #[cfg(not(test))]
+    fn new(callback: Arc<RecoverableRenderCallback>) -> Self {
+        Self {
             events: OnceLock::new(),
-            reported: AtomicBool::new(false),
+            callback,
+            state: AtomicU8::new(REPORT_PENDING),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(
+        callback: Arc<RecoverableRenderCallback>,
+        failure_hook: Option<Arc<TestFailureHook>>,
+    ) -> Self {
+        Self {
+            events: OnceLock::new(),
+            callback,
+            state: AtomicU8::new(REPORT_PENDING),
+            failure_hook,
         }
     }
 
@@ -1660,16 +2433,92 @@ impl OutputFailureReporter {
     }
 
     fn report(&self, reason: AudioOutputDeathReason) {
-        if let Some(events) = self.events.get()
-            && !self.reported.swap(true, Ordering::AcqRel)
-        {
-            let _ = events.report_endpoint_death(reason);
+        let pending = match reason {
+            AudioOutputDeathReason::CallbackPanicked => REPORT_PENDING_CALLBACK_PANICKED,
+            AudioOutputDeathReason::CallbackProtocolViolation => REPORT_PENDING_PROTOCOL,
+            _ => REPORT_PENDING_BACKEND,
+        };
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            match state {
+                REPORT_PENDING => match self.state.compare_exchange_weak(
+                    REPORT_PENDING,
+                    pending,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(actual) => state = actual,
+                },
+                REPORT_ARMED => match self.state.compare_exchange_weak(
+                    REPORT_ARMED,
+                    REPORT_REPORTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        if let Some(events) = self.events.get() {
+                            let _ = events.report_endpoint_death(reason);
+                        }
+                        return;
+                    }
+                    Err(actual) => state = actual,
+                },
+                _ => return,
+            }
         }
+    }
+
+    fn arm(&self) {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let (next, pending) = match state {
+                REPORT_PENDING => (REPORT_ARMED, None),
+                REPORT_PENDING_CALLBACK_PANICKED => (
+                    REPORT_REPORTED,
+                    Some(AudioOutputDeathReason::CallbackPanicked),
+                ),
+                REPORT_PENDING_PROTOCOL => (
+                    REPORT_REPORTED,
+                    Some(AudioOutputDeathReason::CallbackProtocolViolation),
+                ),
+                REPORT_PENDING_BACKEND => (
+                    REPORT_REPORTED,
+                    Some(AudioOutputDeathReason::BackendFailure),
+                ),
+                REPORT_ARMED | REPORT_DISARMED | REPORT_REPORTED => return,
+                _ => unreachable!("invalid output reporter state"),
+            };
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    if let Some(reason) = pending
+                        && let Some(events) = self.events.get()
+                    {
+                        let _ = events.report_endpoint_death(reason);
+                    }
+                    return;
+                }
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    fn disarm(&self) {
+        self.state.store(REPORT_DISARMED, Ordering::Release);
     }
 }
 
 impl MixerFailureObserver for OutputFailureReporter {
     fn output_failed(&self, _failure: MixerOutputFailure) {
+        #[cfg(test)]
+        if let Some(hook) = self.failure_hook.as_ref() {
+            let _ = hook.entered.try_send(());
+            hook.release.wait();
+        }
+        self.callback.mark_device_unavailable();
         self.report(AudioOutputDeathReason::BackendFailure);
     }
 }
@@ -1680,10 +2529,10 @@ impl MixerInput for CallbackMixerInput {
     }
 
     fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
-        let Some(callback) = &mut self.callback else {
+        if !self.callback.is_active() {
             output.fill(MixerFrame::ZERO);
-            return MixerInputStatus::Finished;
-        };
+            return MixerInputStatus::Active;
+        }
         let events = &self.events;
         let package_gain = self
             .package_gain
@@ -1693,7 +2542,7 @@ impl MixerInput for CallbackMixerInput {
             output,
             &mut self.scratch,
             package_gain,
-            |scratch| callback.render_interleaved_f32(scratch),
+            |scratch| self.callback.render_active(scratch),
             |reason| {
                 events.report(reason);
             },
@@ -1733,6 +2582,13 @@ struct TestRenderHook {
     shutdown: mpsc::SyncSender<()>,
     block_once: AtomicBool,
     panic_on_drop: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestFailureHook {
+    entered: mpsc::SyncSender<()>,
+    release: Arc<Barrier>,
 }
 
 fn render_fixed(
@@ -1807,6 +2663,65 @@ impl RunningAudioOutput for ScriptBusRunningOutput {
         };
         endpoint_shutdown(input.shutdown())
     }
+}
+
+struct RunningWithPriorCleanup {
+    running: Option<Box<dyn RunningAudioOutput>>,
+    prior_cleanup: Option<AudioOutputEndpointShutdown>,
+}
+
+impl RunningWithPriorCleanup {
+    fn new(
+        running: Box<dyn RunningAudioOutput>,
+        prior_cleanup: AudioOutputEndpointShutdown,
+    ) -> Self {
+        Self {
+            running: Some(running),
+            prior_cleanup: Some(prior_cleanup),
+        }
+    }
+}
+
+impl RunningAudioOutput for RunningWithPriorCleanup {
+    fn resume(&mut self) -> Result<(), AudioOutputError> {
+        self.running
+            .as_mut()
+            .expect("combined running endpoint is open")
+            .resume()
+    }
+
+    fn suspend(&mut self) -> Result<(), AudioOutputError> {
+        self.running
+            .as_mut()
+            .expect("combined running endpoint is open")
+            .suspend()
+    }
+
+    fn shutdown(mut self: Box<Self>) -> AudioOutputEndpointShutdown {
+        let running = self
+            .running
+            .take()
+            .expect("combined running endpoint is open");
+        let prior_cleanup = self
+            .prior_cleanup
+            .take()
+            .expect("combined running endpoint owns prior cleanup");
+        combine_endpoint_shutdown(prior_cleanup, running.shutdown())
+    }
+}
+
+fn combine_endpoint_shutdown(
+    mut first: AudioOutputEndpointShutdown,
+    mut second: AudioOutputEndpointShutdown,
+) -> AudioOutputEndpointShutdown {
+    AudioOutputEndpointShutdown::from_future(async move {
+        let first_result = (&mut first).await;
+        let second_result = (&mut second).await;
+        match (first_result, second_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    })
 }
 
 fn publish_running(

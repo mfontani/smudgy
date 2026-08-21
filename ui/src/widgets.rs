@@ -1,3 +1,5 @@
+#[cfg(feature = "web-audio-cpal")]
+pub mod audio_gain;
 pub mod bounds_probe;
 pub mod crt_cat;
 pub mod drag_overlay;

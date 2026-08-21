@@ -280,6 +280,9 @@ pub enum Message {
     CaretChanged(CaretState),
     /// The masked eye affordance: toggle the on-screen reveal.
     ToggleMaskedReveal,
+    /// Reserved keyboard entry into the application audio panel.
+    #[cfg(feature = "web-audio-cpal")]
+    OpenAudioPanel,
 }
 
 /// What the parent should do in response to an update.
@@ -295,6 +298,9 @@ pub enum Event {
     FocusMain,
     /// The command editor received keyboard focus.
     FocusGained,
+    /// Open the audio panel in this input's hosting main window.
+    #[cfg(feature = "web-audio-cpal")]
+    OpenAudioPanel,
 }
 
 /// Why an input is masked. The two causes are tracked separately and the
@@ -1122,6 +1128,8 @@ impl SessionInput {
                     }
                 }))
             }
+            #[cfg(feature = "web-audio-cpal")]
+            Message::OpenAudioPanel => Update::with_event(Event::OpenAudioPanel),
         }
     }
 
@@ -1149,19 +1157,22 @@ impl SessionInput {
         .on_unfocus(Message::FocusLost)
         .style(builtins::text_input::borderless)
         .width(Length::Fill)
-        .on_match(Message::HotkeyTriggered)
-        .on_key_pressed(
-            keyboard::Key::Named(keyboard::key::Named::ArrowUp),
-            Message::NavigateHistoryUp,
-        )
-        .on_key_pressed(
-            keyboard::Key::Named(keyboard::key::Named::ArrowDown),
-            Message::NavigateHistoryDown,
-        )
-        .on_key_pressed(
-            keyboard::Key::Named(keyboard::key::Named::Tab),
-            Message::HandleTabCompletion,
-        );
+        .on_match(Message::HotkeyTriggered);
+        #[cfg(feature = "web-audio-cpal")]
+        let input = input.on_audio_panel_shortcut(Message::OpenAudioPanel);
+        let input = input
+            .on_key_pressed(
+                keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+                Message::NavigateHistoryUp,
+            )
+            .on_key_pressed(
+                keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                Message::NavigateHistoryDown,
+            )
+            .on_key_pressed(
+                keyboard::Key::Named(keyboard::key::Named::Tab),
+                Message::HandleTabCompletion,
+            );
 
         // Pane inputs hand focus back to the main input on Escape.
         let input = if self.escape_to_main {

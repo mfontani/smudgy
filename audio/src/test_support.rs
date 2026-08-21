@@ -5,14 +5,15 @@
 //! driver-status, or retirement-proof authority.
 
 use std::sync::{
-    Arc, Mutex, Weak,
+    Arc, Barrier, Mutex, Weak,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, Receiver},
 };
 
 use super::{
     DriverFailureSignal, DriverRenderError, DriverStatus, JoinedOutputDriver, JoinedRenderer,
-    MixerOutputFailure, MixerService, MixerStartError, PhysicalOutputFormat, PhysicalSampleFormat,
-    lock_recover,
+    MixerOutputFailure, MixerService, MixerStartError, OpenSnapshotHook, PhysicalOutputFormat,
+    PhysicalSampleFormat, lock_recover,
 };
 
 /// Physical sample encoding reported by the deterministic fake device.
@@ -154,6 +155,27 @@ impl TestDriverState {
 #[derive(Clone)]
 pub struct TestDriverProbe(Arc<TestDriverState>);
 
+/// One test-only pause after a mixer input observes its initial live driver
+/// snapshot and before it attempts publication.
+pub struct TestInputOpenPause {
+    entered: Receiver<()>,
+    release: Arc<Barrier>,
+}
+
+impl TestInputOpenPause {
+    /// Wait until the exact input start reaches the paused boundary.
+    pub fn wait_until_paused(&self) {
+        self.entered
+            .recv()
+            .expect("the fake mixer input reaches its open boundary");
+    }
+
+    /// Release the paused input start after the test changes driver state.
+    pub fn release(self) {
+        self.release.wait();
+    }
+}
+
 impl std::fmt::Debug for TestDriverProbe {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -163,6 +185,39 @@ impl std::fmt::Debug for TestDriverProbe {
 }
 
 impl TestDriverProbe {
+    /// Pause the next mixer-input start after its initial driver snapshot.
+    #[must_use]
+    pub fn pause_next_input_open_after_snapshot(&self) -> TestInputOpenPause {
+        let status = lock_recover(&self.0.status)
+            .upgrade()
+            .expect("the fake driver status is live");
+        let (entered_send, entered) = mpsc::sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+        *lock_recover(&status.open_snapshot_hook) = Some(Arc::new(OpenSnapshotHook {
+            entered: entered_send,
+            release: Arc::clone(&release),
+            armed: AtomicBool::new(true),
+        }));
+        TestInputOpenPause { entered, release }
+    }
+
+    /// Pause the next mixer-input start after its final driver snapshot and
+    /// immediately before the Running publication CAS.
+    #[must_use]
+    pub fn pause_next_input_open_before_publish(&self) -> TestInputOpenPause {
+        let status = lock_recover(&self.0.status)
+            .upgrade()
+            .expect("the fake driver status is live");
+        let (entered_send, entered) = mpsc::sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+        *lock_recover(&status.open_publish_hook) = Some(Arc::new(OpenSnapshotHook {
+            entered: entered_send,
+            release: Arc::clone(&release),
+            armed: AtomicBool::new(true),
+        }));
+        TestInputOpenPause { entered, release }
+    }
+
     /// Render one interleaved callback using the requested channel count.
     ///
     /// # Errors

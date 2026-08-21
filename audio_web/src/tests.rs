@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use futures::executor::block_on;
 use smudgy_audio::{
     AudioSessionId, MixerControlError, MixerFrame, MixerInput, MixerInputStatus, MixerService,
-    test_support::{TestDriverConfig, TestDriverProbe, start_test_mixer},
+    test_support::{TestDriverConfig, TestDriverProbe, TestInputOpenPause, start_test_mixer},
 };
 use web_audio_api::context::{
     AudioContext, AudioContextOptions, AudioContextShutdownOutcome, AudioContextState,
@@ -56,6 +56,20 @@ impl RenderProbe {
 
     fn physical_play_count(&self) -> usize {
         self.0.as_ref().expect("renderer is live").play_count()
+    }
+
+    fn pause_next_input_open_after_snapshot(&self) -> TestInputOpenPause {
+        self.0
+            .as_ref()
+            .expect("renderer is live")
+            .pause_next_input_open_after_snapshot()
+    }
+
+    fn pause_next_input_open_before_publish(&self) -> TestInputOpenPause {
+        self.0
+            .as_ref()
+            .expect("renderer is live")
+            .pause_next_input_open_before_publish()
     }
 }
 
@@ -345,22 +359,29 @@ fn unavailable_registration_routes_without_mixer_state_and_retires_logically() {
     let first_scope = first.scope();
     let second_scope = second.scope();
 
-    let default = scoped_context(&first_scope, "").expect_err("default needs physical output");
-    assert_eq!(
-        default.output_error().map(AudioOutputError::kind),
-        Some(AudioOutputErrorKind::DeviceUnavailable)
-    );
-    assert!(
-        default
-            .output_error()
-            .expect("default rejection retains its cause")
-            .message()
-            .contains("no default device")
-    );
+    let default = scoped_context(&first_scope, "")
+        .expect("default uses the embedder-selected emulated output");
+    assert_eq!(default.sink_id(), "");
+    assert_eq!(default.state(), AudioContextState::Running);
+    let started_at = default.current_time();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while default.current_time() <= started_at {
+        assert!(
+            Instant::now() < deadline,
+            "emulated default output did not render"
+        );
+        thread::yield_now();
+    }
+    default.suspend_sync();
+    assert_eq!(default.state(), AudioContextState::Suspended);
+    default.resume_sync();
+    assert_eq!(default.state(), AudioContextState::Running);
+    default.close_sync();
+    assert_eq!(default.state(), AudioContextState::Closed);
     assert_eq!(
         application.usage(),
         baseline,
-        "failed default is non-mutating"
+        "closed emulated default releases host usage"
     );
 
     let named = scoped_context(&first_scope, "named-device")
@@ -616,9 +637,110 @@ fn bind_package_factory(
     let (gain, mut binding) = registry.bind(owner, name).expect("package root binds");
     binding.commit().unwrap();
     (
-        SessionAudioOutputFactory::with_package_gain(registry.bus.clone(), gain),
+        SessionAudioOutputFactory::with_package_gain(
+            registry.bus.clone(),
+            gain,
+            Arc::new(AtomicBool::new(false)),
+        ),
         binding,
     )
+}
+
+#[test]
+fn complete_policy_preflights_before_session_mutation_and_resets_active_root_to_default() {
+    let (service, session, probe) = service(211);
+    let mut application = ApplicationAudioOwner::new(authority_limits(2));
+    let registration = application.registrar().register_session(session).unwrap();
+    let scope = registration.scope();
+
+    registration
+        .stage_gain_policy(
+            0.4,
+            true,
+            1.0,
+            false,
+            [(Arc::from("owner"), Arc::from("bell"), 0.5, false)],
+        )
+        .unwrap();
+    let (_factory, binding) = bind_package_factory(&scope, "OWNER", "BELL");
+    let key = registration.package_control_key("owner", "bell").unwrap();
+    let package = registration.set_package_gain_muted(&key, false).unwrap();
+    assert_gain(package.linear(), 0.5);
+
+    let error = registration
+        .stage_gain_policy(
+            0.8,
+            false,
+            0.4,
+            true,
+            [(Arc::from(""), Arc::from("bad"), 0.25, false)],
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        SessionAudioPolicyError::Package(PackageAudioScopeError::InvalidIdentity)
+    );
+    let unchanged = registration.set_gain_muted(true).unwrap();
+    assert_gain(unchanged.linear(), 0.4);
+    assert!(unchanged.is_muted());
+
+    registration
+        .stage_gain_policy(
+            1.0,
+            false,
+            0.4,
+            true,
+            [(Arc::from("owner"), Arc::from("bell"), 1.0, false)],
+        )
+        .unwrap();
+    let reset = registration.set_package_gain_muted(&key, false).unwrap();
+    assert_gain(reset.linear(), 1.0);
+    assert!(!reset.is_muted());
+
+    drop(binding);
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+    application.seal();
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn default_policy_for_many_absent_roots_consumes_no_registry_capacity() {
+    let (service, session, probe) = service(210);
+    let mut application = ApplicationAudioOwner::new(authority_limits(1));
+    let registration = application.registrar().register_session(session).unwrap();
+    registration
+        .stage_gain_policy(
+            1.0,
+            false,
+            1.0,
+            false,
+            (0..MAX_PACKAGE_AUDIO_SCOPES + 10).map(|index| {
+                (
+                    Arc::from("owner"),
+                    Arc::from(format!("default-{index}")),
+                    1.0,
+                    false,
+                )
+            }),
+        )
+        .unwrap();
+    let entries = registration
+        .scope()
+        .inner
+        .package_audio
+        .as_ref()
+        .unwrap()
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    assert_eq!(entries, 0);
+
+    let mut retirement = registration.retire();
+    await_session_retirement(&mut retirement, &probe);
+    application.seal();
+    assert!(service.shutdown().clean);
 }
 
 #[test]
@@ -825,12 +947,14 @@ fn composite_none_is_slot_free_while_default_owns_the_only_available_slot() {
         bus.try_reserve_input(),
         Err(MixerControlError::InputCapacity)
     ));
-    let full_error = composite_context(&factory, "", TEST_RATE_F32, CHANNELS)
-        .expect_err("a second default context observes Script capacity");
-    assert_eq!(
-        full_error.output_error().map(AudioOutputError::kind),
-        Some(AudioOutputErrorKind::DeviceUnavailable)
-    );
+    let capacity_emulated = composite_context(&factory, "", TEST_RATE_F32, CHANNELS)
+        .expect("default output emulates silence when the physical Script bus is full");
+    assert_eq!(capacity_emulated.sink_id(), "");
+    assert!(capacity_emulated.output_latency().abs() < f64::EPSILON);
+    assert!(matches!(
+        bus.try_reserve_input(),
+        Err(MixerControlError::InputCapacity)
+    ));
 
     // Hosted contexts do not migrate between delegates. Construct separate
     // contexts to exercise each exact sink route.
@@ -851,7 +975,7 @@ fn composite_none_is_slot_free_while_default_owns_the_only_available_slot() {
         Err(MixerControlError::InputCapacity)
     ));
 
-    for context in [&first_none, &second_none] {
+    for context in [&capacity_emulated, &first_none, &second_none] {
         assert!(matches!(
             context.request_close().unwrap().wait(),
             AudioContextShutdownOutcome::Confirmed(_)
@@ -870,6 +994,37 @@ fn composite_none_is_slot_free_while_default_owns_the_only_available_slot() {
         .expect("closing the default context returns its exact Script slot");
     assert!(block_on(replacement.abort()).unwrap().is_clean());
     retire_reservations(held);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn forced_emulated_default_preserves_explicit_logical_rate_while_physical_rejects_it() {
+    let (service, session, _probe) = service(224);
+    let bus = session.script_bus();
+    let physical = SessionAudioOutputFactory::new(bus.clone());
+    let error = composite_context(&physical, "", 44_100.0, CHANNELS)
+        .expect_err("audible default output keeps the fixed process-mixer rate");
+    assert_eq!(
+        error.output_error().map(AudioOutputError::kind),
+        Some(AudioOutputErrorKind::NotSupported)
+    );
+
+    let force_emulated = Arc::new(AtomicBool::new(true));
+    let emulated = SessionAudioOutputFactory::with_force_emulated(bus, force_emulated);
+    let context = composite_context(&emulated, "", 44_100.0, CHANNELS)
+        .expect("a pre-forced silent generation keeps its requested logical rate");
+    assert_eq!(context.state(), AudioContextState::Running);
+    assert!((context.sample_rate() - 44_100.0).abs() < f32::EPSILON);
+    let started_at = context.current_time();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while context.current_time() <= started_at {
+        assert!(Instant::now() < deadline, "emulated clock did not advance");
+        thread::yield_now();
+    }
+    assert!(matches!(
+        context.request_close().unwrap().wait(),
+        AudioContextShutdownOutcome::Confirmed(_)
+    ));
     assert!(service.shutdown().clean);
 }
 
@@ -1032,6 +1187,21 @@ fn physical_device_death_affects_default_but_none_closes_independently() {
         }
     }
 
+    let emulated = composite_context(&factory, "", TEST_RATE_F32, CHANNELS)
+        .expect("new default contexts use emulated output after exact device death");
+    assert_eq!(emulated.sink_id(), "");
+    assert_eq!(emulated.state(), AudioContextState::Running);
+    let emulated_started_at = emulated.current_time();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while emulated.current_time() <= emulated_started_at {
+        assert!(
+            Instant::now() < deadline,
+            "post-death emulated context did not render"
+        );
+        thread::yield_now();
+    }
+    emulated.close_sync();
+
     assert_eq!(none.state(), AudioContextState::Running);
     let AudioContextShutdownOutcome::Confirmed(none_report) = none.request_close().unwrap().wait()
     else {
@@ -1049,6 +1219,244 @@ fn physical_device_death_affects_default_but_none_closes_independently() {
         Some(AudioOutputDeathReason::BackendFailure)
     );
     assert_eq!(default.state(), AudioContextState::Closed);
+}
+
+#[test]
+fn device_death_after_default_prepare_reroutes_the_unpublished_callback_to_emulation() {
+    let (service, session, probe) = service(219);
+    let factory = SessionAudioOutputFactory::new(session.script_bus());
+    let (prepared, prepared_rx) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    let (cleanup_thread, _cleanup_thread_rx) = mpsc::sync_channel(1);
+    let output: Arc<dyn AudioOutputFactory> = Arc::new(BlockAfterPrepareFactory {
+        inner: Arc::new(factory),
+        prepared,
+        release: Arc::clone(&release),
+        cleanup_thread,
+    });
+
+    let build = thread::spawn(move || {
+        let context = AudioContext::builder(output)
+            .options(AudioContextOptions {
+                sample_rate: Some(TEST_RATE_F32),
+                ..AudioContextOptions::default()
+            })
+            .number_of_channels(CHANNELS)
+            .build()
+            .expect("default construction silently recovers a prepared physical endpoint");
+        assert_eq!(context.sink_id(), "");
+        assert_eq!(context.state(), AudioContextState::Running);
+        let started_at = context.current_time();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while context.current_time() <= started_at {
+            assert!(
+                Instant::now() < deadline,
+                "recovered emulated output did not advance currentTime"
+            );
+            thread::yield_now();
+        }
+        let AudioContextShutdownOutcome::Confirmed(report) =
+            context.request_close().unwrap().wait()
+        else {
+            panic!("physical and emulated cleanup was not jointly confirmed")
+        };
+        assert_eq!(report.endpoint_death(), None);
+    });
+
+    prepared_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the physical endpoint completed prepare before device death");
+    assert!(probe.fail_output());
+    release.wait();
+    build.join().unwrap();
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+}
+
+#[test]
+fn implicit_non_48khz_default_fallback_preserves_negotiated_format_and_clock_cadence() {
+    const RATE: u32 = 44_100;
+    const RATE_F32: f32 = 44_100.0;
+    let (service, driver_probe) = start_test_mixer(
+        RATE,
+        TestDriverConfig {
+            actual_sample_rate: RATE,
+            ..TestDriverConfig::default()
+        },
+    )
+    .unwrap();
+    let session = service.add_session(AudioSessionId(222)).unwrap();
+    let probe = RenderProbe(Some(driver_probe));
+    let (prepared, prepared_rx) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    let (cleanup_thread, _cleanup_thread_rx) = mpsc::sync_channel(1);
+    let output: Arc<dyn AudioOutputFactory> = Arc::new(BlockAfterPrepareFactory {
+        inner: Arc::new(SessionAudioOutputFactory::new(session.script_bus())),
+        prepared,
+        release: Arc::clone(&release),
+        cleanup_thread,
+    });
+
+    let build = thread::spawn(move || {
+        let context = AudioContext::builder(output)
+            .number_of_channels(CHANNELS)
+            .build()
+            .expect("implicit-rate default construction retains exact negotiated emulation");
+        assert!((context.sample_rate() - RATE_F32).abs() < f32::EPSILON);
+        let quantum = f64::from(u32::try_from(FRAMES).unwrap()) / f64::from(RATE);
+        assert!((context.output_latency() - quantum).abs() < f64::EPSILON);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let advanced = loop {
+            let current = context.current_time();
+            if current > 0.0 {
+                break current;
+            }
+            assert!(Instant::now() < deadline, "emulated clock did not advance");
+            thread::yield_now();
+        };
+        let rendered_quanta = advanced / quantum;
+        assert!(
+            (rendered_quanta - rendered_quanta.round()).abs() < 1.0e-9,
+            "currentTime {advanced} did not advance at the negotiated 44.1 kHz cadence"
+        );
+        let AudioContextShutdownOutcome::Confirmed(report) =
+            context.request_close().unwrap().wait()
+        else {
+            panic!("exact-config fallback cleanup was not confirmed")
+        };
+        assert_eq!(report.endpoint_death(), None);
+    });
+
+    prepared_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("44.1 kHz physical prepare completed");
+    assert!(probe.fail_output());
+    release.wait();
+    build.join().unwrap();
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn device_death_after_live_open_snapshot_never_publishes_the_pending_callback() {
+    let (service, session, probe) = service(221);
+    let script = session.script_bus();
+    let pause = probe.pause_next_input_open_after_snapshot();
+    let (failure_entered, failure_entered_rx) = mpsc::sync_channel(1);
+    let failure_release = Arc::new(Barrier::new(2));
+    let output: Arc<dyn AudioOutputFactory> =
+        Arc::new(SessionAudioOutputFactory::with_failure_hook(
+            script.clone(),
+            Arc::new(TestFailureHook {
+                entered: failure_entered,
+                release: Arc::clone(&failure_release),
+            }),
+        ));
+    let build = thread::spawn(move || {
+        let context = AudioContext::builder(output)
+            .options(AudioContextOptions {
+                sample_rate: Some(TEST_RATE_F32),
+                ..AudioContextOptions::default()
+            })
+            .number_of_channels(CHANNELS)
+            .build()
+            .expect("the start-snapshot race reroutes to emulated output");
+        assert_eq!(context.state(), AudioContextState::Running);
+        let started_at = context.current_time();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while context.current_time() <= started_at {
+            assert!(Instant::now() < deadline, "emulated clock did not advance");
+            thread::yield_now();
+        }
+        let AudioContextShutdownOutcome::Confirmed(report) =
+            context.request_close().unwrap().wait()
+        else {
+            panic!("race fallback cleanup was not confirmed")
+        };
+        assert_eq!(report.endpoint_death(), None);
+    });
+
+    pause.wait_until_paused();
+    assert!(probe.fail_output());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while script.output_failure().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the injected output death was not retained"
+        );
+        thread::yield_now();
+    }
+    pause.release();
+    failure_entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("physical cleanup reached the disarmed pending observer");
+    failure_release.wait();
+    build.join().unwrap();
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn device_death_after_final_start_snapshot_is_typed_and_emulated() {
+    let (service, session, probe) = service(223);
+    let script = session.script_bus();
+    let pause = probe.pause_next_input_open_before_publish();
+    let output: Arc<dyn AudioOutputFactory> =
+        Arc::new(SessionAudioOutputFactory::new(script.clone()));
+    let build = thread::spawn(move || {
+        let context = AudioContext::builder(output)
+            .options(AudioContextOptions {
+                sample_rate: Some(TEST_RATE_F32),
+                ..AudioContextOptions::default()
+            })
+            .number_of_channels(CHANNELS)
+            .build()
+            .expect("the final start window produces emulated default output");
+        assert_eq!(context.state(), AudioContextState::Running);
+        let started_at = context.current_time();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while context.current_time() <= started_at {
+            assert!(Instant::now() < deadline, "emulated clock did not advance");
+            thread::yield_now();
+        }
+        let AudioContextShutdownOutcome::Confirmed(report) =
+            context.request_close().unwrap().wait()
+        else {
+            panic!("final-window fallback cleanup was not confirmed")
+        };
+        assert_eq!(report.endpoint_death(), None);
+    });
+
+    pause.wait_until_paused();
+    assert!(probe.fail_output());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while script.output_failure().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the final-window output failure was not retained"
+        );
+        thread::yield_now();
+    }
+    pause.release();
+    build.join().unwrap();
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn clean_stopped_owner_uses_emulated_default_without_a_retained_device_cause() {
+    let (service, session, _probe) = service(220);
+    let factory = SessionAudioOutputFactory::new(session.script_bus());
+    assert!(service.shutdown().clean);
+
+    let context = composite_context(&factory, "", 44_100.0, CHANNELS)
+        .expect("a clean stopped mixer owner is equivalent to no physical device");
+    assert_eq!(context.sink_id(), "");
+    assert!((context.sample_rate() - 44_100.0).abs() < f32::EPSILON);
+    assert_eq!(context.state(), AudioContextState::Running);
+    let AudioContextShutdownOutcome::Confirmed(report) = context.request_close().unwrap().wait()
+    else {
+        panic!("emulated context cleanup was not confirmed")
+    };
+    assert_eq!(report.endpoint_death(), None);
 }
 
 #[test]
@@ -1270,7 +1678,7 @@ fn hosted_context(factory: &ScriptBusAudioOutputFactory) -> AudioContext {
 
 #[derive(Clone)]
 struct BlockAfterPrepareFactory {
-    inner: ScriptBusAudioOutputFactory,
+    inner: Arc<dyn AudioOutputFactory>,
     prepared: mpsc::SyncSender<()>,
     release: Arc<Barrier>,
     cleanup_thread: mpsc::SyncSender<thread::ThreadId>,
@@ -1524,7 +1932,7 @@ fn production_start_rejects_stopped_owner_and_cleans_the_real_callback() {
     let release = Arc::new(Barrier::new(2));
     let (cleanup_thread, cleanup_thread_rx) = mpsc::sync_channel(1);
     let output: Arc<dyn AudioOutputFactory> = Arc::new(BlockAfterPrepareFactory {
-        inner: ScriptBusAudioOutputFactory::new(session.script_bus()),
+        inner: Arc::new(ScriptBusAudioOutputFactory::new(session.script_bus())),
         prepared,
         release: release.clone(),
         cleanup_thread,

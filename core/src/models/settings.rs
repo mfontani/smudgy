@@ -1,7 +1,7 @@
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{fs, io};
 
 use super::persistence::write_atomic;
@@ -359,6 +359,13 @@ pub struct Settings {
     #[serde(default)]
     pub logging: LoggingSettings,
 
+    /// Persisted Web Audio output policy. Session rows use the durable
+    /// server/profile pair instead of the process-local session id; sandbox
+    /// rows use their versionless package root. The UI applies these values
+    /// before publishing a physical runtime generation.
+    #[serde(default, skip_serializing_if = "AudioSettings::is_default")]
+    pub audio: AudioSettings,
+
     /// Unlocks advanced scripting features that bypass the package sandbox: "Remove sandbox"
     /// (run an installed package with full authority on the main isolate) and the script
     /// inspector. Off by default — these are powerful, footgun-prone affordances, so they stay
@@ -374,6 +381,221 @@ pub struct MapAreaPref {
     pub area_id: smudgy_cloud::AreaId,
     pub disabled: bool,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Maximum durable session policies retained from a hand-edited settings
+/// file. The UI normally creates far fewer; this keeps corrupt input bounded.
+pub const MAX_AUDIO_SESSION_SETTINGS: usize = 256;
+/// Maximum versionless sandbox-root policies retained under one session.
+pub const MAX_AUDIO_PACKAGE_SETTINGS: usize = 256;
+
+/// One independently muted volume setting. The persisted unit is a whole
+/// percent so UI round-trips are exact; mixer conversion happens at the edge.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioGainSettings {
+    #[serde(
+        default = "default_audio_volume",
+        deserialize_with = "deserialize_audio_volume"
+    )]
+    pub volume: u8,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+impl AudioGainSettings {
+    #[must_use]
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+
+    /// Mixer-linear value corresponding to the persisted whole percent.
+    #[must_use]
+    pub fn linear(self) -> f32 {
+        f32::from(self.volume) / 100.0
+    }
+
+    /// Replace the remembered volume while retaining independent mute state.
+    #[must_use]
+    pub const fn with_volume(self, volume: u8) -> Self {
+        Self {
+            volume: if volume > 100 { 100 } else { volume },
+            muted: self.muted,
+        }
+    }
+
+    /// Replace mute while retaining the remembered volume.
+    #[must_use]
+    pub const fn with_muted(self, muted: bool) -> Self {
+        Self {
+            volume: self.volume,
+            muted,
+        }
+    }
+}
+
+impl Default for AudioGainSettings {
+    fn default() -> Self {
+        Self {
+            volume: default_audio_volume(),
+            muted: false,
+        }
+    }
+}
+
+const fn default_audio_volume() -> u8 {
+    100
+}
+
+/// Be liberal with hand-edited JSON: any JSON number is rounded and clamped;
+/// other value kinds fall back to the audible default instead of making the
+/// whole settings file unreadable.
+fn deserialize_audio_volume<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(value) = value.as_f64() else {
+        return Ok(default_audio_volume());
+    };
+    if !value.is_finite() {
+        return Ok(default_audio_volume());
+    }
+    Ok(value.round().clamp(0.0, 100.0) as u8)
+}
+
+/// Versionless sandbox-root policy under one durable session identity.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PackageAudioSettings {
+    pub owner: String,
+    pub name: String,
+    #[serde(default)]
+    pub gain: AudioGainSettings,
+}
+
+/// Audio policy for every process-local session opened from one durable
+/// server/profile pair.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionAudioSettings {
+    pub server: String,
+    pub profile: String,
+    #[serde(default)]
+    pub gain: AudioGainSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<PackageAudioSettings>,
+}
+
+/// Complete persisted audio policy.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AudioSettings {
+    #[serde(default)]
+    pub master: AudioGainSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionAudioSettings>,
+}
+
+impl AudioSettings {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.master == AudioGainSettings::default() && self.sessions.is_empty()
+    }
+
+    /// Find the durable policy for a server/profile pair.
+    #[must_use]
+    pub fn session(&self, server: &str, profile: &str) -> Option<&SessionAudioSettings> {
+        self.sessions
+            .iter()
+            .find(|row| row.server == server && row.profile == profile)
+    }
+
+    /// Find or create the durable policy for a server/profile pair.
+    pub fn session_mut(&mut self, server: &str, profile: &str) -> &mut SessionAudioSettings {
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|row| row.server == server && row.profile == profile)
+        {
+            return &mut self.sessions[index];
+        }
+        if self.sessions.len() >= MAX_AUDIO_SESSION_SETTINGS {
+            self.sessions.remove(0);
+        }
+        self.sessions.push(SessionAudioSettings {
+            server: server.to_string(),
+            profile: profile.to_string(),
+            gain: AudioGainSettings::default(),
+            packages: Vec::new(),
+        });
+        self.sessions
+            .last_mut()
+            .expect("a just-pushed audio session exists")
+    }
+
+    /// Canonicalize and bound policy loaded from editable JSON. Duplicate
+    /// identities resolve last-writer-wins, matching their textual order.
+    pub fn normalize(&mut self) {
+        let mut sessions = std::collections::BTreeMap::new();
+        for mut session in std::mem::take(&mut self.sessions) {
+            if session.server.is_empty() || session.profile.is_empty() {
+                continue;
+            }
+            let mut packages = std::collections::BTreeMap::new();
+            for mut package in session.packages {
+                package.owner.make_ascii_lowercase();
+                package.name.make_ascii_lowercase();
+                if package.owner.is_empty() || package.name.is_empty() {
+                    continue;
+                }
+                let key = (package.owner.clone(), package.name.clone());
+                if package.gain.is_default() {
+                    packages.remove(&key);
+                } else {
+                    packages.insert(key, package);
+                }
+            }
+            session.packages = packages
+                .into_values()
+                .take(MAX_AUDIO_PACKAGE_SETTINGS)
+                .collect();
+            let key = (session.server.clone(), session.profile.clone());
+            if session.gain.is_default() && session.packages.is_empty() {
+                sessions.remove(&key);
+            } else {
+                sessions.insert(key, session);
+            }
+        }
+        self.sessions = sessions
+            .into_values()
+            .take(MAX_AUDIO_SESSION_SETTINGS)
+            .collect();
+    }
+}
+
+impl SessionAudioSettings {
+    #[must_use]
+    pub fn package(&self, owner: &str, name: &str) -> Option<&PackageAudioSettings> {
+        self.packages.iter().find(|row| {
+            row.owner.eq_ignore_ascii_case(owner) && row.name.eq_ignore_ascii_case(name)
+        })
+    }
+
+    pub fn package_mut(&mut self, owner: &str, name: &str) -> &mut PackageAudioSettings {
+        if let Some(index) = self.packages.iter().position(|row| {
+            row.owner.eq_ignore_ascii_case(owner) && row.name.eq_ignore_ascii_case(name)
+        }) {
+            return &mut self.packages[index];
+        }
+        if self.packages.len() >= MAX_AUDIO_PACKAGE_SETTINGS {
+            self.packages.remove(0);
+        }
+        self.packages.push(PackageAudioSettings {
+            owner: owner.to_ascii_lowercase(),
+            name: name.to_ascii_lowercase(),
+            gain: AudioGainSettings::default(),
+        });
+        self.packages
+            .last_mut()
+            .expect("a just-pushed package policy exists")
+    }
 }
 
 /// Non-destructive adjustments layered on a base color scheme.
@@ -630,6 +852,7 @@ impl Default for Settings {
             disabled_map_areas: Vec::new(),
             map_area_prefs: Vec::new(),
             logging: LoggingSettings::default(),
+            audio: AudioSettings::default(),
             advanced_scripting_features: false,
         }
     }
@@ -672,10 +895,15 @@ fn try_load_settings() -> Result<Settings> {
     let smudgy_dir = get_smudgy_home()?;
     let settings_path = smudgy_dir.join("settings.json");
 
+    try_load_settings_from(&settings_path)
+}
+
+fn try_load_settings_from(settings_path: &std::path::Path) -> Result<Settings> {
     match fs::read_to_string(&settings_path) {
         Ok(content) => {
-            let settings: Settings =
+            let mut settings: Settings =
                 serde_json::from_str(&content).context("Failed to parse settings.json")?;
+            settings.audio.normalize();
             Ok(settings)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -690,6 +918,22 @@ fn try_load_settings() -> Result<Settings> {
             ))
         }
     }
+}
+
+/// Atomically replace only the audio policy in the latest settings file.
+///
+/// Unlike [`load_settings`], this merge is deliberately fallible: a malformed
+/// or unreadable existing file is preserved and reported to the caller. A
+/// missing file is the normal first-run case and starts from defaults.
+pub fn merge_audio_settings(audio: &AudioSettings) -> Result<()> {
+    let settings_path = get_smudgy_home()?.join("settings.json");
+    merge_audio_settings_at(&settings_path, audio)
+}
+
+fn merge_audio_settings_at(settings_path: &std::path::Path, audio: &AudioSettings) -> Result<()> {
+    let mut latest = try_load_settings_from(settings_path)?;
+    latest.audio = audio.clone();
+    save_settings_to(settings_path, &latest)
 }
 
 /// File name of the installer's update-check seed. The Windows installer writes
@@ -798,8 +1042,14 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
     let smudgy_dir = get_smudgy_home()?;
     let settings_path = smudgy_dir.join("settings.json");
 
+    save_settings_to(&settings_path, settings)
+}
+
+fn save_settings_to(settings_path: &std::path::Path, settings: &Settings) -> Result<()> {
+    let mut normalized = settings.clone();
+    normalized.audio.normalize();
     let json_content =
-        serde_json::to_string_pretty(settings).context("Failed to serialize settings")?;
+        serde_json::to_string_pretty(&normalized).context("Failed to serialize settings")?;
 
     write_atomic(&settings_path, json_content.as_bytes()).context(format!(
         "Failed to write settings.json at {}",
@@ -812,6 +1062,151 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_settings_default_to_an_omitted_audio_policy() {
+        let settings: Settings = serde_json::from_str(r#"{"scrollback_length":5000}"#).unwrap();
+        assert!(settings.audio.is_default());
+        assert!(
+            !serde_json::to_string(&Settings::default())
+                .unwrap()
+                .contains("\"audio\"")
+        );
+    }
+
+    #[test]
+    fn hand_edited_audio_volumes_are_rounded_clamped_and_type_safe() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "audio": {
+                    "master": {"volume": -8.2, "muted": true},
+                    "sessions": [{
+                        "server": "example",
+                        "profile": "main",
+                        "gain": {"volume": 140.6},
+                        "packages": [{"owner":"Owner","name":"Bell","gain":{"volume":"bad"}}]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(settings.audio.master.volume, 0);
+        assert!(settings.audio.master.muted);
+        let session = settings.audio.session("example", "main").unwrap();
+        assert_eq!(session.gain.volume, 100);
+        assert_eq!(session.package("owner", "bell").unwrap().gain.volume, 100);
+    }
+
+    #[test]
+    fn structured_audio_identity_does_not_alias_delimiter_shaped_pairs() {
+        let mut audio = AudioSettings::default();
+        audio.session_mut("a/b", "c").gain.volume = 20;
+        audio.session_mut("a", "b/c").gain.volume = 80;
+        audio.normalize();
+        assert_eq!(audio.session("a/b", "c").unwrap().gain.volume, 20);
+        assert_eq!(audio.session("a", "b/c").unwrap().gain.volume, 80);
+    }
+
+    #[test]
+    fn audio_normalize_retains_nondefault_reinstall_policy_and_compacts_defaults() {
+        let mut audio = AudioSettings::default();
+        let session = audio.session_mut("server", "profile");
+        session.package_mut("Owner", "Keep").gain.volume = 35;
+        session.package_mut("Owner", "Drop");
+        audio.session_mut("empty", "default");
+        audio.normalize();
+
+        assert_eq!(audio.sessions.len(), 1);
+        let session = audio.session("server", "profile").unwrap();
+        assert_eq!(session.packages.len(), 1);
+        assert_eq!(session.package("owner", "keep").unwrap().gain.volume, 35);
+        assert!(session.package("owner", "drop").is_none());
+    }
+
+    #[test]
+    fn audio_normalize_later_defaults_reset_duplicate_session_and_package_rows() {
+        let mut audio = AudioSettings {
+            sessions: vec![
+                SessionAudioSettings {
+                    server: "server".into(),
+                    profile: "profile".into(),
+                    gain: AudioGainSettings {
+                        volume: 35,
+                        muted: false,
+                    },
+                    packages: Vec::new(),
+                },
+                SessionAudioSettings {
+                    server: "server".into(),
+                    profile: "profile".into(),
+                    gain: AudioGainSettings::default(),
+                    packages: Vec::new(),
+                },
+                SessionAudioSettings {
+                    server: "other".into(),
+                    profile: "profile".into(),
+                    gain: AudioGainSettings::default(),
+                    packages: vec![
+                        PackageAudioSettings {
+                            owner: "Owner".into(),
+                            name: "Bell".into(),
+                            gain: AudioGainSettings {
+                                volume: 35,
+                                muted: false,
+                            },
+                        },
+                        PackageAudioSettings {
+                            owner: "owner".into(),
+                            name: "bell".into(),
+                            gain: AudioGainSettings::default(),
+                        },
+                    ],
+                },
+            ],
+            ..AudioSettings::default()
+        };
+
+        audio.normalize();
+        assert!(audio.session("server", "profile").is_none());
+        assert!(audio.session("other", "profile").is_none());
+    }
+
+    #[test]
+    fn audio_merge_preserves_latest_unrelated_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let latest = Settings {
+            scrollback_length: 12_345,
+            locale: "pl-PL".to_string(),
+            ..Settings::default()
+        };
+        save_settings_to(&path, &latest).unwrap();
+
+        let mut audio = AudioSettings::default();
+        audio.master = AudioGainSettings {
+            volume: 45,
+            muted: true,
+        };
+        merge_audio_settings_at(&path, &audio).unwrap();
+
+        let merged = try_load_settings_from(&path).unwrap();
+        assert_eq!(merged.scrollback_length, 12_345);
+        assert_eq!(merged.locale, "pl-PL");
+        assert_eq!(merged.audio.master, audio.master);
+    }
+
+    #[test]
+    fn audio_merge_refuses_to_replace_malformed_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let malformed = b"{ this is not settings json";
+        fs::write(&path, malformed).unwrap();
+
+        let mut audio = AudioSettings::default();
+        audio.master.volume = 45;
+        assert!(merge_audio_settings_at(&path, &audio).is_err());
+        assert_eq!(fs::read(&path).unwrap(), malformed);
+    }
 
     #[test]
     fn script_settings_from_carries_display_settings_without_palette() {

@@ -12,6 +12,8 @@ use iced::{Point, Rectangle, Size, Subscription, Task};
 use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
 use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, Mapper};
 use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
+#[cfg(feature = "web-audio-cpal")]
+use smudgy_core::models::settings::{AudioGainSettings, AudioSettings};
 use smudgy_core::models::settings::{MapAreaPref, Settings};
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TabPosition,
@@ -99,6 +101,8 @@ pub(crate) const DOWNLOAD_URL: &str = "https://www.smudgy.org/download";
 struct Smudgy {
     #[cfg(feature = "web-audio-cpal")]
     audio_status: AudioBootStatus,
+    #[cfg(feature = "web-audio-cpal")]
+    audio_panel: AudioPanelState,
     account: CloudAccount,
     /// Discord Rich Presence ("Playing smudgy — on <server>"), mirrored from
     /// `settings.discord_rich_presence`. Re-derived from the session store on
@@ -196,7 +200,7 @@ struct Smudgy {
 enum AudioBootStatus {
     Physical,
     Unavailable(Arc<str>),
-    Disabled(Arc<str>),
+    Failed(Arc<str>),
 }
 
 #[cfg(feature = "web-audio-cpal")]
@@ -206,6 +210,9 @@ impl AudioBootStatus {
             application_audio::ApplicationAudioAvailability::Physical => Self::Physical,
             application_audio::ApplicationAudioAvailability::Unavailable(cause) => {
                 Self::Unavailable(cause.to_string().into())
+            }
+            application_audio::ApplicationAudioAvailability::InfrastructureUnavailable(cause) => {
+                Self::Unavailable(Arc::clone(cause))
             }
         }
     }
@@ -217,12 +224,83 @@ impl AudioBootStatus {
                 "audio-output-unavailable",
                 "cause" => cause.as_ref()
             )),
-            Self::Disabled(cause) => Some(i18n::t!(
-                "audio-web-disabled",
+            Self::Failed(cause) => Some(i18n::t!(
+                "audio-output-failed",
                 "cause" => cause.as_ref()
             )),
         }
     }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioControlRoute {
+    Physical,
+    PreferenceOnly,
+    Failed,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_control_route(status: &AudioBootStatus) -> AudioControlRoute {
+    match status {
+        AudioBootStatus::Physical => AudioControlRoute::Physical,
+        AudioBootStatus::Unavailable(_) => AudioControlRoute::PreferenceOnly,
+        AudioBootStatus::Failed(_) => AudioControlRoute::Failed,
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_control_route_with_local_emulation(
+    status: &AudioBootStatus,
+    local_emulated: bool,
+) -> AudioControlRoute {
+    match audio_control_route(status) {
+        AudioControlRoute::Physical if local_emulated => AudioControlRoute::PreferenceOnly,
+        route => route,
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_control_route_for_target(smudgy: &Smudgy, target: &AudioTarget) -> AudioControlRoute {
+    let local_emulated = match target {
+        AudioTarget::Master => false,
+        AudioTarget::Session { id, .. } | AudioTarget::Package { id, .. } => {
+            let Some(session) = smudgy.sessions.get(*id) else {
+                return AudioControlRoute::Failed;
+            };
+            session.audio_is_emulated()
+        }
+    };
+    audio_control_route_with_local_emulation(&smudgy.audio_status, local_emulated)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Debug)]
+struct AudioPanelState {
+    open_windows: HashSet<window::Id>,
+    focused_widgets: HashMap<window::Id, iced::widget::Id>,
+    preferences: AudioSettings,
+    master_live: AudioGainSettings,
+    notice: Option<String>,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Debug)]
+enum AudioTarget {
+    Master,
+    Session {
+        id: SessionId,
+        server: Arc<str>,
+        profile: Arc<str>,
+    },
+    Package {
+        id: SessionId,
+        server: Arc<str>,
+        profile: Arc<str>,
+        owner: Arc<str>,
+        name: Arc<str>,
+        action_key: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +316,22 @@ enum Message {
     /// runs signed in or out.
     UpdateCheckTick,
     SmudgyWindowMessage(window::Id, windows::smudgy_window::Message),
+    #[cfg(feature = "web-audio-cpal")]
+    AudioPanelToggle(window::Id),
+    #[cfg(feature = "web-audio-cpal")]
+    AudioPanelOpenAndFocus(window::Id),
+    #[cfg(feature = "web-audio-cpal")]
+    AudioPanelTraverse {
+        window_id: window::Id,
+        backwards: bool,
+    },
+    #[cfg(feature = "web-audio-cpal")]
+    AudioControl {
+        window_id: window::Id,
+        target: AudioTarget,
+        widget_id: iced::widget::Id,
+        action: widgets::audio_gain::Action,
+    },
     /// An event from a session's runtime stream, routed straight to the
     /// session store (whatever window hosts the session's pane repaints from
     /// the shared state).
@@ -449,6 +543,7 @@ where
 fn init(
     #[cfg(feature = "web-audio-cpal")] audio: Option<application_audio::ApplicationAudioController>,
     #[cfg(feature = "web-audio-cpal")] audio_status: AudioBootStatus,
+    #[cfg(feature = "web-audio-cpal")] master_live: AudioGainSettings,
 ) -> (Smudgy, Task<Message>) {
     // Seed the hot prefs snapshot before any window renders, and load the
     // per-area enable/disable preferences (migrating a legacy disabled-only
@@ -543,6 +638,14 @@ fn init(
         Smudgy {
             #[cfg(feature = "web-audio-cpal")]
             audio_status,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_panel: AudioPanelState {
+                open_windows: HashSet::new(),
+                focused_widgets: HashMap::new(),
+                preferences: settings.audio.clone(),
+                master_live,
+                notice: None,
+            },
             account,
             discord,
             sessions,
@@ -630,32 +733,79 @@ pub fn run() -> anyhow::Result<()> {
     i18n::activate(&startup_settings.locale);
 
     #[cfg(feature = "web-audio-cpal")]
-    let (application_audio, audio_controller, audio_status, audio_start_error) =
-        match application_audio::ApplicationAudio::start() {
-            Ok(application) => {
-                let status = AudioBootStatus::from_availability(&application.availability());
-                let controller = application.controller();
-                (Some(application), Some(controller), status, None)
+    let application_audio = application_audio::ApplicationAudio::start();
+    #[cfg(feature = "web-audio-cpal")]
+    let mut audio_status = AudioBootStatus::from_availability(&application_audio.availability());
+    #[cfg(feature = "web-audio-cpal")]
+    let audio_controller = application_audio.controller();
+    #[cfg(feature = "web-audio-cpal")]
+    let mut master_live = AudioGainSettings::default();
+    #[cfg(feature = "web-audio-cpal")]
+    if matches!(audio_status, AudioBootStatus::Physical) {
+        match audio_controller.set_master_state(
+            startup_settings.audio.master.linear(),
+            startup_settings.audio.master.muted,
+        ) {
+            Ok(state) => {
+                master_live = AudioGainSettings {
+                    volume: (state.linear() * 100.0).round().clamp(0.0, 100.0) as u8,
+                    muted: state.is_muted(),
+                };
             }
             Err(error) => {
-                let status = AudioBootStatus::Disabled(error.to_string().into());
-                (None, None, status, Some(error))
+                // Audio is optional. A failed physical policy application
+                // disables live audio for this launch before any session
+                // runtime can be published. The failed launch's acknowledged
+                // live state remains the physical default; the saved desired
+                // policy stays separate and editable for the next start.
+                log::error!("Web Audio master policy could not be applied: {error}");
+                audio_status = if matches!(
+                    error,
+                    application_audio::ApplicationAudioControlError::OutputFailed(_)
+                ) {
+                    AudioBootStatus::Failed(error.to_string().into())
+                } else {
+                    AudioBootStatus::Unavailable(error.to_string().into())
+                };
+                let cause = match &error {
+                    application_audio::ApplicationAudioControlError::NotApplicable(cause) => {
+                        cause.clone()
+                    }
+                    application_audio::ApplicationAudioControlError::OutputFailed(failure) => {
+                        application_audio::SessionAudioUnavailable::System(
+                            smudgy_audio::SystemMixerUnavailable::from(
+                                smudgy_audio::SystemMixerStartError::DriverFailed(failure.clone()),
+                            ),
+                        )
+                    }
+                    _ => {
+                        application_audio::SessionAudioUnavailable::Policy(error.to_string().into())
+                    }
+                };
+                audio_controller.force_new_sessions_unavailable(cause);
             }
-        };
+        }
+    }
     #[cfg(feature = "web-audio-cpal")]
     match &audio_status {
         AudioBootStatus::Physical => {}
         AudioBootStatus::Unavailable(cause) => {
             log::warn!("physical audio unavailable for this launch; restart to retry: {cause}");
         }
-        AudioBootStatus::Disabled(cause) => {
-            log::error!("Web Audio disabled for this launch; restart to retry: {cause}");
+        AudioBootStatus::Failed(cause) => {
+            log::error!("Web Audio failed for this launch; restart to retry: {cause}");
         }
     }
 
     #[cfg(feature = "web-audio-cpal")]
     let daemon = iced::daemon(
-        move || init(audio_controller.clone(), audio_status.clone()),
+        move || {
+            init(
+                Some(audio_controller.clone()),
+                audio_status.clone(),
+                master_live,
+            )
+        },
         update,
         view,
     );
@@ -729,32 +879,10 @@ pub fn run() -> anyhow::Result<()> {
 
     #[cfg(feature = "web-audio-cpal")]
     {
-        if let Some(application_audio) = application_audio {
-            // Always consume the proof-bearing audio shutdown path, including
-            // when iced itself failed. Keep the two failure domains visible.
-            let audio_report = application_audio.shutdown();
-            finish_run_with_audio(iced_result, audio_report)?;
-        } else {
-            // Lifecycle-worker construction failed. Fall back to the legacy
-            // audio-free runtime for this launch, but retain any physical
-            // cleanup uncertainty through terminal shutdown instead of
-            // silently discarding it.
-            smudgy_core::session::connection::shutdown_io_runtime();
-            smudgy_core::session::runtime::join_runtime_threads();
-            let audio = audio_start_error.expect("disabled audio retains its startup failure");
-            match (iced_result, audio.cleanup_is_clean()) {
-                (Ok(()), true) => {}
-                (Ok(()), false) => {
-                    anyhow::bail!("Web Audio startup cleanup failed: {audio}")
-                }
-                (Err(iced), true) => return Err(iced.into()),
-                (Err(iced), false) => {
-                    anyhow::bail!(
-                        "iced failed: {iced}; Web Audio startup cleanup also failed: {audio}"
-                    )
-                }
-            }
-        }
+        // Always consume the proof-bearing retained-host shutdown path,
+        // including when either worker could not start or iced itself failed.
+        let audio_report = application_audio.shutdown();
+        finish_run_with_audio(iced_result, audio_report)?;
     }
 
     Ok(())
@@ -828,6 +956,11 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
         }));
     }
 
+    #[cfg(feature = "web-audio-cpal")]
+    if !smudgy.audio_panel.open_windows.is_empty() {
+        subs.push(iced::event::listen_with(audio_panel_tab_event));
+    }
+
     // While signed in, poll /me/area-prefs periodically so cross-device
     // changes and prefs for newly-shared areas reconcile in (login covers the
     // session-start case; this covers "after a /sync row-set change").
@@ -869,6 +1002,619 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
     }
 
     Subscription::batch(subs)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_panel_tab_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    window_id: window::Id,
+) -> Option<Message> {
+    if status != iced::event::Status::Ignored {
+        return None;
+    }
+    let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    let backwards = modifiers == iced::keyboard::Modifiers::SHIFT;
+    (modifiers.is_empty() || backwards).then_some(Message::AudioPanelTraverse {
+        window_id,
+        backwards,
+    })
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_panel_id(window_id: window::Id) -> iced::widget::Id {
+    iced::widget::Id::from(format!("audio-panel-{window_id:?}"))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_window_root_id(window_id: window::Id) -> iced::widget::Id {
+    iced::widget::Id::from(format!("audio-window-root-{window_id:?}"))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_master_id(window_id: window::Id) -> iced::widget::Id {
+    iced::widget::Id::from(format!("audio-master-{window_id:?}"))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_scroll_id(window_id: window::Id) -> iced::widget::Id {
+    iced::widget::Id::from(format!("audio-scroll-{window_id:?}"))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn scoped_audio_focus(window_id: window::Id, target: iced::widget::Id) -> Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::scope(
+        audio_window_root_id(window_id),
+        iced::advanced::widget::operation::focusable::focus::<()>(target),
+    ))
+    .discard()
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn scoped_audio_step(window_id: window::Id, backwards: bool) -> Task<Message> {
+    let operation: Box<dyn iced::advanced::widget::Operation<()>> = if backwards {
+        Box::new(iced::advanced::widget::operation::focusable::focus_previous::<()>())
+    } else {
+        Box::new(iced::advanced::widget::operation::focusable::focus_next::<()>())
+    };
+    iced::advanced::widget::operate(iced::advanced::widget::operation::scope(
+        audio_panel_id(window_id),
+        operation,
+    ))
+    .discard()
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_focus_ids(smudgy: &Smudgy, window_id: window::Id) -> Vec<iced::widget::Id> {
+    let mut ids = vec![audio_master_id(window_id)];
+    for (session_id, session) in smudgy.sessions.iter() {
+        ids.push(audio_session_id(window_id, session_id));
+        ids.extend(
+            session
+                .audio_packages()
+                .iter()
+                .filter(|row| !row.trusted)
+                .map(|row| audio_package_id(window_id, session_id, row.ui_key)),
+        );
+    }
+    ids
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn next_audio_focus_target(
+    ids: &[iced::widget::Id],
+    focused: Option<&iced::widget::Id>,
+    backwards: bool,
+) -> Option<(iced::widget::Id, bool)> {
+    let current = focused.and_then(|focused| ids.iter().position(|id| id == focused));
+    let (next, direct) = match current {
+        Some(current) if backwards => (
+            current
+                .checked_sub(1)
+                .unwrap_or(ids.len().saturating_sub(1)),
+            current == 0,
+        ),
+        Some(current) => ((current + 1) % ids.len(), current + 1 == ids.len()),
+        None if backwards => (ids.len().checked_sub(1)?, true),
+        None => (0, true),
+    };
+    Some((ids.get(next)?.clone(), direct))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn reveal_audio_focus(window_id: window::Id, target: iced::widget::Id) -> Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::scope(
+        audio_panel_id(window_id),
+        RevealAudioControl::new(audio_scroll_id(window_id), target),
+    ))
+    .discard()
+}
+
+#[cfg(feature = "web-audio-cpal")]
+struct RevealAudioControl {
+    scroll: iced::widget::Id,
+    target: iced::widget::Id,
+    target_bounds: Option<iced::Rectangle>,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl RevealAudioControl {
+    fn new(scroll: iced::widget::Id, target: iced::widget::Id) -> Self {
+        Self {
+            scroll,
+            target,
+            target_bounds: None,
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl iced::advanced::widget::Operation<()> for RevealAudioControl {
+    fn focusable(
+        &mut self,
+        id: Option<&iced::widget::Id>,
+        bounds: iced::Rectangle,
+        _state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        if id == Some(&self.target) {
+            self.target_bounds = Some(bounds);
+        }
+    }
+
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+    ) {
+        operate(self);
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<()> {
+        self.target_bounds
+            .map_or(iced::advanced::widget::operation::Outcome::None, |target| {
+                iced::advanced::widget::operation::Outcome::Chain(Box::new(
+                    RevealAudioControlApply {
+                        scroll: self.scroll.clone(),
+                        target,
+                    },
+                ))
+            })
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+struct RevealAudioControlApply {
+    scroll: iced::widget::Id,
+    target: iced::Rectangle,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl iced::advanced::widget::Operation<()> for RevealAudioControlApply {
+    fn scrollable(
+        &mut self,
+        id: Option<&iced::widget::Id>,
+        bounds: iced::Rectangle,
+        content_bounds: iced::Rectangle,
+        translation: iced::Vector,
+        state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        if id != Some(&self.scroll) {
+            return;
+        }
+        let current = translation.y;
+        let top = self.target.y - content_bounds.y;
+        let bottom = self.target.y + self.target.height - content_bounds.y;
+        let next = if top < current {
+            top
+        } else if bottom > current + bounds.height {
+            bottom - bounds.height
+        } else {
+            current
+        };
+        state.scroll_to(
+            iced::advanced::widget::operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(next.max(0.0)),
+            },
+        );
+    }
+
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+    ) {
+        operate(self);
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_action_gain(
+    current: AudioGainSettings,
+    action: widgets::audio_gain::Action,
+) -> Option<AudioGainSettings> {
+    match action {
+        widgets::audio_gain::Action::Focus => None,
+        widgets::audio_gain::Action::SetVolume(volume) => Some(current.with_volume(volume)),
+        widgets::audio_gain::Action::ToggleMuted => Some(current.with_muted(!current.muted)),
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_preference_gain(settings: &AudioSettings, target: &AudioTarget) -> AudioGainSettings {
+    match target {
+        AudioTarget::Master => settings.master,
+        AudioTarget::Session {
+            server, profile, ..
+        } => settings
+            .session(server, profile)
+            .map_or_else(AudioGainSettings::default, |row| row.gain),
+        AudioTarget::Package {
+            server,
+            profile,
+            owner,
+            name,
+            ..
+        } => settings
+            .session(server, profile)
+            .and_then(|session| session.package(owner, name))
+            .map_or_else(AudioGainSettings::default, |package| package.gain),
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_action_changes_preference(
+    settings: &AudioSettings,
+    target: &AudioTarget,
+    desired: AudioGainSettings,
+    action: widgets::audio_gain::Action,
+) -> bool {
+    let stored = audio_preference_gain(settings, target);
+    match action {
+        widgets::audio_gain::Action::SetVolume(_) => stored.volume != desired.volume,
+        widgets::audio_gain::Action::ToggleMuted => stored.muted != desired.muted,
+        widgets::audio_gain::Action::Focus => false,
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn update_audio_preference(
+    settings: &mut AudioSettings,
+    target: &AudioTarget,
+    gain: AudioGainSettings,
+) {
+    match target {
+        AudioTarget::Master => settings.master = gain,
+        AudioTarget::Session {
+            server, profile, ..
+        } => settings.session_mut(server, profile).gain = gain,
+        AudioTarget::Package {
+            server,
+            profile,
+            owner,
+            name,
+            ..
+        } => {
+            settings
+                .session_mut(server, profile)
+                .package_mut(owner, name)
+                .gain = gain;
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn persist_audio_preferences(settings: &AudioSettings) -> Result<(), String> {
+    smudgy_core::models::settings::merge_audio_settings(settings).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn persist_updated_audio_preferences(
+    current: &AudioSettings,
+    target: &AudioTarget,
+    gain: AudioGainSettings,
+    action: widgets::audio_gain::Action,
+    persist: impl FnOnce(&AudioSettings) -> Result<(), String>,
+) -> Result<(AudioSettings, AudioGainSettings), String> {
+    let mut next = current.clone();
+    let mut stored = audio_preference_gain(&next, target);
+    match action {
+        widgets::audio_gain::Action::SetVolume(_) => stored.volume = gain.volume,
+        widgets::audio_gain::Action::ToggleMuted => stored.muted = gain.muted,
+        widgets::audio_gain::Action::Focus => unreachable!("focus never persists audio policy"),
+    }
+    update_audio_preference(&mut next, target, stored);
+    next.normalize();
+    persist(&next)?;
+    Ok((next, stored))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_widget_is_current(
+    expected: Option<iced::widget::Id>,
+    supplied: &iced::widget::Id,
+) -> bool {
+    expected.as_ref() == Some(supplied)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_package_action_is_current(row: &session_store::AudioPackageRow, supplied: u64) -> bool {
+    row.action_key == supplied
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn exact_audio_target_gain(smudgy: &Smudgy, target: &AudioTarget) -> Option<AudioGainSettings> {
+    match target {
+        AudioTarget::Master => Some(
+            if matches!(smudgy.audio_status, AudioBootStatus::Unavailable(_)) {
+                smudgy.audio_panel.preferences.master
+            } else {
+                smudgy.audio_panel.master_live
+            },
+        ),
+        AudioTarget::Session {
+            id,
+            server,
+            profile,
+        } => {
+            let session = smudgy.sessions.get(*id)?;
+            if session.server_name != server.as_ref() || session.profile_name != profile.as_ref() {
+                return None;
+            }
+            Some(session.audio_gain())
+        }
+        AudioTarget::Package {
+            id,
+            server,
+            profile,
+            owner,
+            name,
+            action_key,
+        } => {
+            let session = smudgy.sessions.get(*id)?;
+            if session.server_name != server.as_ref() || session.profile_name != profile.as_ref() {
+                return None;
+            }
+            let row = session
+                .audio_packages()
+                .iter()
+                .find(|row| !row.trusted && row.owner == *owner && row.name == *name)?;
+            if !audio_package_action_is_current(row, *action_key) {
+                return None;
+            }
+            Some(row.gain)
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn current_audio_widget_id(
+    smudgy: &Smudgy,
+    window_id: window::Id,
+    target: &AudioTarget,
+) -> Option<iced::widget::Id> {
+    match target {
+        AudioTarget::Master => Some(audio_master_id(window_id)),
+        AudioTarget::Session {
+            id,
+            server,
+            profile,
+        } => {
+            let session = smudgy.sessions.get(*id)?;
+            (session.server_name == server.as_ref() && session.profile_name == profile.as_ref())
+                .then(|| audio_session_id(window_id, *id))
+        }
+        AudioTarget::Package {
+            id,
+            server,
+            profile,
+            owner,
+            name,
+            action_key,
+        } => {
+            let session = smudgy.sessions.get(*id)?;
+            if session.server_name != server.as_ref() || session.profile_name != profile.as_ref() {
+                return None;
+            }
+            let row = session.audio_packages().iter().find(|row| {
+                !row.trusted
+                    && row.owner.eq_ignore_ascii_case(owner)
+                    && row.name.eq_ignore_ascii_case(name)
+            })?;
+            if !audio_package_action_is_current(row, *action_key) {
+                return None;
+            }
+            Some(audio_package_id(window_id, *id, row.ui_key))
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn set_preference_only_live_row(
+    smudgy: &mut Smudgy,
+    target: &AudioTarget,
+    gain: AudioGainSettings,
+) {
+    match target {
+        AudioTarget::Master => smudgy.audio_panel.master_live = gain,
+        AudioTarget::Session { id, .. } => {
+            if let Some(session) = smudgy.sessions.get_mut(*id) {
+                session.set_audio_preference_only(gain);
+            }
+        }
+        AudioTarget::Package {
+            id, owner, name, ..
+        } => {
+            if let Some(session) = smudgy.sessions.get_mut(*id) {
+                let _ = session.set_package_audio_preference_only(owner, name, gain);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn apply_live_audio_gain(
+    smudgy: &mut Smudgy,
+    target: &AudioTarget,
+    desired: AudioGainSettings,
+    action: widgets::audio_gain::Action,
+) -> Result<AudioGainSettings, application_audio::ApplicationAudioControlError> {
+    match target {
+        AudioTarget::Master => {
+            let state = match action {
+                widgets::audio_gain::Action::SetVolume(_) => {
+                    smudgy.sessions.set_master_linear(desired.linear())?
+                }
+                widgets::audio_gain::Action::ToggleMuted => {
+                    smudgy.sessions.set_master_muted(desired.muted)?
+                }
+                widgets::audio_gain::Action::Focus => unreachable!(),
+            };
+            let gain = AudioGainSettings {
+                volume: (state.linear() * 100.0).round().clamp(0.0, 100.0) as u8,
+                muted: state.is_muted(),
+            };
+            smudgy.audio_panel.master_live = gain;
+            Ok(gain)
+        }
+        AudioTarget::Session {
+            id,
+            server,
+            profile,
+        } => {
+            let session = smudgy
+                .sessions
+                .get_mut(*id)
+                .ok_or(application_audio::ApplicationAudioControlError::UnknownSession)?;
+            if session.server_name != server.as_ref() || session.profile_name != profile.as_ref() {
+                return Err(application_audio::ApplicationAudioControlError::StaleSession);
+            }
+            session.set_audio_state(desired)?;
+            Ok(desired)
+        }
+        AudioTarget::Package {
+            id,
+            server,
+            profile,
+            owner,
+            name,
+            action_key,
+        } => {
+            let session = smudgy
+                .sessions
+                .get_mut(*id)
+                .ok_or(application_audio::ApplicationAudioControlError::UnknownSession)?;
+            if session.server_name != server.as_ref() || session.profile_name != profile.as_ref() {
+                return Err(application_audio::ApplicationAudioControlError::StaleSession);
+            }
+            if !session.audio_packages().iter().any(|row| {
+                !row.trusted
+                    && row.owner.eq_ignore_ascii_case(owner)
+                    && row.name.eq_ignore_ascii_case(name)
+                    && audio_package_action_is_current(row, *action_key)
+            }) {
+                return Err(application_audio::ApplicationAudioControlError::StalePackage);
+            }
+            session.set_package_audio_state(owner, name, desired)?;
+            Ok(desired)
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn handle_audio_control(
+    smudgy: &mut Smudgy,
+    window_id: window::Id,
+    target: AudioTarget,
+    widget_id: iced::widget::Id,
+    action: widgets::audio_gain::Action,
+) -> Task<Message> {
+    if !smudgy.smudgy_windows.contains_key(&window_id)
+        || !smudgy.audio_panel.open_windows.contains(&window_id)
+    {
+        return Task::none();
+    }
+    if !audio_widget_is_current(
+        current_audio_widget_id(smudgy, window_id, &target),
+        &widget_id,
+    ) {
+        smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-target-closed"));
+        return Task::none();
+    }
+    if action == widgets::audio_gain::Action::Focus {
+        smudgy
+            .audio_panel
+            .focused_widgets
+            .insert(window_id, widget_id.clone());
+        return scoped_audio_focus(window_id, widget_id);
+    }
+    let Some(current) = exact_audio_target_gain(smudgy, &target) else {
+        smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-target-closed"));
+        return Task::none();
+    };
+    let Some(desired) = audio_action_gain(current, action) else {
+        return Task::none();
+    };
+    if desired == current
+        && !audio_action_changes_preference(
+            &smudgy.audio_panel.preferences,
+            &target,
+            desired,
+            action,
+        )
+    {
+        return Task::none();
+    }
+
+    match audio_control_route_for_target(smudgy, &target) {
+        AudioControlRoute::Physical => {
+            match apply_live_audio_gain(smudgy, &target, desired, action) {
+                Ok(applied) => {
+                    match persist_updated_audio_preferences(
+                        &smudgy.audio_panel.preferences,
+                        &target,
+                        applied,
+                        action,
+                        persist_audio_preferences,
+                    ) {
+                        Ok((next, _stored)) => {
+                            smudgy.audio_panel.preferences = next;
+                            smudgy.audio_panel.notice =
+                                Some(i18n::t!("audio-notice-applied-saved"));
+                        }
+                        Err(error) => {
+                            smudgy.audio_panel.notice = Some(i18n::t!(
+                                "audio-notice-applied-save-failed",
+                                "error" => error
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        application_audio::ApplicationAudioControlError::OutputFailed(_)
+                    ) {
+                        smudgy.audio_status = AudioBootStatus::Failed(error.to_string().into());
+                    }
+                    smudgy.audio_panel.notice = Some(i18n::t!(
+                        "audio-notice-failed",
+                        "error" => error.to_string()
+                    ));
+                }
+            }
+        }
+        AudioControlRoute::PreferenceOnly => {
+            match persist_updated_audio_preferences(
+                &smudgy.audio_panel.preferences,
+                &target,
+                desired,
+                action,
+                persist_audio_preferences,
+            ) {
+                Ok((next, stored)) => {
+                    smudgy.audio_panel.preferences = next;
+                    set_preference_only_live_row(smudgy, &target, stored);
+                    smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-preference-saved"));
+                }
+                Err(error) => {
+                    smudgy.audio_panel.notice = Some(i18n::t!(
+                        "audio-notice-preference-save-failed",
+                        "error" => error
+                    ));
+                }
+            }
+        }
+        AudioControlRoute::Failed => {
+            smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
+        }
+    }
+    Task::none()
 }
 
 /// `event::listen_with` filter feeding the window tracker while a pane drag
@@ -1018,6 +1764,13 @@ fn spike_autosession_target() -> Option<(String, String)> {
 
 fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     let task = update_body(smudgy, message);
+    #[cfg(feature = "web-audio-cpal")]
+    if let Some(cause) = smudgy.sessions.take_audio_degradation()
+        && matches!(smudgy.audio_status, AudioBootStatus::Physical)
+    {
+        smudgy.audio_status = AudioBootStatus::Failed(cause.into());
+        smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
+    }
     // Structural pane mutations mark their window's grid dirty instead of
     // rebuilding eagerly; settling them here coalesces every mutation an
     // update cycle landed into one rebuild per window, re-deriving the
@@ -1911,6 +2664,80 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     #[cfg(debug_assertions)]
     spike_log_capture_owner();
     match message {
+        #[cfg(feature = "web-audio-cpal")]
+        Message::AudioPanelToggle(window_id) => {
+            if !smudgy.smudgy_windows.contains_key(&window_id) {
+                return Task::none();
+            }
+            if !smudgy.audio_panel.open_windows.remove(&window_id) {
+                smudgy.audio_panel.open_windows.insert(window_id);
+            } else {
+                smudgy.audio_panel.focused_widgets.remove(&window_id);
+            }
+            Task::none()
+        }
+        #[cfg(feature = "web-audio-cpal")]
+        Message::AudioPanelOpenAndFocus(window_id) => {
+            if !smudgy.smudgy_windows.contains_key(&window_id) {
+                return Task::none();
+            }
+            smudgy.audio_panel.open_windows.insert(window_id);
+            let master = audio_master_id(window_id);
+            smudgy
+                .audio_panel
+                .focused_widgets
+                .insert(window_id, master.clone());
+            Task::batch([
+                scoped_audio_focus(window_id, master),
+                reveal_audio_focus(window_id, audio_master_id(window_id)),
+            ])
+        }
+        #[cfg(feature = "web-audio-cpal")]
+        Message::AudioPanelTraverse {
+            window_id,
+            backwards,
+        } => {
+            if smudgy.smudgy_windows.contains_key(&window_id)
+                && smudgy.audio_panel.open_windows.contains(&window_id)
+                && !smudgy
+                    .smudgy_windows
+                    .get(&window_id)
+                    .is_some_and(SmudgyWindow::has_modal)
+            {
+                let ids = audio_focus_ids(smudgy, window_id);
+                if ids.is_empty() {
+                    return Task::none();
+                }
+                let Some((target, direct)) = next_audio_focus_target(
+                    &ids,
+                    smudgy.audio_panel.focused_widgets.get(&window_id),
+                    backwards,
+                ) else {
+                    return Task::none();
+                };
+                smudgy
+                    .audio_panel
+                    .focused_widgets
+                    .insert(window_id, target.clone());
+                Task::batch([
+                    if direct {
+                        scoped_audio_focus(window_id, target.clone())
+                    } else {
+                        scoped_audio_step(window_id, backwards)
+                    },
+                    reveal_audio_focus(window_id, target),
+                ])
+            } else {
+                Task::none()
+            }
+        }
+        #[cfg(feature = "web-audio-cpal")]
+        Message::AudioControl {
+            window_id,
+            target,
+            widget_id,
+            action,
+        } => handle_audio_control(smudgy, window_id, target, widget_id, action),
         Message::WindowTracking(id, event) => {
             smudgy.window_tracker.apply(id, event);
             // Every motion sample drives the hover classification the
@@ -1981,6 +2808,10 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
         Message::CloseWindow(id) => {
             smudgy.window_tracker.remove(id);
             smudgy.closing_windows.remove(&id);
+            #[cfg(feature = "web-audio-cpal")]
+            smudgy.audio_panel.open_windows.remove(&id);
+            #[cfg(feature = "web-audio-cpal")]
+            smudgy.audio_panel.focused_widgets.remove(&id);
             // The source window dying mid-drag ends the drag: its model is
             // gone, so the drag identity can never re-resolve. A press
             // candidate in the dying window dies with it.
@@ -2115,6 +2946,10 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 }
                 Some(SmudgyWindowEvent::CloseSession(session_id)) => {
                     Task::batch([task, close_session(smudgy, session_id)])
+                }
+                #[cfg(feature = "web-audio-cpal")]
+                Some(SmudgyWindowEvent::OpenAudioPanel) => {
+                    Task::batch([task, Task::done(Message::AudioPanelOpenAndFocus(id))])
                 }
                 Some(SmudgyWindowEvent::TabDragPressed {
                     tab,
@@ -2647,6 +3482,11 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::SessionAction(session_id, msg) => {
+            #[cfg(feature = "web-audio-cpal")]
+            if let session_store::Message::AudioOutputFailed(cause) = &msg {
+                smudgy.audio_status = AudioBootStatus::Failed(cause.clone().into());
+                smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
+            }
             // Store-routed task continuations (notably script input.focus())
             // carry no window wrapper. Reconcile their confirmed focus edge
             // here so they obey the same single-focused-input invariant as a
@@ -3047,6 +3887,14 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         areas.sort_by_key(|id| id.0);
                         settings.map_area_prefs = prefs;
                         settings.disabled_map_areas = areas;
+                        #[cfg(feature = "web-audio-cpal")]
+                        {
+                            // The settings window opened from a full clone and
+                            // does not edit audio. Merge the daemon's latest
+                            // authoritative policy so a stale form cannot
+                            // overwrite controls changed from the main window.
+                            settings.audio = smudgy.audio_panel.preferences.clone();
+                        }
                         if let Err(err) = smudgy_core::models::settings::save_settings(&settings) {
                             log::warn!("failed to save settings: {err}");
                         }
@@ -5371,6 +6219,242 @@ fn poke_all_mappers(smudgy: &Smudgy) {
     }
 }
 
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioViewRowKey {
+    Master,
+    Session(u32),
+    Package(u64),
+    Trusted(u64),
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_session_id(window_id: window::Id, session_id: SessionId) -> iced::widget::Id {
+    iced::widget::Id::from(format!("audio-session-{window_id:?}-{session_id}"))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_package_id(
+    window_id: window::Id,
+    session_id: SessionId,
+    row_key: u64,
+) -> iced::widget::Id {
+    iced::widget::Id::from(format!(
+        "audio-package-{window_id:?}-{session_id}-{row_key}"
+    ))
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_gain_row<'a>(
+    window_id: window::Id,
+    target: AudioTarget,
+    widget_id: iced::widget::Id,
+    label: String,
+    gain: AudioGainSettings,
+    acknowledgement: String,
+) -> Element<'a, Message> {
+    let state = if gain.muted {
+        i18n::t!("audio-state-muted")
+    } else {
+        i18n::t!("audio-state-unmuted")
+    };
+    let lower = gain.volume.saturating_sub(widgets::audio_gain::VOLUME_STEP);
+    let higher = gain
+        .volume
+        .saturating_add(widgets::audio_gain::VOLUME_STEP)
+        .min(100);
+    let message = |action| Message::AudioControl {
+        window_id,
+        target: target.clone(),
+        widget_id: widget_id.clone(),
+        action,
+    };
+    let content = iced::widget::row![
+        text(i18n::t!(
+            "audio-control-row",
+            "label" => label,
+            "volume" => gain.volume,
+            "state" => state,
+            "acknowledgement" => acknowledgement
+        ))
+        .size(13)
+        .width(iced::Length::Fill),
+        iced::widget::button(text("−").size(13))
+            .on_press(message(widgets::audio_gain::Action::SetVolume(lower))),
+        iced::widget::button(text("+").size(13))
+            .on_press(message(widgets::audio_gain::Action::SetVolume(higher))),
+        iced::widget::button(
+            text(if gain.muted {
+                i18n::t!("audio-action-unmute")
+            } else {
+                i18n::t!("audio-action-mute")
+            })
+            .size(13)
+        )
+        .on_press(message(widgets::audio_gain::Action::ToggleMuted)),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+    let focus_color = prefs::app_theme().styles.general.accent;
+    widgets::audio_gain::AudioGain::new(
+        iced::widget::container(content)
+            .width(iced::Length::Fill)
+            .padding([3, 6]),
+        widget_id.clone(),
+        gain.volume,
+        move |action| Message::AudioControl {
+            window_id,
+            target: target.clone(),
+            widget_id: widget_id.clone(),
+            action,
+        },
+    )
+    .focus_color(focus_color)
+    .into()
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_session_label(session_id: SessionId, server: &str, profile: &str) -> String {
+    i18n::t!(
+        "audio-session-label",
+        "id" => u32::from(session_id),
+        "server" => serde_json::to_string(server)
+            .expect("a string identity is always JSON-serializable"),
+        "profile" => serde_json::to_string(profile)
+            .expect("a string identity is always JSON-serializable")
+    )
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_panel_view<'a>(smudgy: &'a Smudgy, window_id: window::Id) -> Element<'a, Message> {
+    let open = smudgy.audio_panel.open_windows.contains(&window_id);
+    let shortcut = if cfg!(target_os = "macos") {
+        "⌘⇧A"
+    } else {
+        "Ctrl+Shift+A"
+    };
+    let toggle = iced::widget::button(text(if open {
+        i18n::t!("audio-panel-open", "shortcut" => shortcut)
+    } else {
+        i18n::t!("audio-panel-closed", "shortcut" => shortcut)
+    }))
+    .on_press(Message::AudioPanelToggle(window_id));
+
+    let mut panel = iced::widget::column![toggle].spacing(4);
+    if open {
+        panel = panel.push(text(i18n::t!("audio-panel-keyboard-help")).size(12));
+        let master_preference_only = matches!(smudgy.audio_status, AudioBootStatus::Unavailable(_));
+        let master_acknowledgement = match smudgy.audio_status {
+            AudioBootStatus::Physical => i18n::t!("audio-ack-applied"),
+            AudioBootStatus::Failed(_) => i18n::t!("audio-ack-failed"),
+            AudioBootStatus::Unavailable(_) => i18n::t!("audio-ack-preference"),
+        };
+        let mut rows: Vec<(AudioViewRowKey, Element<'a, Message>)> = Vec::new();
+        rows.push((
+            AudioViewRowKey::Master,
+            audio_gain_row(
+                window_id,
+                AudioTarget::Master,
+                audio_master_id(window_id),
+                i18n::t!("audio-master-label"),
+                if master_preference_only {
+                    smudgy.audio_panel.preferences.master
+                } else {
+                    smudgy.audio_panel.master_live
+                },
+                master_acknowledgement,
+            ),
+        ));
+        for (session_id, session) in smudgy.sessions.iter() {
+            let server: Arc<str> = Arc::from(session.server_name.as_str());
+            let profile: Arc<str> = Arc::from(session.profile_name.as_str());
+            let target = AudioTarget::Session {
+                id: session_id,
+                server: Arc::clone(&server),
+                profile: Arc::clone(&profile),
+            };
+            let session_route = audio_control_route_for_target(smudgy, &target);
+            let session_acknowledgement = match session_route {
+                AudioControlRoute::Physical => i18n::t!("audio-ack-applied"),
+                AudioControlRoute::PreferenceOnly => i18n::t!("audio-ack-preference"),
+                AudioControlRoute::Failed => i18n::t!("audio-ack-failed"),
+            };
+            rows.push((
+                AudioViewRowKey::Session(u32::from(session_id)),
+                audio_gain_row(
+                    window_id,
+                    target,
+                    audio_session_id(window_id, session_id),
+                    audio_session_label(session_id, &session.server_name, &session.profile_name),
+                    session.audio_gain(),
+                    session_acknowledgement.clone(),
+                ),
+            ));
+            for package in session.audio_packages() {
+                let label = format!("  {}/{}", package.owner, package.name);
+                if package.trusted {
+                    rows.push((
+                        AudioViewRowKey::Trusted(package.ui_key),
+                        iced::widget::container(
+                            text(i18n::t!("audio-trusted-row", "label" => label)).size(13),
+                        )
+                        .padding([3, 6])
+                        .into(),
+                    ));
+                } else {
+                    let package_target = AudioTarget::Package {
+                        id: session_id,
+                        server: Arc::clone(&server),
+                        profile: Arc::clone(&profile),
+                        owner: Arc::clone(&package.owner),
+                        name: Arc::clone(&package.name),
+                        action_key: package.action_key,
+                    };
+                    let package_route = audio_control_route_for_target(smudgy, &package_target);
+                    rows.push((
+                        AudioViewRowKey::Package(package.ui_key),
+                        audio_gain_row(
+                            window_id,
+                            package_target,
+                            audio_package_id(window_id, session_id, package.ui_key),
+                            label,
+                            package.gain,
+                            match package_route {
+                                AudioControlRoute::Physical if package.applied => {
+                                    i18n::t!("audio-ack-applied")
+                                }
+                                AudioControlRoute::Physical => {
+                                    i18n::t!("audio-ack-package-unconfirmed")
+                                }
+                                AudioControlRoute::PreferenceOnly => {
+                                    i18n::t!("audio-ack-preference")
+                                }
+                                AudioControlRoute::Failed => i18n::t!("audio-ack-failed"),
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+        let controls = iced::widget::keyed_column(rows).spacing(2);
+        panel = panel.push(
+            iced::widget::scrollable(controls)
+                .id(audio_scroll_id(window_id))
+                .height(iced::Length::Fixed(180.0))
+                .width(iced::Length::Fill),
+        );
+        if let Some(notice) = smudgy.audio_panel.notice.as_ref() {
+            panel = panel.push(text(notice).size(12));
+        }
+    }
+    iced::widget::container(panel)
+        .id(audio_panel_id(window_id))
+        .width(iced::Length::Fill)
+        .padding([6, 12])
+        .style(theme::builtins::container::modal_title_bar)
+        .into()
+}
+
 fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
     if let Some(window) = smudgy.smudgy_windows.get(&id) {
         // Each window derives its view of the daemon-owned drag state: the
@@ -5391,21 +6475,34 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
             .view(&smudgy.sessions, drag)
             .map(move |message| Message::SmudgyWindowMessage(id, message));
         #[cfg(feature = "web-audio-cpal")]
-        let window_content: Element<'_, Message> =
+        let window_content: Element<'_, Message> = {
+            let mut content = iced::widget::column![audio_panel_view(smudgy, id)];
             if let Some(status) = smudgy.audio_status.banner() {
-                iced::widget::column![
+                content = content.push(
                     iced::widget::container(text(status).size(13))
                         .width(iced::Length::Fill)
                         .padding([6, 12])
                         .style(theme::builtins::container::modal_title_bar),
-                    window_content,
-                ]
+                );
+            }
+            content
+                .push(window_content)
                 .width(iced::Length::Fill)
                 .height(iced::Length::Fill)
                 .into()
-            } else {
-                window_content
-            };
+        };
+        #[cfg(feature = "web-audio-cpal")]
+        let window_content: Element<'_, Message> = {
+            let scoped: Element<'_, Message> = iced::widget::container(window_content)
+                .id(audio_window_root_id(id))
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .into();
+            widgets::audio_gain::AudioPanelRoot::new(scoped, move || {
+                Message::AudioPanelOpenAndFocus(id)
+            })
+            .into()
+        };
         let content = center(window_content);
         return if client_rounded_frame() {
             // The window surface is transparent and this container paints the
@@ -5473,8 +6570,675 @@ mod tests {
     use smudgy_cloud::Uuid;
 
     #[cfg(feature = "web-audio-cpal")]
+    #[derive(Clone, Debug, PartialEq)]
+    enum FocusTestMessage {
+        Open,
+        TabCaptured,
+        Gain(widgets::audio_gain::Action),
+        Input(String),
+        ConflictingHotkey(smudgy_core::session::HotkeyId),
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    type FocusTestElement<'a> = iced::Element<'a, FocusTestMessage, crate::theme::Theme, ()>;
+
+    #[cfg(feature = "web-audio-cpal")]
+    fn operate_mounted(
+        element: &mut FocusTestElement<'_>,
+        tree: &mut iced::advanced::widget::Tree,
+        node: &iced::advanced::layout::Node,
+        operation: &mut dyn iced::advanced::widget::Operation<()>,
+    ) {
+        element
+            .as_widget_mut()
+            .operate(tree, iced::advanced::Layout::new(node), &(), operation);
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    fn update_mounted(
+        element: &mut FocusTestElement<'_>,
+        tree: &mut iced::advanced::widget::Tree,
+        node: &iced::advanced::layout::Node,
+        event: &iced::Event,
+    ) -> (Vec<FocusTestMessage>, iced::event::Status) {
+        let mut messages = Vec::new();
+        let mut shell = iced::advanced::Shell::new(&mut messages);
+        let mut clipboard = iced::advanced::clipboard::Null;
+        element.as_widget_mut().update(
+            tree,
+            event,
+            iced::advanced::Layout::new(node),
+            iced::advanced::mouse::Cursor::Unavailable,
+            &(),
+            &mut clipboard,
+            &mut shell,
+            &node.bounds(),
+        );
+        let status = shell.event_status();
+        drop(shell);
+        (messages, status)
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    struct MountedFocusProbe {
+        target: iced::widget::Id,
+        focused: Option<bool>,
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    impl iced::advanced::widget::Operation<()> for MountedFocusProbe {
+        fn focusable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            _bounds: iced::Rectangle,
+            state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if id == Some(&self.target) {
+                self.focused = Some(state.is_focused());
+            }
+        }
+
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+        ) {
+            if self.focused.is_none() {
+                operate(self);
+            }
+        }
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    fn mounted_is_focused(
+        element: &mut FocusTestElement<'_>,
+        tree: &mut iced::advanced::widget::Tree,
+        node: &iced::advanced::layout::Node,
+        id: iced::widget::Id,
+    ) -> bool {
+        let mut operation = MountedFocusProbe {
+            target: id,
+            focused: None,
+        };
+        operate_mounted(element, tree, node, &mut operation);
+        operation.focused.unwrap_or(false)
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
     #[test]
-    fn physical_layout_batch_rolls_back_prior_open_when_next_admission_fails() {
+    fn bounded_volume_noop_does_not_allocate_or_evict_a_policy_row() {
+        let mut preferences = AudioSettings::default();
+        for index in 0..256 {
+            preferences
+                .session_mut(&format!("server-{index}"), "profile")
+                .gain
+                .volume = 50;
+        }
+        let before = preferences.clone();
+        let target = AudioTarget::Session {
+            id: SessionId::from(999),
+            server: Arc::from("new-server"),
+            profile: Arc::from("profile"),
+        };
+
+        let current = AudioGainSettings::default();
+        let action = widgets::audio_gain::Action::SetVolume(100);
+        if let Some(desired) = audio_action_gain(current, action)
+            && (desired != current
+                || audio_action_changes_preference(&preferences, &target, desired, action))
+        {
+            update_audio_preference(&mut preferences, &target, desired);
+        }
+
+        assert_eq!(preferences, before);
+        assert_eq!(preferences.sessions.len(), 256);
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn unavailable_controls_route_to_saved_preference_only() {
+        assert_eq!(
+            audio_control_route(&AudioBootStatus::Unavailable(Arc::from("no device"))),
+            AudioControlRoute::PreferenceOnly
+        );
+        assert_eq!(
+            audio_control_route(&AudioBootStatus::Physical),
+            AudioControlRoute::Physical
+        );
+        assert_eq!(
+            audio_control_route_with_local_emulation(&AudioBootStatus::Physical, true),
+            AudioControlRoute::PreferenceOnly,
+            "a session-local capacity/policy fallback does not downgrade the healthy master"
+        );
+        assert_eq!(
+            audio_control_route_with_local_emulation(&AudioBootStatus::Physical, false),
+            AudioControlRoute::Physical
+        );
+        assert_eq!(
+            audio_control_route(&AudioBootStatus::Failed(Arc::from("output dead"))),
+            AudioControlRoute::Failed
+        );
+
+        let current = AudioSettings::default();
+        let desired = AudioGainSettings {
+            volume: 45,
+            muted: true,
+        };
+        let persisted = std::cell::Cell::new(false);
+        let next = persist_updated_audio_preferences(
+            &current,
+            &AudioTarget::Master,
+            desired,
+            widgets::audio_gain::Action::ToggleMuted,
+            |candidate| {
+                assert_eq!(candidate.master.volume, 100);
+                assert!(candidate.master.muted);
+                persisted.set(true);
+                Ok(())
+            },
+        )
+        .expect("preference-only save succeeds");
+
+        assert!(persisted.get());
+        assert_eq!(next.0.master.volume, 100);
+        assert!(next.0.master.muted);
+        assert_eq!(current.master, AudioGainSettings::default());
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn duplicate_live_identity_persists_only_the_field_each_control_changed() {
+        let first = AudioTarget::Session {
+            id: SessionId::from(1),
+            server: Arc::from("same"),
+            profile: Arc::from("profile"),
+        };
+        let second = AudioTarget::Session {
+            id: SessionId::from(2),
+            server: Arc::from("same"),
+            profile: Arc::from("profile"),
+        };
+        let (after_volume, _) = persist_updated_audio_preferences(
+            &AudioSettings::default(),
+            &first,
+            AudioGainSettings {
+                volume: 50,
+                muted: false,
+            },
+            widgets::audio_gain::Action::SetVolume(50),
+            |_| Ok(()),
+        )
+        .expect("first exact session saves volume");
+        let (after_mute, stored) = persist_updated_audio_preferences(
+            &after_volume,
+            &second,
+            AudioGainSettings {
+                volume: 100,
+                muted: true,
+            },
+            widgets::audio_gain::Action::ToggleMuted,
+            |_| Ok(()),
+        )
+        .expect("second exact session saves mute without its stale volume");
+
+        assert_eq!(stored.volume, 50);
+        assert!(stored.muted);
+        assert_eq!(after_mute.session("same", "profile").unwrap().gain, stored);
+
+        let first_live = AudioGainSettings {
+            volume: 50,
+            muted: false,
+        };
+        let second_live = AudioGainSettings {
+            volume: 100,
+            muted: true,
+        };
+        let action = widgets::audio_gain::Action::SetVolume(100);
+        let desired = audio_action_gain(second_live, action).unwrap();
+        assert_eq!(desired, second_live, "End is a no-op for B's live gain");
+        assert!(
+            audio_action_changes_preference(&after_mute, &second, desired, action),
+            "End is still meaningful because the shared durable volume is stale"
+        );
+        let (restored, stored) =
+            persist_updated_audio_preferences(&after_mute, &second, desired, action, |_| Ok(()))
+                .expect("B restores the shared next-start volume");
+        assert_eq!(stored, second_live, "the independent mute field survives");
+        assert_eq!(restored.session("same", "profile").unwrap().gain, stored);
+        assert_eq!(
+            first_live,
+            AudioGainSettings {
+                volume: 50,
+                muted: false,
+            },
+            "B's exact live control never mutates sibling A"
+        );
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn audio_session_labels_distinguish_duplicate_instances_and_delimiter_shaped_identities() {
+        let first = audio_session_label(SessionId::from(1), "same", "profile");
+        let second = audio_session_label(SessionId::from(2), "same", "profile");
+        assert_ne!(
+            first, second,
+            "display-only SessionId distinguishes instances"
+        );
+
+        let left = audio_session_label(SessionId::from(3), "a/b", "c");
+        let right = audio_session_label(SessionId::from(3), "a", "b/c");
+        assert_ne!(left, right, "server and profile remain separately labelled");
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn stale_package_action_epoch_is_rejected_while_logical_widget_identity_survives_reload() {
+        let window_id = iced::window::Id::unique();
+        let session_id = SessionId::from(9);
+        let retained_widget = audio_package_id(window_id, session_id, 42);
+        let replacement = session_store::AudioPackageRow {
+            ui_key: 42,
+            action_key: 9002,
+            owner: Arc::from("owner"),
+            name: Arc::from("name"),
+            trusted: false,
+            gain: AudioGainSettings::default(),
+            applied: false,
+        };
+        let delayed_action_key = 9001;
+        let mutated = std::cell::Cell::new(false);
+        let saved = std::cell::Cell::new(false);
+
+        if audio_widget_is_current(Some(retained_widget.clone()), &retained_widget)
+            && audio_package_action_is_current(&replacement, delayed_action_key)
+        {
+            mutated.set(true);
+            saved.set(true);
+        }
+
+        assert!(!mutated.get());
+        assert!(!saved.get());
+        assert!(audio_widget_is_current(
+            Some(retained_widget.clone()),
+            &retained_widget
+        ));
+        assert!(audio_package_action_is_current(&replacement, 9002));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn preference_save_failure_leaves_authoritative_cache_unchanged() {
+        let current = AudioSettings::default();
+        let desired = AudioGainSettings {
+            volume: 25,
+            muted: false,
+        };
+        let cached = std::cell::Cell::new(current.master);
+        let saved = std::cell::Cell::new(false);
+
+        let result = persist_updated_audio_preferences(
+            &current,
+            &AudioTarget::Master,
+            desired,
+            widgets::audio_gain::Action::SetVolume(25),
+            |_| Err("disk refused write".to_string()),
+        );
+        assert!(result.is_err());
+        if let Ok(next) = result {
+            cached.set(next.0.master);
+            saved.set(true);
+        }
+
+        assert_eq!(cached.get(), AudioGainSettings::default());
+        assert!(!saved.get());
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    struct AudioVisibilityProbe {
+        scroll: iced::widget::Id,
+        target: iced::widget::Id,
+        viewport: Option<iced::Rectangle>,
+        translation: iced::Vector,
+        target_bounds: Option<iced::Rectangle>,
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    impl iced::advanced::widget::Operation<()> for AudioVisibilityProbe {
+        fn scrollable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            bounds: iced::Rectangle,
+            _content_bounds: iced::Rectangle,
+            translation: iced::Vector,
+            _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            if id == Some(&self.scroll) {
+                self.viewport = Some(bounds);
+                self.translation = translation;
+            }
+        }
+
+        fn focusable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            bounds: iced::Rectangle,
+            _state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if id == Some(&self.target) {
+                self.target_bounds = Some(bounds);
+            }
+        }
+
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+        ) {
+            operate(self);
+        }
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn mounted_audio_tree_enters_from_text_input_scopes_traversal_and_reveals_focus() {
+        use iced::advanced::widget::operation::{Operation as _, Outcome, focusable};
+
+        let root_id = iced::widget::Id::from("test-audio-window-root".to_string());
+        let panel_id = iced::widget::Id::from("test-audio-panel".to_string());
+        let scroll_id = iced::widget::Id::from("test-audio-scroll".to_string());
+        let input_id = iced::widget::Id::from("test-session-input".to_string());
+        let modal_input_id = iced::widget::Id::from("test-modal-input".to_string());
+        let outside_id = iced::widget::Id::from("test-outside-focus".to_string());
+        let row_ids: Vec<_> = (0..8)
+            .map(|index| iced::widget::Id::from(format!("test-audio-row-{index}")))
+            .collect();
+
+        let mut conflicting_hotkeys = std::collections::HashMap::new();
+        conflicting_hotkeys.insert(
+            crate::keymap::MaybePhysicalKey::Key(iced::keyboard::Key::Character("a".into())),
+            vec![(
+                iced::keyboard::Modifiers::COMMAND | iced::keyboard::Modifiers::SHIFT,
+                smudgy_core::session::HotkeyId::default(),
+            )],
+        );
+        let input: FocusTestElement<'_> = iced::Element::new(
+            widgets::hotkey_matching_input::HotkeyMatchingInput::new(
+                &conflicting_hotkeys,
+                "",
+                "command text",
+            )
+            .id(input_id.clone())
+            .on_input(FocusTestMessage::Input)
+            .on_key_pressed(
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                FocusTestMessage::TabCaptured,
+            )
+            .on_match(FocusTestMessage::ConflictingHotkey),
+        );
+        let modal_input: FocusTestElement<'_> = iced::widget::TextInput::new("", "modal text")
+            .id(modal_input_id.clone())
+            .on_input(FocusTestMessage::Input)
+            .into();
+        let outside: FocusTestElement<'_> = widgets::audio_gain::AudioGain::new(
+            iced::widget::Space::new().height(20),
+            outside_id.clone(),
+            100,
+            FocusTestMessage::Gain,
+        )
+        .into();
+        let rows: Vec<FocusTestElement<'_>> = row_ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                widgets::audio_gain::AudioGain::new(
+                    iced::widget::Space::new()
+                        .width(iced::Length::Fill)
+                        .height(30),
+                    id,
+                    100,
+                    FocusTestMessage::Gain,
+                )
+                .into()
+            })
+            .collect();
+        let panel: FocusTestElement<'_> = iced::widget::container(
+            iced::widget::scrollable(iced::widget::Column::with_children(rows))
+                .id(scroll_id.clone())
+                .height(60),
+        )
+        .id(panel_id.clone())
+        .into();
+        let scoped: FocusTestElement<'_> =
+            iced::widget::container(iced::widget::Column::with_children(vec![
+                input,
+                modal_input,
+                outside,
+                panel,
+            ]))
+            .id(root_id.clone())
+            .into();
+        let mut mounted: FocusTestElement<'_> =
+            widgets::audio_gain::AudioPanelRoot::new(scoped, || FocusTestMessage::Open).into();
+        let mut tree = iced::advanced::widget::Tree::new(mounted.as_widget());
+        let node = mounted.as_widget_mut().layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(500.0, 180.0)),
+        );
+        let shortcut = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character("a".into()),
+            modified_key: iced::keyboard::Key::Character("A".into()),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyA),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::COMMAND | iced::keyboard::Modifiers::SHIFT,
+            text: None,
+            repeat: false,
+        });
+
+        let mut focus_input = iced::advanced::widget::operation::scope(
+            root_id.clone(),
+            focusable::focus::<()>(input_id.clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut focus_input);
+        assert!(mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            input_id.clone()
+        ));
+        let tab = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Tab),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let (messages, status) = update_mounted(&mut mounted, &mut tree, &node, &tab);
+        assert_eq!(messages, vec![FocusTestMessage::TabCaptured]);
+        assert_eq!(status, iced::event::Status::Captured);
+        assert!(audio_panel_tab_event(tab.clone(), status, iced::window::Id::unique()).is_none());
+
+        let (messages, status) = update_mounted(&mut mounted, &mut tree, &node, &shortcut);
+        assert_eq!(messages, vec![FocusTestMessage::Open]);
+        assert_eq!(status, iced::event::Status::Captured);
+        assert!(mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            input_id.clone()
+        ));
+
+        let mut focus_modal = iced::advanced::widget::operation::scope(
+            root_id.clone(),
+            focusable::focus::<()>(modal_input_id.clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut focus_modal);
+        let (messages, status) = update_mounted(&mut mounted, &mut tree, &node, &shortcut);
+        assert_eq!(messages, vec![FocusTestMessage::Open]);
+        assert_eq!(status, iced::event::Status::Captured);
+        let typed = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character("x".into()),
+            modified_key: iced::keyboard::Key::Character("x".into()),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyX),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: Some("x".into()),
+            repeat: false,
+        });
+        let (messages, _) = update_mounted(&mut mounted, &mut tree, &node, &typed);
+        assert_eq!(
+            messages,
+            vec![FocusTestMessage::Input("modal textx".to_string())],
+            "the reserved chord never selected the stock modal input"
+        );
+
+        let mut focus_input_again = iced::advanced::widget::operation::scope(
+            root_id.clone(),
+            focusable::focus::<()>(input_id.clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut focus_input_again);
+
+        let mut enter = iced::advanced::widget::operation::scope(
+            root_id.clone(),
+            focusable::focus::<()>(row_ids[0].clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut enter);
+        assert!(!mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            input_id
+        ));
+        assert!(mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            row_ids[0].clone()
+        ));
+        assert!(!mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            outside_id
+        ));
+
+        let (messages, status) = update_mounted(&mut mounted, &mut tree, &node, &tab);
+        assert!(messages.is_empty());
+        assert_eq!(status, iced::event::Status::Ignored);
+        assert!(matches!(
+            audio_panel_tab_event(tab, status, iced::window::Id::unique()),
+            Some(Message::AudioPanelTraverse {
+                backwards: false,
+                ..
+            })
+        ));
+
+        let mut next = iced::advanced::widget::operation::scope(
+            panel_id.clone(),
+            focusable::focus_next::<()>(),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut next);
+        let Outcome::Chain(mut apply_next) = next.finish() else {
+            panic!("focus_next must produce its second mounted-tree pass");
+        };
+        operate_mounted(&mut mounted, &mut tree, &node, apply_next.as_mut());
+        assert!(mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            row_ids[1].clone()
+        ));
+
+        let space = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Space),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: Some(" ".into()),
+            repeat: false,
+        });
+        let (messages, status) = update_mounted(&mut mounted, &mut tree, &node, &space);
+        assert_eq!(
+            messages,
+            vec![FocusTestMessage::Gain(
+                widgets::audio_gain::Action::ToggleMuted
+            )]
+        );
+        assert_eq!(status, iced::event::Status::Captured);
+
+        let mut previous = iced::advanced::widget::operation::scope(
+            panel_id.clone(),
+            focusable::focus_previous::<()>(),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut previous);
+        let Outcome::Chain(mut apply_previous) = previous.finish() else {
+            panic!("focus_previous must produce its second mounted-tree pass");
+        };
+        operate_mounted(&mut mounted, &mut tree, &node, apply_previous.as_mut());
+        assert!(mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            row_ids[0].clone()
+        ));
+
+        let last = row_ids.last().unwrap().clone();
+        let mut focus_last = iced::advanced::widget::operation::scope(
+            panel_id.clone(),
+            focusable::focus::<()>(last.clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut focus_last);
+        let mut reveal = iced::advanced::widget::operation::scope(
+            panel_id,
+            RevealAudioControl::new(scroll_id.clone(), last.clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut reveal);
+        let Outcome::Chain(mut apply_reveal) = reveal.finish() else {
+            panic!("reveal must produce its scroll application pass");
+        };
+        operate_mounted(&mut mounted, &mut tree, &node, apply_reveal.as_mut());
+
+        let mut visibility = AudioVisibilityProbe {
+            scroll: scroll_id,
+            target: last,
+            viewport: None,
+            translation: iced::Vector::ZERO,
+            target_bounds: None,
+        };
+        operate_mounted(&mut mounted, &mut tree, &node, &mut visibility);
+        let viewport = visibility.viewport.unwrap();
+        let target = visibility.target_bounds.unwrap();
+        let visible_top = target.y - visibility.translation.y;
+        let visible_bottom = target.y + target.height - visibility.translation.y;
+        assert!(visible_top >= viewport.y - f32::EPSILON);
+        assert!(visible_bottom <= viewport.y + viewport.height + f32::EPSILON);
+
+        // A row can disappear between key events (session close or package
+        // replacement). The stored bookkeeping id is then absent from the
+        // mounted tree. Production must directly focus and reveal the same
+        // deterministic boundary row instead of issuing focus_next from no
+        // actual panel focus and recording a different row.
+        let removed = iced::widget::Id::from("removed-audio-row".to_string());
+        let (recovered, direct) = next_audio_focus_target(&row_ids, Some(&removed), false).unwrap();
+        assert!(direct);
+        assert_eq!(recovered, row_ids[0]);
+        let mut recover = iced::advanced::widget::operation::scope(
+            root_id,
+            focusable::focus::<()>(recovered.clone()),
+        );
+        operate_mounted(&mut mounted, &mut tree, &node, &mut recover);
+        assert!(mounted_is_focused(
+            &mut mounted,
+            &mut tree,
+            &node,
+            recovered
+        ));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn layout_batch_keeps_terminals_usable_when_next_session_exceeds_physical_capacity() {
         let _core_runtime_lock = application_audio::lock_core_runtime_test();
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5513,42 +7277,44 @@ mod tests {
                 connect: false,
             },
         ];
-        assert!(
-            open_layout_spawn_batch(
-                &mut sessions,
-                &spawns,
-                &workspace::TemplateSource::Named("test".to_string()),
-            )
-            .is_err(),
-            "the second admission reaches mixer capacity"
-        );
+        open_layout_spawn_batch(
+            &mut sessions,
+            &spawns,
+            &workspace::TemplateSource::Named("test".to_string()),
+        )
+        .expect("physical capacity degrades only the overflowing session to silent Web Audio");
         let first = SessionId::from(0);
+        let second = SessionId::from(1);
         assert_eq!(
             sessions.iter().count(),
-            0,
-            "the batch publishes no partial store"
+            2,
+            "both terminal sessions are published"
         );
+        assert!(sessions.uses_physical_audio_for_test(first));
+        assert!(!sessions.uses_physical_audio_for_test(second));
+        assert!(smudgy_core::session::registry::get_runtime(first).is_some());
+        assert!(smudgy_core::session::registry::get_runtime(second).is_some());
         assert_eq!(
             sessions.next_session_id_for_test(),
             Some(SessionId::from(2)),
-            "the failed second id is permanently spent"
+            "the two successful ids are spent"
         );
 
+        assert!(sessions.shutdown_and_remove(first));
+        assert!(sessions.shutdown_and_remove(second));
+
         let report = application.shutdown();
-        let first_result = report
-            .sessions
-            .iter()
-            .find(|result| result.session_id == first)
-            .expect("rolled-back physical session has an exact result");
-        assert_eq!(
-            first_result.shutdown,
-            application_audio::RuntimeShutdownRequest::Requested
-        );
-        assert_eq!(
-            first_result.runtime,
-            smudgy_core::session::runtime::RuntimeThreadJoinOutcome::Clean { session_id: first }
-        );
-        assert!(first_result.retirement.is_clean_for(first));
+        for session_id in [first, second] {
+            assert!(
+                report
+                    .sessions
+                    .iter()
+                    .find(|result| result.session_id == session_id)
+                    .copied()
+                    .is_some_and(application_audio::SessionAudioCloseResult::is_clean),
+                "published session {session_id} did not close cleanly: {report}"
+            );
+        }
         assert!(report.output.is_clean(), "physical output still shuts down");
     }
 
@@ -5585,6 +7351,48 @@ mod tests {
         assert_eq!(report.sessions.len(), 1);
         assert!(report.sessions[0].is_clean());
         assert!(report.is_clean(), "{report}");
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn confirmed_post_start_output_death_still_opens_terminal_and_reports_degradation() {
+        let _core_runtime_lock = application_audio::lock_core_runtime_test();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let _tokio_guard = tokio.enter();
+        let (application, probe) = application_audio::test_application_audio_with_core_runtime();
+        let controller = application.controller();
+        assert!(probe.fail_output());
+        assert!(matches!(
+            controller.set_master_muted(true),
+            Err(application_audio::ApplicationAudioControlError::OutputFailed(_))
+        ));
+        let (ui_commands, _ui_events) = smudgy_core::session::ui_command::channel();
+        let mut sessions = SessionStore::with_ui_commands_and_audio(
+            crate::cloud_account::test_handles(),
+            ui_commands,
+            controller,
+        );
+        let session_id = sessions
+            .open_session(
+                "missing-dead-output-server".to_string(),
+                "offline-profile".to_string(),
+                false,
+            )
+            .expect("audio failure never blocks the terminal");
+
+        assert!(smudgy_core::session::registry::get_runtime(session_id).is_some());
+        assert!(sessions.take_audio_degradation().is_some());
+        assert!(sessions.shutdown_and_remove(session_id));
+        let report = application.shutdown();
+        assert_eq!(report.sessions.len(), 1);
+        assert!(report.sessions[0].is_clean());
+        assert!(
+            !report.is_clean(),
+            "the retained output death stays visible"
+        );
     }
 
     fn area(n: u128) -> AreaId {
