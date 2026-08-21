@@ -270,6 +270,10 @@ pub struct State {
     profile_form_send_on_connect_content: text_editor::Content,
     /// Holds any error message related to profile CRUD operations.
     profile_crud_error: Option<String>,
+    /// Fatal/session-admission error from the daemon-owned open transaction.
+    /// Kept separate from CRUD validation so the Connect surface can remain
+    /// intact and retryable when no session or pane was published.
+    session_open_error: Option<String>,
     /// Secure-input buffer for a new auto-login password. Never persisted to disk;
     /// stored in the OS keyring on save. Empty unless the user is entering one.
     profile_form_password: String,
@@ -439,12 +443,24 @@ impl Default for State {
             profile_form_data: ProfileConfigFormData::default(),
             profile_form_send_on_connect_content: text_editor::Content::with_text(""),
             profile_crud_error: None,
+            session_open_error: None,
             profile_form_password: String::new(),
             profile_form_password_stored: false,
             profile_form_password_editing: false,
             image_cache_usage: None,
             image_cache_usage_request: 0,
         }
+    }
+}
+
+impl State {
+    pub fn set_session_open_error(&mut self, error: impl Into<String>) {
+        self.session_open_error = Some(error.into());
+    }
+
+    #[cfg(all(test, feature = "web-audio-cpal"))]
+    pub(crate) fn session_open_error_for_test(&self) -> Option<&str> {
+        self.session_open_error.as_deref()
     }
 }
 
@@ -1254,7 +1270,15 @@ pub fn view(state: &State) -> Element<'_, Message> {
         .into();
 
     // Combine panes into the modal body
-    let body: Element<'_, Message> = Row::with_children(vec![server_pane, main_pane]).into();
+    let panes: Element<'_, Message> = Row::with_children(vec![server_pane, main_pane]).into();
+    let body: Element<'_, Message> = match &state.session_open_error {
+        Some(error) => column![
+            container(text(error).style(builtins::text::danger)).padding([8, 15]),
+            panes,
+        ]
+        .into(),
+        None => panes,
+    };
 
     // A metadata link held at the trust gate renders its confirm dialog over
     // the whole modal body, exactly like the session view's link dialog.

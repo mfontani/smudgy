@@ -2377,6 +2377,43 @@ pub enum MixerStartError<E> {
     OwnerStopped,
 }
 
+impl<E: fmt::Display + fmt::Debug> fmt::Display for MixerStartError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSampleRate => formatter.write_str("the mixer sample rate is invalid"),
+            Self::Thread(error) => {
+                write!(formatter, "the mixer owner thread could not start: {error}")
+            }
+            Self::Backend(error) => write!(formatter, "physical output could not start: {error}"),
+            Self::SampleRateMismatch { expected, actual } => write!(
+                formatter,
+                "physical output selected {actual} Hz instead of the required {expected} Hz"
+            ),
+            Self::UnsupportedPhysicalFormat(format) => {
+                write!(
+                    formatter,
+                    "physical output format is unsupported: {format:?}"
+                )
+            }
+            Self::DriverFailed(failure) => {
+                write!(
+                    formatter,
+                    "physical output failed during startup: {failure:?}"
+                )
+            }
+            Self::CleanupUncertain(cause) => {
+                write!(
+                    formatter,
+                    "physical output startup cleanup is uncertain: {cause:?}"
+                )
+            }
+            Self::OwnerStopped => formatter.write_str("the mixer owner stopped during startup"),
+        }
+    }
+}
+
+impl<E> std::error::Error for MixerStartError<E> where E: std::error::Error + 'static {}
+
 /// Result of explicitly joining the mixer owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MixerShutdown {

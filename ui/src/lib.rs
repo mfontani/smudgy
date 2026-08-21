@@ -26,6 +26,8 @@ use windows::automations_window::{AutomationsWindow, Event as AutomationsWindowE
 use windows::settings_window::{self, Event as SettingsWindowEvent, SettingsWindow};
 use windows::smudgy_window::SmudgyWindow;
 
+#[cfg(feature = "web-audio-cpal")]
+mod application_audio;
 mod assets;
 mod cloud_account;
 mod discord_presence;
@@ -389,7 +391,28 @@ fn secondary_window_settings(min_size: Size) -> window::Settings {
     }
 }
 
-fn init() -> (Smudgy, Task<Message>) {
+#[cfg(feature = "web-audio-cpal")]
+fn finish_run_with_audio<E>(
+    iced_result: Result<(), E>,
+    audio_report: application_audio::ApplicationAudioShutdownReport,
+) -> anyhow::Result<()>
+where
+    E: Into<anyhow::Error>,
+{
+    match (iced_result, audio_report.is_clean()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => anyhow::bail!("Web Audio shutdown failed: {audio_report}"),
+        (Err(iced), true) => Err(iced.into()),
+        (Err(iced), false) => {
+            let iced = iced.into();
+            anyhow::bail!("iced failed: {iced}; Web Audio shutdown also failed: {audio_report}")
+        }
+    }
+}
+
+fn init(
+    #[cfg(feature = "web-audio-cpal")] audio: application_audio::ApplicationAudioController,
+) -> (Smudgy, Task<Message>) {
     // Seed the hot prefs snapshot before any window renders, and load the
     // per-area enable/disable preferences (migrating a legacy disabled-only
     // file) for fan-out to mappers and cross-device reconcile. `load_settings`
@@ -441,6 +464,10 @@ fn init() -> (Smudgy, Task<Message>) {
     };
 
     let (ui_command_bus, ui_commands) = smudgy_core::session::ui_command::channel();
+    #[cfg(feature = "web-audio-cpal")]
+    let sessions =
+        SessionStore::with_ui_commands_and_audio(account.handles(), ui_command_bus, audio);
+    #[cfg(not(feature = "web-audio-cpal"))]
     let sessions = SessionStore::with_ui_commands(account.handles(), ui_command_bus);
     let discord = DiscordPresence::new(settings.discord_rich_presence);
 
@@ -559,7 +586,17 @@ pub fn run() -> anyhow::Result<()> {
     let startup_settings = smudgy_core::models::settings::load_settings();
     i18n::activate(&startup_settings.locale);
 
-    iced::daemon(init, update, view)
+    #[cfg(feature = "web-audio-cpal")]
+    let application_audio = application_audio::ApplicationAudio::start()?;
+    #[cfg(feature = "web-audio-cpal")]
+    let audio_controller = application_audio.controller();
+
+    #[cfg(feature = "web-audio-cpal")]
+    let daemon = iced::daemon(move || init(audio_controller.clone()), update, view);
+    #[cfg(not(feature = "web-audio-cpal"))]
+    let daemon = iced::daemon(init, update, view);
+
+    let iced_result = daemon
         .theme(|smudgy: &Smudgy, window_id| {
             if smudgy.smudgy_windows.contains_key(&window_id) {
                 // Palette-aware: re-evaluated per frame, so theme changes in
@@ -613,12 +650,24 @@ pub fn run() -> anyhow::Result<()> {
                 main_window_title()
             }
         })
-        .run()?;
+        .run();
 
     log::info!("Application closing");
 
-    smudgy_core::session::connection::shutdown_io_runtime();
-    smudgy_core::session::runtime::join_runtime_threads();
+    #[cfg(not(feature = "web-audio-cpal"))]
+    {
+        smudgy_core::session::connection::shutdown_io_runtime();
+        smudgy_core::session::runtime::join_runtime_threads();
+        iced_result?;
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    {
+        // Always consume the proof-bearing audio shutdown path, including
+        // when iced itself failed. Keep the two failure domains visible.
+        let audio_report = application_audio.shutdown();
+        finish_run_with_audio(iced_result, audio_report)?;
+    }
 
     Ok(())
 }
@@ -1521,6 +1570,43 @@ fn save_named_layout(
     ))
 }
 
+fn rollback_spawned_sessions(sessions: &mut SessionStore, spawned: &mut Vec<SessionId>) {
+    for session_id in spawned.drain(..) {
+        sessions.shutdown_and_remove(session_id);
+    }
+}
+
+fn open_layout_spawn_batch(
+    sessions: &mut SessionStore,
+    spawns: &[workspace::apply::SpawnSlot],
+    source: &workspace::TemplateSource,
+) -> Result<Vec<SessionId>, ()> {
+    let mut spawned = Vec::with_capacity(spawns.len());
+    for spawn in spawns {
+        match sessions.open_session(spawn.server.clone(), spawn.profile.clone(), spawn.connect) {
+            Ok(session_id) => {
+                spawned.push(session_id);
+                log::info!(
+                    "[layouts] spawned {} ({}/{}) for {source}",
+                    session_id,
+                    spawn.server,
+                    spawn.profile
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "[layouts] could not spawn {}/{} for {source}: {error}",
+                    spawn.server,
+                    spawn.profile
+                );
+                rollback_spawned_sessions(sessions, &mut spawned);
+                return Err(());
+            }
+        }
+    }
+    Ok(spawned)
+}
+
 /// Apply a stored template of `server`'s — a named layout or the server's
 /// last-session snapshot — as a user restore: project the plan, route
 /// unanswered keep-or-close questions back to the initiating window, spawn
@@ -1597,6 +1683,7 @@ fn apply_workspace_template(
             },
         ));
     }
+    let mut batch_spawned = Vec::new();
     let plan = if plan.spawns.is_empty() {
         plan
     } else {
@@ -1604,35 +1691,29 @@ fn apply_workspace_template(
         // intent (an online slot reconnects exactly as the Connect button
         // would), then re-project so the fresh sessions bind and the plan
         // is validated against the workspace actually being mutated.
-        for spawn in &plan.spawns {
-            let session_id = smudgy.sessions.open_session(
-                spawn.server.clone(),
-                spawn.profile.clone(),
-                spawn.connect,
-            );
-            log::info!(
-                "[layouts] spawned {} ({}/{}) for {source}",
-                session_id,
-                spawn.server,
-                spawn.profile
-            );
-        }
+        batch_spawned = match open_layout_spawn_batch(&mut smudgy.sessions, &plan.spawns, source) {
+            Ok(spawned) => spawned,
+            Err(()) => return Task::none(),
+        };
         let live = build_live_workspace(smudgy);
         match workspace::apply::plan_apply(&template, &live, mode, answers) {
             Ok(plan) => plan,
             Err(error) => {
                 log::info!("[layouts] replan of {source} failed after spawning: {error}");
+                rollback_spawned_sessions(&mut smudgy.sessions, &mut batch_spawned);
                 return Task::none();
             }
         }
     };
     if !plan.is_executable() {
         log::info!("[layouts] plan for {source} did not settle; not applying");
+        rollback_spawned_sessions(&mut smudgy.sessions, &mut batch_spawned);
         return Task::none();
     }
     let live = build_live_workspace(smudgy);
     if let Err(error) = workspace::apply::validate_conservation(&template, &live, mode, &plan) {
         log::info!("[layouts] conservation check refused {source}: {error}");
+        rollback_spawned_sessions(&mut smudgy.sessions, &mut batch_spawned);
         return Task::none();
     }
     execute_layout_apply(smudgy, &plan)
@@ -5287,6 +5368,118 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
 mod tests {
     use super::*;
     use smudgy_cloud::Uuid;
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn physical_layout_batch_rolls_back_prior_open_when_next_admission_fails() {
+        let _core_runtime_lock = application_audio::lock_core_runtime_test();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let _tokio_guard = tokio.enter();
+        let (application, probe) = application_audio::test_application_audio_with_core_runtime();
+        let _renderer = application_audio::TestAudioRenderer::start(probe);
+        let controller = application.controller();
+        // Leave one of the mixer's 32 slots for the first real SessionStore
+        // open. These staged sessions deliberately own no core runtime.
+        for id in 100..131 {
+            controller
+                .begin_session(SessionId::from(id))
+                .expect("filler registration")
+                .commit();
+        }
+        let (ui_commands, _ui_events) = smudgy_core::session::ui_command::channel();
+        let mut sessions = SessionStore::with_ui_commands_and_audio(
+            crate::cloud_account::test_handles(),
+            ui_commands,
+            controller,
+        );
+
+        let spawns = [
+            workspace::apply::SpawnSlot {
+                slot: 1,
+                server: "missing-layout-server".to_string(),
+                profile: "first-profile".to_string(),
+                connect: false,
+            },
+            workspace::apply::SpawnSlot {
+                slot: 2,
+                server: "missing-layout-server".to_string(),
+                profile: "second-profile".to_string(),
+                connect: false,
+            },
+        ];
+        assert!(
+            open_layout_spawn_batch(
+                &mut sessions,
+                &spawns,
+                &workspace::TemplateSource::Named("test".to_string()),
+            )
+            .is_err(),
+            "the second admission reaches mixer capacity"
+        );
+        let first = SessionId::from(0);
+        assert_eq!(
+            sessions.iter().count(),
+            0,
+            "the batch publishes no partial store"
+        );
+        assert_eq!(
+            sessions.next_session_id_for_test(),
+            Some(SessionId::from(2)),
+            "the failed second id is permanently spent"
+        );
+
+        let report = application.shutdown();
+        let first_result = report
+            .sessions
+            .iter()
+            .find(|result| result.session_id == first)
+            .expect("rolled-back physical session has an exact result");
+        assert!(first_result.shutdown_requested);
+        assert_eq!(
+            first_result.runtime,
+            smudgy_core::session::runtime::RuntimeThreadJoinOutcome::Clean { session_id: first }
+        );
+        assert!(first_result.retirement.is_ok());
+        assert!(report.output.clean, "physical output still shuts down");
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn successful_physical_store_open_publishes_explicit_audio_runtime() {
+        let _core_runtime_lock = application_audio::lock_core_runtime_test();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let _tokio_guard = tokio.enter();
+        let (application, probe) = application_audio::test_application_audio_with_core_runtime();
+        let _renderer = application_audio::TestAudioRenderer::start(probe);
+        let (ui_commands, _ui_events) = smudgy_core::session::ui_command::channel();
+        let mut sessions = SessionStore::with_ui_commands_and_audio(
+            crate::cloud_account::test_handles(),
+            ui_commands,
+            application.controller(),
+        );
+        let session_id = sessions
+            .open_session(
+                "missing-physical-server".to_string(),
+                "physical-profile".to_string(),
+                false,
+            )
+            .expect("physical open succeeds");
+
+        assert!(sessions.uses_physical_audio_for_test(session_id));
+        assert!(smudgy_core::session::registry::get_runtime(session_id).is_some());
+        assert!(sessions.shutdown_and_remove(session_id));
+
+        let report = application.shutdown();
+        assert_eq!(report.sessions.len(), 1);
+        assert!(report.sessions[0].is_clean());
+        assert!(report.is_clean(), "{report}");
+    }
 
     fn area(n: u128) -> AreaId {
         AreaId(Uuid::from_u128(n))

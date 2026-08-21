@@ -87,6 +87,9 @@ base64 = "0.22"
 # HTTP date parsing (Expires/Last-Modified/Date) for the RFC-9111-subset freshness math.
 httpdate = "1"
 discord-rich-presence = "1.1.0"
+smudgy_audio = { workspace = true, optional = true }
+smudgy_audio_web = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 # Restart Manager cooperation so the installer can upgrade over a running smudgy:
 # a window-proc subclass catches the session-end message and exits. See win_rm.rs.
@@ -104,7 +107,13 @@ winapi = { workspace = true, features = [
 # CPAL variant for speakers; the base feature keeps `sinkId: "none"` available
 # to deterministic tests and headless environments.
 web-audio = ["smudgy_core/web-audio"]
-web-audio-cpal = ["web-audio", "smudgy_core/web-audio-cpal"]
+web-audio-cpal = [
+    "web-audio",
+    "dep:futures",
+    "dep:smudgy_audio",
+    "dep:smudgy_audio_web",
+    "smudgy_audio/physical-output",
+]
 # Attach iced's devtools to the running app (iced_debug + the in-app overlay, plus the
 # beacon a running `comet` viewer connects to). Dev-only instrumentation -- keep it out
 # of release builds. Usage: cargo run --features iced-debug
@@ -112,6 +121,7 @@ iced-debug = ["iced/debug"]
 
 [dev-dependencies]
 async-trait = "0.1"
+smudgy_audio = { workspace = true, features = ["test-support"] }
 # Isolated on-disk fixtures for the workspace load/set-aside tests (same
 # version core already pins).
 tempfile = "3"

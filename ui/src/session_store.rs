@@ -54,7 +54,73 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(feature = "web-audio-cpal")]
+use std::sync::Mutex;
+#[cfg(feature = "web-audio-cpal")]
+use std::{panic::AssertUnwindSafe, pin::Pin};
 use tokio::sync::mpsc::{self};
+
+#[cfg(feature = "web-audio-cpal")]
+use crate::application_audio::{
+    ApplicationAudioController, ApplicationAudioOpenError, SessionAudioCloseDisposition,
+};
+
+#[cfg(feature = "web-audio-cpal")]
+type BoxSessionEventStream =
+    Pin<Box<dyn iced::futures::Stream<Item = TaggedSessionEvent> + Send + 'static>>;
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone)]
+struct SessionEventSource {
+    session_id: SessionId,
+    stream: Arc<Mutex<Option<BoxSessionEventStream>>>,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl std::hash::Hash for SessionEventSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.session_id, state);
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn take_session_event_stream(source: &SessionEventSource) -> BoxSessionEventStream {
+    source
+        .stream
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_else(|| Box::pin(iced::futures::stream::empty()))
+}
+
+#[derive(Debug)]
+pub enum SessionOpenError {
+    IdExhausted,
+    #[cfg(feature = "web-audio-cpal")]
+    Audio(ApplicationAudioOpenError),
+    #[cfg(feature = "web-audio-cpal")]
+    Runtime(smudgy_core::session::AudioSessionSpawnError),
+    #[cfg(feature = "web-audio-cpal")]
+    RuntimeConstructionPanicked,
+}
+
+impl std::fmt::Display for SessionOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdExhausted => formatter.write_str("the session id space is exhausted"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::Audio(error) => write!(formatter, "Web Audio session setup failed: {error}"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::Runtime(error) => write!(formatter, "session runtime setup failed: {error}"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::RuntimeConstructionPanicked => {
+                formatter.write_str("session runtime setup panicked before publication")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionOpenError {}
 
 /// All live sessions, keyed by id. Windows borrow sessions from here to
 /// render and update their panes; the daemon routes session events here
@@ -64,7 +130,9 @@ pub struct SessionStore {
     cloud: CloudHandles,
     ui_commands: Option<UiCommandBus>,
     sessions: BTreeMap<SessionId, ManagedSession>,
-    next_session_id: SessionId,
+    next_session_id: Option<SessionId>,
+    #[cfg(feature = "web-audio-cpal")]
+    audio: Option<ApplicationAudioController>,
 }
 
 impl SessionStore {
@@ -73,7 +141,9 @@ impl SessionStore {
             cloud,
             ui_commands: None,
             sessions: BTreeMap::new(),
-            next_session_id: 0.into(),
+            next_session_id: Some(0.into()),
+            #[cfg(feature = "web-audio-cpal")]
+            audio: None,
         }
     }
 
@@ -85,6 +155,20 @@ impl SessionStore {
         store
     }
 
+    /// Production physical-audio constructor. Tests and hardware-independent
+    /// builds retain [`Self::new`] / [`Self::with_ui_commands`] and therefore
+    /// the legacy no-audio runtime path.
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn with_ui_commands_and_audio(
+        cloud: CloudHandles,
+        ui_commands: UiCommandBus,
+        audio: ApplicationAudioController,
+    ) -> Self {
+        let mut store = Self::with_ui_commands(cloud, ui_commands);
+        store.audio = Some(audio);
+        store
+    }
+
     /// Allocates an id and creates the session state. Giving the session a
     /// pane in some window's grid is the caller's job.
     pub fn open_session(
@@ -92,11 +176,13 @@ impl SessionStore {
         server_name: String,
         profile_name: String,
         auto_connect: bool,
-    ) -> SessionId {
-        let session_id = self.next_session_id;
-        self.next_session_id = self.next_session_id + 1.into();
+    ) -> Result<SessionId, SessionOpenError> {
+        let session_id = self.next_session_id.ok_or(SessionOpenError::IdExhausted)?;
+        // Spend the id before every fallible operation. A failed open can
+        // never alias a stale scope, subscription identity, or runtime.
+        self.next_session_id = u32::from(session_id).checked_add(1).map(SessionId::from);
 
-        let session = ManagedSession::new(
+        let session = match ManagedSession::new(
             session_id,
             server_name,
             profile_name,
@@ -104,13 +190,30 @@ impl SessionStore {
             self.cloud.base_url.as_str(),
             auto_connect,
             self.ui_commands.clone(),
-        );
+            #[cfg(feature = "web-audio-cpal")]
+            self.audio.as_ref(),
+        ) {
+            Ok(session) => session,
+            Err(error) => return Err(error),
+        };
         self.sessions.insert(session_id, session);
-        session_id
+        Ok(session_id)
     }
 
     pub fn get(&self, session_id: SessionId) -> Option<&ManagedSession> {
         self.sessions.get(&session_id)
+    }
+
+    #[cfg(all(test, feature = "web-audio-cpal"))]
+    pub(crate) fn next_session_id_for_test(&self) -> Option<SessionId> {
+        self.next_session_id
+    }
+
+    #[cfg(all(test, feature = "web-audio-cpal"))]
+    pub(crate) fn uses_physical_audio_for_test(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|session| session.session_events.is_some())
     }
 
     pub fn get_mut(&mut self, session_id: SessionId) -> Option<&mut ManagedSession> {
@@ -174,6 +277,16 @@ impl SessionStore {
     pub fn shutdown_and_remove(&mut self, session_id: SessionId) -> bool {
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
+                #[cfg(feature = "web-audio-cpal")]
+                if let Some(audio) = &self.audio {
+                    match audio.close_session(session_id) {
+                        SessionAudioCloseDisposition::Requested
+                        | SessionAudioCloseDisposition::AlreadyClosing => {}
+                        disposition => log::error!(
+                            "audio close for session {session_id} was not accepted: {disposition:?}"
+                        ),
+                    }
+                }
                 session.shutdown();
                 true
             }
@@ -210,8 +323,12 @@ pub struct ManagedSession {
     pub input: session_input::SessionInput,
 
     pub session_params: Arc<SessionParams>,
+    /// Eagerly-created exact runtime stream. Eager construction reserves and
+    /// publishes the core runtime before the session can enter the UI store;
+    /// iced only takes and polls this already-created stream.
+    #[cfg(feature = "web-audio-cpal")]
+    session_events: Option<SessionEventSource>,
     ui_commands: Option<UiCommandBus>,
-
     pub mapper: Option<Mapper>,
 
     terminal_buffer: Rc<RefCell<TerminalBuffer>>,
@@ -778,6 +895,7 @@ impl ManagedSession {
     ///
     /// `credentials` is the app-wide hot-swappable credential slot: logging
     /// in or out upgrades this session's mapper without a reconnect.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: SessionId,
         server_name: String,
@@ -786,7 +904,8 @@ impl ManagedSession {
         base_url: &str,
         auto_connect: bool,
         ui_commands: Option<UiCommandBus>,
-    ) -> Self {
+        #[cfg(feature = "web-audio-cpal")] audio: Option<&ApplicationAudioController>,
+    ) -> Result<Self, SessionOpenError> {
         let settings = load_settings();
 
         info!("Settings: {settings:?}");
@@ -900,19 +1019,66 @@ impl ManagedSession {
             Some(Arc::new(move || widget_root.clear()) as Arc<dyn Fn() + Send + Sync>)
         };
 
-        Self {
+        let session_params = Arc::new(SessionParams {
+            session_id: id,
+            server_name: Arc::new(server_name.clone()),
+            profile_name: Arc::new(profile_name.clone()),
+            profile_subtext,
+            mapper: mapper.clone(),
+            package_client: Some(package_client),
+            extra_script_extensions,
+            on_engine_rebuild,
+        });
+        #[cfg(feature = "web-audio-cpal")]
+        let mut pending_audio = audio
+            .map(|audio| audio.begin_session(id))
+            .transpose()
+            .map_err(SessionOpenError::Audio)?;
+        #[cfg(feature = "web-audio-cpal")]
+        let audio_scope = pending_audio.as_ref().map(|pending| pending.scope());
+        #[cfg(feature = "web-audio-cpal")]
+        let session_stream: Option<BoxSessionEventStream> =
+            if let (Some(commands), Some(scope)) = (&ui_commands, audio_scope) {
+                let spawned = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    session::try_spawn_with_ui_commands_and_audio(
+                        &session_params,
+                        commands.clone(),
+                        scope,
+                    )
+                }));
+                match spawned {
+                    Ok(Ok(stream)) => Some(Box::pin(stream)),
+                    Ok(Err(error)) => {
+                        if let Some(pending) = pending_audio.take() {
+                            let _ = pending.abort();
+                        }
+                        return Err(SessionOpenError::Runtime(error));
+                    }
+                    Err(payload) => {
+                        // Panic payload destructors are arbitrary. The typed
+                        // UI error is safe; exact audio cleanup is still
+                        // requested before the failed shell can escape.
+                        std::mem::forget(payload);
+                        if let Some(pending) = pending_audio.take() {
+                            let _ = pending.abort();
+                        }
+                        return Err(SessionOpenError::RuntimeConstructionPanicked);
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(feature = "web-audio-cpal")]
+        let session_events = session_stream.map(|stream| SessionEventSource {
+            session_id: id,
+            stream: Arc::new(Mutex::new(Some(stream))),
+        });
+        let session = Self {
             id,
-            session_params: Arc::new(SessionParams {
-                session_id: id,
-                server_name: Arc::new(server_name.clone()),
-                profile_name: Arc::new(profile_name.clone()),
-                profile_subtext,
-                mapper: mapper.clone(),
-                package_client: Some(package_client),
-                extra_script_extensions,
-                on_engine_rebuild,
-            }),
+            session_params,
             ui_commands,
+            #[cfg(feature = "web-audio-cpal")]
+            session_events,
             server_config: Rc::new(RefCell::new(load_server(&server_name).map_or_else(
                 |e| {
                     // Sessions can outlive an on-disk rename; a fallback
@@ -949,7 +1115,12 @@ impl ManagedSession {
             widget_root,
             map_store,
             text_store,
+        };
+        #[cfg(feature = "web-audio-cpal")]
+        if let Some(pending_audio) = pending_audio {
+            pending_audio.commit();
         }
+        Ok(session)
     }
 
     /// Returns whether this session is currently connected
@@ -1676,6 +1847,10 @@ impl ManagedSession {
     }
 
     pub fn session_subscription(&self) -> Subscription<TaggedSessionEvent> {
+        #[cfg(feature = "web-audio-cpal")]
+        if let Some(events) = &self.session_events {
+            return Subscription::run_with(events.clone(), take_session_event_stream);
+        }
         if let Some(ui_commands) = &self.ui_commands {
             Subscription::run_with(
                 (self.session_params.clone(), ui_commands.clone()),

@@ -315,6 +315,17 @@ pub struct Runtime {
     start_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
+/// The exact runtime thread could not be created after its session id was
+/// reserved. The reservation remains as a result-bearing `SpawnFailed`
+/// tombstone for the lifecycle owner to consume.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to spawn runtime thread for session {session_id}: {source}")]
+pub struct RuntimeThreadSpawnError {
+    pub session_id: SessionId,
+    #[source]
+    pub source: std::io::Error,
+}
+
 /// Exact, non-panicking result of consuming one runtime-thread join authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1146,6 +1157,26 @@ mod runtime_thread_registry_tests {
         );
         assert!(registry.join_all().is_empty());
     }
+
+    #[test]
+    fn public_runtime_new_keeps_its_infallible_compatibility_signature() {
+        type InfallibleRuntimeConstructor = fn(
+            SessionId,
+            Arc<String>,
+            Arc<String>,
+            Arc<String>,
+            Option<Mapper>,
+            Option<smudgy_cloud::PackageApiClient>,
+            Option<PackageProviderFactory>,
+            ScriptExtensionFactory,
+            Option<crate::session::EngineResetHook>,
+            Option<crate::session::RuntimeAudioScope>,
+            Sender<TaggedSessionEvent>,
+            Option<UiCommandBus>,
+        ) -> Runtime;
+
+        let _: InfallibleRuntimeConstructor = Runtime::new;
+    }
 }
 
 type SentSessionEvent<'a> = futures::sink::Send<'a, Sender<TaggedSessionEvent>, TaggedSessionEvent>;
@@ -1198,6 +1229,39 @@ impl Runtime {
         profile_subtext: Arc<String>,
         mapper: Option<Mapper>,
         package_client: Option<smudgy_cloud::PackageApiClient>,
+        package_provider_override: Option<PackageProviderFactory>,
+        extra_script_extensions: ScriptExtensionFactory,
+        on_engine_rebuild: Option<crate::session::EngineResetHook>,
+        audio_scope: Option<crate::session::RuntimeAudioScope>,
+        ui_tx: Sender<TaggedSessionEvent>,
+        ui_commands: Option<UiCommandBus>,
+    ) -> Self {
+        Self::try_new(
+            session_id,
+            server_name,
+            profile_name,
+            profile_subtext,
+            mapper,
+            package_client,
+            package_provider_override,
+            extra_script_extensions,
+            on_engine_rebuild,
+            audio_scope,
+            ui_tx,
+            ui_commands,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible runtime-thread constructor used by transactional embedders.
+    /// A thread creation failure leaves its exact result-bearing tombstone.
+    pub(crate) fn try_new(
+        session_id: SessionId,
+        server_name: Arc<String>,
+        profile_name: Arc<String>,
+        profile_subtext: Arc<String>,
+        mapper: Option<Mapper>,
+        package_client: Option<smudgy_cloud::PackageApiClient>,
         // Optional alternate package resolver, built per engine on the session thread; when
         // `None` the engine builds the cloud-backed provider from `package_client`. The
         // `Arc` factory is cloned for the initial build and each reload.
@@ -1211,7 +1275,7 @@ impl Runtime {
         audio_scope: Option<crate::session::RuntimeAudioScope>,
         ui_tx: Sender<TaggedSessionEvent>,
         ui_commands: Option<UiCommandBus>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeThreadSpawnError> {
         let (session_runtime_tx, session_runtime_rx) =
             tokio::sync::mpsc::unbounded_channel::<RuntimeAction>();
 
@@ -1872,11 +1936,14 @@ impl Runtime {
             Ok(thread) => thread_reservation.publish(thread),
             Err(error) => {
                 thread_reservation.fail();
-                panic!("failed to spawn runtime thread for session {session_id}: {error}");
+                return Err(RuntimeThreadSpawnError {
+                    session_id,
+                    source: error,
+                });
             }
         }
 
-        Self {
+        Ok(Self {
             session_id,
             server_name,
             profile_name,
@@ -1893,7 +1960,7 @@ impl Runtime {
             input_word_sets,
             pane_input_callbacks,
             start_tx: Mutex::new(Some(start_tx)),
-        }
+        })
     }
 
     /// Allow the worker to begin engine construction after registry insertion.

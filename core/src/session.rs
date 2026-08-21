@@ -270,6 +270,16 @@ pub struct SessionAudioScopeMismatch {
     pub audio_session_id: u64,
 }
 
+/// Typed failure for the UI's transactional audio-session spawn boundary.
+#[cfg(feature = "web-audio")]
+#[derive(Debug, thiserror::Error)]
+pub enum AudioSessionSpawnError {
+    #[error(transparent)]
+    Scope(#[from] SessionAudioScopeMismatch),
+    #[error(transparent)]
+    RuntimeThread(#[from] runtime::RuntimeThreadSpawnError),
+}
+
 pub struct SessionParams {
     pub session_id: SessionId,
     pub server_name: Arc<String>,
@@ -446,6 +456,26 @@ pub fn spawn_with_ui_commands_and_audio(
     ))
 }
 
+/// Fallible production UI variant. Unlike compatibility spawn entry points,
+/// an OS-thread creation failure is returned before a session is published.
+/// Its exact `SpawnFailed` join tombstone remains available to the caller's
+/// lifecycle coordinator.
+///
+/// # Errors
+///
+/// Returns [`AudioSessionSpawnError::Scope`] when the supplied audio scope is
+/// not bound to this session, or [`AudioSessionSpawnError::RuntimeThread`]
+/// when the operating system refuses the runtime thread.
+#[cfg(feature = "web-audio")]
+pub fn try_spawn_with_ui_commands_and_audio(
+    params: &Arc<SessionParams>,
+    ui_commands: ui_command::UiCommandBus,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, AudioSessionSpawnError> {
+    validate_audio_scope(params, &audio_scope)?;
+    try_spawn_inner(params, None, Some(ui_commands), Some(audio_scope)).map_err(Into::into)
+}
+
 #[cfg(feature = "web-audio")]
 fn validate_audio_scope(
     params: &SessionParams,
@@ -468,6 +498,16 @@ fn spawn_inner(
     ui_commands: Option<ui_command::UiCommandBus>,
     audio_scope: Option<RuntimeAudioScope>,
 ) -> impl Stream<Item = TaggedSessionEvent> + use<> {
+    try_spawn_inner(params, package_provider_override, ui_commands, audio_scope)
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn try_spawn_inner(
+    params: &SessionParams,
+    package_provider_override: Option<PackageProviderFactory>,
+    ui_commands: Option<ui_command::UiCommandBus>,
+    audio_scope: Option<RuntimeAudioScope>,
+) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, runtime::RuntimeThreadSpawnError> {
     let (mut ui_tx, ui_rx) = futures::channel::mpsc::channel::<TaggedSessionEvent>(1024);
 
     if let Err(e) = ui_tx.try_send(TaggedSessionEvent {
@@ -479,7 +519,7 @@ fn spawn_inner(
         error!("Failed to send initial buffer update: {e:?}");
     }
 
-    let runtime = runtime::Runtime::new(
+    let runtime = runtime::Runtime::try_new(
         params.session_id,
         params.server_name.clone(),
         params.profile_name.clone(),
@@ -492,14 +532,14 @@ fn spawn_inner(
         audio_scope,
         ui_tx,
         ui_commands,
-    );
+    )?;
     let shutdown_tx = runtime.tx();
 
     // Register the runtime in the global registry
     registry::register_session(params.session_id, runtime.into());
 
-    SessionEventStream {
+    Ok(SessionEventStream {
         events: ui_rx,
         shutdown_tx,
-    }
+    })
 }

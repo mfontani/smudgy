@@ -105,7 +105,7 @@ smudgy_audio = { workspace = true, features = ["test-support"] }
 # audio-free. The hardware-independent form supports `sinkId: "none"`; CPAL is a separate opt-in so
 # normal/headless workspace builds do not acquire an audio device dependency.
 web-audio = ["dep:deno_audio", "dep:smudgy_audio_web", "smudgy_script/web-audio"]
-web-audio-cpal = ["web-audio", "deno_audio/cpal"]
+web-audio-cpal = ["web-audio"]
 # Exposes otherwise-private internals so the `smudgy_bench` crate can drive real
 # subsystems: the trigger engine (`session::runtime::Manager` + `PushTriggerParams`),
 # the inbound telnet+VT ingest glue (`session::connection::{feed_inbound, TelnetBridge}`

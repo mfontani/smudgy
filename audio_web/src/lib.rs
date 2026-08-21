@@ -11,12 +11,13 @@ use std::sync::{Barrier, mpsc};
 #[cfg(test)]
 use std::thread::{self, ThreadId};
 
+pub use deno_audio::AudioHostLimits;
 use deno_audio::{
-    AudioExtensionOptions, AudioHost, AudioHostLimits, AudioHostUsage, AudioOutputConfig,
-    AudioOutputDeathReason, AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind,
-    AudioOutputEventSink, AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure,
-    AudioPermissions, AudioRenderCallback, AudioRenderFormat, AudioRenderStatus,
-    PreparedAudioOutput, RunningAudioOutput, SystemAudioOutput,
+    AudioExtensionOptions, AudioHost, AudioHostUsage, AudioOutputConfig, AudioOutputDeathReason,
+    AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind, AudioOutputEventSink,
+    AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure, AudioPermissions,
+    AudioRenderCallback, AudioRenderFormat, AudioRenderStatus, PreparedAudioOutput,
+    RunningAudioOutput, SystemAudioOutput,
 };
 use deno_error::JsErrorBox;
 use smudgy_audio::{
