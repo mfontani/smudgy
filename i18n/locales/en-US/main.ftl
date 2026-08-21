@@ -1085,6 +1085,16 @@ editor-priority-note-triggers = Higher numbered triggers run first.
 editor-continue-aliases = Let other matching aliases run too
 editor-continue-triggers = Let other matching triggers run too
 
+# The action module: tabs and generated-until-edited bodies
+editor-tab-send-text = Send text
+editor-tab-run-js = Run JavaScript
+editor-gen-alias-hello = say Hello, { $hole }!
+editor-gen-alias-hello-none = say Hello!
+editor-gen-alias-emote = emote smiles and waves to { $hole }.
+editor-gen-alias-emote-none = emote smiles and waves.
+editor-gen-trigger = say I heard about { $hole }.
+editor-gen-trigger-none = say Understood.
+
 # Gutter tooltips
 editor-gutter-before-pattern = Anything may come before the pattern
 editor-gutter-after-pattern = Anything may come after the pattern

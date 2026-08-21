@@ -307,6 +307,8 @@ pub enum Message {
     AdjustPriority(i32),
     ToggleFallthrough,
     ScriptEditorAction(text_editor::Action),
+    /// An edit in the send-text action draft.
+    SendTextAction(text_editor::Action),
     /// Expand/collapse the Try-it accordion (collapsed by default).
     ToggleTryIt,
     SetTestInput(String),
@@ -610,6 +612,18 @@ pub struct AutomationsWindow {
 
     // ---- shared editor buffers --------------------------------------------
     pub(super) editor_content: text_editor::Content,
+    /// The send-text action draft, held separately from the script draft so
+    /// switching action tabs never destroys work. Save writes whichever tab
+    /// is active.
+    pub(super) send_text_content: text_editor::Content,
+    /// Whether the send-text draft has been edited (or came from disk). An
+    /// unpinned draft is regenerated from the live matcher on every edit.
+    pub(super) action_text_pinned: bool,
+    /// As [`Self::action_text_pinned`], for the script draft.
+    pub(super) action_script_pinned: bool,
+    /// The language the Run JavaScript tab writes: `JS`, or `TS` when the
+    /// automation opened as TypeScript (a TS alias stays TS on save).
+    pub(super) action_script_lang: ScriptLang,
     /// The alias Simple-pattern field's buffer; `alias_draft.pattern_source`
     /// mirrors it after every edit (the draft stays the compile input).
     pub(super) alias_pattern_content: text_editor::Content,
@@ -858,6 +872,10 @@ impl AutomationsWindow {
             chip: Chip::All,
             new_menu_open: false,
             editor_content: text_editor::Content::new(),
+            send_text_content: text_editor::Content::new(),
+            action_text_pinned: false,
+            action_script_pinned: false,
+            action_script_lang: ScriptLang::JS,
             alias_pattern_content: text_editor::Content::new(),
             alias_regex_content: text_editor::Content::new(),
             trigger_row_contents: Vec::new(),
@@ -1020,7 +1038,8 @@ impl AutomationsWindow {
         if Self::is_edit_message(&message) {
             self.dirty = true;
         }
-        match message {
+        let refresh_generated = Self::affects_captures(&message);
+        let update = match message {
             // -------- loading ----------------------------------------------
             Message::ScriptsLoaded(scripts, errors) => {
                 self.scripts = scripts;
@@ -1284,10 +1303,16 @@ impl AutomationsWindow {
                 Update::none()
             }
             Message::InsertReference(reference) => {
-                self.editor_content
-                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        Arc::new(reference),
-                    )));
+                // The badge inserts into whichever action tab is active.
+                let paste =
+                    text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(reference)));
+                if self.open_action_language() == Some(ScriptLang::Plaintext) {
+                    self.action_text_pinned = true;
+                    self.send_text_content.perform(paste);
+                } else {
+                    self.action_script_pinned = true;
+                    self.editor_content.perform(paste);
+                }
                 Update::none()
             }
             Message::SetScriptFolder(folder) => self.set_script_folder(folder),
@@ -1328,7 +1353,17 @@ impl AutomationsWindow {
                 Update::none()
             }
             Message::ScriptEditorAction(action) => {
+                if action.is_edit() {
+                    self.action_script_pinned = true;
+                }
                 self.editor_content.perform(action);
+                Update::none()
+            }
+            Message::SendTextAction(action) => {
+                if action.is_edit() {
+                    self.action_text_pinned = true;
+                }
+                self.send_text_content.perform(action);
                 Update::none()
             }
             Message::ToggleTryIt => {
@@ -1919,7 +1954,13 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
+        };
+        // An unpinned action draft follows the live matcher: any edit that can
+        // change what is captured regenerates the example bodies.
+        if refresh_generated {
+            self.refresh_generated_actions();
         }
+        update
     }
 
     // ---- guards ------------------------------------------------------------
@@ -1927,6 +1968,7 @@ impl AutomationsWindow {
     fn is_edit_message(message: &Message) -> bool {
         match message {
             Message::ScriptEditorAction(action)
+            | Message::SendTextAction(action)
             | Message::AliasPatternAction(action)
             | Message::AliasRegexAction(action)
             | Message::RowSourceAction(_, action) => {
@@ -1960,6 +2002,46 @@ impl AutomationsWindow {
             | Message::InsertReference(_)
             | Message::MarkHotkeyState(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether a message can change what the open matcher captures — the
+    /// signal to regenerate any unpinned action draft.
+    fn affects_captures(message: &Message) -> bool {
+        match message {
+            Message::AliasPatternAction(action)
+            | Message::AliasRegexAction(action)
+            | Message::RowSourceAction(_, action) => {
+                matches!(action, text_editor::Action::Edit(_))
+            }
+            Message::SetAliasKind(_)
+            | Message::SetCommandName(_)
+            | Message::SetArgName(_, _)
+            | Message::SetArgKind(_, _)
+            | Message::AddArg
+            | Message::RemoveArg(_)
+            | Message::SetCmdMode(_)
+            | Message::AddPattern
+            | Message::AddExceptionRow
+            | Message::AddRawRow
+            | Message::SetTriggerCard(_)
+            | Message::RemovePattern(_)
+            | Message::MoveRowUp(_)
+            | Message::MoveRowDown(_)
+            | Message::SetRowSyntax(_, _) => true,
+            _ => false,
+        }
+    }
+
+    /// The action language of the open alias/trigger editor, if one is open.
+    fn open_action_language(&self) -> Option<ScriptLang> {
+        match &self.pane {
+            Pane::Editor(EditorState { node, .. }) => match node {
+                EditNode::Alias(alias) => Some(alias.language),
+                EditNode::Trigger { language, .. } => Some(*language),
+                EditNode::Hotkey(_) => None,
+            },
+            _ => None,
         }
     }
 

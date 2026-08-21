@@ -93,13 +93,15 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
 
-        let body = match &script {
-            Script::Alias(a) => a.script.clone().unwrap_or_default(),
-            Script::Hotkey(h) => h.script.clone().unwrap_or_default(),
-            Script::Trigger(t) => t.script.clone().unwrap_or_default(),
+        match &script {
+            Script::Alias(a) => self.seed_action_buffers(a.language, a.script.as_deref()),
+            Script::Trigger(t) => self.seed_action_buffers(t.language, t.script.as_deref()),
+            Script::Hotkey(h) => {
+                self.editor_content =
+                    text_editor::Content::with_text(h.script.as_deref().unwrap_or_default());
+            }
             Script::Folder(_, _) => return Update::none(),
-        };
-        self.editor_content = text_editor::Content::with_text(&body);
+        }
 
         let node = match script {
             Script::Alias(a) => {
@@ -145,13 +147,100 @@ impl AutomationsWindow {
             node,
             error: None,
         });
+        // The inactive action tab starts with a generated example body.
+        self.refresh_generated_actions();
         Update::none()
+    }
+
+    /// Seeds the two action drafts from a stored automation: the stored body
+    /// lands in its language's tab, pinned (saved work is never regenerated
+    /// over — a file-backed body, `script: None`, pins as empty for the same
+    /// reason); the other tab starts unpinned so it can carry a generated
+    /// example until edited.
+    fn seed_action_buffers(&mut self, language: ScriptLang, body: Option<&str>) {
+        self.action_script_lang = if language == ScriptLang::TS {
+            ScriptLang::TS
+        } else {
+            ScriptLang::JS
+        };
+        let stored = body.unwrap_or_default();
+        if language == ScriptLang::Plaintext {
+            self.send_text_content = text_editor::Content::with_text(stored);
+            self.editor_content = text_editor::Content::new();
+            self.action_text_pinned = true;
+            self.action_script_pinned = false;
+        } else {
+            self.editor_content = text_editor::Content::with_text(stored);
+            self.send_text_content = text_editor::Content::new();
+            self.action_script_pinned = true;
+            self.action_text_pinned = false;
+        }
+    }
+
+    /// Resets both action drafts for a create pane: unpinned, so they carry
+    /// generated example bodies until the user edits one.
+    fn reset_action_buffers(&mut self) {
+        self.editor_content = text_editor::Content::new();
+        self.send_text_content = text_editor::Content::new();
+        self.action_text_pinned = false;
+        self.action_script_pinned = false;
+        self.action_script_lang = ScriptLang::JS;
+    }
+
+    /// Regenerates any unpinned action draft from the live matcher
+    /// (`matching-logic.md` §8): until the user edits a draft, its example
+    /// body tracks the captures, so it can never reference one that doesn't
+    /// exist. Any edit pins the draft and ends the tracking.
+    pub(super) fn refresh_generated_actions(&mut self) {
+        let computed = match &self.pane {
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(_),
+                ..
+            }) => {
+                let kind = if self.alias_draft.kind == AliasKind::Pattern {
+                    ExampleKind::AliasEmote
+                } else {
+                    ExampleKind::AliasSay
+                };
+                Some((
+                    kind,
+                    self.alias_capture_references(ScriptLang::Plaintext),
+                    self.alias_capture_references(ScriptLang::JS),
+                ))
+            }
+            Pane::Editor(EditorState {
+                node: EditNode::Trigger { rows, .. },
+                ..
+            }) => Some((
+                ExampleKind::Trigger,
+                Self::trigger_capture_references(rows, ScriptLang::Plaintext),
+                Self::trigger_capture_references(rows, ScriptLang::JS),
+            )),
+            _ => None,
+        };
+        let Some((kind, text_references, script_references)) = computed else {
+            return;
+        };
+        if !self.action_text_pinned {
+            self.send_text_content = text_editor::Content::with_text(&generated_body(
+                kind,
+                text_references.first().map(String::as_str),
+                false,
+            ));
+        }
+        if !self.action_script_pinned {
+            self.editor_content = text_editor::Content::with_text(&generated_body(
+                kind,
+                script_references.first().map(String::as_str),
+                true,
+            ));
+        }
     }
 
     pub(super) fn new_alias(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
-        self.editor_content = text_editor::Content::new();
+        self.reset_action_buffers();
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
@@ -175,13 +264,14 @@ impl AutomationsWindow {
             }),
             error: None,
         });
+        self.refresh_generated_actions();
         Update::none()
     }
 
     pub(super) fn new_trigger(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
-        self.editor_content = text_editor::Content::new();
+        self.reset_action_buffers();
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
@@ -202,6 +292,7 @@ impl AutomationsWindow {
             },
             error: None,
         });
+        self.refresh_generated_actions();
         Update::none()
     }
 
@@ -450,7 +541,24 @@ impl AutomationsWindow {
             None
         };
 
-        let body = self.editor_content.text();
+        // The body comes from whichever action tab is active: the send-text
+        // draft for a Plaintext action, the script draft otherwise. Hotkeys
+        // and modules only ever use the script buffer.
+        let body = match &self.pane {
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(a),
+                ..
+            }) if a.language == ScriptLang::Plaintext => self.send_text_content.text(),
+            Pane::Editor(EditorState {
+                node:
+                    EditNode::Trigger {
+                        language: ScriptLang::Plaintext,
+                        ..
+                    },
+                ..
+            }) => self.send_text_content.text(),
+            _ => self.editor_content.text(),
+        };
         let body = body.trim_end_matches('\n').to_string();
         let final_script = match &self.pane {
             Pane::Editor(EditorState { node, .. }) => match node {
@@ -1199,7 +1307,7 @@ impl AutomationsWindow {
                         .size(12.0)
                         .font(fonts::GEIST_MONO_VF),
                 )
-                .style(button_style::secondary)
+                .style(capture_badge_style)
                 .on_press(Message::InsertReference(reference))
                 .padding([3, 8]),
             );
@@ -1300,36 +1408,96 @@ impl AutomationsWindow {
         .into()
     }
 
-    /// The send-text action body: the shared body editor with `$ref`
-    /// highlighting — known references take the capture accent, unknown ones
-    /// the error color (`matching-logic.md` §9).
-    fn send_text_editor<'a>(&'a self, known: Vec<String>) -> Elem<'a> {
-        let editor = text_editor(&self.editor_content)
-            .highlight_with::<highlight::PatternHighlighter>(
-                highlight::FieldSyntax::SendText { known },
-                token_format,
+    /// The action module: the `Send text | Run JavaScript` tab strip fused to
+    /// the body editor it labels — the tab IS the field's label. Each tab has
+    /// its own draft, so switching never destroys work; a TS automation opens
+    /// under (and saves from) the JavaScript tab as TS.
+    fn action_module<'a>(&'a self, language: ScriptLang, references: Vec<String>) -> Elem<'a> {
+        let text_active = language == ScriptLang::Plaintext;
+        let tab = |label: &'static str, active: bool, message: Message| {
+            button(
+                column![
+                    text(label).size(13.0).style(if active {
+                        common::regular
+                    } else {
+                        common::muted
+                    }),
+                    container(Space::new())
+                        .height(Length::Fixed(2.0))
+                        .width(Length::Fill)
+                        .style(move |_theme: &Theme| iced::widget::container::Style {
+                            background: Some(iced::Background::Color(if active {
+                                common::KIND_PATTERN
+                            } else {
+                                iced::Color::TRANSPARENT
+                            })),
+                            ..Default::default()
+                        }),
+                ]
+                .spacing(4.0),
             )
-            .font(fonts::GEIST_MONO_VF)
-            .on_action(Message::ScriptEditorAction)
-            .height(Length::Fixed(220.0));
-        column![
-            common::section_label(crate::i18n::ts!("editor-script")),
-            container(editor).style(common::code_surface_style),
+            .style(|_theme: &Theme, _status| iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding(Padding {
+                top: 4.0,
+                bottom: 0.0,
+                left: 2.0,
+                right: 2.0,
+            })
+            .on_press(message)
+        };
+        let strip = row![
+            tab(
+                crate::i18n::ts!("editor-tab-send-text"),
+                text_active,
+                Message::SetBehavior(ScriptLang::Plaintext),
+            ),
+            tab(
+                crate::i18n::ts!("editor-tab-run-js"),
+                !text_active,
+                Message::SetBehavior(self.action_script_lang),
+            ),
         ]
-        .spacing(6.0)
-        .into()
-    }
+        .spacing(16.0);
 
-    /// The action body editor for `language`: `$ref`-aware for send-text
-    /// bodies, the stock code highlighter for scripts. `known` is every
-    /// reference the current matcher provides, `$0` included.
-    fn action_body_editor<'a>(&'a self, language: ScriptLang, mut known: Vec<String>) -> Elem<'a> {
-        if language == ScriptLang::Plaintext {
+        let editor: Elem<'a> = if text_active {
+            let mut known = references;
             known.push("$0".to_string());
-            self.send_text_editor(known)
+            text_editor(&self.send_text_content)
+                .highlight_with::<highlight::PatternHighlighter>(
+                    highlight::FieldSyntax::SendText { known },
+                    token_format,
+                )
+                .font(fonts::GEIST_MONO_VF)
+                .size(13.0)
+                .padding(10.0)
+                .on_action(Message::SendTextAction)
+                .min_height(120.0)
+                .into()
         } else {
-            self.code_editor(language)
-        }
+            let token = match self.action_script_lang {
+                ScriptLang::TS => "ts",
+                _ => "js",
+            }
+            .to_string();
+            text_editor(&self.editor_content)
+                .highlight_with::<iced::highlighter::Highlighter>(
+                    iced::highlighter::Settings {
+                        theme: iced::highlighter::Theme::SolarizedDark,
+                        token,
+                    },
+                    |h: &iced::highlighter::Highlight, _| h.to_format(),
+                )
+                .font(fonts::GEIST_MONO_VF)
+                .on_action(Message::ScriptEditorAction)
+                .height(Length::Fixed(220.0))
+                .into()
+        };
+        column![strip, container(editor).style(common::code_surface_style)]
+            .spacing(0.0)
+            .into()
     }
 
     /// The syntax-highlighted code body editor.
@@ -1433,10 +1601,10 @@ impl AutomationsWindow {
         alias: &'a aliases::AliasDefinition,
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
-        let badge_label = if alias.language == ScriptLang::JS {
-            "JavaScript"
-        } else {
+        let badge_label = if alias.language == ScriptLang::Plaintext {
             crate::i18n::ts!("editor-text")
+        } else {
+            "JavaScript"
         };
         let title = if create {
             crate::i18n::ts!("editor-new-alias")
@@ -1536,12 +1704,11 @@ impl AutomationsWindow {
         }
         body = body.push(self.tester_box(true, false));
         body = body.push(self.order_module(alias.priority, alias.fallthrough, None, false));
-        body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
         let references = self.alias_capture_references(alias.language);
         if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
         }
-        body = body.push(self.action_body_editor(alias.language, references));
+        body = body.push(self.action_module(alias.language, references));
         if let Some(bar) = self.save_bar(
             create,
             !create,
@@ -1653,12 +1820,17 @@ impl AutomationsWindow {
             .iter()
             .any(|row| !row.source.trim().is_empty() && row.compiled().is_err());
         let status = Self::editor_status(create, enabled, any_invalid);
+        let badge_label = if language == ScriptLang::Plaintext {
+            crate::i18n::ts!("editor-text")
+        } else {
+            "JavaScript"
+        };
 
         let mut body = column![self.scene_header_with_aside(
             Some(status),
             title,
             Some(subtitle),
-            Some(self.header_actions("JavaScript", enabled)),
+            Some(self.header_actions(badge_label, enabled)),
             self.folder_aside(trigger_package(state)),
         )]
         .spacing(16.0);
@@ -1836,12 +2008,11 @@ impl AutomationsWindow {
             .any(|row| row.role == PatternKind::Raw && !row.source.trim().is_empty());
         body = body.push(self.tester_box(false, has_raw));
         body = body.push(self.order_module(priority, fallthrough, Some(prompt), true));
-        body = body.push(field_row("Behavior", self.behavior_radios(language)));
         let references = Self::trigger_capture_references(rows, language);
         if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
         }
-        body = body.push(self.action_body_editor(language, references));
+        body = body.push(self.action_module(language, references));
         if let Some(bar) = self.save_bar(
             create,
             !create,
@@ -3240,6 +3411,77 @@ fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style 
         NodeStatus::Error => common::danger,
         NodeStatus::Warning => common::warning,
         NodeStatus::Disabled => common::muted,
+    }
+}
+
+/// A capture badge on the Matched-values rail (visual-contract §5): the
+/// lavender-family fill and border that mean "a value the script receives",
+/// lifted on hover.
+fn capture_badge_style(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let fill = iced::Color::from_rgb8(0x7C, 0x57, 0xFF);
+    let hovered = matches!(
+        status,
+        iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+    );
+    iced::widget::button::Style {
+        background: Some(iced::Background::Color(fill.scale_alpha(if hovered {
+            0.3
+        } else {
+            0.14
+        }))),
+        border: iced::Border {
+            color: iced::Color::from_rgb8(0x4E, 0x37, 0x83),
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: theme.styles.text.normal,
+        ..Default::default()
+    }
+}
+
+/// Which generated example a pane shows (`matching-logic.md` §8).
+#[derive(Clone, Copy)]
+enum ExampleKind {
+    /// Alias, Command or Regex kind: the `say Hello` example.
+    AliasSay,
+    /// Alias, Simple-pattern kind: the `emote` example.
+    AliasEmote,
+    /// Trigger: the `say I heard about` example.
+    Trigger,
+}
+
+/// One generated action body, in the deck's words: the example line with the
+/// first capture reference interpolated (or the no-captures variant), wrapped
+/// in ``send(`…`);`` for the script tab.
+fn generated_body(kind: ExampleKind, reference: Option<&str>, script: bool) -> String {
+    let hole = reference.map(|reference| {
+        if script {
+            format!("${{{reference}}}")
+        } else {
+            reference.to_string()
+        }
+    });
+    let line = match (kind, hole) {
+        (ExampleKind::AliasSay, Some(hole)) => {
+            crate::i18n::t!("editor-gen-alias-hello", "hole" => hole)
+        }
+        (ExampleKind::AliasSay, None) => crate::i18n::t!("editor-gen-alias-hello-none"),
+        (ExampleKind::AliasEmote, Some(hole)) => {
+            crate::i18n::t!("editor-gen-alias-emote", "hole" => hole)
+        }
+        (ExampleKind::AliasEmote, None) => crate::i18n::t!("editor-gen-alias-emote-none"),
+        (ExampleKind::Trigger, Some(hole)) => {
+            crate::i18n::t!("editor-gen-trigger", "hole" => hole)
+        }
+        (ExampleKind::Trigger, None) => crate::i18n::t!("editor-gen-trigger-none"),
+    };
+    if script {
+        format!("send(`{line}`);")
+    } else {
+        line
     }
 }
 
