@@ -12,6 +12,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use encoding_rs::Encoding;
+
 use super::telnet::{frame_subnegotiation, option};
 
 /// TTYPE subnegotiation command bytes (RFC 1091).
@@ -159,19 +161,110 @@ pub mod charset {
     pub const ACCEPTED: u8 = 2;
     /// "None of those" — no offered label is supported.
     pub const REJECTED: u8 = 3;
+    /// A translation table, offered in answer to a `REQUEST` carrying `[TTABLE]`.
+    pub const TTABLE_IS: u8 = 4;
+    /// "I cannot use that translation table." RFC 2066 §2 makes this one of the four
+    /// messages every CHARSET implementation MUST support, even one that never sends a
+    /// `TTABLE-IS` of its own — it is the only way to end an exchange a server opened with
+    /// one, and silence would strand the server mid-subnegotiation (§5: another cannot
+    /// start until this one completes).
+    pub const TTABLE_REJECTED: u8 = 5;
 
-    /// The `[TTABLE]` marker an RFC 2066 REQUEST may carry before the separator.
-    /// Translation tables are a dead letter nobody implements; a request carrying one is
-    /// answered `REJECTED` outright.
+    /// The `[TTABLE]` marker a REQUEST may carry, ahead of a version octet and then the
+    /// ordinary charset list: RFC 2066 §2 gives the shape as
+    /// `REQUEST { "[TTABLE ]" <Version> } <char set list>`.
+    ///
+    /// The marker is an *offer* — "answer with a translation table if you would rather" —
+    /// not a replacement for the list. Declining the table is right (nobody implements
+    /// them); declining the request is not, since §2 reserves `REJECTED` for a receiver
+    /// "not capable of handling any of the specified character sets", and the list the
+    /// marker precedes may well name one we speak.
     const TTABLE_MARKER: &[u8] = b"[TTABLE]";
+
+    /// The separator our own REQUEST uses. RFC 2066 reads the byte after `REQUEST` as the
+    /// separator for that message; a space is the RFC's own example and the form a legacy
+    /// server is likeliest to parse.
+    const REQUEST_SEPARATOR: u8 = b' ';
+
+    /// The charsets our REQUEST offers, in preference order, for a connection configured to
+    /// `configured`.
+    ///
+    /// UTF-8 alone by default. When the per-server `encoding` setting names something else it
+    /// leads and UTF-8 follows: the setting is the user's stated preference, so a server that
+    /// speaks it should honor it, while a server that cannot still gets a way off whatever
+    /// legacy default it would otherwise have used.
+    ///
+    /// Deliberately short. Every label offered is one the server may pick, and outbound
+    /// commands then have to *encode* into it — a wide offer list buys a little decoding
+    /// fidelity and risks turning an em-dash in a user's command into a refused send.
+    #[must_use]
+    pub fn offer(configured: &'static Encoding) -> Vec<&'static Encoding> {
+        if configured == UTF_8 {
+            vec![UTF_8]
+        } else {
+            vec![configured, UTF_8]
+        }
+    }
+
+    /// Frame our own `REQUEST` — the client half of RFC 2066's minimal implementation, owed
+    /// the moment we answer `DO CHARSET` with `WILL CHARSET`.
+    pub fn frame_request(configured: &'static Encoding, replies: &mut Vec<u8>) {
+        let offered = offer(configured);
+        let mut payload = Vec::with_capacity(
+            1 + offered
+                .iter()
+                .map(|encoding| encoding.name().len() + 1)
+                .sum::<usize>(),
+        );
+        payload.push(REQUEST);
+        for encoding in offered {
+            payload.push(REQUEST_SEPARATOR);
+            payload.extend_from_slice(encoding.name().as_bytes());
+        }
+        frame_subnegotiation(option::CHARSET, &payload, replies);
+    }
+
+    /// The encoding a server's answer to *our* REQUEST selects, or `None` to stay put.
+    ///
+    /// `None` covers `REJECTED` (RFC 2066: nothing offered was supported), a malformed answer,
+    /// and — the case worth the check — an `ACCEPTED` naming a charset we never offered. The
+    /// server picks *from our list*; honoring anything else would let it move the whole
+    /// session onto an encoding we may not be able to encode commands in. Labels are compared
+    /// by the encoding they resolve to, not byte-wise, so a server echoing `utf8` or `UTF-8 `
+    /// still matches.
+    #[must_use]
+    pub fn accepted_encoding(
+        payload: &[u8],
+        configured: &'static Encoding,
+    ) -> Option<&'static Encoding> {
+        let (&code, label) = payload.split_first()?;
+        if code != ACCEPTED {
+            return None;
+        }
+        let picked = Encoding::for_label_no_replacement(label)?;
+        offer(configured).contains(&picked).then_some(picked)
+    }
 
     /// Answer one CHARSET `REQUEST`, framing `ACCEPTED <label>` or `REJECTED` into
     /// `replies` and returning the encoding to switch the connection to (`None` on
     /// reject). Payload shape: `<sep> name <sep> name …` where the first byte is the
-    /// separator; UTF-8 is preferred whenever offered, otherwise the first label
-    /// `encoding_rs` resolves wins. Labels echo back exactly as the server spelled them.
-    pub fn answer_request(payload: &[u8], replies: &mut Vec<u8>) -> Option<&'static Encoding> {
-        if let Some((label, encoding)) = choose(payload) {
+    /// separator. Labels echo back exactly as the server spelled them.
+    ///
+    /// `configured` is the per-server `encoding` setting, and it is preferred over UTF-8
+    /// whenever the server offers both — the same order [`offer`] puts on the wire when we
+    /// are the side asking, so the preference reads the same from either end.
+    ///
+    /// It is only a preference in one of those directions. When we drive, the *server* picks
+    /// from our list, and §2 lets it "choose one based on its own preferences" rather than
+    /// take the first it can handle — so a UTF-8-preferring server can still land the
+    /// connection on UTF-8 with `configured` leading the offer. What this ordering removes is
+    /// smudgy contradicting itself, not the server's last word.
+    pub fn answer_request(
+        payload: &[u8],
+        configured: &'static Encoding,
+        replies: &mut Vec<u8>,
+    ) -> Option<&'static Encoding> {
+        if let Some((label, encoding)) = choose(payload, configured) {
             let mut reply = Vec::with_capacity(label.len() + 1);
             reply.push(ACCEPTED);
             reply.extend_from_slice(label);
@@ -186,27 +279,46 @@ pub mod charset {
     /// The `(label, encoding)` pick for a REQUEST payload, or `None` when nothing offered
     /// is supported (or the request is malformed / carries a TTABLE).
     ///
+    /// Preference order: `configured` first — the user named it for this server, so a server
+    /// able to speak it should — then UTF-8 wherever in the list it appears, then the first
+    /// label `encoding_rs` resolves. The list order the server sent is only the tiebreak;
+    /// RFC 2066 §2 leaves the pick to the receiver ("may choose one based on its own
+    /// preferences").
+    ///
     /// `for_label_no_replacement`, not `for_label`: the WHATWG mapping resolves the
     /// ISO-2022-CN/KR and HZ labels to the *replacement* encoding, whose decoder collapses
     /// every input run to a single U+FFFD — accepting one would destroy the whole session's
     /// feed. Those labels must be REJECTED like any other unsupported charset.
-    fn choose(payload: &[u8]) -> Option<(&[u8], &'static Encoding)> {
-        if payload.starts_with(TTABLE_MARKER) {
-            return None;
-        }
-        let (&sep, names) = payload.split_first()?;
+    fn choose<'a>(
+        payload: &'a [u8],
+        configured: &'static Encoding,
+    ) -> Option<(&'a [u8], &'static Encoding)> {
+        // Skip a leading `[TTABLE]` and the version octet behind it; what follows is an
+        // ordinary charset list, and the table on offer is simply not taken up.
+        let list = match payload.strip_prefix(TTABLE_MARKER) {
+            Some(versioned) => versioned.split_first()?.1,
+            None => payload,
+        };
+        let (&sep, names) = list.split_first()?;
+        let mut utf8 = None;
         let mut first_supported = None;
         for label in names.split(|&b| b == sep).filter(|l| !l.is_empty()) {
             if let Some(encoding) = Encoding::for_label_no_replacement(label) {
-                if encoding == UTF_8 {
+                // Nothing later in the list can outrank the configured encoding, so the
+                // first spelling of it settles the pick. (When `configured` *is* UTF-8 the
+                // two preferences coincide and this is the UTF-8 early-out.)
+                if encoding == configured {
                     return Some((label, encoding));
+                }
+                if encoding == UTF_8 && utf8.is_none() {
+                    utf8 = Some((label, encoding));
                 }
                 if first_supported.is_none() {
                     first_supported = Some((label, encoding));
                 }
             }
         }
-        first_supported
+        utf8.or(first_supported)
     }
 }
 
@@ -250,6 +362,14 @@ pub struct ProtocolState {
     /// The dimensions most recently put on the wire, so a size-change wakeup only sends a
     /// NAWS update when the current size actually differs.
     last_sent_dims: Option<(u16, u16)>,
+    /// Whether a CHARSET `REQUEST` of ours is outstanding. Gates the answer path, so an
+    /// `ACCEPTED` nobody asked for can never move the connection's encoding.
+    charset_requested: bool,
+    /// Whether that outstanding request still holds outbound text (RFC 2066 §5). Set only
+    /// when the offer could actually change our outbound encoding, and cleared by
+    /// [`release_charset_hold`](Self::release_charset_hold) when the socket task gives up
+    /// waiting — separate from `charset_requested`, so a late answer still lands.
+    charset_hold: bool,
 }
 
 impl ProtocolState {
@@ -260,6 +380,8 @@ impl ProtocolState {
             secure,
             window_size,
             last_sent_dims: None,
+            charset_requested: false,
+            charset_hold: false,
         }
     }
 
@@ -317,6 +439,74 @@ impl ProtocolState {
         frame_naws(dims, replies);
         true
     }
+
+    /// Send our CHARSET `REQUEST`, framed into `replies` right behind the `WILL CHARSET` that
+    /// occasioned it. RFC 2066's minimal implementation in full: a server that sent only `DO`
+    /// may not request, so if we do not ask, no charset is ever negotiated.
+    ///
+    /// `active` is the encoding outbound text is being written in right now. If every charset
+    /// offered *is* that encoding, no answer can change how we encode and the exchange is
+    /// invisible to the write path; otherwise the request also takes the §5 outbound hold
+    /// ([`charset_holds_outbound`](Self::charset_holds_outbound)).
+    pub fn send_charset_request(
+        &mut self,
+        configured: &'static Encoding,
+        active: &'static Encoding,
+        replies: &mut Vec<u8>,
+    ) {
+        self.charset_requested = true;
+        self.charset_hold = charset::offer(configured)
+            .iter()
+            .any(|offered| *offered != active);
+        charset::frame_request(configured, replies);
+    }
+
+    /// Whether outbound text must wait for the answer to our `REQUEST` (RFC 2066 §5: "While a
+    /// CHARSET subnegotiation is in progress, data SHOULD be queued").
+    ///
+    /// The rule matters in this direction and no other. A server changes how it *decodes* our
+    /// stream the moment it sends `ACCEPTED`, and we have no way to mark that position in a
+    /// stream flowing the other way — so for one round trip anything we write is read under a
+    /// charset we did not encode it in. (The mirror case is safe for free: when the server
+    /// requests and we answer, it switches on receiving our `ACCEPTED`, and everything sent
+    /// before that arrives before it.)
+    #[must_use]
+    pub const fn charset_holds_outbound(&self) -> bool {
+        self.charset_requested && self.charset_hold
+    }
+
+    /// Give up holding outbound text: the answer is taking too long, and a server that ignores
+    /// a `REQUEST` outright is ordinary rather than exceptional. Only the hold is dropped — the
+    /// request stays outstanding, so an answer that does eventually arrive is still honored
+    /// (by then it describes a switch we can only make going forward anyway).
+    pub const fn release_charset_hold(&mut self) {
+        self.charset_hold = false;
+    }
+
+    /// The encoding the server's answer to our outstanding `REQUEST` switches us to, or `None`
+    /// to stay on the configured one — including when no request of ours is outstanding, so an
+    /// unsolicited `ACCEPTED` is inert. Either kind of answer closes the exchange.
+    pub fn on_charset_answer(
+        &mut self,
+        payload: &[u8],
+        configured: &'static Encoding,
+    ) -> Option<&'static Encoding> {
+        if !self.charset_requested {
+            return None;
+        }
+        self.charset_requested = false;
+        self.charset_hold = false;
+        charset::accepted_encoding(payload, configured)
+    }
+
+    /// Drop any outstanding `REQUEST`. Two callers: the option going away (a later
+    /// renegotiation then starts clean), and a server `REQUEST` arriving while ours is in
+    /// flight — RFC 2066's simultaneous-request rule gives the server's the right of way, and
+    /// the negative acknowledgment it owes ours is then nothing we need to wait for.
+    pub fn reset_charset_request(&mut self) {
+        self.charset_requested = false;
+        self.charset_hold = false;
+    }
 }
 
 /// Frame one NAWS dimension report (RFC 1073): two 16-bit big-endian values.
@@ -332,7 +522,8 @@ mod tests {
     use super::super::telnet::command::{IAC, SB, SE};
     use super::super::telnet::option::{NAWS, NEW_ENVIRON, TTYPE};
     use super::{
-        CLIENT_NAME, ProtocolState, TERMINAL_TYPE, mtts, new_environ, pack_dims, ttype, unpack_dims,
+        CLIENT_NAME, ProtocolState, TERMINAL_TYPE, charset, mtts, new_environ, pack_dims, ttype,
+        unpack_dims,
     };
 
     /// Strip one `IAC SB <opt> … IAC SE` frame, returning the option and payload.
@@ -526,12 +717,15 @@ mod tests {
         assert_eq!(payload, vec![0, 1, 0, 1], "0x0 must never reach the wire");
     }
 
+    /// UTF-8 outranks whatever the server listed first, so long as the per-server
+    /// `encoding` setting is not itself on offer.
     #[test]
     fn charset_request_prefers_utf8_over_earlier_offers() {
         use super::super::telnet::option::CHARSET;
         use super::charset;
         let mut replies = Vec::new();
-        let enc = charset::answer_request(b";big5;UTF-8;iso-8859-1", &mut replies);
+        let enc =
+            charset::answer_request(b";big5;UTF-8;iso-8859-1", encoding_rs::UTF_8, &mut replies);
         assert_eq!(enc, Some(encoding_rs::UTF_8));
         let (opt, payload) = unframe(&replies);
         assert_eq!(opt, CHARSET);
@@ -543,27 +737,112 @@ mod tests {
         );
     }
 
+    /// The configured encoding outranks UTF-8 when the server offers both — the same order
+    /// [`charset::offer`] puts on the wire, so the outcome does not depend on which side
+    /// opened the negotiation.
+    #[test]
+    fn charset_request_prefers_the_configured_encoding_over_utf8() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(
+            b";UTF-8;windows-1252",
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        assert_eq!(
+            enc,
+            Some(encoding_rs::WINDOWS_1252),
+            "the user named windows-1252 for this server; a server that speaks it should"
+        );
+        let (_, payload) = unframe(&replies);
+        assert_eq!(&payload[1..], b"windows-1252");
+    }
+
+    /// Configured-beats-UTF-8 applies only when the server actually offers it; otherwise
+    /// UTF-8 still wins over the rest of the list.
+    #[test]
+    fn charset_request_falls_back_to_utf8_when_configured_is_not_offered() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(b";big5;UTF-8", encoding_rs::WINDOWS_1252, &mut replies);
+        assert_eq!(enc, Some(encoding_rs::UTF_8));
+        let (_, payload) = unframe(&replies);
+        assert_eq!(&payload[1..], b"UTF-8");
+    }
+
+    /// Labels are compared by the encoding they resolve to, so a server spelling the
+    /// configured charset differently than the setting does still matches.
+    #[test]
+    fn charset_request_matches_configured_by_encoding_not_spelling() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc =
+            charset::answer_request(b";UTF-8;cp1252", encoding_rs::WINDOWS_1252, &mut replies);
+        assert_eq!(enc, Some(encoding_rs::WINDOWS_1252));
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            &payload[1..],
+            b"cp1252",
+            "the echo keeps the server's spelling"
+        );
+    }
+
     #[test]
     fn charset_request_takes_the_first_resolvable_label() {
         use super::charset;
         let mut replies = Vec::new();
         // "NO-SUCH-CHARSET" resolves to nothing, so the first WHATWG-resolvable
         // offer (big5) wins over the later latin1.
-        let enc = charset::answer_request(b" NO-SUCH-CHARSET big5 latin1", &mut replies);
+        let enc = charset::answer_request(
+            b" NO-SUCH-CHARSET big5 latin1",
+            encoding_rs::UTF_8,
+            &mut replies,
+        );
         assert_eq!(enc, Some(encoding_rs::BIG5));
         let (_, payload) = unframe(&replies);
         assert_eq!(&payload[1..], b"big5");
     }
 
     #[test]
-    fn charset_request_with_nothing_supported_or_a_ttable_is_rejected() {
+    fn charset_request_with_nothing_supported_is_rejected() {
         use super::charset;
-        for payload in [&b";EBCDIC-US;KLINGON"[..], b"[TTABLE]\x01;UTF-8", b""] {
+        for payload in [&b";EBCDIC-US;KLINGON"[..], b""] {
             let mut replies = Vec::new();
-            assert_eq!(charset::answer_request(payload, &mut replies), None);
+            assert_eq!(
+                charset::answer_request(payload, encoding_rs::UTF_8, &mut replies),
+                None
+            );
             let (_, reply) = unframe(&replies);
             assert_eq!(reply, vec![charset::REJECTED], "payload {payload:02x?}");
         }
+    }
+
+    /// RFC 2066 §2 shapes a REQUEST as `{ "[TTABLE ]" <Version> } <char set list>`: the
+    /// marker offers a translation table, it does not replace the list behind it. Declining
+    /// the table must not decline a charset we speak — REJECTED is for a receiver "not
+    /// capable of handling any of the specified character sets".
+    #[test]
+    fn charset_request_reads_the_list_behind_a_ttable_marker() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc = charset::answer_request(b"[TTABLE]\x01;UTF-8", encoding_rs::UTF_8, &mut replies);
+        assert_eq!(enc, Some(encoding_rs::UTF_8));
+        let (_, payload) = unframe(&replies);
+        assert_eq!(payload[0], charset::ACCEPTED);
+        assert_eq!(&payload[1..], b"UTF-8");
+    }
+
+    /// A TTABLE request whose list holds nothing we speak is still a REJECTED, on the
+    /// strength of the list rather than the marker.
+    #[test]
+    fn charset_request_with_a_ttable_and_no_usable_label_is_rejected() {
+        use super::charset;
+        let mut replies = Vec::new();
+        let enc =
+            charset::answer_request(b"[TTABLE]\x01;KLINGON", encoding_rs::UTF_8, &mut replies);
+        assert_eq!(enc, None);
+        let (_, reply) = unframe(&replies);
+        assert_eq!(reply, vec![charset::REJECTED]);
     }
 
     /// The WHATWG mapping resolves these labels to the *replacement* encoding, whose
@@ -576,13 +855,150 @@ mod tests {
             let mut replies = Vec::new();
             let payload = format!(";{label}");
             assert_eq!(
-                charset::answer_request(payload.as_bytes(), &mut replies),
+                charset::answer_request(payload.as_bytes(), encoding_rs::UTF_8, &mut replies),
                 None,
                 "label {label} must not be accepted"
             );
             let (_, reply) = unframe(&replies);
             assert_eq!(reply, vec![charset::REJECTED]);
         }
+    }
+
+    /// The default connection asks for UTF-8 and nothing else.
+    #[test]
+    fn charset_request_offers_utf8_alone_by_default() {
+        use super::super::telnet::option::CHARSET;
+        use super::charset;
+        let mut replies = Vec::new();
+        charset::frame_request(encoding_rs::UTF_8, &mut replies);
+        let (opt, payload) = unframe(&replies);
+        assert_eq!(opt, CHARSET);
+        assert_eq!(payload, [&[charset::REQUEST][..], b" UTF-8"].concat());
+    }
+
+    /// A per-server `encoding` override leads the offer; UTF-8 stays on as the fallback a
+    /// server that cannot speak the override can still take.
+    #[test]
+    fn charset_request_leads_with_the_configured_override() {
+        use super::charset;
+        let mut replies = Vec::new();
+        charset::frame_request(encoding_rs::WINDOWS_1252, &mut replies);
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            payload,
+            [&[charset::REQUEST][..], b" windows-1252 UTF-8"].concat()
+        );
+    }
+
+    /// An `ACCEPTED` counts only for a charset we actually offered, and only while a request
+    /// of ours is outstanding; `REJECTED` leaves the connection where it was.
+    #[test]
+    fn charset_answers_switch_only_on_an_offered_label() {
+        use super::charset;
+        let configured = encoding_rs::WINDOWS_1252;
+
+        let accepted_offered = [&[charset::ACCEPTED][..], b"utf8"].concat();
+        assert_eq!(
+            charset::accepted_encoding(&accepted_offered, configured),
+            Some(encoding_rs::UTF_8),
+            "label resolution is by encoding, not spelling"
+        );
+        for payload in [
+            &[&[charset::ACCEPTED][..], b"big5"].concat()[..],
+            &[&[charset::ACCEPTED][..], b"KLINGON"].concat(),
+            &[charset::REJECTED],
+            &[],
+        ] {
+            assert_eq!(
+                charset::accepted_encoding(payload, configured),
+                None,
+                "payload {payload:02x?}"
+            );
+        }
+    }
+
+    /// The `ACCEPTED` gate: solicited answers land, unsolicited ones are inert, and one
+    /// request is answered only once.
+    #[test]
+    fn charset_answers_are_ignored_without_an_outstanding_request() {
+        use super::charset;
+        let accepted = [&[charset::ACCEPTED][..], b"UTF-8"].concat();
+        let mut state = ProtocolState::with_fixed_dims(super::DEFAULT_DIMS);
+
+        assert_eq!(
+            state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
+            None,
+            "nothing was asked, so nothing may switch"
+        );
+
+        let mut replies = Vec::new();
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        assert_eq!(
+            state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
+            Some(encoding_rs::UTF_8)
+        );
+        assert_eq!(
+            state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
+            None,
+            "the exchange is closed by the first answer"
+        );
+
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        state.reset_charset_request();
+        assert_eq!(
+            state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
+            None,
+            "a withdrawn request accepts no answer"
+        );
+    }
+
+    /// The RFC 2066 §5 hold is taken only when an answer could change how we encode, and it
+    /// ends on the answer, on a reset, or when the socket task gives up — the last of which
+    /// leaves the request itself outstanding so a late answer still lands.
+    #[test]
+    fn the_outbound_hold_covers_only_a_request_that_could_change_the_encoding() {
+        let mut replies = Vec::new();
+        let mut state = ProtocolState::with_fixed_dims(super::DEFAULT_DIMS);
+        assert!(!state.charset_holds_outbound(), "nothing requested yet");
+
+        // UTF-8 offered to a UTF-8 connection: whatever the server answers, our encoder does
+        // not move, so the write path never notices the exchange.
+        state.send_charset_request(encoding_rs::UTF_8, encoding_rs::UTF_8, &mut replies);
+        assert!(!state.charset_holds_outbound());
+
+        // The override case: `windows-1252 UTF-8` offered while encoding windows-1252 — the
+        // UTF-8 fallback would change the encoder, so outbound waits.
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        assert!(state.charset_holds_outbound());
+
+        let accepted = [&[charset::ACCEPTED][..], b"UTF-8"].concat();
+        state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252);
+        assert!(!state.charset_holds_outbound(), "the answer ends the hold");
+
+        state.send_charset_request(
+            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252,
+            &mut replies,
+        );
+        state.release_charset_hold();
+        assert!(!state.charset_holds_outbound());
+        assert_eq!(
+            state.on_charset_answer(&accepted, encoding_rs::WINDOWS_1252),
+            Some(encoding_rs::UTF_8),
+            "giving up on the wait must not discard a late answer"
+        );
     }
 
     #[test]

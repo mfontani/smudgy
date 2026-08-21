@@ -88,9 +88,7 @@ static LAYERING_TEST_ESM: &[deno_core::ExtensionFileSource] =
         // only in InitMode::New), so runtime-added ops never appear there.
         // Runtime-added ops ARE (re)bound onto `Deno.core.ops` whenever
         // `skip_op_registration` is false — capture from there at eval time.
-        deno_core::ascii_str!(
-            "globalThis.__layeringDouble = Deno.core.ops.op_layering_double;\n"
-        ),
+        deno_core::ascii_str!("globalThis.__layeringDouble = Deno.core.ops.op_layering_double;\n"),
     )];
 
 /// The runtime boots from a startup snapshot holding only the deno_runtime base

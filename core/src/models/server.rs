@@ -34,9 +34,13 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_all_links: bool,
     /// The character encoding this server speaks, as an Encoding Standard label
-    /// (`"big5"`, `"iso-8859-1"`, …). `None` = UTF-8. CHARSET negotiation (RFC
-    /// 2066), when the server offers it, overrides this for the life of the
-    /// connection. An unresolvable label is logged and treated as UTF-8.
+    /// (`"big5"`, `"iso-8859-1"`, …). `None` = UTF-8. An unresolvable label is
+    /// logged and treated as UTF-8.
+    ///
+    /// This is a preference, not a floor: it leads what CHARSET negotiation (RFC
+    /// 2066) offers and wins over UTF-8 when a server offers both, but a server
+    /// that cannot speak it still settles the connection somewhere else for the
+    /// life of that connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
     /// Whether inbound compression offers (MCCP2) are accepted. On by default;

@@ -99,6 +99,61 @@ mod ingest {
         }
     }
 
+    impl TelnetBridge<'_> {
+        /// One CHARSET subnegotiation (RFC 2066), in either direction.
+        ///
+        /// A server REQUEST is answered — [`answer_request`](responders::charset::answer_request)
+        /// always frames a reply (ACCEPTED or the mandatory REJECTED) — and takes the right of
+        /// way over a REQUEST of ours still in flight (the simultaneous-request rule).
+        ///
+        /// Only `ACCEPTED` and `REJECTED` are answers to a REQUEST of ours, and only they close
+        /// the exchange. Anything else must leave our request outstanding: closing on a message
+        /// that is not an answer would discard the real answer behind it and leave the two sides
+        /// reading each other in different charsets. `TTABLE-IS` is declined explicitly, since
+        /// §5 lets no further subnegotiation start until this one completes and silence would
+        /// strand the server; the remaining codes are inert.
+        ///
+        /// Either way the transcoder switches at this exact stream position: encodings change
+        /// only after the ACCEPTED crosses, so in-order delivery makes the switch race-free.
+        fn on_charset_subnegotiation(&mut self, payload: &[u8]) {
+            use responders::charset;
+            let Some((&code, rest)) = payload.split_first() else {
+                return;
+            };
+            let switch_to = match code {
+                charset::REQUEST => {
+                    self.protocol.reset_charset_request();
+                    charset::answer_request(
+                        rest,
+                        self.transcode.configured_encoding(),
+                        self.replies,
+                    )
+                }
+                charset::ACCEPTED | charset::REJECTED => self
+                    .protocol
+                    .on_charset_answer(payload, self.transcode.configured_encoding()),
+                // We never offer `[TTABLE]`, so a table is unsolicited — but it is still a
+                // subnegotiation the server is waiting on, and TTABLE-REJECTED is the message
+                // RFC 2066 §2 requires every implementation to be able to send. It terminates
+                // the exchange, so any request of ours dies with it rather than waiting for an
+                // answer that is no longer coming.
+                charset::TTABLE_IS => {
+                    telnet::frame_subnegotiation(
+                        telnet::option::CHARSET,
+                        &[charset::TTABLE_REJECTED],
+                        self.replies,
+                    );
+                    self.protocol.reset_charset_request();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(encoding) = switch_to {
+                self.transcode.switch_to(encoding);
+            }
+        }
+    }
+
     impl telnet::TelnetSink for TelnetBridge<'_> {
         fn on_data(&mut self, data: &[u8]) {
             if self.transcode.is_passthrough() {
@@ -155,18 +210,7 @@ mod ingest {
                 return;
             }
             if option == telnet::option::CHARSET {
-                // RFC 2066: answer the server's REQUEST — `answer_request` always frames a
-                // reply (ACCEPTED or the mandatory REJECTED) — and switch the transcoder at
-                // this exact stream position: the server changes encodings only after
-                // seeing our ACCEPTED, so in-order delivery makes the switch race-free.
-                // ACCEPTED/REJECTED we never solicited (we don't initiate) fall through
-                // ignored.
-                if let Some((&responders::charset::REQUEST, offer)) = payload.split_first() {
-                    let accepted = responders::charset::answer_request(offer, self.replies);
-                    if let Some(encoding) = accepted {
-                        self.transcode.switch_to(encoding);
-                    }
-                }
+                self.on_charset_subnegotiation(payload);
                 return;
             }
             if option == telnet::option::MSDP {
@@ -249,6 +293,18 @@ mod ingest {
                     // A disable restarts the TTYPE cycle so a renegotiation re-reports
                     // from the client name (the MTTS convention).
                     telnet::option::TTYPE if !enabled => self.protocol.reset_ttype(),
+                    // RFC 2066's minimal implementation, our half: the server sends DO
+                    // CHARSET, we send WILL CHARSET and then the REQUEST. Nothing else will
+                    // drive it — a server that sent only DO has not itself sent WILL, so the
+                    // RFC does not entitle it to request, and both sides would wait forever.
+                    telnet::option::CHARSET if enabled => self.protocol.send_charset_request(
+                        self.transcode.configured_encoding(),
+                        self.transcode.encoding(),
+                        self.replies,
+                    ),
+                    // The option going away drops any request still outstanding, so a later
+                    // renegotiation starts clean.
+                    telnet::option::CHARSET => self.protocol.reset_charset_request(),
                     _ => {}
                 }
                 return;
@@ -773,6 +829,15 @@ pub enum OutboundFrame {
 /// bursts before they reach this queue.
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 
+/// How long outbound frames wait on an unanswered CHARSET `REQUEST` of ours before the socket
+/// task sends them anyway (RFC 2066 §5's queue rule, bounded).
+///
+/// A bound is mandatory, not defensive: plenty of servers open with `DO CHARSET` expecting to
+/// send the `REQUEST` themselves and simply ignore ours, and the hold falls exactly on the
+/// login exchange. Long enough for a round trip to any real MUD, short enough that a server
+/// which never answers costs one noticeable pause and nothing worse.
+const CHARSET_HOLD_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct Connection {
     disconnect: Option<oneshot::Sender<()>>,
     runtime_tx: UnboundedSender<RuntimeAction>,
@@ -998,6 +1063,11 @@ impl Connection {
             let mut transcode = transcode::Transcode::new(encoding.unwrap_or(encoding_rs::UTF_8));
             // Negotiation replies to write back to the server, reused across reads.
             let mut telnet_replies: Vec<u8> = Vec::new();
+            // Deadline for the RFC 2066 §5 outbound hold, set while a CHARSET `REQUEST` of
+            // ours is outstanding and could change how we encode. `Some` disables the write
+            // arm, so frames simply stay in their queue (in order, under the same
+            // backpressure) instead of being buffered a second time here.
+            let mut charset_hold_until: Option<tokio::time::Instant> = None;
             let (write_to_socket_tx, mut write_to_socket_rx) =
                 tokio::sync::mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
 
@@ -1345,11 +1415,30 @@ impl Connection {
                                         if dead {
                                             break;
                                         }
+                                        // This batch is where our CHARSET `REQUEST` went out,
+                                        // or where its answer arrived. Arm the hold on the
+                                        // first, drop it on the second; an already-armed
+                                        // deadline is left alone so it cannot be pushed out
+                                        // by unrelated traffic.
+                                        charset_hold_until = if protocol.charset_holds_outbound() {
+                                            charset_hold_until.or_else(|| {
+                                                Some(tokio::time::Instant::now() + CHARSET_HOLD_TIMEOUT)
+                                            })
+                                        } else {
+                                            None
+                                        };
                                         if fed {
                                             tokio::task::yield_now().await;
                                         }
                                 }
-                                Some(frame) = write_to_socket_rx.recv() => {
+                                // RFC 2066 §5: while a CHARSET subnegotiation of ours is in
+                                // progress, outbound data waits. The whole queue waits, not
+                                // just its text frames — `Raw` sends are ordered against
+                                // `Text` by construction, and picking text out of the middle
+                                // would break that.
+                                Some(frame) = write_to_socket_rx.recv(),
+                                    if charset_hold_until.is_none() =>
+                                {
                                     let mut outcome = match &frame {
                                         OutboundFrame::Text(text) => {
                                             if transcode.is_passthrough() {
@@ -1413,6 +1502,22 @@ impl Connection {
                                         warn!("Socket write to {addr} failed: {err}");
                                         break;
                                     }
+                                }
+                                // The answer never came. Release the queue and stop holding
+                                // for this connection; the request itself stays outstanding,
+                                // so an answer arriving later is still honored.
+                                // `select!` evaluates a disabled branch's expression (it just
+                                // never polls the future), so this must be total — the
+                                // fallback deadline is built and dropped unpolled, and an
+                                // unpolled `Sleep` never arms a timer.
+                                () = tokio::time::sleep_until(
+                                    charset_hold_until.unwrap_or_else(tokio::time::Instant::now),
+                                ), if charset_hold_until.is_some() => {
+                                    debug!(
+                                        "No CHARSET answer from {addr} within {CHARSET_HOLD_TIMEOUT:?}; releasing held output"
+                                    );
+                                    protocol.release_charset_hold();
+                                    charset_hold_until = None;
                                 }
                                 else => {
                                     break;
@@ -1951,6 +2056,197 @@ mod tests {
         assert_eq!(line.as_deref(), Some("caf\u{e9} \u{ff}"));
     }
 
+    /// RFC 2066's minimal implementation, end to end: `DO CHARSET` is answered `WILL
+    /// CHARSET` and, immediately behind it, our own `REQUEST`. A server that sent only `DO`
+    /// is not entitled to request, so this is the whole negotiation if we do not.
+    #[test]
+    fn do_charset_is_answered_with_will_and_our_own_request() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+
+        let (replies, _) = ingest_buffer_with(
+            &[command::IAC, command::DO, CHARSET],
+            &mut protocol,
+            &mut transcode,
+        );
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
+    }
+
+    /// The other half of that exchange: a connection configured to windows-1252 offers it
+    /// first, the server takes the UTF-8 fallback, and the application bytes right behind the
+    /// `ACCEPTED` decode through the switched encoding.
+    #[test]
+    fn charset_accepted_switches_decoding_at_the_stream_position() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::WINDOWS_1252);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::ACCEPTED][..], b"UTF-8"].concat(),
+            &mut input,
+        );
+        // "café\r\n" as UTF-8 — the same bytes read as "cafÃ©" under windows-1252.
+        input.extend_from_slice("caf\u{e9}\r\n".as_bytes());
+
+        let (replies, actions) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" windows-1252 UTF-8"].concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected, "the ACCEPTED itself is not answered");
+        assert_eq!(transcode.encoding(), encoding_rs::UTF_8);
+
+        let line = actions.iter().find_map(|action| match action {
+            RuntimeAction::HandleIncomingLine(line) => Some(line.text.clone()),
+            _ => None,
+        });
+        assert_eq!(line.as_deref(), Some("caf\u{e9}"));
+    }
+
+    /// A `TTABLE-IS` is declined with the `TTABLE-REJECTED` RFC 2066 §2 requires every
+    /// implementation to be able to send — silence would strand the server, since §5 lets no
+    /// further CHARSET subnegotiation start until this one completes.
+    #[test]
+    fn charset_ttable_is_declined_rather_than_ignored() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[responders::charset::TTABLE_IS, 0x08, 0x08],
+            &mut input,
+        );
+
+        let (replies, _) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+            &mut expected,
+        );
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[responders::charset::TTABLE_REJECTED],
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
+    }
+
+    /// Only `ACCEPTED` and `REJECTED` answer a REQUEST of ours. A subnegotiation that is not
+    /// an answer must leave the request outstanding — closing the exchange early would discard
+    /// the real answer behind it and leave the two sides reading each other in different
+    /// charsets.
+    #[test]
+    fn a_non_answer_does_not_consume_the_outstanding_charset_request() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::WINDOWS_1252);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        // Neither of these answers our REQUEST: an empty subnegotiation and a TTABLE-ACK.
+        telnet::frame_subnegotiation(CHARSET, &[], &mut input);
+        telnet::frame_subnegotiation(CHARSET, &[6], &mut input);
+        // ...so the ACCEPTED behind them is still live and must land.
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::ACCEPTED][..], b"UTF-8"].concat(),
+            &mut input,
+        );
+
+        let (_, _) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+        assert_eq!(
+            transcode.encoding(),
+            encoding_rs::UTF_8,
+            "the ACCEPTED must still be honored"
+        );
+    }
+
+    /// An `ACCEPTED` naming a charset we never offered is ignored — the server picks from our
+    /// list, and honoring anything else would hand it the session's encoding outright. So is
+    /// one that arrives with no request of ours outstanding.
+    #[test]
+    fn charset_accepted_is_ignored_when_unoffered_or_unsolicited() {
+        use super::telnet::option::CHARSET;
+        let accepted_big5 = {
+            let mut frame = Vec::new();
+            telnet::frame_subnegotiation(
+                CHARSET,
+                &[&[responders::charset::ACCEPTED][..], b"big5"].concat(),
+                &mut frame,
+            );
+            frame
+        };
+
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+        let mut negotiated = vec![command::IAC, command::DO, CHARSET];
+        negotiated.extend_from_slice(&accepted_big5);
+        ingest_buffer_with(&negotiated, &mut protocol, &mut transcode);
+        assert_eq!(
+            transcode.encoding(),
+            encoding_rs::UTF_8,
+            "big5 was never in our offer"
+        );
+
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+        let (replies, _) = ingest_buffer_with(&accepted_big5, &mut protocol, &mut transcode);
+        assert_eq!(transcode.encoding(), encoding_rs::UTF_8);
+        assert!(replies.is_empty(), "an unsolicited answer is inert");
+    }
+
+    /// RFC 2066's simultaneous-request rule: when the server's own `REQUEST` crosses ours, the
+    /// server's wins — we answer it, and the negative acknowledgment it owes ours is nothing
+    /// we wait for.
+    #[test]
+    fn a_server_request_overrides_our_outstanding_one() {
+        use super::telnet::option::CHARSET;
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+
+        let mut input = vec![command::IAC, command::DO, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" big5"].concat(),
+            &mut input,
+        );
+        // The server's rejection of our crossed request must not be mistaken for an answer
+        // that still matters.
+        telnet::frame_subnegotiation(CHARSET, &[responders::charset::REJECTED], &mut input);
+
+        let (replies, _) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+
+        let mut expected = vec![command::IAC, command::WILL, CHARSET];
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+            &mut expected,
+        );
+        telnet::frame_subnegotiation(
+            CHARSET,
+            &[&[responders::charset::ACCEPTED][..], b"big5"].concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
+        assert_eq!(transcode.encoding(), encoding_rs::BIG5);
+    }
+
     #[tokio::test]
     async fn write_returns_an_error_when_the_socket_queue_is_closed() {
         let (mut connection, _runtime_rx) = test_connection();
@@ -2124,6 +2420,224 @@ mod tests {
             release_rx.await.ok();
         });
         (port, release_tx, server)
+    }
+
+    /// Read from `socket` until `collected` ends with a full copy of `needle`.
+    async fn read_until(
+        socket: &mut tokio::net::TcpStream,
+        collected: &mut Vec<u8>,
+        needle: &[u8],
+    ) {
+        while !collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            let mut buf = [0_u8; 512];
+            let read = timeout(Duration::from_secs(5), socket.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {needle:02x?}"))
+                .expect("read");
+            assert_ne!(read, 0, "socket closed waiting for {needle:02x?}");
+            collected.extend_from_slice(&buf[..read]);
+        }
+    }
+
+    /// RFC 2066 §5: while our CHARSET REQUEST is unanswered, outbound text waits — and once the
+    /// exchange terminates it goes out **in the negotiated charset**. A windows-1252 connection
+    /// whose server takes the UTF-8 fallback is the case that needs it: without the hold, a
+    /// command written in that window would leave as windows-1252 while the server had already
+    /// switched to decoding UTF-8.
+    #[tokio::test]
+    async fn outbound_text_waits_for_the_charset_answer_and_leaves_in_the_new_charset() {
+        use super::telnet::option::CHARSET;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let (requested_tx, requested_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            socket
+                .write_all(&[command::IAC, command::DO, CHARSET])
+                .await
+                .expect("DO CHARSET");
+
+            let mut request = Vec::new();
+            telnet::frame_subnegotiation(
+                CHARSET,
+                &[&[responders::charset::REQUEST][..], b" windows-1252 UTF-8"].concat(),
+                &mut request,
+            );
+            let mut seen = Vec::new();
+            read_until(&mut socket, &mut seen, &request).await;
+            requested_tx.send(()).expect("client still waiting");
+
+            // The command is written now; nothing may reach us until we answer.
+            let mut buf = [0_u8; 64];
+            assert!(
+                timeout(Duration::from_millis(300), socket.read(&mut buf))
+                    .await
+                    .is_err(),
+                "outbound text must be held while the REQUEST is unanswered"
+            );
+
+            let mut accepted = Vec::new();
+            telnet::frame_subnegotiation(
+                CHARSET,
+                &[&[responders::charset::ACCEPTED][..], b"UTF-8"].concat(),
+                &mut accepted,
+            );
+            socket.write_all(&accepted).await.expect("ACCEPTED");
+
+            let mut command_bytes = Vec::new();
+            read_until(&mut socket, &mut command_bytes, b"\r\n").await;
+            command_bytes
+        });
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            Some(encoding_rs::WINDOWS_1252),
+            true,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        requested_rx.await.expect("the REQUEST reached the server");
+        connection
+            .write(Arc::new("caf\u{e9}\r\n".to_string()))
+            .await
+            .expect("the socket queue is live");
+
+        let sent = timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server task")
+            .expect("server task panicked");
+        assert_eq!(
+            sent,
+            "caf\u{e9}\r\n".as_bytes(),
+            "the held command must leave in the charset the negotiation settled on (UTF-8), \
+             not the windows-1252 it was configured with"
+        );
+        connection.disconnect();
+    }
+
+    /// The default connection offers UTF-8 while already speaking it, so no answer could move
+    /// the encoder and nothing is ever held — the negotiation is invisible to the write path.
+    #[tokio::test]
+    async fn a_utf8_connection_holds_nothing_while_negotiating_charset() {
+        use super::telnet::option::CHARSET;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let (requested_tx, requested_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            socket
+                .write_all(&[command::IAC, command::DO, CHARSET])
+                .await
+                .expect("DO CHARSET");
+
+            let mut request = Vec::new();
+            telnet::frame_subnegotiation(
+                CHARSET,
+                &[&[responders::charset::REQUEST][..], b" UTF-8"].concat(),
+                &mut request,
+            );
+            let mut seen = Vec::new();
+            read_until(&mut socket, &mut seen, &request).await;
+            requested_tx.send(()).expect("client still waiting");
+
+            // Never answered — and it must not matter.
+            let started = tokio::time::Instant::now();
+            let mut command_bytes = Vec::new();
+            read_until(&mut socket, &mut command_bytes, b"\r\n").await;
+            (started.elapsed(), command_bytes)
+        });
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        expect_connected(&mut runtime_rx).await;
+        requested_rx.await.expect("the REQUEST reached the server");
+        connection
+            .write(Arc::new("look\r\n".to_string()))
+            .await
+            .expect("the socket queue is live");
+
+        let (waited, sent) = timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server task")
+            .expect("server task panicked");
+        assert_eq!(sent, b"look\r\n");
+        assert!(
+            waited < Duration::from_millis(500),
+            "a UTF-8 connection must not wait on CHARSET; it took {waited:?}"
+        );
+        connection.disconnect();
+    }
+
+    /// A server that opens with `DO CHARSET` and then ignores our REQUEST is ordinary, so the
+    /// hold is bounded: the text goes out anyway, in the configured charset, and the connection
+    /// stays usable.
+    #[tokio::test]
+    async fn held_output_is_released_when_no_charset_answer_arrives() {
+        use super::telnet::option::CHARSET;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let (requested_tx, requested_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            socket
+                .write_all(&[command::IAC, command::DO, CHARSET])
+                .await
+                .expect("DO CHARSET");
+
+            let mut seen = Vec::new();
+            read_until(
+                &mut socket,
+                &mut seen,
+                &[command::IAC, command::WILL, CHARSET],
+            )
+            .await;
+            requested_tx.send(()).expect("client still waiting");
+
+            // No answer, ever. The command must still arrive, after the bounded wait.
+            let started = tokio::time::Instant::now();
+            let mut command_bytes = Vec::new();
+            read_until(&mut socket, &mut command_bytes, b"\r\n").await;
+            (started.elapsed(), command_bytes)
+        });
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            Some(encoding_rs::WINDOWS_1252),
+            true,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        requested_rx.await.expect("the REQUEST reached the server");
+        connection
+            .write(Arc::new("caf\u{e9}\r\n".to_string()))
+            .await
+            .expect("the socket queue is live");
+
+        let (waited, sent) = timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server task")
+            .expect("server task panicked");
+        assert!(
+            waited >= Duration::from_millis(1500),
+            "the text left after {waited:?}, before the hold could have expired"
+        );
+        assert_eq!(
+            sent, b"caf\xe9\r\n",
+            "with no negotiation to honor, the configured windows-1252 stands"
+        );
+        connection.disconnect();
     }
 
     async fn expect_connected(runtime_rx: &mut tokio_mpsc::UnboundedReceiver<RuntimeAction>) {
