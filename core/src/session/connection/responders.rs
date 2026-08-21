@@ -24,11 +24,17 @@ pub mod ttype {
     pub const SEND: u8 = 1;
 }
 
-/// RFC 1572 NEW-ENVIRON responder for the OSC 8 capability variables used by
-/// current MUD servers. These are USERVARs rather than process environment
-/// variables; nothing from the host environment is ever exposed.
+/// RFC 1572 NEW-ENVIRON responder, answering two vocabularies. The MNES
+/// identity variables (<https://tintin.mudhalla.net/protocols/mnes/>) are
+/// `VAR`s: MNES is the NEW-ENVIRON replacement for TTYPE cycling, and a server
+/// that sees the option accepted may query identity here *instead of* ever
+/// sending a TTYPE `SEND` — leaving these unanswered reads as "no terminal
+/// type, no color support" and downgrades the session to bare ANSI. The OSC 8
+/// capability variables used by current MUD servers are `USERVAR`s. Nothing
+/// from the host process environment is ever exposed.
 pub mod new_environ {
     use super::super::telnet::{frame_subnegotiation, option};
+    use super::{CLIENT_NAME, TERMINAL_TYPE};
 
     pub const IS: u8 = 0;
     pub const SEND: u8 = 1;
@@ -56,7 +62,40 @@ pub mod new_environ {
         (b"OSC_HYPERLINKS_VISIBILITY", b"1"),
     ];
 
-    fn requested_user_vars(payload: &[u8]) -> Vec<Vec<u8>> {
+    /// The MNES identity variables, in the order an answer-everything reply
+    /// reports them.
+    const MNES_NAMES: &[&[u8]] = &[
+        b"CLIENT_NAME",
+        b"CLIENT_VERSION",
+        b"CHARSET",
+        b"MTTS",
+        b"TERMINAL_TYPE",
+    ];
+
+    /// The `(canonical name, value)` for an MNES identity variable, or `None`
+    /// for any other name. `MTTS` and `CHARSET` are live values (the TLS bit,
+    /// the active wire encoding), so they arrive as parameters.
+    fn mnes_value(name: &[u8], mtts: u16, charset: &str) -> Option<(&'static [u8], String)> {
+        if name.eq_ignore_ascii_case(b"CLIENT_NAME") {
+            Some((b"CLIENT_NAME", CLIENT_NAME.to_string()))
+        } else if name.eq_ignore_ascii_case(b"CLIENT_VERSION") {
+            Some((b"CLIENT_VERSION", env!("CARGO_PKG_VERSION").to_string()))
+        } else if name.eq_ignore_ascii_case(b"CHARSET") {
+            Some((b"CHARSET", charset.to_string()))
+        } else if name.eq_ignore_ascii_case(b"MTTS") {
+            Some((b"MTTS", mtts.to_string()))
+        } else if name.eq_ignore_ascii_case(b"TERMINAL_TYPE") {
+            Some((b"TERMINAL_TYPE", TERMINAL_TYPE.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Parse a SEND request body into `(type, name)` pairs — both `VAR` and
+    /// `USERVAR`, since MNES requests identity as `VAR`s while the OSC 8
+    /// convention requests capabilities as `USERVAR`s — unescaping RFC 1572
+    /// `ESC` bytes. Parsing stops at a byte that is neither type marker.
+    fn requested_vars(payload: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let mut requested = Vec::new();
         let mut cursor = 0;
         while cursor < payload.len() {
@@ -82,28 +121,68 @@ pub mod new_environ {
                     }
                 }
             }
-            if kind == USERVAR {
-                requested.push(name);
-            }
+            requested.push((kind, name));
         }
         requested
     }
 
-    /// Answer an empty SEND with all supported capabilities, or a selective
-    /// SEND with only recognized USERVAR names, preserving catalogue order.
-    pub fn answer_send(request: &[u8], replies: &mut Vec<u8>) {
-        let requested = (!request.is_empty()).then(|| requested_user_vars(request));
-        let mut payload = vec![IS];
+    fn push_entry(payload: &mut Vec<u8>, kind: u8, name: &[u8], value: &[u8]) {
+        payload.push(kind);
+        payload.extend_from_slice(name);
+        payload.push(VALUE);
+        payload.extend_from_slice(value);
+    }
+
+    /// Append the MNES identity variables, in the spec's order.
+    fn push_identity(payload: &mut Vec<u8>, kind: u8, mtts: u16, charset: &str) {
+        for &name in MNES_NAMES {
+            if let Some((canonical, value)) = mnes_value(name, mtts, charset) {
+                push_entry(payload, kind, canonical, value.as_bytes());
+            }
+        }
+    }
+
+    /// Append the OSC 8 capability catalogue.
+    fn push_capabilities(payload: &mut Vec<u8>, kind: u8) {
         for &(name, value) in CAPABILITIES {
-            if requested.as_ref().is_none_or(|requested| {
-                requested
+            push_entry(payload, kind, name, value);
+        }
+    }
+
+    /// Answer a NEW-ENVIRON `SEND`. An empty request gets everything: the MNES
+    /// identity as `VAR`s, then the capability catalogue as `USERVAR`s. A
+    /// selective request is answered per recognized name in request order,
+    /// echoing the type byte the server used (so its own table lookup matches
+    /// however it typed the query) with the name's canonical spelling.
+    /// Unrecognized names are omitted.
+    ///
+    /// A type byte carrying no name asks for every variable of that type (RFC 1572:
+    /// "all variables of that type"), which is the form MNES documents for requesting
+    /// the identity block. It is answered like the matching half of an empty request —
+    /// omitting it would return the empty `IS` a server reads as "no terminal type, no
+    /// color support", the very downgrade this responder exists to prevent.
+    pub fn answer_send(request: &[u8], mtts: u16, charset: &str, replies: &mut Vec<u8>) {
+        let mut payload = vec![IS];
+        if request.is_empty() {
+            push_identity(&mut payload, VAR, mtts, charset);
+            push_capabilities(&mut payload, USERVAR);
+        } else {
+            for (kind, name) in requested_vars(request) {
+                if name.is_empty() {
+                    if kind == VAR {
+                        push_identity(&mut payload, VAR, mtts, charset);
+                    } else {
+                        push_capabilities(&mut payload, USERVAR);
+                    }
+                } else if let Some((canonical, value)) = mnes_value(&name, mtts, charset) {
+                    push_entry(&mut payload, kind, canonical, value.as_bytes());
+                } else if let Some((canonical, value)) = CAPABILITIES
                     .iter()
-                    .any(|wanted| wanted.eq_ignore_ascii_case(name))
-            }) {
-                payload.push(USERVAR);
-                payload.extend_from_slice(name);
-                payload.push(VALUE);
-                payload.extend_from_slice(value);
+                    .copied()
+                    .find(|(catalogue_name, _)| catalogue_name.eq_ignore_ascii_case(&name))
+                {
+                    push_entry(&mut payload, kind, canonical, value);
+                }
             }
         }
         frame_subnegotiation(option::NEW_ENVIRON, &payload, replies);
@@ -121,17 +200,20 @@ pub mod mtts {
     pub const COLORS_256: u16 = 8;
     /// Client supports truecolor codes using semicolon notation.
     pub const TRUECOLOR: u16 = 256;
+    /// Client supports the Mud New-Environ Standard (the NEW-ENVIRON identity
+    /// variables answered by [`super::new_environ::answer_send`]).
+    pub const MNES: u16 = 512;
     /// Client is using a secure (TLS) connection.
     pub const SSL: u16 = 2048;
 
     /// The bitvector smudgy truthfully claims. Deliberately **not** claimed: VT100 (2 — the
     /// display is line-oriented, no cursor addressing), mouse tracking (16), OSC color
     /// palette (32 — OSC 4/104 are deliberately unsupported), screen reader (64), proxy
-    /// (128), MNES (512), and MSLP (1024). `secure` ORs in [`SSL`] when the game connection
+    /// (128), and MSLP (1024). `secure` ORs in [`SSL`] when the game connection
     /// runs over TLS (`GameStream::Tls`).
     #[must_use]
     pub const fn bitvector(secure: bool) -> u16 {
-        let base = ANSI | UTF8 | COLORS_256 | TRUECOLOR;
+        let base = ANSI | UTF8 | COLORS_256 | TRUECOLOR | MNES;
         if secure { base | SSL } else { base }
     }
 }
@@ -421,6 +503,14 @@ impl ProtocolState {
         self.ttype_cursor = 0;
     }
 
+    /// Answer a NEW-ENVIRON `SEND` (the MNES identity variables plus the OSC 8
+    /// capability catalogue — see [`new_environ::answer_send`]), the MTTS
+    /// bitvector reflecting this connection's transport. `charset` is the
+    /// active wire encoding's name.
+    pub fn on_new_environ_send(&self, request: &[u8], charset: &str, replies: &mut Vec<u8>) {
+        new_environ::answer_send(request, mtts::bitvector(self.secure), charset, replies);
+    }
+
     /// The unconditional NAWS report RFC 1073 requires the moment the option turns on.
     pub fn send_naws(&mut self, replies: &mut Vec<u8>) {
         let dims = self.current_dims();
@@ -534,9 +624,10 @@ mod tests {
     }
 
     #[test]
-    fn mtts_bitvector_is_269_and_2317_when_secure() {
-        assert_eq!(mtts::bitvector(false), 269);
-        assert_eq!(mtts::bitvector(true), 2317);
+    fn mtts_bitvector_is_781_and_2829_when_secure() {
+        // ANSI 1 + UTF-8 4 + 256-color 8 + truecolor 256 + MNES 512 = 781.
+        assert_eq!(mtts::bitvector(false), 781);
+        assert_eq!(mtts::bitvector(true), 2829);
     }
 
     #[test]
@@ -550,13 +641,13 @@ mod tests {
         replies.clear();
         state.on_ttype_send(&mut replies);
         let (_, payload) = unframe(&replies);
-        assert_eq!(&payload[1..], b"MTTS 2317", "SSL bit set over TLS");
+        assert_eq!(&payload[1..], b"MTTS 2829", "SSL bit set over TLS");
     }
 
     #[test]
     fn new_environ_advertises_only_truthful_osc8_capabilities() {
         let mut replies = Vec::new();
-        new_environ::answer_send(&[], &mut replies);
+        new_environ::answer_send(&[], mtts::bitvector(false), "UTF-8", &mut replies);
         let (option, payload) = unframe(&replies);
         assert_eq!(option, NEW_ENVIRON);
         assert_eq!(payload[0], new_environ::IS);
@@ -590,6 +681,46 @@ mod tests {
         }
     }
 
+    /// RFC 1572 reads a type byte with no name as "all variables of that type", and MNES
+    /// documents `SEND VAR` as the way to ask for the identity block. Answering it with an
+    /// empty `IS` is exactly the "no terminal type, no color support" downgrade this
+    /// responder exists to prevent.
+    #[test]
+    fn new_environ_send_var_with_no_name_returns_the_identity_block() {
+        let mut all = Vec::new();
+        new_environ::answer_send(&[], mtts::bitvector(false), "UTF-8", &mut all);
+        let (_, everything) = unframe(&all);
+
+        let mut replies = Vec::new();
+        new_environ::answer_send(&[0], mtts::bitvector(false), "UTF-8", &mut replies);
+        let (_, payload) = unframe(&replies);
+
+        assert!(
+            payload.len() > 1,
+            "a bare SEND VAR must not be answered with an empty IS"
+        );
+        assert!(
+            everything.starts_with(&payload),
+            "it answers the VAR half of an empty request, verbatim"
+        );
+        assert!(payload.windows(11).any(|w| w == b"CLIENT_NAME"));
+        assert!(payload.windows(4).any(|w| w == b"MTTS"));
+    }
+
+    /// The USERVAR half of the same rule: a bare `SEND USERVAR` gets the capability
+    /// catalogue rather than silence.
+    #[test]
+    fn new_environ_send_uservar_with_no_name_returns_the_capabilities() {
+        let mut replies = Vec::new();
+        new_environ::answer_send(&[3], mtts::bitvector(false), "UTF-8", &mut replies);
+        let (_, payload) = unframe(&replies);
+        assert!(payload.windows(14).any(|w| w == b"OSC_HYPERLINKS"));
+        assert!(
+            !payload.windows(11).any(|w| w == b"CLIENT_NAME"),
+            "identity is VAR-typed and does not belong in a USERVAR answer"
+        );
+    }
+
     #[test]
     fn new_environ_honors_selective_uservar_send() {
         let request = [
@@ -597,7 +728,7 @@ mod tests {
             b'_', b'T', b'O', b'O', b'L', b'T', b'I', b'P',
         ];
         let mut replies = Vec::new();
-        new_environ::answer_send(&request, &mut replies);
+        new_environ::answer_send(&request, mtts::bitvector(false), "UTF-8", &mut replies);
         let (_, payload) = unframe(&replies);
         assert_eq!(
             payload,
@@ -614,7 +745,7 @@ mod tests {
     fn new_environ_selectively_advertises_the_smudgy_tooltip_sgr_extension() {
         let request = [&[3][..], b"OSC_HYPERLINKS_TOOLTIP_SGR"].concat();
         let mut replies = Vec::new();
-        new_environ::answer_send(&request, &mut replies);
+        new_environ::answer_send(&request, mtts::bitvector(false), "UTF-8", &mut replies);
         let (_, payload) = unframe(&replies);
         assert_eq!(
             payload,
@@ -628,13 +759,128 @@ mod tests {
     }
 
     #[test]
+    fn new_environ_answers_the_mnes_identity_vars() {
+        // MNES requests identity variables as VARs (type 0), lowercase names
+        // match case-insensitively, and answers echo the canonical spelling.
+        let request = [
+            &[0][..],
+            b"CLIENT_NAME",
+            &[0][..],
+            b"mtts",
+            &[0][..],
+            b"TERMINAL_TYPE",
+        ]
+        .concat();
+        let mut replies = Vec::new();
+        new_environ::answer_send(&request, mtts::bitvector(false), "UTF-8", &mut replies);
+        let (option, payload) = unframe(&replies);
+        assert_eq!(option, NEW_ENVIRON);
+        assert_eq!(
+            payload,
+            [
+                &[new_environ::IS, 0][..],
+                b"CLIENT_NAME",
+                &[1][..],
+                CLIENT_NAME.as_bytes(),
+                &[0][..],
+                b"MTTS",
+                &[1][..],
+                b"781",
+                &[0][..],
+                b"TERMINAL_TYPE",
+                &[1][..],
+                TERMINAL_TYPE.as_bytes(),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn new_environ_reports_charset_version_and_the_ssl_mtts_bit() {
+        let request = [
+            &[0][..],
+            b"CHARSET",
+            &[0][..],
+            b"CLIENT_VERSION",
+            &[0][..],
+            b"MTTS",
+        ]
+        .concat();
+        let mut replies = Vec::new();
+        new_environ::answer_send(
+            &request,
+            mtts::bitvector(true),
+            "windows-1252",
+            &mut replies,
+        );
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            payload,
+            [
+                &[new_environ::IS, 0][..],
+                b"CHARSET",
+                &[1][..],
+                b"windows-1252",
+                &[0][..],
+                b"CLIENT_VERSION",
+                &[1][..],
+                env!("CARGO_PKG_VERSION").as_bytes(),
+                &[0][..],
+                b"MTTS",
+                &[1][..],
+                b"2829",
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn new_environ_bare_send_reports_identity_and_capabilities() {
+        let mut replies = Vec::new();
+        new_environ::answer_send(&[], mtts::bitvector(false), "UTF-8", &mut replies);
+        let (_, payload) = unframe(&replies);
+        for expected in [
+            [&[0][..], b"CLIENT_NAME", &[1][..], CLIENT_NAME.as_bytes()].concat(),
+            [&[0][..], b"MTTS", &[1][..], b"781"].concat(),
+            [
+                &[0][..],
+                b"TERMINAL_TYPE",
+                &[1][..],
+                TERMINAL_TYPE.as_bytes(),
+            ]
+            .concat(),
+            [&[3][..], b"OSC_HYPERLINKS", &[1, b'1'][..]].concat(),
+        ] {
+            assert!(
+                payload
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "missing entry {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_state_reports_the_ssl_mtts_bit_through_new_environ() {
+        let cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(pack_dims(80, 24)));
+        let state = ProtocolState::new(cell, true);
+        let mut replies = Vec::new();
+        state.on_new_environ_send(&[&[0][..], b"MTTS"].concat(), "UTF-8", &mut replies);
+        let (_, payload) = unframe(&replies);
+        assert_eq!(
+            payload,
+            [&[new_environ::IS, 0][..], b"MTTS", &[1][..], b"2829"].concat()
+        );
+    }
+
+    #[test]
     fn ttype_cycle_reports_name_type_mtts_then_repeats() {
         let mut state = ProtocolState::with_fixed_dims((80, 24));
         let expected = [
             CLIENT_NAME.to_string(),
             TERMINAL_TYPE.to_string(),
-            "MTTS 269".to_string(),
-            "MTTS 269".to_string(), // repetition signals end-of-list
+            "MTTS 781".to_string(),
+            "MTTS 781".to_string(), // repetition signals end-of-list
         ];
         for want in expected {
             let mut replies = Vec::new();
