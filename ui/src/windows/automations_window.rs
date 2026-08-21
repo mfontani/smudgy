@@ -291,6 +291,11 @@ pub enum Message {
     RemoveArg(usize),
     SetCmdMode(smudgy_core::models::matchers::CmdMode),
     SetParseMode(smudgy_core::models::matchers::ParseMode),
+    /// Open/close the Parsing picker's floating list.
+    OpenParsingPicker,
+    CloseParsingPicker,
+    /// Move the Parsing picker's keyboard cursor by a delta.
+    MoveParsingCursor(i32),
     /// An edit in the alias Simple-pattern field's one-line editor.
     AliasPatternAction(text_editor::Action),
     ToggleAnchorStart,
@@ -642,6 +647,11 @@ pub struct AutomationsWindow {
     pub(super) order_revealed: bool,
     /// Whether the Try-it accordion is expanded; collapsed when an editor opens.
     pub(super) try_it_open: bool,
+    /// Whether the Parsing picker's floating list is open.
+    pub(super) parsing_open: bool,
+    /// The Parsing picker's keyboard cursor (an index into
+    /// `ParseModeChoice::ALL`).
+    pub(super) parsing_cursor: usize,
     pub(super) test_input: String,
     pub(super) dirty: bool,
     pub(super) pending_nav: Option<Box<Message>>,
@@ -883,6 +893,8 @@ impl AutomationsWindow {
             alias_draft: model::AliasMatcherDraft::default(),
             order_revealed: false,
             try_it_open: false,
+            parsing_open: false,
+            parsing_cursor: 0,
             test_input: String::new(),
             dirty: false,
             pending_nav: None,
@@ -1268,6 +1280,26 @@ impl AutomationsWindow {
             }
             Message::SetParseMode(parse) => {
                 self.alias_draft.parse = parse;
+                self.parsing_open = false;
+                Update::none()
+            }
+            Message::OpenParsingPicker => {
+                self.parsing_open = true;
+                // The cursor starts on the current choice.
+                self.parsing_cursor = model::ParseModeChoice::ALL
+                    .iter()
+                    .position(|choice| choice.0 == self.alias_draft.parse)
+                    .unwrap_or(0);
+                Update::none()
+            }
+            Message::CloseParsingPicker => {
+                self.parsing_open = false;
+                Update::none()
+            }
+            Message::MoveParsingCursor(delta) => {
+                let len = model::ParseModeChoice::ALL.len() as i32;
+                let cursor = self.parsing_cursor as i32 + delta;
+                self.parsing_cursor = cursor.rem_euclid(len) as usize;
                 Update::none()
             }
             Message::AliasPatternAction(action) => {

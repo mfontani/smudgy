@@ -22,6 +22,7 @@ use crate::keymap::{self as hotkey_helpers, MaybePhysicalKey};
 use crate::theme::Theme;
 use crate::theme::builtins::button as button_style;
 use crate::update::Update;
+use crate::widgets::dropdown::Dropdown;
 use crate::widgets::hotkey_input::HotkeyInput;
 
 use super::common;
@@ -92,6 +93,7 @@ impl AutomationsWindow {
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
+        self.parsing_open = false;
 
         match &script {
             Script::Alias(a) => self.seed_action_buffers(a.language, a.script.as_deref()),
@@ -244,6 +246,7 @@ impl AutomationsWindow {
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
+        self.parsing_open = false;
         // Command is the default kind for new aliases.
         self.alias_draft = AliasMatcherDraft::default();
         self.alias_pattern_content = text_editor::Content::new();
@@ -275,6 +278,7 @@ impl AutomationsWindow {
         self.test_input.clear();
         self.order_revealed = false;
         self.try_it_open = false;
+        self.parsing_open = false;
         // No rows yet: the pane opens at the teaching-cards state.
         self.trigger_row_contents = Vec::new();
         self.pane = Pane::Editor(EditorState {
@@ -2328,16 +2332,122 @@ impl AutomationsWindow {
         if draft.cmd_mode == CmdMode::Advanced {
             body = body.push(field_row(
                 crate::i18n::ts!("editor-parsing"),
-                pick_list(
-                    ParseModeChoice::ALL.to_vec(),
-                    Some(ParseModeChoice(draft.parse)),
-                    |choice| Message::SetParseMode(choice.0),
-                )
-                .text_size(13.0)
-                .into(),
+                self.parsing_picker(),
             ));
         }
         body
+    }
+
+    /// The Parsing picker (D7): a custom overlay dropdown, because the rows
+    /// are two lines — the label over `example → GETS → result` — and that
+    /// pairing is the whole point of the control. The floating list escapes
+    /// the scrollable; Escape/click-outside/selection dismiss it, and
+    /// up/down/enter drive the keyboard cursor.
+    fn parsing_picker<'a>(&self) -> Elem<'a> {
+        use smudgy_core::models::matchers::ParseMode;
+
+        let current = self.alias_draft.parse;
+        let (current_label, current_example, _) = parse_mode_strings(current);
+        let anchor = button(
+            row![
+                text(current_label).size(13.0),
+                text(current_example)
+                    .size(12.0)
+                    .font(fonts::GEIST_MONO_VF)
+                    .style(common::faint),
+                text("\u{25BE}").size(10.0).style(common::muted),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+        )
+        .style(button_style::subtle)
+        .padding(Padding {
+            top: 6.0,
+            bottom: 6.0,
+            left: 10.0,
+            right: 10.0,
+        })
+        .on_press(if self.parsing_open {
+            Message::CloseParsingPicker
+        } else {
+            Message::OpenParsingPicker
+        });
+
+        let content: Option<Elem<'a>> = self.parsing_open.then(|| {
+            let mut list = Column::new().spacing(2.0);
+            for (index, choice) in ParseModeChoice::ALL.iter().enumerate() {
+                let (label, example, gets) = parse_mode_strings(choice.0);
+                let selected = choice.0 == current;
+                let at_cursor = index == self.parsing_cursor;
+                let inner = column![
+                    text(label).size(13.0),
+                    row![
+                        text(example)
+                            .size(12.0)
+                            .font(fonts::GEIST_MONO_VF)
+                            .style(common::muted),
+                        common::section_label(crate::i18n::ts!("editor-gets")),
+                        text(gets).size(12.0).font(fonts::GEIST_MONO_VF),
+                    ]
+                    .spacing(8.0)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(2.0);
+                list = list.push(
+                    button(inner)
+                        .width(Length::Fill)
+                        .style(move |theme: &Theme, status| {
+                            let background = if selected {
+                                Some(theme.styles.general.accent.scale_alpha(0.35))
+                            } else if at_cursor || status == iced::widget::button::Status::Hovered {
+                                Some(theme.styles.text.normal.scale_alpha(0.06))
+                            } else {
+                                None
+                            };
+                            iced::widget::button::Style {
+                                background: background.map(iced::Background::Color),
+                                border: iced::Border::default().rounded(4.0),
+                                text_color: theme.styles.text.normal,
+                                ..Default::default()
+                            }
+                        })
+                        .padding(Padding {
+                            top: 6.0,
+                            bottom: 6.0,
+                            left: 10.0,
+                            right: 10.0,
+                        })
+                        .on_press(Message::SetParseMode(choice.0)),
+                );
+            }
+            container(list)
+                .width(Length::Fixed(460.0))
+                .padding(6.0)
+                .style(|theme: &Theme| iced::widget::container::Style {
+                    background: Some(theme.styles.modal.body_background),
+                    border: theme.styles.modal.body_border,
+                    shadow: theme.styles.modal.shadow,
+                    ..Default::default()
+                })
+                .into()
+        });
+
+        let cursor_mode: ParseMode =
+            ParseModeChoice::ALL[self.parsing_cursor.min(ParseModeChoice::ALL.len() - 1)].0;
+        Dropdown::new(anchor, content, Message::CloseParsingPicker)
+            .on_key(move |key| match key {
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp) => {
+                    Some(Message::MoveParsingCursor(-1))
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown) => {
+                    Some(Message::MoveParsingCursor(1))
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
+                    Some(Message::SetParseMode(cursor_mode))
+                }
+                _ => None,
+            })
+            .into()
     }
 
     /// The non-blocking matches-every-line warning for the Pattern kind.
@@ -3411,6 +3521,40 @@ fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style 
         NodeStatus::Error => common::danger,
         NodeStatus::Warning => common::warning,
         NodeStatus::Disabled => common::muted,
+    }
+}
+
+/// The Parsing picker's per-mode strings: `(label, example, what it gets)`.
+fn parse_mode_strings(
+    mode: smudgy_core::models::matchers::ParseMode,
+) -> (&'static str, &'static str, &'static str) {
+    use smudgy_core::models::matchers::ParseMode;
+    match mode {
+        ParseMode::Spaces => (
+            crate::i18n::ts!("editor-parse-spaces"),
+            crate::i18n::ts!("editor-parse-spaces-example"),
+            crate::i18n::ts!("editor-parse-spaces-gets"),
+        ),
+        ParseMode::Quotes => (
+            crate::i18n::ts!("editor-parse-quotes"),
+            crate::i18n::ts!("editor-parse-quotes-example"),
+            crate::i18n::ts!("editor-parse-quotes-gets"),
+        ),
+        ParseMode::Braces => (
+            crate::i18n::ts!("editor-parse-braces"),
+            crate::i18n::ts!("editor-parse-braces-example"),
+            crate::i18n::ts!("editor-parse-braces-gets"),
+        ),
+        ParseMode::All => (
+            crate::i18n::ts!("editor-parse-all"),
+            crate::i18n::ts!("editor-parse-all-example"),
+            crate::i18n::ts!("editor-parse-all-gets"),
+        ),
+        ParseMode::Raw => (
+            crate::i18n::ts!("editor-parse-raw"),
+            crate::i18n::ts!("editor-parse-raw-example"),
+            crate::i18n::ts!("editor-parse-raw-gets"),
+        ),
     }
 }
 
