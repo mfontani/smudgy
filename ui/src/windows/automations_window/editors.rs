@@ -3106,24 +3106,41 @@ fn tip<'a>(content: Elem<'a>, label: String) -> Elem<'a> {
 /// A `. . .` gutter cell (visual-contract §6): the literal spaced string in
 /// the mono font on a faint wash, flush against the field inside the
 /// composite's single border.
-fn gutter_cell<'a>(tooltip_label: String) -> Elem<'a> {
-    let cell = container(text(". . .").size(11.0).font(fonts::GEIST_MONO_VF).style(
-        |theme: &Theme| iced::widget::text::Style {
-            color: Some(theme.styles.text.normal.scale_alpha(0.32)),
-        },
-    ))
-    .padding(Padding {
-        top: 0.0,
-        bottom: 0.0,
-        left: 8.0,
-        right: 8.0,
+///
+/// The cell is ALWAYS in the composite's widget tree; a hidden side keeps
+/// its slot and collapses to nothing (empty text, no padding — NOT a
+/// `Fixed(0)` width, which `Row::push` treats as void and silently drops
+/// from the child list, defeating the whole point). Mounting and unmounting
+/// the cell would shift the editor's position among the row's children
+/// whenever typing flips the anchor derivation (the first unanchored
+/// character, adding or removing `^`/`$`), and iced's positional tree diff
+/// would then rebuild the editor's state mid-keystroke — dropping focus and
+/// swallowing everything typed after it. A collapsed cell has no hoverable
+/// area, so a hidden side's tooltip can never fire.
+fn gutter_cell<'a>(shown: bool, tooltip_label: String) -> Elem<'a> {
+    let cell = container(
+        text(if shown { ". . ." } else { "" })
+            .size(11.0)
+            .font(fonts::GEIST_MONO_VF)
+            .style(|theme: &Theme| iced::widget::text::Style {
+                color: Some(theme.styles.text.normal.scale_alpha(0.32)),
+            }),
+    )
+    .padding(if shown {
+        Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 8.0,
+            right: 8.0,
+        }
+    } else {
+        Padding::ZERO
     })
     .height(Length::Fill)
     .align_y(Vertical::Center)
-    .style(|theme: &Theme| iced::widget::container::Style {
-        background: Some(iced::Background::Color(
-            theme.styles.text.normal.scale_alpha(0.04),
-        )),
+    .style(move |theme: &Theme| iced::widget::container::Style {
+        background: shown
+            .then(|| iced::Background::Color(theme.styles.text.normal.scale_alpha(0.04))),
         ..Default::default()
     });
     tip(cell.into(), tooltip_label)
@@ -3192,14 +3209,13 @@ fn matcher_field<'a>(
             crate::i18n::t!("editor-gutter-after-regex"),
         )
     };
-    let mut inner = row![];
-    if loose.0 {
-        inner = inner.push(gutter_cell(left_tip));
-    }
-    inner = inner.push(editor);
-    if loose.1 {
-        inner = inner.push(gutter_cell(right_tip));
-    }
+    // Both gutters stay mounted in every anchor state (see [`gutter_cell`]) so
+    // the editor's tree position — and with it its focus — survives typing.
+    let inner = row![
+        gutter_cell(loose.0, left_tip),
+        editor,
+        gutter_cell(loose.1, right_tip),
+    ];
     container(inner)
         .width(Length::Fill)
         .style(|theme: &Theme| iced::widget::container::Style {
@@ -3773,6 +3789,45 @@ mod tests {
         assert_eq!(regex_loose_sides(r"costs 5\$"), (true, true));
         assert_eq!(regex_loose_sides(""), (false, false));
         assert_eq!(regex_loose_sides("$"), (true, false));
+    }
+
+    /// The field composite's widget tree must be identical in every anchor
+    /// state. iced diffs children positionally, so a gutter cell mounting or
+    /// unmounting would shift the editor's tree position and reset its state
+    /// — focus included — on the very keystroke that flips the derivation
+    /// (the first unanchored character, adding or removing `^`/`$`), leaving
+    /// the field unfocused and swallowing everything typed after it.
+    #[test]
+    fn matcher_field_tree_is_stable_across_anchor_states() {
+        fn topology(tree: &Tree, depth: usize, out: &mut Vec<String>) {
+            out.push(format!("{depth}:{:?}", tree.tag));
+            for child in &tree.children {
+                topology(child, depth + 1, out);
+            }
+        }
+
+        let content = iced::widget::text_editor::Content::with_text("You are (hungry");
+        let mut shapes: Vec<Vec<String>> = Vec::new();
+        for loose in [(false, false), (true, false), (false, true), (true, true)] {
+            let field = matcher_field(
+                &content,
+                "placeholder",
+                highlight::FieldSyntax::Regex,
+                loose,
+                false,
+                Message::AliasRegexAction,
+            );
+            let tree = Tree::new(field.as_widget());
+            let mut tags = Vec::new();
+            topology(&tree, 0, &mut tags);
+            shapes.push(tags);
+        }
+        assert_eq!(
+            shapes[0], shapes[1],
+            "gutter states must not change the composite's tree shape"
+        );
+        assert_eq!(shapes[1], shapes[2]);
+        assert_eq!(shapes[2], shapes[3]);
     }
 
     /// Enter never reaches a one-line buffer, and pasted newlines flatten.
