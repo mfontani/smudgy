@@ -38,6 +38,12 @@ pub struct TriggerDefinition {
     pub priority: i32,
     /// Whether matching continues to later triggers after this one runs. Defaults to true.
     pub fallthrough: bool,
+    /// Authoring intent behind the three pattern vectors, as the editor's row
+    /// list in author order. Editor-only: the runtime never reads it, and the
+    /// vectors are derived from it on every save
+    /// ([`super::matchers::trigger_patterns`]). Absent means every row is a
+    /// hand-written regex shown verbatim — the pre-sidecar behavior.
+    pub matchers: Option<Vec<super::matchers::TriggerMatcherSource>>,
     // TODO: Add other trigger-specific fields like sound file, highlighting, etc.
 }
 
@@ -54,6 +60,7 @@ impl Default for TriggerDefinition {
             prompt: false,
             priority: 0,
             fallthrough: true,
+            matchers: None,
         }
     }
 }
@@ -123,6 +130,12 @@ impl Serialize for TriggerDefinition {
         if !self.fallthrough {
             map.serialize_entry("fallthrough", &self.fallthrough)?;
         }
+        match &self.matchers {
+            Some(matchers) if !matchers.is_empty() => {
+                map.serialize_entry("matchers", matchers)?;
+            }
+            _ => {}
+        }
 
         map.end()
     }
@@ -162,6 +175,8 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             priority: i32,
             #[serde(default = "default_true")]
             fallthrough: bool,
+            #[serde(default)]
+            matchers: Option<Vec<crate::models::matchers::TriggerMatcherSource>>,
         }
 
         let helper = TriggerHelper::deserialize(deserializer)?;
@@ -228,6 +243,8 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             prompt: helper.prompt,
             priority: helper.priority,
             fallthrough: helper.fallthrough,
+            // An empty list carries no authoring intent; normalize to absent.
+            matchers: helper.matchers.filter(|matchers| !matchers.is_empty()),
         })
     }
 }
@@ -531,6 +548,37 @@ mod tests {
 
         // Empty vectors should not be serialized
         assert!(!json.contains("pattern"));
+    }
+
+    #[test]
+    fn matchers_sidecar_round_trips_and_stays_sparse() {
+        use crate::models::matchers::{MatcherRole, MatcherSyntax, TriggerMatcherSource};
+
+        let trigger = TriggerDefinition {
+            patterns: Some(vec![r"^You\s+are\s+(?<state>.*?)\.$".to_string()]),
+            matchers: Some(vec![TriggerMatcherSource {
+                role: MatcherRole::Match,
+                syntax: MatcherSyntax::Pattern,
+                source: "You are {state}.".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        assert!(json.contains("\"matchers\""));
+        let back: TriggerDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, trigger);
+
+        // No sidecar (or an empty one) serializes nothing, and pre-sidecar
+        // files load with `None` — the verbatim-regex degradation.
+        let plain = serde_json::to_string(&TriggerDefinition::default()).unwrap();
+        assert!(!plain.contains("matchers"));
+        let old: TriggerDefinition = serde_json::from_str(r#"{"pattern":"^x$"}"#).unwrap();
+        assert!(old.matchers.is_none());
+        let empty: TriggerDefinition =
+            serde_json::from_str(r#"{"pattern":"^x$","matchers":[]}"#).unwrap();
+        assert!(empty.matchers.is_none());
     }
 
     #[test]

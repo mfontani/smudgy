@@ -162,6 +162,7 @@ fn plaintext_alias(pattern: &str, script: &str) -> AliasDefinition {
         priority: 0,
         fallthrough: true,
         language: ScriptLang::Plaintext,
+        matcher: None,
     }
 }
 
@@ -175,6 +176,7 @@ async fn plaintext_alias_expansion_preserves_command_order() {
         priority: 0,
         fallthrough: true,
         language: ScriptLang::Plaintext,
+        matcher: None,
     };
 
     let seen = run_scenario(
@@ -198,6 +200,7 @@ async fn script_alias_sends_preserve_command_order() {
         priority: 0,
         fallthrough: true,
         language: ScriptLang::JS,
+        matcher: None,
     };
 
     let seen = run_scenario(

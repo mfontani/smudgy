@@ -4399,6 +4399,7 @@ fn op_smudgy_create_simple_alias(
         priority,
         fallthrough,
         language: ScriptLang::Plaintext,
+        matcher: None,
     };
 
     let isolate = current_isolate(state);
@@ -4489,6 +4490,7 @@ fn op_smudgy_create_simple_trigger(
         prompt,
         priority,
         fallthrough,
+        matchers: None,
     };
 
     let isolate = current_isolate(state);

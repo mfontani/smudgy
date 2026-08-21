@@ -137,6 +137,7 @@ impl AutomationsWindow {
                 priority: 0,
                 fallthrough: true,
                 language: ScriptLang::Plaintext,
+                matcher: None,
             }),
             error: None,
         });
@@ -429,6 +430,7 @@ impl AutomationsWindow {
                         prompt: *prompt,
                         priority: *priority,
                         fallthrough: *fallthrough,
+                        matchers: None,
                     };
                     rows_into_trigger(rows, &mut t);
                     Script::Trigger(t)
