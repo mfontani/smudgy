@@ -272,6 +272,15 @@ impl SystemMixerService {
         self.0.session_registrar()
     }
 
+    /// Returns a weak, cloneable authority over the application main track.
+    ///
+    /// The authority never retains this thread-affine service or its unique
+    /// physical-output join capability.
+    #[must_use]
+    pub fn master_gain_authority(&self) -> crate::MixerMasterGainAuthority {
+        self.0.master_gain_authority()
+    }
+
     /// Add one fully preinstalled session subtree.
     ///
     /// # Errors

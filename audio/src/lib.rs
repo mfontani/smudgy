@@ -50,6 +50,13 @@ use kira::{
     track::{MainTrackBuilder, TrackBuilder, TrackHandle},
 };
 
+/// Smallest accepted application or session linear gain.
+pub const MIN_CONTROL_GAIN: f32 = 0.0;
+/// Largest accepted application or session linear gain.
+pub const MAX_CONTROL_GAIN: f32 = 1.0;
+/// Initial remembered application and session linear gain.
+pub const DEFAULT_CONTROL_GAIN: f32 = 1.0;
+
 /// The fixed number of frames in one internal mixer quantum.
 pub const INTERNAL_BUFFER_FRAMES: usize = 128;
 /// Hard maximum accepted from one physical output callback.
@@ -88,6 +95,84 @@ impl SessionBus {
             Self::Native => 1,
             Self::Speech => 2,
         }
+    }
+}
+
+/// Applied state of one application or session gain authority.
+///
+/// Muting is independent from the remembered linear gain. A muted authority
+/// therefore reports an effective gain of zero without discarding the value
+/// that will be restored when it is unmuted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MixerGainState {
+    linear: f32,
+    muted: bool,
+}
+
+impl MixerGainState {
+    /// Remembered finite linear gain in [`MIN_CONTROL_GAIN`] through
+    /// [`MAX_CONTROL_GAIN`], inclusive.
+    #[must_use]
+    pub const fn linear(self) -> f32 {
+        self.linear
+    }
+
+    /// Whether this authority is currently muted.
+    #[must_use]
+    pub const fn is_muted(self) -> bool {
+        self.muted
+    }
+
+    /// Gain currently applied to the owned Kira track.
+    #[must_use]
+    pub const fn effective_linear(self) -> f32 {
+        if self.muted { 0.0 } else { self.linear }
+    }
+}
+
+impl Default for MixerGainState {
+    fn default() -> Self {
+        Self {
+            linear: DEFAULT_CONTROL_GAIN,
+            muted: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MixerGainUpdate {
+    Linear(f32),
+    Muted(bool),
+}
+
+impl MixerGainUpdate {
+    fn apply(self, current: MixerGainState) -> MixerGainState {
+        match self {
+            Self::Linear(linear) => MixerGainState { linear, ..current },
+            Self::Muted(muted) => MixerGainState { muted, ..current },
+        }
+    }
+}
+
+fn validate_control_gain(linear: f32) -> Result<f32, MixerControlError> {
+    if !linear.is_finite() || !(MIN_CONTROL_GAIN..=MAX_CONTROL_GAIN).contains(&linear) {
+        return Err(MixerControlError::InvalidGain);
+    }
+    Ok(if linear == 0.0 { 0.0 } else { linear })
+}
+
+fn linear_to_decibels(linear: f32) -> Decibels {
+    if linear == 0.0 {
+        Decibels::SILENCE
+    } else {
+        Decibels(20.0 * linear.log10())
+    }
+}
+
+fn immediate_tween() -> Tween {
+    Tween {
+        duration: Duration::ZERO,
+        ..Tween::default()
     }
 }
 
@@ -1441,7 +1526,7 @@ impl SlotPool {
 }
 
 struct SessionTrackHandles {
-    _root: TrackHandle,
+    root: TrackHandle,
     tracks: [TrackHandle; SESSION_BUS_COUNT],
 }
 
@@ -1457,6 +1542,7 @@ struct SessionTracks {
     handles: Option<SessionTrackHandles>,
     pools: [SlotPool; SESSION_BUS_COUNT],
     key: SessionKey,
+    gain: MixerGainState,
     control: Arc<SessionControl>,
     retirement: Option<SessionRetirementState>,
 }
@@ -1469,6 +1555,15 @@ impl SessionTracks {
             .expect("active session lost its track handles")
             .tracks[bus.ordinal()]
     }
+
+    fn root_mut(&mut self) -> &mut TrackHandle {
+        &mut self
+            .handles
+            .as_mut()
+            .expect("active session lost its track handles")
+            .root
+    }
+
     fn pool_mut(&mut self, bus: SessionBus) -> &mut SlotPool {
         &mut self.pools[bus.ordinal()]
     }
@@ -1480,6 +1575,7 @@ struct MixerCore<D: JoinedOutputDriver> {
     max_sessions: usize,
     inputs_per_bus: usize,
     next_session_generation: u64,
+    master_gain: MixerGainState,
     cleanup_clean: bool,
     #[cfg(test)]
     reported_sub_track_count: Option<usize>,
@@ -1539,6 +1635,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 max_sessions,
                 inputs_per_bus,
                 next_session_generation: 1,
+                master_gain: MixerGainState::default(),
                 cleanup_clean: true,
                 #[cfg(test)]
                 reported_sub_track_count: None,
@@ -1626,11 +1723,12 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             id,
             SessionTracks {
                 handles: Some(SessionTrackHandles {
-                    _root: root,
+                    root,
                     tracks: [script, native, speech],
                 }),
                 pools: [script_pool, native_pool, speech_pool],
                 key,
+                gain: MixerGainState::default(),
                 control: Arc::clone(&session_control),
                 retirement: None,
             },
@@ -1695,19 +1793,46 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             .get_mut(&key.id)
             .filter(|session| session.key == key && session.retirement.is_none())
             .ok_or(MixerMutationError::UnknownSession)?;
-        let decibels = if linear == 0.0 {
-            Decibels::SILENCE
-        } else {
-            Decibels(20.0 * linear.log10())
-        };
-        session.track_mut(bus).set_volume(
-            decibels,
-            Tween {
-                duration: Duration::ZERO,
-                ..Tween::default()
-            },
-        );
+        session
+            .track_mut(bus)
+            .set_volume(linear_to_decibels(linear), immediate_tween());
         Ok(())
+    }
+
+    fn update_master_gain(
+        &mut self,
+        update: MixerGainUpdate,
+    ) -> Result<MixerGainState, MixerMutationError> {
+        let state = update.apply(self.master_gain);
+        self.manager
+            .as_mut()
+            .ok_or(MixerMutationError::InternalInvariant)?
+            .main_track()
+            .set_volume(
+                linear_to_decibels(state.effective_linear()),
+                immediate_tween(),
+            );
+        self.master_gain = state;
+        Ok(state)
+    }
+
+    fn update_session_gain(
+        &mut self,
+        key: SessionKey,
+        update: MixerGainUpdate,
+    ) -> Result<MixerGainState, MixerMutationError> {
+        let session = self
+            .sessions
+            .get_mut(&key.id)
+            .filter(|session| session.key == key && session.retirement.is_none())
+            .ok_or(MixerMutationError::UnknownSession)?;
+        let state = update.apply(session.gain);
+        session.root_mut().set_volume(
+            linear_to_decibels(state.effective_linear()),
+            immediate_tween(),
+        );
+        session.gain = state;
+        Ok(state)
     }
 
     fn close_all_slots(&self) {
@@ -2038,6 +2163,15 @@ enum OwnerCommand {
         SessionBus,
         f32,
         SyncSender<Result<(), MixerMutationError>>,
+    ),
+    UpdateMasterGain(
+        MixerGainUpdate,
+        SyncSender<Result<MixerGainState, MixerMutationError>>,
+    ),
+    UpdateSessionGain(
+        SessionKey,
+        MixerGainUpdate,
+        SyncSender<Result<MixerGainState, MixerMutationError>>,
     ),
     Shutdown,
 }
@@ -3043,6 +3177,123 @@ impl Drop for RunningMixerInput {
     }
 }
 
+/// Weak, cloneable authority over the application mixer master gain.
+///
+/// The authority does not retain the mixer service or its unique physical
+/// output join capability. Every accepted mutation runs on the sole mixer
+/// owner and applies to Kira's main track, above every session subtree.
+#[derive(Clone)]
+pub struct MixerMasterGainAuthority {
+    control: Weak<ControlInner>,
+}
+
+impl fmt::Debug for MixerMasterGainAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MixerMasterGainAuthority")
+            .field("service_live", &(self.control.strong_count() != 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl MixerMasterGainAuthority {
+    fn update(&self, update: MixerGainUpdate) -> Result<MixerGainState, MixerControlError> {
+        let control = self
+            .control
+            .upgrade()
+            .ok_or(MixerControlError::OwnerStopped)?;
+        send_request(&control, |response| {
+            OwnerCommand::UpdateMasterGain(update, response)
+        })?
+        .map_err(Into::into)
+    }
+
+    /// Set and remember a finite linear gain from [`MIN_CONTROL_GAIN`] through
+    /// [`MAX_CONTROL_GAIN`], inclusive.
+    ///
+    /// If this authority is muted, the remembered value changes while its
+    /// effective gain remains zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerControlError::InvalidGain`] before enqueueing for a
+    /// non-finite or out-of-range value. Sealed, failed, saturated, and stopped
+    /// services retain their existing typed control outcomes.
+    pub fn set_linear(&self, linear: f32) -> Result<MixerGainState, MixerControlError> {
+        self.update(MixerGainUpdate::Linear(validate_control_gain(linear)?))
+    }
+
+    /// Set the independent mute state and return the state applied by the
+    /// mixer owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed bounded-control or stopped-service error.
+    pub fn set_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
+        self.update(MixerGainUpdate::Muted(muted))
+    }
+}
+
+/// Weak, cloneable authority over one exact session-generation root gain.
+///
+/// Every accepted mutation runs on the sole mixer owner and applies above the
+/// session's Script, Native, and Speech tracks. The encapsulated non-wrapping
+/// generation prevents an authority from controlling a later session that
+/// reuses the same public [`AudioSessionId`].
+#[derive(Clone)]
+pub struct MixerSessionGainAuthority {
+    control: Weak<ControlInner>,
+    session: Arc<SessionControl>,
+}
+
+impl fmt::Debug for MixerSessionGainAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MixerSessionGainAuthority")
+            .field("id", &self.session.key.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MixerSessionGainAuthority {
+    fn update(&self, update: MixerGainUpdate) -> Result<MixerGainState, MixerControlError> {
+        let control = self
+            .control
+            .upgrade()
+            .ok_or(MixerControlError::OwnerStopped)?;
+        send_session_request(&control, &self.session, |response| {
+            OwnerCommand::UpdateSessionGain(self.session.key, update, response)
+        })?
+        .map_err(Into::into)
+    }
+
+    /// Set and remember a finite linear gain from [`MIN_CONTROL_GAIN`] through
+    /// [`MAX_CONTROL_GAIN`], inclusive.
+    ///
+    /// If this authority is muted, the remembered value changes while its
+    /// effective gain remains zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerControlError::InvalidGain`] before enqueueing for a
+    /// non-finite or out-of-range value. Closing/stale sessions and failed,
+    /// saturated, sealed, or stopped services retain typed control outcomes.
+    pub fn set_linear(&self, linear: f32) -> Result<MixerGainState, MixerControlError> {
+        self.update(MixerGainUpdate::Linear(validate_control_gain(linear)?))
+    }
+
+    /// Set the independent mute state and return the state applied by the
+    /// mixer owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed bounded-control, stale-session, or stopped-service
+    /// error.
+    pub fn set_muted(&self, muted: bool) -> Result<MixerGainState, MixerControlError> {
+        self.update(MixerGainUpdate::Muted(muted))
+    }
+}
+
 #[derive(Clone)]
 struct MixerBusHandle {
     control: Weak<ControlInner>,
@@ -3282,6 +3533,27 @@ impl MixerSessionOwner {
             .expect("retired session owner was used again")
             .key
             .id
+    }
+
+    /// Cloneable control authority for this exact session-generation root.
+    ///
+    /// The returned value is weak with respect to the mixer service and cannot
+    /// control a later session that reuses this owner's public id.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the owner's private unique-lifetime invariant was
+    /// corrupted inside this crate.
+    #[must_use]
+    pub fn gain_authority(&self) -> MixerSessionGainAuthority {
+        MixerSessionGainAuthority {
+            control: self.control.clone(),
+            session: Arc::clone(
+                self.session
+                    .as_ref()
+                    .expect("retired session owner was used again"),
+            ),
+        }
     }
 
     fn bus(&self, bus: SessionBus) -> MixerBusHandle {
@@ -3524,6 +3796,17 @@ impl MixerService {
     #[must_use]
     pub fn session_registrar(&self) -> MixerSessionRegistrar {
         MixerSessionRegistrar {
+            control: self.control.as_ref().map_or_else(Weak::new, Arc::downgrade),
+        }
+    }
+
+    /// Returns a weak, cloneable authority over Kira's application main track.
+    ///
+    /// The authority becomes inert when this service seals or dies and never
+    /// owns the unique physical-output join capability.
+    #[must_use]
+    pub fn master_gain_authority(&self) -> MixerMasterGainAuthority {
+        MixerMasterGainAuthority {
             control: self.control.as_ref().map_or_else(Weak::new, Arc::downgrade),
         }
     }
@@ -3824,6 +4107,22 @@ fn run_active_owner<D: JoinedOutputDriver>(
             Ok(OwnerCommand::SetGain(key, bus, linear, response)) => {
                 let result = if driver_status.is_live() {
                     mixer.set_gain(key, bus, linear)
+                } else {
+                    Err(MixerMutationError::DriverStopped)
+                };
+                let _ = response.send(result);
+            }
+            Ok(OwnerCommand::UpdateMasterGain(update, response)) => {
+                let result = if driver_status.is_live() {
+                    mixer.update_master_gain(update)
+                } else {
+                    Err(MixerMutationError::DriverStopped)
+                };
+                let _ = response.send(result);
+            }
+            Ok(OwnerCommand::UpdateSessionGain(key, update, response)) => {
+                let result = if driver_status.is_live() {
+                    mixer.update_session_gain(key, update)
                 } else {
                     Err(MixerMutationError::DriverStopped)
                 };

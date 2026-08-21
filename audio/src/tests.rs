@@ -289,6 +289,10 @@ fn assert_samples(output: &[f32], expected: f32) {
     }
 }
 
+fn assert_linear(actual: f32, expected: f32) {
+    assert_eq!(actual.to_bits(), expected.to_bits());
+}
+
 fn eventually(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !condition() {
@@ -469,6 +473,7 @@ fn join_authority_is_not_send_but_scoped_bus_handles_are_send() {
         fn assert_not_clone() {}
     }
     fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
 
     impl<T: ?Sized> AmbiguousIfSend<()> for T {}
     impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
@@ -480,6 +485,8 @@ fn join_authority_is_not_send_but_scoped_bus_handles_are_send() {
     assert_send::<MixerScriptBusHandle>();
     assert_send::<MixerNativeBusHandle>();
     assert_send::<MixerSpeechBusHandle>();
+    assert_send_sync::<MixerMasterGainAuthority>();
+    assert_send_sync::<MixerSessionGainAuthority>();
 }
 
 #[test]
@@ -563,6 +570,169 @@ fn permanent_slots_mix_two_script_inputs_and_native_with_independent_gains() {
     let shutdown = service.shutdown();
     assert!(shutdown.clean);
     assert_eq!(shutdown.failure, None);
+}
+
+fn render_settled(probe: &RenderProbe, output: &mut [f32]) {
+    // Kira can already have one internal quantum buffered when an owner-side
+    // track command is accepted. The second callback observes the mutation.
+    probe.render(output);
+    probe.render(output);
+}
+
+#[test]
+fn master_and_session_gain_compose_across_all_three_buses_without_rt_allocation() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let master = service.master_gain_authority();
+    let session = service.add_session(AudioSessionId(70)).unwrap();
+    let session_gain = session.gain_authority();
+
+    let (script, _, _) = constant(0.125);
+    let (native, _, _) = constant(0.25);
+    let (speech, _, _) = constant(0.5);
+    let script = start_reserved(session.script_bus().try_reserve_input().unwrap(), script);
+    let native = start_reserved(session.native_bus().try_reserve_input().unwrap(), native);
+    let speech = start_reserved(session.speech_bus().try_reserve_input().unwrap(), speech);
+
+    assert_eq!(
+        session_gain.set_linear(0.5).unwrap(),
+        MixerGainState {
+            linear: 0.5,
+            muted: false,
+        }
+    );
+    assert_eq!(
+        master.set_linear(0.25).unwrap(),
+        MixerGainState {
+            linear: 0.25,
+            muted: false,
+        }
+    );
+    let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+    render_settled(&probe, &mut output);
+    assert_samples(&output, (0.125 + 0.25 + 0.5) * 0.5 * 0.25);
+    assert_no_alloc::assert_no_alloc(|| probe.render(&mut output));
+    assert_samples(&output, (0.125 + 0.25 + 0.5) * 0.5 * 0.25);
+
+    // Exercise the render-side consumption of fresh Kira track commands, not
+    // only the steady state after those commands have already been observed.
+    session_gain.set_linear(0.4).unwrap();
+    master.set_linear(0.2).unwrap();
+    assert_no_alloc::assert_no_alloc(|| probe.render(&mut output));
+    probe.render(&mut output);
+    assert_samples(&output, (0.125 + 0.25 + 0.5) * 0.4 * 0.2);
+
+    assert!(block_on(script.shutdown()).unwrap().is_clean());
+    assert!(block_on(native.shutdown()).unwrap().is_clean());
+    assert!(block_on(speech.shutdown()).unwrap().is_clean());
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn session_gain_isolates_siblings_while_master_fans_out_to_both() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let master = service.master_gain_authority();
+    let first_session = service.add_session(AudioSessionId(71)).unwrap();
+    let second_session = service.add_session(AudioSessionId(72)).unwrap();
+    let first_gain = first_session.gain_authority();
+
+    let (first, first_calls, _) = constant(0.2);
+    let (second, second_calls, _) = constant(0.4);
+    let first = start_reserved(
+        first_session.script_bus().try_reserve_input().unwrap(),
+        first,
+    );
+    let second = start_reserved(
+        second_session.speech_bus().try_reserve_input().unwrap(),
+        second,
+    );
+    let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+
+    master.set_linear(0.5).unwrap();
+    render_settled(&probe, &mut output);
+    assert_samples(&output, (0.2 + 0.4) * 0.5);
+
+    first_gain.set_linear(0.25).unwrap();
+    render_settled(&probe, &mut output);
+    assert_samples(&output, (0.2 * 0.25 + 0.4) * 0.5);
+
+    let first_before_mute = first_calls.load(Ordering::Acquire);
+    let second_before_mute = second_calls.load(Ordering::Acquire);
+    let muted = first_gain.set_muted(true).unwrap();
+    assert_linear(muted.linear(), 0.25);
+    assert!(muted.is_muted());
+    assert_linear(muted.effective_linear(), 0.0);
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.4 * 0.5);
+    assert!(first_calls.load(Ordering::Acquire) > first_before_mute);
+    assert!(second_calls.load(Ordering::Acquire) > second_before_mute);
+
+    master.set_linear(1.0).unwrap();
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.4);
+    master.set_linear(0.0).unwrap();
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.0);
+
+    assert!(block_on(first.shutdown()).unwrap().is_clean());
+    assert!(block_on(second.shutdown()).unwrap().is_clean());
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn gain_updates_preserve_remembered_volume_and_apply_in_owner_order() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let master = service.master_gain_authority();
+    let session = service.add_session(AudioSessionId(73)).unwrap();
+    let gain = session.gain_authority();
+    let (source, _, _) = constant(0.8);
+    let running = start_reserved(session.native_bus().try_reserve_input().unwrap(), source);
+    let mut output = [0.0; INTERNAL_BUFFER_FRAMES * 2];
+
+    let muted_default = gain.set_muted(true).unwrap();
+    assert_linear(muted_default.linear(), DEFAULT_CONTROL_GAIN);
+    assert!(muted_default.is_muted());
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.0);
+
+    let changed_while_muted = gain.set_linear(0.375).unwrap();
+    assert_linear(changed_while_muted.linear(), 0.375);
+    assert!(changed_while_muted.is_muted());
+    assert_linear(changed_while_muted.effective_linear(), 0.0);
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.0);
+
+    let restored = gain.set_muted(false).unwrap();
+    assert_linear(restored.linear(), 0.375);
+    assert!(!restored.is_muted());
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.8 * 0.375);
+
+    let master_muted = master.set_muted(true).unwrap();
+    assert_linear(master_muted.linear(), DEFAULT_CONTROL_GAIN);
+    master.set_linear(0.5).unwrap();
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.0);
+    let master_restored = master.set_muted(false).unwrap();
+    assert_linear(master_restored.linear(), 0.5);
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.8 * 0.375 * 0.5);
+
+    let canonical_zero = gain.set_linear(-0.0).unwrap();
+    assert_eq!(canonical_zero.linear().to_bits(), 0.0_f32.to_bits());
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.0);
+    assert_linear(gain.set_linear(1.0).unwrap().linear(), 1.0);
+    render_settled(&probe, &mut output);
+    assert_samples(&output, 0.8 * 0.5);
+
+    assert!(block_on(running.shutdown()).unwrap().is_clean());
+    assert!(service.shutdown().clean);
 }
 
 #[test]
@@ -1335,6 +1505,47 @@ fn accepted_session_retirement_survives_dropped_receipt_and_service_seal() {
 }
 
 #[test]
+fn stale_session_gain_cannot_control_same_id_reuse_and_replacement_resets_default() {
+    let probe = RenderProbe::default();
+    let service = MixerService::start_with_driver_and_limits::<TestBackend>(
+        settings(probe.clone()),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let original = service.add_session(AudioSessionId(240)).unwrap();
+    let stale = original.gain_authority();
+    assert_linear(stale.set_linear(0.25).unwrap().linear(), 0.25);
+    let mut retirement = original.retire();
+    assert_eq!(
+        stale.set_muted(true),
+        Err(MixerControlError::UnknownSession)
+    );
+    assert_eq!(drive_session_retirement(&probe, &mut retirement), Ok(()));
+
+    let replacement = service.add_session(AudioSessionId(240)).unwrap();
+    let replacement_gain = replacement.gain_authority();
+    assert_eq!(
+        stale.set_linear(0.5),
+        Err(MixerControlError::UnknownSession)
+    );
+    let replacement_default = replacement_gain.set_muted(true).unwrap();
+    assert_linear(replacement_default.linear(), DEFAULT_CONTROL_GAIN);
+    assert!(replacement_default.is_muted());
+    assert_linear(replacement_gain.set_muted(false).unwrap().linear(), 1.0);
+
+    let mut replacement_retirement = replacement.retire();
+    assert_eq!(
+        drive_session_retirement(&probe, &mut replacement_retirement),
+        Ok(())
+    );
+    assert!(service.shutdown().clean);
+}
+
+#[test]
 fn accepted_session_retirement_settles_after_device_failure_cleanup() {
     let probe = RenderProbe::default();
     let service = MixerService::start_with_driver_and_limits::<TestBackend>(
@@ -1353,6 +1564,35 @@ fn accepted_session_retirement_settles_after_device_failure_cleanup() {
     assert!(shutdown.clean);
     assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
     assert_eq!(block_on(retirement), Ok(()));
+}
+
+#[test]
+fn gain_authorities_fail_typed_after_output_death_and_joined_shutdown() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let master = service.master_gain_authority();
+    let session = service.add_session(AudioSessionId(291)).unwrap();
+    let session_gain = session.gain_authority();
+    assert_linear(master.set_linear(0.5).unwrap().linear(), 0.5);
+    assert_linear(session_gain.set_linear(0.25).unwrap().linear(), 0.25);
+
+    assert!(probe.fail_output());
+    assert_eq!(master.set_linear(1.0), Err(MixerControlError::OwnerStopped));
+    assert_eq!(
+        session_gain.set_muted(true),
+        Err(MixerControlError::OwnerStopped)
+    );
+    let retirement = session.retire();
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+    assert_eq!(block_on(retirement), Ok(()));
+    assert_eq!(master.set_muted(true), Err(MixerControlError::OwnerStopped));
+    assert_eq!(
+        session_gain.set_linear(0.5),
+        Err(MixerControlError::OwnerStopped)
+    );
 }
 
 #[test]
@@ -1488,6 +1728,55 @@ fn bounded_control_full_and_disconnect_are_typed_without_mutation() {
     assert_eq!(handle.set_gain(0.5), Err(MixerControlError::Saturated));
     drop(full_receiver);
     assert_eq!(handle.set_gain(0.5), Err(MixerControlError::OwnerStopped));
+}
+
+#[test]
+fn bounded_gain_validation_precedes_enqueue_for_both_authorities() {
+    let (commands, command_receiver) = mpsc::sync_channel(0);
+    let (retirements, _retirement_receiver) = mpsc::sync_channel(1);
+    let control = test_control(commands, retirements);
+    let session = Arc::new(SessionControl::new(SessionKey {
+        id: AudioSessionId(300),
+        generation: 1,
+    }));
+    let master = MixerMasterGainAuthority {
+        control: Arc::downgrade(&control),
+    };
+    let session_gain = MixerSessionGainAuthority {
+        control: Arc::downgrade(&control),
+        session,
+    };
+
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.001, 1.001] {
+        assert_eq!(
+            master.set_linear(invalid),
+            Err(MixerControlError::InvalidGain)
+        );
+        assert_eq!(
+            session_gain.set_linear(invalid),
+            Err(MixerControlError::InvalidGain)
+        );
+    }
+    assert!(matches!(
+        command_receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    assert_eq!(
+        master.set_linear(MIN_CONTROL_GAIN),
+        Err(MixerControlError::Saturated)
+    );
+    assert_eq!(
+        session_gain.set_linear(MAX_CONTROL_GAIN),
+        Err(MixerControlError::Saturated)
+    );
+    assert_eq!(master.set_muted(true), Err(MixerControlError::Saturated));
+    drop(command_receiver);
+    assert_eq!(master.set_muted(true), Err(MixerControlError::OwnerStopped));
+    assert_eq!(
+        session_gain.set_muted(true),
+        Err(MixerControlError::OwnerStopped)
+    );
 }
 
 #[test]
