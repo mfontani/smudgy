@@ -189,6 +189,11 @@ impl scrollable::Catalog for Theme {
 
 pub enum TextEditorClass {
     Default,
+    /// Chromeless: no background, no border. For editors composed inside an
+    /// outer styled container that provides both (e.g. the automations
+    /// editors' gutter-flanked pattern fields, where the composite owns the
+    /// single border).
+    Inline,
 }
 
 impl text_editor::Catalog for Theme {
@@ -198,10 +203,17 @@ impl text_editor::Catalog for Theme {
         TextEditorClass::Default
     }
 
-    fn style(&self, _class: &Self::Class<'_>, _status: text_editor::Status) -> text_editor::Style {
+    fn style(&self, class: &Self::Class<'_>, _status: text_editor::Status) -> text_editor::Style {
+        let (background, border) = match class {
+            TextEditorClass::Default => (
+                Background::Color(self.styles.general.container_background),
+                border::color(self.styles.general.border).width(1.0),
+            ),
+            TextEditorClass::Inline => (Background::Color(Color::TRANSPARENT), Border::default()),
+        };
         text_editor::Style {
-            background: Background::Color(self.styles.general.container_background),
-            border: border::color(self.styles.general.border).width(1.0),
+            background,
+            border,
             placeholder: self.styles.text.normal.scale_alpha(0.4),
             value: self.styles.text.normal,
             selection: self.styles.general.accent,
