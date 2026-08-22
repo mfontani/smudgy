@@ -39,6 +39,12 @@ const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.md"
 pub enum Tab {
     Account,
     Preferences,
+    /// Live audio controls (master/session/package gain). The pane's content
+    /// renders from daemon-owned audio state, so the daemon composes it around
+    /// this window's [`SettingsWindow::nav`]; see the `Tab::Audio` arm in
+    /// [`SettingsWindow::view`].
+    #[cfg(feature = "web-audio-cpal")]
+    Audio,
     Security,
     Friends,
     Licenses,
@@ -969,31 +975,57 @@ impl SettingsWindow {
 
     // ===================== views =====================
 
-    pub fn view(&self) -> ThemedElement<'_, Message> {
-        let nav = column![
+    /// The currently selected tab, read by the daemon to decide whether the
+    /// Audio pane (composed outside this window) should render.
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// The left nav rail, shared by [`Self::view`] and the daemon's composed
+    /// Audio pane.
+    pub fn nav(&self) -> ThemedElement<'_, Message> {
+        let mut nav = column![
             nav_button(t!("nav-account"), self.tab == Tab::Account, Tab::Account),
             nav_button(
                 t!("nav-preferences"),
                 self.tab == Tab::Preferences,
                 Tab::Preferences
             ),
-            nav_button(t!("nav-security"), self.tab == Tab::Security, Tab::Security),
-            nav_button(t!("nav-friends"), self.tab == Tab::Friends, Tab::Friends),
-            nav_button(t!("nav-licenses"), self.tab == Tab::Licenses, Tab::Licenses),
-        ]
-        .spacing(4)
-        .width(140);
+        ];
+        #[cfg(feature = "web-audio-cpal")]
+        {
+            nav = nav.push(nav_button(t!("nav-audio"), self.tab == Tab::Audio, Tab::Audio));
+        }
+        nav = nav.push(nav_button(
+            t!("nav-security"),
+            self.tab == Tab::Security,
+            Tab::Security,
+        ));
+        nav = nav.push(nav_button(t!("nav-friends"), self.tab == Tab::Friends, Tab::Friends));
+        nav = nav.push(nav_button(
+            t!("nav-licenses"),
+            self.tab == Tab::Licenses,
+            Tab::Licenses,
+        ));
+        nav.spacing(4).width(140).into()
+    }
 
+    pub fn view(&self) -> ThemedElement<'_, Message> {
         let content: ThemedElement<'_, Message> = match self.tab {
             Tab::Account => self.account_view(),
             Tab::Preferences => self.preferences_view(),
+            // The Audio pane renders daemon-owned audio state this window
+            // cannot see, so the daemon intercepts the tab and composes the
+            // pane itself around `nav()`; this arm is never rendered.
+            #[cfg(feature = "web-audio-cpal")]
+            Tab::Audio => column![].into(),
             Tab::Security => self.security_view(),
             Tab::Friends => self.friends_view(),
             Tab::Licenses => self.licenses_view(),
         };
 
         row![
-            container(nav).padding(12),
+            container(self.nav()).padding(12),
             rule::vertical(1),
             container(iced::widget::scrollable(container(content).padding(16)))
                 .width(Length::Fill)

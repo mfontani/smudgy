@@ -21,8 +21,8 @@ not persisted as a successful change.
 
 ## Volume and mute controls
 
-The audio panel exposes one master row, one row for every active session,
-and one row for each enabled sandbox package root. Trusted packages run on
+The Settings window's Audio pane exposes one master row, one row for every
+active session, and one row for each enabled sandbox package root. Trusted packages run on
 Main and are explicitly labeled as session-controlled; Smudgy does not claim
 truthful per-package control inside that shared isolate.
 
@@ -33,18 +33,21 @@ server/profile identity, and sandbox policy adds its folded, versionless
 owner/name root. Non-default package policies remain available across
 uninstall/reinstall and version changes; default rows are compacted away.
 
-Open and focus the panel with `Ctrl+Shift+A` (`Command+Shift+A` on macOS).
-`Tab` and `Shift+Tab` cycle its focusable rows without a pointer. On a focused
+Open the pane from the toolbar's Audio button, from Settings itself, or with
+`Ctrl+Shift+A` (`Command+Shift+A` on macOS); every entry lands on the pane with
+the master row focused. `Tab` and `Shift+Tab` cycle its focusable rows without
+a pointer. On a focused
 row, the arrow keys adjust volume by five points, `Home` and `End` select 0 and
 100, and `Space` toggles mute. Focus is visibly outlined and off-screen rows
 are scrolled into view.
 
 These are visible, keyboard-focusable controls, not a full screen-reader
 semantics claim. Smudgy carries narrow patch-crate changes to iced runtime and
-winit that expose one AccessKit live region per native window. The audio panel
-uses it only for its localized applied, saved, and failure feedback. It does not
-describe the controls, their values, focus, or the rest of the widget tree, so
-full screen-reader navigation remains out of scope.
+winit that expose one AccessKit live region per native window. The Audio pane
+uses it only for its localized saved-preference and failure feedback — a
+routine applied-and-saved change is silent. It does not describe the controls,
+their values, focus, or the rest of the widget tree, so full screen-reader
+navigation remains out of scope.
 
 Each window holds at most one pending announcement of at most 4 KiB. The newest
 valid request in an event-loop batch replaces the earlier one; empty and

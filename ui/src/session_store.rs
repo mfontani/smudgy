@@ -360,16 +360,6 @@ impl SessionStore {
         true
     }
 
-    /// Publish focus loss for every command input while an application modal
-    /// owns keyboard interaction. Runtime-originated focus requests are
-    /// suppressed by the daemon until the modal closes.
-    #[cfg(feature = "web-audio-cpal")]
-    pub fn clear_all_input_focus(&mut self) {
-        for session in self.sessions.values_mut() {
-            session.clear_input_focus();
-        }
-    }
-
     /// Collect and clear every session's workspace-dirty mark (connection-
     /// intent changes). Part of the daemon's once-per-update sweep into the
     /// autosave schedule.
@@ -564,7 +554,7 @@ pub struct AudioPackageRow {
     pub trusted: bool,
     /// Persisted evidence that this versionless package root has successfully
     /// prepared Web Audio at least once. Rows without this evidence stay out
-    /// of the audio-controls modal.
+    /// of the Settings window's Audio pane.
     pub audio_used: bool,
     pub gain: AudioGainSettings,
     /// True only after an exact live package controller acknowledged a UI

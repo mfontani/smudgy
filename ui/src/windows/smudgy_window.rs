@@ -162,7 +162,8 @@ pub enum Event {
     /// runtime shutdown, grid cleanup across all windows, the empty-window
     /// rule — is the daemon's job.
     CloseSession(SessionId),
-    /// The toolbar or reserved keyboard shortcut requested the audio modal.
+    /// The toolbar or reserved keyboard shortcut requested the audio
+    /// controls (the Settings window's Audio pane).
     #[cfg(feature = "web-audio-cpal")]
     OpenAudioPanel,
     /// The user clicked a pane's title-bar eyeball. The window already
@@ -4024,7 +4025,7 @@ mod tests {
 
     #[cfg(feature = "web-audio-cpal")]
     #[test]
-    fn toolbar_audio_action_requests_the_window_modal() {
+    fn toolbar_audio_action_requests_the_audio_settings_pane() {
         let mut window = test_window();
         let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
         let update = window.update(
