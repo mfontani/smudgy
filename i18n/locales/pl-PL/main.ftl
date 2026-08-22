@@ -251,6 +251,31 @@ server-error-action-missing = Nieoczekiwany błąd: Brak trwającej operacji.
 server-edit-short = Edytuj
 server-details-missing = Nie znaleziono szczegółów serwera.
 
+# Zaobserwowane metadane serwera (MSSP) na ekranie połączenia
+observed-players = { $players ->
+    [one] 1 gracz podczas ostatniego połączenia · { $ago }
+   *[other] { $players } graczy podczas ostatniego połączenia · { $ago }
+}
+observed-last-connected = Ostatnie połączenie { $ago }
+observed-uptime = { $days ->
+    [one] działa od { $days } dnia
+   *[other] działa od { $days } dni
+}
+observed-tls-available = TLS dostępny
+observed-contact = Kontakt: { $contact }
+observed-link-discord = Discord
+observed-link-website = Witryna
+observed-link-contact = Kontakt
+ago-just-now = przed chwilą
+ago-minutes = { $minutes } min temu
+ago-hours = { $hours } godz. temu
+ago-days = { $days } dni temu
+
+# Propozycja przejścia na TLS w sesji
+tls-offer-body = Ten serwer oferuje szyfrowane połączenie na porcie { $port }.
+tls-offer-accept = Przełącz i połącz ponownie
+tls-offer-decline = Nie dla tego serwera
+
 profiles-title = Profile
 profiles-saved-help = Zapisane loginy dla tego serwera.
 profiles-load-error = Nie udało się załadować profili dla tego serwera.
@@ -996,16 +1021,16 @@ editor-name = Nazwa
 editor-pattern = Wzorzec
 editor-behavior = Zachowanie
 editor-shortcut = Skrót
-editor-patterns-invalid = Co najmniej jeden wzorzec się nie kompiluje — sprawdź podświetlone wiersze.
-editor-patterns = Wzorce
-editor-add-pattern = Dodaj wzorzec
+editor-patterns-invalid = Co najmniej jeden wzorzec się nie kompiluje. Sprawdź podświetlone wiersze.
+editor-patterns = Dopasuj wiersze jako
+editor-add-pattern = Dodaj kolejny wzorzec
 editor-create-alias = Utwórz alias
 editor-create-hotkey = Utwórz skrót klawiszowy
 editor-create-trigger = Utwórz wyzwalacz
-editor-no-match = Brak dopasowania
-editor-enter-line = Wprowadź wiersz
-editor-would-fire = Zostałby wyzwolony
-editor-enter-command = Wprowadź polecenie
+editor-no-match = ✗ brak dopasowania
+editor-enter-line = · wpisz wiersz, który gra może wysłać
+editor-would-fire = ✓ uruchamia się
+editor-enter-command = · wpisz polecenie do przetestowania
 editor-folder-summary = Folder · liczba elementów: { $count }
 editor-path = Ścieżka
 editor-folder-disabled-help = Wyłączony — skrypty w tym folderze nie będą uruchamiane. Użyj „/", aby zagnieżdżać foldery.
@@ -1017,6 +1042,144 @@ editor-delete-scripts-too = Usuń też skrypty
 editor-create-folder = Utwórz folder
 editor-module-help = Moduły lokalne są ładowane podobnie jak pakiety, ale działają z pełnymi uprawnieniami i bez sandboxu
 editor-source = Źródło
+
+# ---- Edytory dopasowań aliasów i wyzwalaczy ----
+editor-match-input-as = Dopasuj dane wejściowe jako
+editor-kind-command = Polecenie + argumenty
+editor-kind-pattern = Prosty wzorzec
+editor-kind-regex = Wyrażenie regularne
+editor-kind-raw = Surowe bajty
+editor-badge-advanced = Zaawansowane
+editor-badge-wizardry = Eksperckie
+editor-card-example-command = greet <person>
+editor-card-blurb-pattern = Wklej wiersz tak, jak wyświetla go gra, i wstaw {"{"}nazwę{"}"} w miejscu zmiennego tekstu.
+editor-card-blurb-regex = Używane bez zmian dla wierszy, których nie da się opisać prostym wzorcem.
+editor-card-blurb-raw = Uwzględnia kody kolorów i bajty sterujące.
+editor-raw-hint = Wpisz \e jako znak ucieczki. Kody kolorów i bajty sterujące pozostają w wierszu.
+editor-group-exceptions = Wyjątki
+editor-group-exceptions-note = Zapobiega uruchomieniu tego wyzwalacza
+editor-group-raw = Surowe dopasowania
+editor-group-raw-note = Dopasowywane do surowego wiersza wraz z kodami kolorów
+editor-add-raw-another = Dodaj kolejny surowy wzorzec
+editor-add-normal = Dodaj zwykły wzorzec
+editor-add-exception-another = Dodaj kolejny wyjątek
+editor-add-exception = Dodaj wyjątek
+editor-add-exception-tip = Jeśli pasuje, wyzwalacz nie zostanie uruchomiony
+editor-match-raw = Dopasuj surowe bajty
+editor-match-raw-tip = Surowe wyrażenie regularne dopasowywane przed tekstem, z zachowaniem kodów kolorów i bajtów sterujących
+editor-move-up = Przenieś w górę
+editor-move-down = Przenieś w dół
+editor-remove-line = Usuń ten wiersz
+editor-dot-matches = pasuje do wiersza testowego
+editor-dot-no-match = nie pasuje do wiersza testowego
+editor-dot-blocks = pasuje — blokuje wyzwalacz
+editor-command = Polecenie
+editor-arguments = Argumenty
+editor-usage = Użycie
+editor-parsing = Analiza
+editor-regex = Wyrażenie regularne
+editor-arg-required = Wymagany
+editor-arg-optional = Opcjonalny
+editor-arg-rest = Reszta wiersza
+editor-add-argument = Dodaj argument
+editor-cmd-simple = Proste
+editor-cmd-advanced = Zaawansowane
+editor-parse-spaces = Tylko spacje
+editor-parse-quotes = Spacje lub cudzysłowy
+editor-parse-braces = Spacje lub nawiasy klamrowe
+editor-parse-all = Spacje, cudzysłowy lub nawiasy klamrowe
+editor-parse-raw = Cały wiersz jako jeden argument
+editor-gets = OTRZYMUJE
+editor-parse-spaces-example = greet big "ugly" troll
+editor-parse-spaces-gets = big · "ugly" · troll
+editor-parse-quotes-example = greet "big ugly" troll
+editor-parse-quotes-gets = big ugly · troll
+editor-parse-braces-example = greet {"{"}big "ugly"{"}"} troll
+editor-parse-braces-gets = big "ugly" · troll
+editor-parse-all-example = greet "big ugly" {"{"}a "gift"{"}"}
+editor-parse-all-gets = big ugly · a "gift"
+editor-parse-raw-example = greet big ugly troll
+editor-parse-raw-gets = big ugly troll
+editor-allow-before = Zezwól na tekst przed wzorcem
+editor-allow-after = Zezwól na tekst po wzorcu
+editor-prompt = Dopasowuj także wiersz monitu
+editor-prompt-note = Wiersz pozostawiony przez grę w oczekiwaniu na dane wejściowe.
+editor-syntax-pattern = Prosty wzorzec
+editor-syntax-regex = Wyrażenie regularne
+editor-command-name-empty = Brak nazwy polecenia
+editor-command-name-spaces = Polecenie jest jednym słowem — nadaj temu aliasowi jednowyrazową nazwę albo ustaw słowo polecenia
+editor-command-override = Użyj innego słowa…
+editor-command-completion-note = Nazwy poleceń można uzupełniać klawiszem Tab w polu wejściowym.
+editor-example-command = greet
+editor-example-arg-name = name
+editor-example-trigger-pattern = You are hungry.
+editor-example-trigger-regex = ^You are (hungry|thirsty)\.$
+editor-example-trigger-raw = \e\[1;31m(?<hp>\d+)hp
+editor-example-alias-simple = greet {"{"}person{"}"} warmly
+editor-example-alias-regex = ^greet\s+(.+?)[!.]?$
+editor-numbered-hole = Wpisz {"{}"} zamiast {"{"}{ $body }{"}"}. Pola są numerowane w kolejności zapisu.
+editor-unknown-hole-type = Nieznany typ w {"{"}{ $body }{"}"}. Użyj :word, :number lub :rest.
+editor-invalid-regex = Nieprawidłowe wyrażenie regularne: { $error }
+editor-matches-every-line = Ten wzorzec pasuje do każdego wiersza.
+editor-fires-on-raw = ✓ uruchamia się przy surowym dopasowaniu { $n }
+editor-fires-on-match = ✓ uruchamia się przy dopasowaniu { $n }
+editor-blocked-by = ✗ zablokowany przez wyjątek { $n }
+editor-wrong-first-word = ✗ pierwsze słowo to nie „{ $name }”
+editor-missing-arg = ✗ brak <{ $name }>
+editor-unclaimed = ✗ żaden element nie przechwytuje „{ $text }”
+editor-unterminated-quote = ✗ niezamknięty cudzysłów
+editor-unbalanced-braces = ✗ niedomknięte nawiasy klamrowe
+editor-row-error = Wiersz { $row }: { $error }
+editor-reveal-order-aliases = Dostosuj priorytet lub zablokuj uruchamianie innych aliasów
+editor-reveal-order-triggers = Dostosuj priorytet lub zablokuj uruchamianie innych wyzwalaczy
+editor-hide-order = Ukryj opcje priorytetu
+editor-matched-values = Dopasowane wartości
+
+# Wypróbuj i wyniki testu
+editor-try-alias-cta = Wypróbuj z tekstem, który możesz wpisać
+editor-try-trigger-cta = Wypróbuj z wierszem wysłanym przez grę
+editor-try-it = Wypróbuj
+editor-game-sent = GRA WYSŁAŁA
+editor-test-placeholder-alias = greet Mira
+editor-test-placeholder-trigger = You are hungry.
+editor-try-bytes-prefix = jako bajty ·
+editor-verdict-no-command = ✗ brak nazwy polecenia
+editor-verdict-command-spaces = ✗ polecenie jest jednym słowem — to nigdy nie może pasować
+editor-verdict-no-pattern = ✗ brak wzorca
+editor-verdict-no-regex = ✗ brak wyrażenia regularnego
+editor-verdict-no-matchers = ✗ brak wierszy do dopasowania
+editor-verdict-invalid-regex = ✗ nieprawidłowe wyrażenie regularne: { $error }
+editor-verdict-compile-error = ✗ { $error }
+
+# Kiedy jest uruchamiany
+editor-when-it-runs = Kiedy jest uruchamiany
+editor-priority = Priorytet
+editor-priority-note-aliases = Aliasy z wyższymi numerami są uruchamiane najpierw.
+editor-priority-note-triggers = Wyzwalacze z wyższymi numerami są uruchamiane najpierw.
+editor-continue-aliases = Uruchom także inne pasujące aliasy
+editor-continue-triggers = Uruchom także inne pasujące wyzwalacze
+
+# Moduł akcji
+editor-tab-send-text = Wyślij tekst
+editor-tab-run-js = Uruchom JavaScript
+editor-gen-alias-hello = say Hello, { $hole }!
+editor-gen-alias-hello-none = say Hello!
+editor-gen-alias-emote = emote smiles and waves to { $hole }.
+editor-gen-alias-emote-none = emote smiles and waves.
+editor-gen-trigger = say I heard about { $hole }.
+editor-gen-trigger-none = say Understood.
+
+# Etykiety marginesów
+editor-gutter-before-pattern = Przed wzorcem może występować dowolny tekst
+editor-gutter-after-pattern = Po wzorcu może występować dowolny tekst
+editor-gutter-before-regex = Brak ^ — przed wyrażeniem może występować dowolny tekst
+editor-gutter-after-regex = Brak $ — po wyrażeniu może występować dowolny tekst
+
+# Opisy nagłówków i łącza stopki
+editor-deck-alias = Aliasy pozwalają tworzyć własne polecenia.
+editor-deck-trigger = Wyzwalacze reagują na tekst wysyłany przez grę.
+editor-delete-this-alias = Usuń ten alias
+editor-delete-this-trigger = Usuń ten wyzwalacz
 widget-hotkey-click-to-record = kliknij, aby zarejestrować
 widget-hotkey-listening = nasłuchiwanie...
 
