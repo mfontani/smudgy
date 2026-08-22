@@ -305,6 +305,7 @@ struct TestDriver {
 impl JoinedOutputDriver for TestDriver {
     type Settings = TestDriverSettings;
     type Error = TestDriverError;
+    const CALLBACKS_RUN_AUTONOMOUSLY: bool = false;
 
     fn setup(
         settings: Self::Settings,

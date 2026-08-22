@@ -39,7 +39,7 @@ use std::{
     },
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::channel::oneshot;
@@ -72,6 +72,7 @@ const SESSION_BUS_COUNT: usize = 3;
 const RETIREMENT_QUEUE_CAPACITY: usize = MAX_SESSIONS * SESSION_BUS_COUNT * INPUTS_PER_BUS;
 const SESSION_RETIREMENT_QUEUE_CAPACITY: usize = MAX_SESSIONS;
 const RETIREMENT_SCAN_INTERVAL: Duration = Duration::from_millis(10);
+const SESSION_TRACK_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A stable session identity within one process mixer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1410,6 +1411,11 @@ trait JoinedOutputDriver: Sized {
     type Settings;
     type Error;
 
+    /// Whether render callbacks advance independently of test code. Manual
+    /// probes intentionally return `false`; a pause between explicit renders
+    /// is not evidence that their synthetic device stalled.
+    const CALLBACKS_RUN_AUTONOMOUSLY: bool = true;
+
     fn setup(
         settings: Self::Settings,
         internal_buffer_size: usize,
@@ -1553,6 +1559,7 @@ struct SessionRetirementState {
     failure: Option<MixerSessionRetirementError>,
     inputs_closed: bool,
     tracks_dropped: bool,
+    tracks_dropped_at: Option<Instant>,
 }
 
 struct SessionTracks {
@@ -1596,6 +1603,8 @@ struct MixerCore<D: JoinedOutputDriver> {
     cleanup_clean: bool,
     #[cfg(test)]
     reported_sub_track_count: Option<usize>,
+    #[cfg(test)]
+    session_track_retirement_timeout: Option<Duration>,
 }
 
 impl<D: JoinedOutputDriver> MixerCore<D> {
@@ -1656,6 +1665,8 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 cleanup_clean: true,
                 #[cfg(test)]
                 reported_sub_track_count: None,
+                #[cfg(test)]
+                session_track_retirement_timeout: None,
             },
             negotiated,
         ))
@@ -1876,6 +1887,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             failure: None,
             inputs_closed: false,
             tracks_dropped: false,
+            tracks_dropped_at: None,
         });
         Ok(())
     }
@@ -1996,10 +2008,15 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 .as_mut()
                 .expect("filtered retiring session")
                 .tracks_dropped = true;
+            session
+                .retirement
+                .as_mut()
+                .expect("filtered retiring session")
+                .tracks_dropped_at = Some(Instant::now());
         }
     }
 
-    fn complete_rendered_session_retirements(&mut self) -> bool {
+    fn complete_rendered_session_retirements(&mut self, driver_status: &DriverStatus) -> bool {
         let active_track_count = self
             .sessions
             .values()
@@ -2015,6 +2032,34 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         #[cfg(not(test))]
         let reported_track_count = manager.num_sub_tracks();
         if reported_track_count > active_track_count {
+            let now = Instant::now();
+            #[cfg(test)]
+            let retirement_timeout = self.session_track_retirement_timeout.or_else(|| {
+                D::CALLBACKS_RUN_AUTONOMOUSLY.then_some(SESSION_TRACK_RETIREMENT_TIMEOUT)
+            });
+            #[cfg(not(test))]
+            let retirement_timeout =
+                D::CALLBACKS_RUN_AUTONOMOUSLY.then_some(SESSION_TRACK_RETIREMENT_TIMEOUT);
+            let callback_stalled = self.sessions.values().any(|session| {
+                session
+                    .retirement
+                    .as_ref()
+                    .and_then(|retirement| retirement.tracks_dropped_at)
+                    .is_some_and(|dropped| {
+                        retirement_timeout.is_some_and(|timeout| {
+                            now.saturating_duration_since(dropped) >= timeout
+                        })
+                    })
+            });
+            if callback_stalled {
+                // Kira removes dropped tracks only while its renderer advances.
+                // A device that stops invoking callbacks must therefore
+                // terminalize the shared output instead of leaving this
+                // session's retirement future pending forever.
+                self.cleanup_clean = false;
+                driver_status.fail(MixerOutputFailure::BackendFailure);
+                return false;
+            }
             return true;
         }
         if reported_track_count < active_track_count {
@@ -3947,11 +3992,16 @@ impl MixerService {
     /// Seal production, join the physical output owner, and force-resolve live slots.
     #[must_use]
     pub fn shutdown(mut self) -> MixerShutdown {
-        self.driver_status.begin_close();
         if let Some(control) = self.control.as_ref()
             && control.seal_production().is_ok()
         {
+            // Drain already-admitted opens while the driver is still live.
+            // Once the admission gate is sealed, no opener can observe a
+            // synthetic shutdown failure between its two liveness checks.
+            self.driver_status.begin_close();
             let _ = control.commands.send(OwnerCommand::Shutdown);
+        } else {
+            self.driver_status.begin_close();
         }
         self.control.take();
         let joined = self.owner.take().is_some_and(|owner| owner.join().is_ok());
@@ -3979,10 +4029,12 @@ fn add_session(
 
 impl Drop for MixerService {
     fn drop(&mut self) {
-        self.driver_status.begin_close();
         if let Some(control) = self.control.take() {
             let _ = control.seal_production();
+            self.driver_status.begin_close();
             let _ = control.commands.try_send(OwnerCommand::Shutdown);
+        } else {
+            self.driver_status.begin_close();
         }
         // Explicit shutdown is the proof-bearing joined path. Dropping the last
         // control Arc disconnects the owner if the bounded queue was full.
@@ -4182,7 +4234,7 @@ fn run_active_owner<D: JoinedOutputDriver>(
         scan_retirements(mixer, pending, cleanup_sender);
         #[cfg(test)]
         driver_status.pause_before_session_forced_cleanup();
-        if !progress_session_retirements(mixer, cleanup_sender, pending) {
+        if !progress_session_retirements(mixer, cleanup_sender, pending, driver_status) {
             break;
         }
         let mut shutting_down = false;
@@ -4354,6 +4406,7 @@ fn progress_session_retirements<D: JoinedOutputDriver>(
     mixer: &mut MixerCore<D>,
     cleanup_sender: &SyncSender<CleanupTask>,
     pending: &[RetirementRequest],
+    driver_status: &DriverStatus,
 ) -> bool {
     mixer.close_drained_session_inputs();
     let jobs = mixer.prepare_session_forced_jobs(pending);
@@ -4368,7 +4421,7 @@ fn progress_session_retirements<D: JoinedOutputDriver>(
         }
     }
     mixer.drop_ready_session_tracks();
-    mixer.complete_rendered_session_retirements()
+    mixer.complete_rendered_session_retirements(driver_status)
 }
 
 fn scan_retirements<D: JoinedOutputDriver>(

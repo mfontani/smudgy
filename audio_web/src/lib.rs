@@ -2682,8 +2682,15 @@ fn render_fixed(
                     .iter_mut()
                     .zip(scratch[..sample_count].chunks_exact(2))
                 {
-                    *frame =
-                        MixerFrame::new(samples[0] * effective_gain, samples[1] * effective_gain);
+                    let left = samples[0] * effective_gain;
+                    let right = samples[1] * effective_gain;
+                    // A hostile or broken graph must not poison the shared
+                    // application mix. Treat every non-finite component as
+                    // silence while preserving a finite peer channel.
+                    *frame = MixerFrame::new(
+                        if left.is_finite() { left } else { 0.0 },
+                        if right.is_finite() { right } else { 0.0 },
+                    );
                 }
             }
             MixerInputStatus::Active

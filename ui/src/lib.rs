@@ -282,6 +282,20 @@ struct AudioPanelState {
     preferences: AudioSettings,
     master_live: AudioGainSettings,
     notice: Option<String>,
+    persistence_generation: u64,
+    persistence_dirty: bool,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_modal_blocks_script_focus(panel_open: bool, event: &SessionEvent) -> bool {
+    panel_open
+        && matches!(
+            event,
+            SessionEvent::InputOp {
+                op: smudgy_core::session::runtime::input::InputOp::Focus,
+                ..
+            }
+        )
 }
 
 #[cfg(feature = "web-audio-cpal")]
@@ -331,6 +345,19 @@ enum Message {
         target: AudioTarget,
         widget_id: iced::widget::Id,
         action: widgets::audio_gain::Action,
+    },
+    #[cfg(feature = "web-audio-cpal")]
+    PersistAudioPreferences {
+        generation: u64,
+        window_id: window::Id,
+        preference_only: bool,
+    },
+    #[cfg(feature = "web-audio-cpal")]
+    AudioPreferencesPersisted {
+        generation: u64,
+        window_id: window::Id,
+        preference_only: bool,
+        result: Result<(), String>,
     },
     /// An event from a session's runtime stream, routed straight to the
     /// session store (whatever window hosts the session's pane repaints from
@@ -645,6 +672,8 @@ fn init(
                 preferences: settings.audio.clone(),
                 master_live,
                 notice: None,
+                persistence_generation: 0,
+                persistence_dirty: false,
             },
             account,
             discord,
@@ -1289,7 +1318,13 @@ fn update_audio_preference(
 }
 
 #[cfg(feature = "web-audio-cpal")]
+static AUDIO_SETTINGS_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "web-audio-cpal")]
 fn persist_audio_preferences(settings: &AudioSettings) -> Result<(), String> {
+    let _guard = AUDIO_SETTINGS_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     smudgy_core::models::settings::merge_audio_settings(settings).map_err(|error| error.to_string())
 }
 
@@ -1574,6 +1609,29 @@ fn audio_control_feedback(
 }
 
 #[cfg(feature = "web-audio-cpal")]
+fn schedule_audio_preferences_persist(
+    smudgy: &mut Smudgy,
+    window_id: window::Id,
+    preference_only: bool,
+) -> Task<Message> {
+    smudgy.audio_panel.persistence_generation =
+        smudgy.audio_panel.persistence_generation.wrapping_add(1);
+    let generation = smudgy.audio_panel.persistence_generation;
+    smudgy.audio_panel.persistence_dirty = true;
+    Task::perform(
+        async move {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            (generation, window_id, preference_only)
+        },
+        |(generation, window_id, preference_only)| Message::PersistAudioPreferences {
+            generation,
+            window_id,
+            preference_only,
+        },
+    )
+}
+
+#[cfg(feature = "web-audio-cpal")]
 fn handle_audio_control(
     smudgy: &mut Smudgy,
     window_id: window::Id,
@@ -1635,13 +1693,11 @@ fn handle_audio_control(
                         &target,
                         applied,
                         action,
-                        persist_audio_preferences,
+                        |_| Ok(()),
                     ) {
                         Ok((next, _stored)) => {
                             smudgy.audio_panel.preferences = next;
-                            smudgy.audio_panel.notice =
-                                Some(i18n::t!("audio-notice-applied-saved"));
-                            AudioAnnouncement::AppliedAndSaved
+                            return schedule_audio_preferences_persist(smudgy, window_id, false);
                         }
                         Err(error) => {
                             smudgy.audio_panel.notice = Some(i18n::t!(
@@ -1673,13 +1729,12 @@ fn handle_audio_control(
                 &target,
                 desired,
                 action,
-                persist_audio_preferences,
+                |_| Ok(()),
             ) {
                 Ok((next, stored)) => {
                     smudgy.audio_panel.preferences = next;
                     set_preference_only_live_row(smudgy, &target, stored);
-                    smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-preference-saved"));
-                    AudioAnnouncement::PreferenceSaved
+                    return schedule_audio_preferences_persist(smudgy, window_id, true);
                 }
                 Err(error) => {
                     smudgy.audio_panel.notice = Some(i18n::t!(
@@ -2731,6 +2786,15 @@ fn begin_workspace_quit_flush(smudgy: &mut Smudgy) -> Option<Task<Message>> {
     if !smudgy.workspace.schedule.begin_shutdown() {
         return None;
     }
+    #[cfg(feature = "web-audio-cpal")]
+    if smudgy.audio_panel.persistence_dirty {
+        match persist_audio_preferences(&smudgy.audio_panel.preferences) {
+            Ok(()) => smudgy.audio_panel.persistence_dirty = false,
+            Err(error) => {
+                log::error!("final audio preference flush failed during quit: {error}");
+            }
+        }
+    }
     let (ack, done) = tokio::sync::oneshot::channel();
     // `publish_workspace_snapshot` resolves the ack on every path, so the
     // awaited task below always completes — and the await is bounded
@@ -2757,6 +2821,16 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
             if !smudgy.audio_panel.open_windows.remove(&window_id) {
                 smudgy.audio_panel.open_windows.insert(window_id);
+                smudgy.sessions.clear_all_input_focus();
+                let master = audio_master_id(window_id);
+                smudgy
+                    .audio_panel
+                    .focused_widgets
+                    .insert(window_id, master.clone());
+                return Task::batch([
+                    scoped_audio_focus(window_id, master),
+                    reveal_audio_focus(window_id, audio_master_id(window_id)),
+                ]);
             } else {
                 smudgy.audio_panel.focused_widgets.remove(&window_id);
             }
@@ -2768,6 +2842,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 return Task::none();
             }
             smudgy.audio_panel.open_windows.insert(window_id);
+            smudgy.sessions.clear_all_input_focus();
             let master = audio_master_id(window_id);
             smudgy
                 .audio_panel
@@ -2820,6 +2895,88 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             widget_id,
             action,
         } => handle_audio_control(smudgy, window_id, target, widget_id, action),
+        #[cfg(feature = "web-audio-cpal")]
+        Message::PersistAudioPreferences {
+            generation,
+            window_id,
+            preference_only,
+        } => {
+            if generation != smudgy.audio_panel.persistence_generation {
+                return Task::none();
+            }
+            let settings = smudgy.audio_panel.preferences.clone();
+            Task::perform(
+                async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || persist_audio_preferences(&settings))
+                            .await
+                            .unwrap_or_else(|error| {
+                                Err(format!("audio settings writer stopped: {error}"))
+                            });
+                    (generation, window_id, preference_only, result)
+                },
+                |(generation, window_id, preference_only, result)| {
+                    Message::AudioPreferencesPersisted {
+                        generation,
+                        window_id,
+                        preference_only,
+                        result,
+                    }
+                },
+            )
+        }
+        #[cfg(feature = "web-audio-cpal")]
+        Message::AudioPreferencesPersisted {
+            generation,
+            window_id,
+            preference_only,
+            result,
+        } => {
+            if generation != smudgy.audio_panel.persistence_generation {
+                return Task::none();
+            }
+            match result {
+                Ok(()) => {
+                    smudgy.audio_panel.persistence_dirty = false;
+                    if preference_only {
+                        audio_control_feedback(
+                            smudgy,
+                            window_id,
+                            i18n::t!("audio-notice-preference-saved"),
+                            AudioAnnouncement::PreferenceSaved,
+                        )
+                    } else {
+                        audio_control_feedback(
+                            smudgy,
+                            window_id,
+                            i18n::t!("audio-notice-applied-saved"),
+                            AudioAnnouncement::AppliedAndSaved,
+                        )
+                    }
+                }
+                Err(error) => {
+                    smudgy.audio_panel.persistence_dirty = true;
+                    if preference_only {
+                        audio_control_feedback(
+                            smudgy,
+                            window_id,
+                            i18n::t!(
+                                "audio-notice-preference-save-failed",
+                                "error" => error
+                            ),
+                            AudioAnnouncement::PreferenceSaveFailed,
+                        )
+                    } else {
+                        audio_control_feedback(
+                            smudgy,
+                            window_id,
+                            i18n::t!("audio-notice-applied-save-failed", "error" => error),
+                            AudioAnnouncement::AppliedSaveFailed,
+                        )
+                    }
+                }
+            }
+        }
         Message::WindowTracking(id, event) => {
             smudgy.window_tracker.apply(id, event);
             // Every motion sample drives the hover classification the
@@ -3276,6 +3433,14 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
         }
         Message::UiCommand(envelope) => handle_ui_command(smudgy, envelope),
         Message::SessionEvent(TaggedSessionEvent { session_id, event }) => {
+            #[cfg(feature = "web-audio-cpal")]
+            if audio_modal_blocks_script_focus(!smudgy.audio_panel.open_windows.is_empty(), &event)
+            {
+                log::debug!(
+                    "Suppressing scripted command-input focus while an audio modal is open"
+                );
+                return Task::none();
+            }
             // Open is repeated on the owning session stream to order display
             // state before output. A fast later Close can win the independent
             // bus subscription; do not let that delayed echo resurrect the
@@ -6786,6 +6951,17 @@ mod tests {
 
     #[cfg(feature = "web-audio-cpal")]
     #[test]
+    fn audio_modal_blocks_runtime_command_input_focus() {
+        let focus = SessionEvent::InputOp {
+            key: MAIN_PANE_KEY,
+            op: smudgy_core::session::runtime::input::InputOp::Focus,
+        };
+        assert!(audio_modal_blocks_script_focus(true, &focus));
+        assert!(!audio_modal_blocks_script_focus(false, &focus));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
     fn every_locale_maps_exact_audio_feedback_to_the_frozen_priority() {
         use iced_runtime::window::AnnouncementPriority::{Assertive, Polite};
 
@@ -7653,8 +7829,8 @@ mod tests {
         assert_eq!(report.sessions.len(), 1);
         assert!(report.sessions[0].is_clean());
         assert!(
-            !report.is_clean(),
-            "the retained output death stays visible"
+            report.is_clean(),
+            "the retained output death stays visible without turning proven cleanup into a failed exit"
         );
     }
 

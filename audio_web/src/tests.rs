@@ -1603,6 +1603,26 @@ fn render_copy_stop_panic_and_invalid_geometry_fail_closed_without_allocating() 
     assert_eq!(muted_callbacks.load(Ordering::Relaxed), 1);
     assert!(output.iter().all(|frame| *frame == MixerFrame::ZERO));
 
+    let status = assert_no_alloc::assert_no_alloc(|| {
+        render_fixed(
+            &mut output,
+            &mut scratch,
+            0.5,
+            |samples| {
+                for frame in samples.chunks_exact_mut(2) {
+                    frame[0] = f32::NAN;
+                    frame[1] = f32::INFINITY;
+                }
+                samples[1] = -0.5;
+                AudioRenderStatus::Continue
+            },
+            |_| {},
+        )
+    });
+    assert_eq!(status, MixerInputStatus::Active);
+    assert_eq!(output[0], MixerFrame::new(0.0, -0.25));
+    assert!(output[1..].iter().all(|frame| *frame == MixerFrame::ZERO));
+
     output.fill(MixerFrame::from_mono(1.0));
     let status = assert_no_alloc::assert_no_alloc(|| {
         render_fixed(

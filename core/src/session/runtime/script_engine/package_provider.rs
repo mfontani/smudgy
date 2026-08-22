@@ -406,20 +406,20 @@ impl SmudgyPackageProvider {
                 false
             }
         };
-        let persisted = shared_packages::load_lock(&self.server_name).and_then(|mut disk| {
+        let persisted = shared_packages::mutate_lock(&self.server_name, |disk| {
             if let Some(entry) = disk.packages.iter_mut().find(|p| p.specifier == specifier) {
                 entry.last_resolved_version = Some(version.to_string());
                 entry.integrity = Some(integrity.to_string());
-                shared_packages::save_lock(&self.server_name, &disk)
+                Ok(((), true))
             } else if known_install {
                 // Uninstalled since this session loaded — don't resurrect it just to stamp
                 // resolution metadata on it.
-                Ok(())
+                Ok(((), false))
             } else {
                 // Not an install at all (a top-level resolve outside the lockfile): record it
                 // on disk the same way it was recorded in memory.
                 disk.upsert(fresh_entry());
-                shared_packages::save_lock(&self.server_name, &disk)
+                Ok(((), true))
             }
         });
         if let Err(err) = persisted {

@@ -171,6 +171,18 @@ impl From<crate::application_audio::ApplicationAudioControlError> for AudioReloa
     }
 }
 
+#[cfg(feature = "web-audio-cpal")]
+fn is_transient_audio_policy_error(
+    error: &crate::application_audio::ApplicationAudioControlError,
+) -> bool {
+    use crate::application_audio::ApplicationAudioControlError;
+    matches!(
+        error,
+        ApplicationAudioControlError::CoordinatorSaturated
+            | ApplicationAudioControlError::MixerQueueSaturated
+    )
+}
+
 /// All live sessions, keyed by id. Windows borrow sessions from here to
 /// render and update their panes; the daemon routes session events here
 /// directly. An id missing from the store is the signal that the session was
@@ -346,6 +358,16 @@ impl SessionStore {
             session.focus_only_input(key);
         }
         true
+    }
+
+    /// Publish focus loss for every command input while an application modal
+    /// owns keyboard interaction. Runtime-originated focus requests are
+    /// suppressed by the daemon until the modal closes.
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn clear_all_input_focus(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.clear_input_focus();
+        }
     }
 
     /// Collect and clear every session's workspace-dirty mark (connection-
@@ -1266,6 +1288,8 @@ impl ManagedSession {
                         | ApplicationAudioControlError::UnknownSession
                         | ApplicationAudioControlError::SessionClosing
                         | ApplicationAudioControlError::StaleSession
+                        | ApplicationAudioControlError::CoordinatorSaturated
+                        | ApplicationAudioControlError::MixerQueueSaturated
                 ) {
                     return Err(error.into());
                 }
@@ -1303,6 +1327,49 @@ impl ManagedSession {
                 Ok(output_failed.then(|| error.to_string()))
             }
         }
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    fn restore_audio_after_failed_reload_send(
+        &mut self,
+        previous_gain: AudioGainSettings,
+        previous_packages: Vec<AudioPackageRow>,
+        previous_unavailable_cause: Option<crate::application_audio::SessionAudioUnavailable>,
+        previous_preference_only: bool,
+    ) {
+        if previous_unavailable_cause.is_none()
+            && self.audio_unavailable_cause.is_none()
+            && let Some(controller) = self.audio_control.as_ref()
+        {
+            let packages = previous_packages
+                .iter()
+                .filter(|row| !row.trusted)
+                .map(|row| {
+                    (
+                        Arc::clone(&row.owner),
+                        Arc::clone(&row.name),
+                        row.gain.linear(),
+                        row.gain.muted,
+                    )
+                });
+            if let Err(error) = controller.stage_policy(
+                previous_gain.linear(),
+                previous_gain.muted,
+                self.audio_gain.linear(),
+                self.audio_gain.muted,
+                packages,
+            ) {
+                log::error!(
+                    "runtime reload channel closed after audio staging, and the prior live policy could not be restored for session {}: {error}",
+                    self.id
+                );
+                return;
+            }
+        }
+        self.audio_gain = previous_gain;
+        self.audio_packages = previous_packages;
+        self.audio_unavailable_cause = previous_unavailable_cause;
+        self.audio_preference_only = previous_preference_only;
     }
 
     fn note_visibility_input(&self) {
@@ -1527,53 +1594,65 @@ impl ManagedSession {
                 desired_audio_gain.muted,
                 package_gains,
             ) {
-                let (cause, show_saved_preference) = match &error {
-                    crate::application_audio::ApplicationAudioControlError::NotApplicable(
-                        cause,
-                    ) => (cause.clone(), true),
-                    crate::application_audio::ApplicationAudioControlError::OutputFailed(
-                        failure,
-                    ) => (
-                        crate::application_audio::SessionAudioUnavailable::System(
-                            smudgy_audio::SystemMixerUnavailable::from(
-                                smudgy_audio::SystemMixerStartError::DriverFailed(failure.clone()),
+                if is_transient_audio_policy_error(&error) {
+                    // Queue pressure says nothing about whether this physical
+                    // registration remains viable. Leave its acknowledged
+                    // defaults live so a later control or reload can retry.
+                    log::warn!(
+                        "saved Web Audio policy for session {id} was not staged because control capacity was temporarily saturated: {error}"
+                    );
+                    for row in &mut audio_packages {
+                        row.applied = false;
+                    }
+                } else {
+                    let (cause, show_saved_preference) = match &error {
+                        crate::application_audio::ApplicationAudioControlError::NotApplicable(
+                            cause,
+                        ) => (cause.clone(), true),
+                        crate::application_audio::ApplicationAudioControlError::OutputFailed(
+                            failure,
+                        ) => (
+                            crate::application_audio::SessionAudioUnavailable::System(
+                                smudgy_audio::SystemMixerUnavailable::from(
+                                    smudgy_audio::SystemMixerStartError::DriverFailed(*failure),
+                                ),
                             ),
+                            false,
                         ),
-                        false,
-                    ),
-                    _ => (
-                        crate::application_audio::SessionAudioUnavailable::Policy(
-                            error.to_string().into(),
+                        _ => (
+                            crate::application_audio::SessionAudioUnavailable::Policy(
+                                error.to_string().into(),
+                            ),
+                            true,
                         ),
-                        true,
-                    ),
-                };
-                if !matches!(
-                    &error,
-                    crate::application_audio::ApplicationAudioControlError::NotApplicable(_)
-                ) {
-                    let transition = pending_audio
-                        .as_mut()
-                        .expect("the staged registration remains owned")
-                        .force_emulated(cause.clone());
-                    if let Err(transition) = transition {
-                        log::error!(
-                            "exact Web Audio scope was forced emulated after policy failure, but coordinator metadata also failed: {error}; {transition}"
-                        );
+                    };
+                    if !matches!(
+                        &error,
+                        crate::application_audio::ApplicationAudioControlError::NotApplicable(_)
+                    ) {
+                        let transition = pending_audio
+                            .as_mut()
+                            .expect("the staged registration remains owned")
+                            .force_emulated(cause.clone());
+                        if let Err(transition) = transition {
+                            log::error!(
+                                "exact Web Audio scope was forced emulated after policy failure, but coordinator metadata also failed: {error}; {transition}"
+                            );
+                        }
                     }
-                }
-                audio_unavailable_cause = Some(cause);
-                audio_preference_only = show_saved_preference;
-                if show_saved_preference {
-                    audio_gain = desired_audio_gain;
-                }
-                for row in &mut audio_packages {
+                    audio_unavailable_cause = Some(cause);
+                    audio_preference_only = show_saved_preference;
                     if show_saved_preference {
-                        row.gain = audio_policy
-                            .and_then(|policy| policy.package(&row.owner, &row.name))
-                            .map_or_else(AudioGainSettings::default, |package| package.gain);
+                        audio_gain = desired_audio_gain;
                     }
-                    row.applied = false;
+                    for row in &mut audio_packages {
+                        if show_saved_preference {
+                            row.gain = audio_policy
+                                .and_then(|policy| policy.package(&row.owner, &row.name))
+                                .map_or_else(AudioGainSettings::default, |package| package.gain);
+                        }
+                        row.applied = false;
+                    }
                 }
             } else {
                 audio_gain = desired_audio_gain;
@@ -2896,6 +2975,20 @@ impl ManagedSession {
                 Task::none()
             }
             Message::Reload => {
+                if self.runtime_tx.as_ref().is_none_or(|tx| tx.is_closed()) {
+                    log::error!(
+                        "refusing script reload for session {} because its runtime channel is closed",
+                        self.id
+                    );
+                    return Task::none();
+                }
+                #[cfg(feature = "web-audio-cpal")]
+                let previous_audio = (
+                    self.audio_gain,
+                    self.audio_packages.clone(),
+                    self.audio_unavailable_cause.clone(),
+                    self.audio_preference_only,
+                );
                 #[cfg(feature = "web-audio-cpal")]
                 let audio_output_failure = match self.prepare_audio_reload() {
                     Ok(failure) => failure,
@@ -2907,10 +3000,25 @@ impl ManagedSession {
                         return Task::none();
                     }
                 };
-                self.input.clear_hotkeys();
-                if let Some(tx) = self.runtime_tx.as_ref() {
-                    tx.send(RuntimeAction::Reload).ok();
+                let sent = self
+                    .runtime_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(RuntimeAction::Reload).is_ok());
+                if !sent {
+                    #[cfg(feature = "web-audio-cpal")]
+                    self.restore_audio_after_failed_reload_send(
+                        previous_audio.0,
+                        previous_audio.1,
+                        previous_audio.2,
+                        previous_audio.3,
+                    );
+                    log::error!(
+                        "refusing script reload for session {} because its runtime channel closed during preparation",
+                        self.id
+                    );
+                    return Task::none();
                 }
+                self.input.clear_hotkeys();
                 #[cfg(feature = "web-audio-cpal")]
                 {
                     audio_output_failure.map_or_else(Task::none, |cause| {
@@ -3538,6 +3646,22 @@ mod tests {
             mark_package_audio_used(&mut rows, "unknown", "package"),
             None
         );
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn transient_audio_policy_pressure_does_not_require_emulation() {
+        use crate::application_audio::ApplicationAudioControlError;
+
+        assert!(is_transient_audio_policy_error(
+            &ApplicationAudioControlError::CoordinatorSaturated
+        ));
+        assert!(is_transient_audio_policy_error(
+            &ApplicationAudioControlError::MixerQueueSaturated
+        ));
+        assert!(!is_transient_audio_policy_error(
+            &ApplicationAudioControlError::MixerWorkerStopped
+        ));
     }
 
     #[cfg(feature = "web-audio-cpal")]

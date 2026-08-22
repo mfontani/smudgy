@@ -318,7 +318,10 @@ impl ApplicationAudioOutputShutdown {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         match self {
-            Self::Physical(shutdown) => shutdown.clean && shutdown.failure.is_none(),
+            // Operational output death remains in `failure` for reporting,
+            // but process success is a cleanup claim: a safely joined and
+            // retired output is clean even when it failed while running.
+            Self::Physical(shutdown) => shutdown.clean,
             Self::Unavailable(cause) => cause.cleanup_proven(),
         }
     }
@@ -865,26 +868,63 @@ impl ApplicationAudioController {
     }
 
     pub fn close_session(&self, session_id: SessionId) -> SessionAudioCloseDisposition {
-        let (reply, response) = mpsc::sync_channel(1);
-        if self
-            .commands
-            .send(CoordinatorCommand::Close { session_id, reply })
-            .is_err()
         {
-            return self.close_session_direct(session_id);
-        }
-        response
-            .recv()
-            .unwrap_or_else(|_| self.close_session_direct(session_id))
-    }
-
-    fn close_session_direct(&self, session_id: SessionId) -> SessionAudioCloseDisposition {
-        match take_close_job(&self.state, &self.runtime_shutdown, session_id) {
-            Ok(job) => {
-                submit_job(&self.state, &self.lifecycle, &self.runtime_join, job);
-                SessionAudioCloseDisposition::Requested
+            let mut state = lock_state(&self.state);
+            if state.closing.contains(&session_id) {
+                return SessionAudioCloseDisposition::AlreadyClosing;
             }
-            Err(disposition) => disposition,
+            if !state.registrations.contains_key(&session_id) {
+                return SessionAudioCloseDisposition::UnknownSession;
+            }
+            // Linearize close before leaving iced, but leave the potentially
+            // blocking registration seal and runtime gates off the UI thread.
+            state.closing.insert(session_id);
+        }
+        let (reply, _response) = mpsc::sync_channel(1);
+        let command = CoordinatorCommand::Close { session_id, reply };
+        match self.commands.try_send(command) {
+            Ok(()) => SessionAudioCloseDisposition::Requested,
+            Err(mpsc::TrySendError::Full(command)) => {
+                let commands = self.commands.clone();
+                let state = Arc::clone(&self.state);
+                let lifecycle = self.lifecycle.clone();
+                let runtime_shutdown = Arc::clone(&self.runtime_shutdown);
+                let runtime_join = Arc::clone(&self.runtime_join);
+                match thread::Builder::new()
+                    .name("smudgy-audio-close-admission".into())
+                    .spawn(move || {
+                        if commands.send(command).is_err()
+                            && let Ok(job) = take_close_job(&state, &runtime_shutdown, session_id)
+                        {
+                            submit_job(&state, &lifecycle, &runtime_join, job);
+                        }
+                    }) {
+                    Ok(_) => SessionAudioCloseDisposition::Requested,
+                    Err(_) => {
+                        lock_state(&self.state).closing.remove(&session_id);
+                        SessionAudioCloseDisposition::CoordinatorStopped
+                    }
+                }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                let state = Arc::clone(&self.state);
+                let lifecycle = self.lifecycle.clone();
+                let runtime_shutdown = Arc::clone(&self.runtime_shutdown);
+                let runtime_join = Arc::clone(&self.runtime_join);
+                match thread::Builder::new()
+                    .name("smudgy-audio-close-fallback".into())
+                    .spawn(move || {
+                        if let Ok(job) = take_close_job(&state, &runtime_shutdown, session_id) {
+                            submit_job(&state, &lifecycle, &runtime_join, job);
+                        }
+                    }) {
+                    Ok(_) => SessionAudioCloseDisposition::Requested,
+                    Err(_) => {
+                        lock_state(&self.state).closing.remove(&session_id);
+                        SessionAudioCloseDisposition::CoordinatorStopped
+                    }
+                }
+            }
         }
     }
 
@@ -3220,8 +3260,8 @@ mod tests {
             })
         ));
         assert!(
-            !report.is_clean(),
-            "operational output death remains visible"
+            report.is_clean(),
+            "operational output death stays visible in the report without invalidating proven cleanup"
         );
         assert!(matches!(
             controller.set_master_linear(1.0),
@@ -3582,6 +3622,60 @@ mod tests {
         }
         assert_eq!(&*events.lock().unwrap(), &["shutdown:7", "join:7"]);
         let report = shutdown_while_rendering(application, probe);
+        assert!(report.is_clean(), "{report}");
+    }
+
+    #[test]
+    fn close_admission_never_waits_for_a_busy_coordinator() {
+        let (service, probe) =
+            start_test_mixer(PHYSICAL_SAMPLE_RATE, TestDriverConfig::default()).unwrap();
+        let (entered, entered_receiver) = mpsc::sync_channel(1);
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let shutdown_release = Arc::clone(&release);
+        let first = AtomicBool::new(true);
+        let application = ApplicationAudio::with_service_and_runtime(
+            service,
+            production_limits(),
+            Arc::new(move |session_id| {
+                if session_id == SessionId::from(70) && first.swap(false, Ordering::AcqRel) {
+                    let _ = entered.send(());
+                    shutdown_release.wait();
+                }
+                true
+            }),
+            Arc::new(|session_id| RuntimeThreadJoinOutcome::Clean { session_id }),
+            Arc::new(Vec::new),
+            Arc::new(|| {}),
+        )
+        .unwrap_or_else(|(error, _)| panic!("test lifecycle workers start: {error}"));
+        let controller = application.controller();
+        for id in [70, 71] {
+            controller
+                .begin_session(SessionId::from(id))
+                .unwrap()
+                .commit();
+        }
+
+        assert_eq!(
+            controller.close_session(SessionId::from(70)),
+            SessionAudioCloseDisposition::Requested
+        );
+        entered_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            controller.close_session(SessionId::from(71)),
+            SessionAudioCloseDisposition::Requested
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "iced close waited for coordinator-owned session gates"
+        );
+
+        release.wait();
+        let report = shutdown_while_rendering(application, probe);
+        assert_eq!(report.sessions.len(), 2);
         assert!(report.is_clean(), "{report}");
     }
 

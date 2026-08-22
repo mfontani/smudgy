@@ -95,6 +95,7 @@ fn record_backend_owner(threads: &Mutex<Vec<thread::ThreadId>>, enforce_owner_th
 impl JoinedOutputDriver for TestBackend {
     type Settings = TestBackendSettings;
     type Error = TestBackendError;
+    const CALLBACKS_RUN_AUTONOMOUSLY: bool = false;
 
     fn setup(
         settings: Self::Settings,
@@ -180,6 +181,7 @@ struct UnjoinedSettings {
 impl JoinedOutputDriver for UnjoinedBackend {
     type Settings = UnjoinedSettings;
     type Error = TestBackendError;
+    const CALLBACKS_RUN_AUTONOMOUSLY: bool = false;
 
     fn setup(
         settings: Self::Settings,
@@ -1861,7 +1863,10 @@ fn dropped_reserve_response_restores_the_same_physical_capacity() {
     .unwrap();
     let session = service.add_session(AudioSessionId(31)).unwrap();
     let control = service.control.as_ref().unwrap();
-    let (response, abandoned) = mpsc::sync_channel(1);
+    // A rendezvous channel proves the receiver is gone before the owner can
+    // publish the reservation; a buffered response could win the race and
+    // make this a test of receiver timing instead of rollback.
+    let (response, abandoned) = mpsc::sync_channel(0);
     control
         .commands
         .send(OwnerCommand::Reserve(
@@ -2603,6 +2608,52 @@ fn output_death_after_live_open_snapshot_rejects_before_running_publication() {
 }
 
 #[test]
+fn service_shutdown_drains_an_admitted_open_before_marking_driver_closing() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe), TEST_RATE).unwrap();
+    let session = service.add_session(AudioSessionId(911)).unwrap();
+    let reservation = session.script_bus().try_reserve_input().unwrap();
+    let (source, _, _) = constant(0.125);
+    let Ok(installed) = reservation.install_preboxed(source) else {
+        panic!("live reservation must install");
+    };
+    let (entered, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    *lock_recover(&service.driver_status.open_snapshot_hook) = Some(Arc::new(OpenSnapshotHook {
+        entered,
+        release: Arc::clone(&release),
+        armed: AtomicBool::new(true),
+    }));
+    let control = Arc::clone(service.control.as_ref().unwrap());
+    let status = Arc::clone(&service.driver_status);
+
+    let opening = thread::spawn(move || installed.open());
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let release_after_seal = thread::spawn(move || {
+        eventually(|| lock_recover(&control.gate).production_sealed);
+        let stayed_live = status.is_live();
+        release.wait();
+        stayed_live
+    });
+    let shutdown = service.shutdown();
+    assert!(
+        release_after_seal.join().unwrap(),
+        "shutdown must drain admitted opens while live"
+    );
+    let running = opening
+        .join()
+        .unwrap()
+        .expect("the admitted open completes before shutdown closes the driver");
+    drop(running);
+    drop(session);
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, None);
+}
+
+#[test]
 fn output_death_after_final_snapshot_is_classified_as_owner_stopped() {
     let probe = RenderProbe::default();
     let service =
@@ -3063,7 +3114,8 @@ fn impossible_kira_track_undercount_terminalizes_with_structural_session_error()
     assert!(!progress_session_retirements(
         &mut mixer,
         &cleanup_sender,
-        &[]
+        &[],
+        &status
     ));
     assert!(!mixer.cleanup_clean);
     assert!(retire_backend(&mut mixer));
@@ -3072,6 +3124,59 @@ fn impossible_kira_track_undercount_terminalizes_with_structural_session_error()
         block_on(completed).unwrap(),
         Err(MixerSessionRetirementError::Structural)
     );
+}
+
+#[test]
+fn stalled_render_callbacks_terminalize_session_retirement() {
+    let status = Arc::new(DriverStatus::new());
+    let probe = RenderProbe::default();
+    let mut backend_settings = settings(probe);
+    backend_settings.enforce_owner_thread = false;
+    let (mut mixer, _) = MixerCore::<TestBackend>::with_limits(
+        backend_settings,
+        Arc::clone(&status),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let retiring = mixer.add_session(AudioSessionId(952)).unwrap();
+    retiring.begin_close().unwrap();
+    let (completion, completed) = oneshot::channel();
+    assert!(
+        mixer
+            .begin_session_retirement(SessionRetirementRequest {
+                key: retiring.key,
+                completion,
+            })
+            .is_ok()
+    );
+    mixer.close_drained_session_inputs();
+    mixer.drop_ready_session_tracks();
+    mixer
+        .sessions
+        .get_mut(&AudioSessionId(952))
+        .unwrap()
+        .retirement
+        .as_mut()
+        .unwrap()
+        .tracks_dropped_at = Some(
+        Instant::now()
+            .checked_sub(SESSION_TRACK_RETIREMENT_TIMEOUT)
+            .expect("the monotonic clock has advanced past the retirement timeout"),
+    );
+    // A callback would reduce this to zero after observing the dropped track.
+    mixer.reported_sub_track_count = Some(1);
+    mixer.session_track_retirement_timeout = Some(SESSION_TRACK_RETIREMENT_TIMEOUT);
+
+    assert!(!mixer.complete_rendered_session_retirements(&status));
+    assert_eq!(status.failure(), Some(MixerOutputFailure::BackendFailure));
+    assert!(!mixer.cleanup_clean);
+    assert!(retire_backend(&mut mixer));
+    mixer.finish_session_retirements_after_backend(true);
+    assert_eq!(block_on(completed).unwrap(), Ok(()));
 }
 
 #[test]
