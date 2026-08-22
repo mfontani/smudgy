@@ -251,6 +251,33 @@ server-error-action-missing = Неочікувана помилка: немає 
 server-edit-short = Редагувати
 server-details-missing = Відомості про сервер не знайдено.
 
+# Спостережені метадані сервера (MSSP) на екрані підключення
+observed-players = { $players ->
+    [one] 1 гравець під час останнього з'єднання · { $ago }
+    [few] { $players } гравці під час останнього з'єднання · { $ago }
+   *[other] { $players } гравців під час останнього з'єднання · { $ago }
+}
+observed-last-connected = Останнє з'єднання { $ago }
+observed-uptime = { $days ->
+    [one] працює { $days } день
+    [few] працює { $days } дні
+   *[other] працює { $days } днів
+}
+observed-tls-available = Доступний TLS
+observed-contact = Контакт: { $contact }
+observed-link-discord = Discord
+observed-link-website = Вебсайт
+observed-link-contact = Контакт
+ago-just-now = щойно
+ago-minutes = { $minutes } хв тому
+ago-hours = { $hours } год тому
+ago-days = { $days } дн тому
+
+# Пропозиція перейти на TLS під час сесії
+tls-offer-body = Цей сервер пропонує зашифроване з'єднання через порт { $port }.
+tls-offer-accept = Перемкнутися й підключитися знову
+tls-offer-decline = Не для цього сервера
+
 profiles-title = Профілі
 profiles-saved-help = Збережені логіни для цього сервера.
 profiles-load-error = Не вдалося завантажити профілі для цього сервера.
@@ -996,21 +1023,16 @@ editor-name = Назва
 editor-pattern = Шаблон
 editor-behavior = Поведінка
 editor-shortcut = Комбінація
-editor-test-command = Перевірити на команді
-editor-test-line = Перевірити на рядку
-editor-patterns-invalid = Щонайменше один шаблон не компілюється — перевірте підсвічені рядки.
-editor-patterns = Шаблони
-editor-add-pattern = Додати шаблон
+editor-patterns-invalid = Щонайменше один шаблон не компілюється. Перевірте підсвічені рядки.
+editor-patterns = Зіставляти рядки як
+editor-add-pattern = Додати ще один шаблон
 editor-create-alias = Створити аліас
 editor-create-hotkey = Створити гарячу клавішу
 editor-create-trigger = Створити тригер
-editor-no-match = Немає збігу
-editor-invalid-pattern = Некоректний шаблон
-editor-enter-line = Введіть рядок
-editor-would-fire = Спрацював би
-editor-enter-pattern = Введіть шаблон
-editor-enter-command = Введіть команду
-editor-matches = Збігається
+editor-no-match = ✗ немає збігу
+editor-enter-line = · введіть рядок, який може надіслати гра
+editor-would-fire = ✓ спрацьовує
+editor-enter-command = · введіть команду для перевірки
 editor-folder-summary = Тека · кількість елементів: { $count }
 editor-path = Шлях
 editor-folder-disabled-help = Вимкнено — скрипти в цій теці не запускатимуться. Використовуйте «/», щоб вкладати теки.
@@ -1022,9 +1044,144 @@ editor-delete-scripts-too = Видалити також скрипти
 editor-create-folder = Створити теку
 editor-module-help = Локальні модулі завантажуються подібно до пакунків, але працюють з повними правами й без пісочниці
 editor-source = Джерело
-pattern-kind-match = Збіг
-pattern-kind-anti = Анти-збіг
-pattern-kind-raw = Необроблений регулярний вираз
+
+# ---- Редактори зіставлень аліасів і тригерів ----
+editor-match-input-as = Зіставляти введення як
+editor-kind-command = Команда + аргументи
+editor-kind-pattern = Простий шаблон
+editor-kind-regex = Регулярний вираз
+editor-kind-raw = Необроблені байти
+editor-badge-advanced = Розширений
+editor-badge-wizardry = Експертний
+editor-card-example-command = greet <person>
+editor-card-blurb-pattern = Вставте рядок так, як його показує гра, і додайте {"{"}назву{"}"} там, де текст змінюється.
+editor-card-blurb-regex = Використовується без змін для рядків, які неможливо описати простим шаблоном.
+editor-card-blurb-raw = Враховує коди кольорів і керівні байти.
+editor-raw-hint = Запишіть \e як символ екранування. Коди кольорів і керівні байти залишаються в рядку.
+editor-group-exceptions = Винятки
+editor-group-exceptions-note = Не дає цьому тригеру спрацювати
+editor-group-raw = Необроблені збіги
+editor-group-raw-note = Зіставляються з необробленим рядком разом із кодами кольорів
+editor-add-raw-another = Додати ще один необроблений шаблон
+editor-add-normal = Додати звичайний шаблон
+editor-add-exception-another = Додати ще один виняток
+editor-add-exception = Додати виняток
+editor-add-exception-tip = Якщо є збіг, тригер не спрацює
+editor-match-raw = Зіставляти необроблені байти
+editor-match-raw-tip = Необроблений регулярний вираз, що зіставляється перед текстом зі збереженням кодів кольорів і керівних байтів
+editor-move-up = Перемістити вгору
+editor-move-down = Перемістити вниз
+editor-remove-line = Видалити цей рядок
+editor-dot-matches = відповідає тестовому рядку
+editor-dot-no-match = не відповідає тестовому рядку
+editor-dot-blocks = відповідає — блокує тригер
+editor-command = Команда
+editor-arguments = Аргументи
+editor-usage = Використання
+editor-parsing = Розбір
+editor-regex = Регулярний вираз
+editor-arg-required = Обов'язковий
+editor-arg-optional = Необов'язковий
+editor-arg-rest = Решта рядка
+editor-add-argument = Додати аргумент
+editor-cmd-simple = Простий
+editor-cmd-advanced = Розширений
+editor-parse-spaces = Лише пробіли
+editor-parse-quotes = Пробіли або лапки
+editor-parse-braces = Пробіли або фігурні дужки
+editor-parse-all = Пробіли, лапки або фігурні дужки
+editor-parse-raw = Увесь рядок як один аргумент
+editor-gets = ОТРИМУЄ
+editor-parse-spaces-example = greet big "ugly" troll
+editor-parse-spaces-gets = big · "ugly" · troll
+editor-parse-quotes-example = greet "big ugly" troll
+editor-parse-quotes-gets = big ugly · troll
+editor-parse-braces-example = greet {"{"}big "ugly"{"}"} troll
+editor-parse-braces-gets = big "ugly" · troll
+editor-parse-all-example = greet "big ugly" {"{"}a "gift"{"}"}
+editor-parse-all-gets = big ugly · a "gift"
+editor-parse-raw-example = greet big ugly troll
+editor-parse-raw-gets = big ugly troll
+editor-allow-before = Дозволити текст перед шаблоном
+editor-allow-after = Дозволити текст після шаблону
+editor-prompt = Також зіставляти рядок запрошення
+editor-prompt-note = Рядок, який гра залишає в очікуванні введення.
+editor-syntax-pattern = Простий шаблон
+editor-syntax-regex = Регулярний вираз
+editor-command-name-empty = Назву команди ще не задано
+editor-command-name-spaces = Команда — це одне слово. Надайте цьому аліасу назву з одного слова або задайте слово команди
+editor-command-override = Використати інше слово…
+editor-command-completion-note = Назви команд можна доповнювати клавішею Tab у полі введення.
+editor-example-command = greet
+editor-example-arg-name = name
+editor-example-trigger-pattern = You are hungry.
+editor-example-trigger-regex = ^You are (hungry|thirsty)\.$
+editor-example-trigger-raw = \e\[1;31m(?<hp>\d+)hp
+editor-example-alias-simple = greet {"{"}person{"}"} warmly
+editor-example-alias-regex = ^greet\s+(.+?)[!.]?$
+editor-numbered-hole = Запишіть {"{}"} замість {"{"}{ $body }{"}"}. Поля нумеруються в порядку запису.
+editor-unknown-hole-type = Невідомий тип у {"{"}{ $body }{"}"}. Використовуйте :word, :number або :rest.
+editor-invalid-regex = Некоректний регулярний вираз: { $error }
+editor-matches-every-line = Цей шаблон відповідає кожному рядку.
+editor-fires-on-raw = ✓ спрацьовує за необробленим збігом { $n }
+editor-fires-on-match = ✓ спрацьовує за збігом { $n }
+editor-blocked-by = ✗ заблоковано винятком { $n }
+editor-wrong-first-word = ✗ перше слово — не «{ $name }»
+editor-missing-arg = ✗ бракує <{ $name }>
+editor-unclaimed = ✗ жоден елемент не захоплює «{ $text }»
+editor-unterminated-quote = ✗ незакриті лапки
+editor-unbalanced-braces = ✗ незбалансовані фігурні дужки
+editor-row-error = Рядок { $row }: { $error }
+editor-reveal-order-aliases = Налаштувати пріоритет або заборонити спрацьовування інших аліасів
+editor-reveal-order-triggers = Налаштувати пріоритет або заборонити спрацьовування інших тригерів
+editor-hide-order = Сховати параметри пріоритету
+editor-matched-values = Зіставлені значення
+
+# Спробувати та результати перевірки
+editor-try-alias-cta = Спробуйте з текстом, який ви могли б ввести
+editor-try-trigger-cta = Спробуйте з рядком, надісланим грою
+editor-try-it = Спробувати
+editor-game-sent = ГРА НАДІСЛАЛА
+editor-test-placeholder-alias = greet Mira
+editor-test-placeholder-trigger = You are hungry.
+editor-try-bytes-prefix = як байти ·
+editor-verdict-no-command = ✗ назву команди ще не задано
+editor-verdict-command-spaces = ✗ команда — це одне слово, тому збіг неможливий
+editor-verdict-no-pattern = ✗ шаблон ще не задано
+editor-verdict-no-regex = ✗ регулярний вираз ще не задано
+editor-verdict-no-matchers = ✗ немає рядків для зіставлення
+editor-verdict-invalid-regex = ✗ некоректний регулярний вираз: { $error }
+editor-verdict-compile-error = ✗ { $error }
+
+# Коли спрацьовує
+editor-when-it-runs = Коли спрацьовує
+editor-priority = Пріоритет
+editor-priority-note-aliases = Аліаси з вищими номерами спрацьовують першими.
+editor-priority-note-triggers = Тригери з вищими номерами спрацьовують першими.
+editor-continue-aliases = Також дозволити спрацювати іншим відповідним аліасам
+editor-continue-triggers = Також дозволити спрацювати іншим відповідним тригерам
+
+# Модуль дії
+editor-tab-send-text = Надіслати текст
+editor-tab-run-js = Запустити JavaScript
+editor-gen-alias-hello = say Hello, { $hole }!
+editor-gen-alias-hello-none = say Hello!
+editor-gen-alias-emote = emote smiles and waves to { $hole }.
+editor-gen-alias-emote-none = emote smiles and waves.
+editor-gen-trigger = say I heard about { $hole }.
+editor-gen-trigger-none = say Understood.
+
+# Підказки полів
+editor-gutter-before-pattern = Перед шаблоном може бути будь-який текст
+editor-gutter-after-pattern = Після шаблону може бути будь-який текст
+editor-gutter-before-regex = Немає ^ — перед виразом може бути будь-який текст
+editor-gutter-after-regex = Немає $ — після виразу може бути будь-який текст
+
+# Описи заголовків і посилання внизу
+editor-deck-alias = Аліаси дають змогу створювати власні команди.
+editor-deck-trigger = Тригери реагують на текст, надісланий грою.
+editor-delete-this-alias = Видалити цей аліас
+editor-delete-this-trigger = Видалити цей тригер
 widget-hotkey-click-to-record = Натисніть, щоб зареєструватися
 widget-hotkey-listening = слухання...
 
@@ -1211,7 +1368,6 @@ automation-publish-failed = Не вдалося опублікувати: { $err
 automation-reloaded = Перезавантажено скрипти для { $server }.
 automation-nav-unsaved = У вас є незбережені зміни.
 automation-keep-editing = Продовжити редагування
-editor-priority-order-help = Вищі номери мають пріоритет
 
 # Package management
 package-sign-in-shared = Увійдіть у головному вікні в Налаштування → Обліковий запис, щоб побачити пакунки, якими ви володієте, а також ті, що надані друзями.
@@ -1540,7 +1696,6 @@ package-version-build-metadata = Версія не може містити ме�
 # Remaining app-shell and editor surfaces
 badge-dependency = ЗАЛ.
 editor-example-alias-name = напр., kill
-editor-example-alias-pattern = напр., ^k (.+)$
 editor-example-hotkey-name = напр., north
 editor-example-trigger-name = напр., low-health-alert
 editor-example-folder-path = напр., combat/healing

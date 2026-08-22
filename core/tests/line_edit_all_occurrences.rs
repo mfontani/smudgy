@@ -42,6 +42,10 @@ createTrigger("^HLK ", () => {
     if (!line.highlight("orc", { fg: "red", link: link("kill orc") })) echo("HLK_MISS");
 });
 
+createTrigger("\\[AUTOLOOT\\]", (matches) => {
+    line.highlight(matches[0], style.red.bgWhite);
+});
+
 createTrigger("^ERR ", () => {
     // Bad inputs are loud at the call site: an attribute typo, a bad color
     // on the plain path, and a bad color on a LINKED highlight (which must
@@ -118,6 +122,8 @@ async fn line_text_search_edits_apply_to_every_occurrence() {
     let hlb_incoming = "HLB an orc and an orc";
     let hlk_incoming = "HLK an orc and an orc";
     let err_incoming = "ERR an orc";
+    let fragmented_incoming = "[AUTOLOOT] You retrieve a silver disc.";
+    let fragmented_completion = "TOLOOT] You retrieve a silver disc.";
 
     let mut lines: Vec<Arc<StyledLine>> = Vec::new();
     let mut sent = false;
@@ -127,7 +133,9 @@ async fn line_text_search_edits_apply_to_every_occurrence() {
         };
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             for update in updates.iter() {
-                if let BufferUpdate::Append(line) = update {
+                if let BufferUpdate::Append(line)
+                | BufferUpdate::FinishOpenLineReplacement(Some(line)) = update
+                {
                     lines.push(line.clone());
                     if !sent && line.text == "EDITALL_READY" {
                         for incoming in [
@@ -141,6 +149,18 @@ async fn line_text_search_edits_apply_to_every_occurrence() {
                             tx.send(RuntimeAction::HandleIncomingLine(plain_line(incoming)))
                                 .unwrap();
                         }
+                        // Model the exact producer contract for a socket read
+                        // boundary inside one logical line: the prefix is
+                        // provisionally displayed, then the newline-bearing
+                        // completion carries both the assembled match subject
+                        // and the unseen suffix.
+                        tx.send(RuntimeAction::HandleIncomingPartialLine(plain_line("[AU")))
+                            .unwrap();
+                        tx.send(RuntimeAction::HandleIncomingFragmentedLine {
+                            line: plain_line(fragmented_incoming),
+                            completion_fragment: plain_line(fragmented_completion),
+                        })
+                        .unwrap();
                         tx.send(RuntimeAction::RequestRepaint).unwrap();
                         sent = true;
                     }
@@ -232,6 +252,35 @@ async fn line_text_search_edits_apply_to_every_occurrence() {
             .iter()
             .all(|span| !span.style.attributes.bold && !span.style.attributes.italic),
         "spans outside the matches must be untouched"
+    );
+
+    let fragmented = lines
+        .iter()
+        .find(|line| line.text == fragmented_incoming)
+        .unwrap_or_else(|| {
+            panic!(
+                "the fragmented AUTOLOOT line must be atomically replaced.\nTranscript:\n{transcript}"
+            )
+        });
+    assert!(
+        fragmented.spans.iter().any(|span| {
+            &fragmented.text[span.begin_pos..span.end_pos] == "[AUTOLOOT]"
+                && matches!(
+                    span.style.fg,
+                    Color::Ansi {
+                        color: AnsiColor::Red,
+                        ..
+                    }
+                )
+                && matches!(
+                    span.style.bg,
+                    Color::Ansi {
+                        color: AnsiColor::White,
+                        ..
+                    }
+                )
+        }),
+        "a normal trigger must match and highlight across an arbitrary read-batch boundary"
     );
 
     // A link in the highlight options recolors AND linkifies each match in

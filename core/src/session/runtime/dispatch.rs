@@ -166,6 +166,23 @@ impl Inner<'_> {
     /// alias matching — then flush the buffered display updates (the echoed copy)
     /// to the UI. The shared tail of every raw-send arm: the raw-prefix branch of
     /// [`Self::dispatch_send`], `SendRaw`, and `SendRawUnless`.
+    /// Push the enabled Command-alias names to the UI when they changed —
+    /// called from every arm that mutates the alias set (the sync path
+    /// reconciles into those same arms). Feeds command-position tab
+    /// completion in the main input; the Manager's change detection keeps
+    /// unrelated alias churn from re-sending an identical list.
+    async fn push_command_names_if_changed(&mut self) -> Result<(), anyhow::Error> {
+        if let Some(names) = self.trigger_manager.command_names_update() {
+            self.ui_tx
+                .send(TaggedSessionEvent {
+                    session_id: self.session_id,
+                    event: SessionEvent::CommandNames { names },
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn send_verbatim_lines(&mut self, text: &str) -> Result<(), anyhow::Error> {
         for line in text.split('\n') {
             self.send(line).await?;
@@ -511,6 +528,35 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::None)
             }
+            RuntimeAction::HandleIncomingFragmentedLine {
+                line,
+                completion_fragment,
+            } => {
+                // Cold path: a socket read-batch boundary provisionally
+                // displayed a prefix, but normal triggers still receive the
+                // same complete logical line they would have seen if the
+                // newline arrived in the first batch.
+                self.fragmented_completion_in_flight = true;
+                self.script_engine
+                    .set_current_line(Some(Arc::downgrade(&line)));
+                if let Err(err) = self.trigger_manager.process_incoming_line(&line) {
+                    self.abort_incoming_line_sync();
+                    return Ok(ActionResult::Echo(format!("Error processing line {err:?}")));
+                }
+
+                let sys_receive = self.gated_host_emit("sys:receive", || {
+                    serde_json::json!({ "text": &**line }).to_string()
+                });
+                {
+                    let mut spawned = self.spawned_actions.borrow_mut();
+                    spawned.extend(sys_receive);
+                    spawned.push_back(RuntimeAction::CompleteFragmentedLineTriggersProcessed {
+                        line,
+                        completion_fragment,
+                    });
+                }
+                Ok(ActionResult::None)
+            }
             RuntimeAction::HandleIncomingPartialLine(line) => {
                 self.script_engine
                     .set_current_line(Some(Arc::downgrade(&line)));
@@ -583,6 +629,23 @@ impl Inner<'_> {
                 let processed_line = self.apply_pending_line_operations(line);
                 let routing = self.line_routing.borrow_mut().take();
                 self.route_complete_line(processed_line, &routing);
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::CompleteFragmentedLineTriggersProcessed {
+                line,
+                completion_fragment,
+            } => {
+                self.fragmented_completion_in_flight = false;
+                self.script_engine.set_current_line(None);
+                let transformed = !self.pending_line_operations.borrow().is_empty();
+                let processed_line = self.apply_pending_line_operations(line);
+                let routing = self.line_routing.borrow_mut().take();
+                self.route_fragmented_complete_line(
+                    processed_line,
+                    completion_fragment,
+                    transformed,
+                    &routing,
+                );
                 Ok(ActionResult::None)
             }
             RuntimeAction::PartialLineTriggersProcessed(line) => {
@@ -758,6 +821,26 @@ impl Inner<'_> {
                     stopped.store(true, Ordering::Relaxed);
                 }
                 Ok(result)
+            }
+            RuntimeAction::EchoUsage {
+                text,
+                is_captured,
+                stopped,
+                fallthrough,
+            } => {
+                // Fallthrough parity with RunAutomation: a stopped scope means this
+                // alias would never have run, so the line falls through untouched.
+                if stopped.load(Ordering::Relaxed) {
+                    return Ok(ActionResult::None);
+                }
+                if let Some(is_captured) = &is_captured {
+                    is_captured.store(true, Ordering::Relaxed);
+                }
+                if !fallthrough {
+                    stopped.store(true, Ordering::Relaxed);
+                }
+                // Deliberately no record_fire: a usage echo is not a fire.
+                Ok(ActionResult::Echo(text.as_ref().clone()))
             }
             RuntimeAction::EvalJavascript {
                 isolate,
@@ -1039,6 +1122,14 @@ impl Inner<'_> {
                 alias,
                 fire_limit,
             } => {
+                // The one place the runtime reads authoring state: a Command
+                // sidecar's parser spec rides into the matcher at load time.
+                // The alias name resolves the command word unless the sidecar
+                // pins an override.
+                let command = alias
+                    .matcher
+                    .as_ref()
+                    .and_then(|matcher| matcher.command_spec(name.as_str()));
                 match alias.language {
                     ScriptLang::Plaintext => {
                         self.trigger_manager.push_simple_alias(
@@ -1050,6 +1141,7 @@ impl Inner<'_> {
                             alias.priority,
                             alias.fallthrough,
                             fire_limit,
+                            command,
                         )?;
                     }
                     ScriptLang::JS | ScriptLang::TS => {
@@ -1065,9 +1157,11 @@ impl Inner<'_> {
                             alias.fallthrough,
                             fire_limit,
                             Some(Arc::from(src)),
+                            command,
                         )?;
                     }
                 }
+                self.push_command_names_if_changed().await?;
 
                 Ok(ActionResult::None)
             }
@@ -1173,6 +1267,7 @@ impl Inner<'_> {
             RuntimeAction::EnableAlias(isolate, origin, name, enabled) => {
                 self.trigger_manager
                     .enable_alias(&isolate, &origin, &name, enabled);
+                self.push_command_names_if_changed().await?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::EnableTrigger(isolate, origin, name, enabled) => {
@@ -1182,6 +1277,7 @@ impl Inner<'_> {
             }
             RuntimeAction::RemoveAlias(isolate, origin, name) => {
                 self.trigger_manager.remove_alias(&isolate, &origin, &name);
+                self.push_command_names_if_changed().await?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::RemoveTrigger(isolate, origin, name) => {

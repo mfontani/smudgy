@@ -184,6 +184,16 @@ pub enum SessionEvent {
         suggestions: Arc<Vec<Arc<String>>>,
         blacklist: Arc<std::collections::HashSet<String>>,
     },
+    /// The names of every enabled Command-kind alias, sorted and deduplicated,
+    /// replaced wholesale whenever the alias set changes. Host-derived (not a
+    /// script word set): the main input offers these on Tab in *command
+    /// position* — where everything between the caret's word start and the
+    /// nearest boundary (start of input, or an occurrence of the command
+    /// separator) is whitespace — ahead of the registered suggestion sets and
+    /// the scrollback scan. The `InputWordSets` blacklist filters these too.
+    CommandNames {
+        names: Arc<Vec<Arc<String>>>,
+    },
     /// The server's `observed.json` sidecar was rewritten (a successful
     /// connect stamped `last_connected_at`, or a fresh MSSP payload merged).
     /// A pure refresh nudge for whatever displays observed server state (the

@@ -48,6 +48,17 @@ pub struct AliasDefinition {
     /// The language of the script. Defaults to Plaintext.
     #[serde(default)]
     pub language: ScriptLang,
+    /// Authoring intent behind `pattern` (a Simple pattern or a Command).
+    /// `pattern` is recompiled from it on every save, resolved against this
+    /// alias's own name — a Command inherits that name as its command word
+    /// unless the sidecar pins an override. Absent means `pattern` is a
+    /// hand-written regex shown verbatim — the pre-sidecar behavior.
+    ///
+    /// Otherwise editor-only, with one exception: a Command's argument parser
+    /// rides into the runtime matcher at load time (see
+    /// [`matchers::AliasMatcherSource::command_spec`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<super::matchers::AliasMatcherSource>,
 }
 
 impl AliasDefinition {
@@ -235,14 +246,40 @@ mod tests {
     use super::AliasDefinition;
 
     #[test]
+    fn matcher_sidecar_round_trips_and_stays_sparse() {
+        use crate::models::matchers::AliasMatcherSource;
+
+        let alias = AliasDefinition {
+            pattern: r"^greet\s+(?<person>.*)$".to_string(),
+            script: None,
+            package: None,
+            enabled: true,
+            priority: 0,
+            fallthrough: true,
+            language: super::ScriptLang::Plaintext,
+            matcher: Some(AliasMatcherSource::Pattern {
+                source: "greet {person}".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+            }),
+        };
+        let json = serde_json::to_string(&alias).unwrap();
+        assert!(json.contains("\"matcher\""));
+        let back: AliasDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, alias);
+    }
+
+    #[test]
     fn matching_options_are_backward_compatible_and_sparse() {
         let old: AliasDefinition = serde_json::from_str(r#"{"pattern":"^look$"}"#).unwrap();
         assert_eq!(old.priority, 0);
         assert!(old.fallthrough);
+        assert!(old.matcher.is_none());
 
         let default_json = serde_json::to_string(&old).unwrap();
         assert!(!default_json.contains("priority"));
         assert!(!default_json.contains("fallthrough"));
+        assert!(!default_json.contains("matcher"));
 
         let configured: AliasDefinition =
             serde_json::from_str(r#"{"pattern":"^look$","priority":7,"fallthrough":false}"#)

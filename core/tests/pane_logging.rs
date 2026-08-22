@@ -18,7 +18,7 @@ const LOGGING_TS: &str = r#"
 import { createTrigger, echo, line, session } from "smudgy:core";
 
 const chat = session.mainPane.split("right", { name: "chat" });
-createTrigger("^REDIR-REST$", () => { line.redirect(chat); });
+createTrigger("REDIR-REST$", () => { line.redirect(chat); });
 createTrigger("^GAGME$", () => { line.gag(); });
 echo("LOG_READY");
 "#;
@@ -82,8 +82,11 @@ async fn session_log_is_line_structured_under_redirects_and_gags() {
     tx.send(RuntimeAction::HandleIncomingPartialLine(sl("PROMPT>")))
         .unwrap();
     tx.send(RuntimeAction::RequestRepaint).unwrap();
-    tx.send(RuntimeAction::HandleIncomingLine(sl("REDIR-REST")))
-        .unwrap();
+    tx.send(RuntimeAction::HandleIncomingFragmentedLine {
+        line: sl("PROMPT>REDIR-REST"),
+        completion_fragment: sl("REDIR-REST"),
+    })
+    .unwrap();
     tx.send(RuntimeAction::HandleIncomingLine(sl("GAGME")))
         .unwrap();
     tx.send(RuntimeAction::HandleIncomingLine(sl("AFTER")))

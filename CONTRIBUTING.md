@@ -79,6 +79,16 @@ Please avoid introducing new compiler or Clippy warnings. Existing unrelated
 warnings do not need to be fixed as part of your change. Documentation-only
 changes do not need to run the full Rust test suite.
 
+## Translations
+
+English (`en-US`) is the source catalog. The Traditional Chinese (`zh-TW`),
+Polish (`pl-PL`), and Ukrainian (`uk-UA`) catalogs must contain every English
+message ID and use the same Fluent variables. Run
+`cargo test -p smudgy_i18n --lib --locked` to check catalog parity.
+
+Changes to the Polish or Ukrainian catalogs require review from `@haniu03`.
+The repository's `CODEOWNERS` rules request that review automatically.
+
 ## Pull requests
 
 A helpful pull request:

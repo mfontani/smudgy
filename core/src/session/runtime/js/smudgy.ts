@@ -2683,9 +2683,7 @@ function createAlias(
     const priority = normalizePriority(options);
     const fallthrough = normalizeFallthrough(options);
 
-    const patternList = (Array.isArray(patterns) ? patterns : [patterns]).map((p) =>
-        p instanceof RegExp ? p.source : p,
-    );
+    const patternList = (Array.isArray(patterns) ? patterns : [patterns]).map(patternSource);
     const name = resolveAutomationName(options.name, () => derivePatternName(patternList));
 
     const singleton = options.singleton ?? false;
@@ -2905,6 +2903,260 @@ function validateCreateTriggerParams(
     return { name, normalizedPatterns, script };
 }
 
+/**
+ * The engine-facing source of one pattern. A string passes through as regex source.
+ * A RegExp contributes its source with its flags translated: `i` and `s` carry the
+ * same meaning in the host engine and are baked in as a non-capturing inline-flag
+ * group, `(?is:...)`, which leaves capture-group numbering untouched. The remaining
+ * flags are dropped: `m` would promise interior line boundaries that a
+ * one-line-at-a-time subject never contains, `g`, `y`, and `d` are
+ * iteration/stateful flags with no meaning for a match-once-per-line engine, and
+ * `u`/`v` are moot because the host engine is Unicode-aware by default (a `v`-mode
+ * source using set notation may still be rejected by the host at registration).
+ */
+function patternSource(p: Pattern): string {
+    if (!(p instanceof RegExp)) {
+        return p;
+    }
+    let flags = "";
+    if (p.ignoreCase) flags += "i";
+    if (p.dotAll) flags += "s";
+    return flags === "" ? p.source : `(?${flags}:${p.source})`;
+}
+
+// ---- The `pattern` tagged template ------------------------------------------------
+
+/**
+ * One compiler input segment: literal Simple-pattern text, or an interpolated
+ * value spliced in as escaped literal characters. Splices bypass the pattern
+ * grammar entirely, which is what makes the tag safe to build from game data:
+ * a value containing `{`, `*`, `.`, or `/` never becomes syntax.
+ */
+type PatternSegment = { text: string } | { splice: string };
+
+/** The characters escaped in literal pattern text (the Rust compiler's set). */
+const PATTERN_LITERAL_ESCAPE = /[.*+?^${}()|[\]\\\/]/;
+
+/**
+ * Compiles Simple-pattern segments to regex source. The grammar and its
+ * compiled shapes are owned by the editor's compiler in
+ * `core/src/models/matchers.rs`; this implementation exists so the tag can
+ * evaluate in script land, and an integration test holds the two compilers to
+ * byte-identical output. Compile errors throw (`TypeError`), carrying the same
+ * messages the editor shows.
+ */
+function compilePatternSegments(
+    segments: PatternSegment[],
+    anchorStart: boolean,
+    anchorEnd: boolean,
+): string {
+    let out = "";
+
+    const pushLiteral = (c: string) => {
+        if (PATTERN_LITERAL_ESCAPE.test(c)) out += "\\";
+        out += c;
+    };
+    // Emit literal text under the whitespace rule (any run of whitespace
+    // matches any run of whitespace).
+    const pushLiteralText = (text: string) => {
+        const chars = Array.from(text);
+        let i = 0;
+        while (i < chars.length) {
+            if (/\s/.test(chars[i])) {
+                out += "\\s+";
+                while (i < chars.length && /\s/.test(chars[i])) i++;
+            } else {
+                pushLiteral(chars[i]);
+                i++;
+            }
+        }
+    };
+    // Whether anything follows this position, in this segment or any later
+    // one -- the TinTin greedy-at-end rule for wild holes.
+    const somethingFollows = (si: number, chars: string[], i: number): boolean => {
+        if (i < chars.length) return true;
+        for (let j = si + 1; j < segments.length; j++) {
+            const segment = segments[j];
+            const content = "text" in segment ? segment.text : segment.splice;
+            if (content.length > 0) return true;
+        }
+        return false;
+    };
+
+    for (let si = 0; si < segments.length; si++) {
+        const segment = segments[si];
+        if ("splice" in segment) {
+            for (const c of segment.splice) pushLiteral(c);
+            continue;
+        }
+        const chars = Array.from(segment.text);
+        let i = 0;
+        while (i < chars.length) {
+            const c = chars[i];
+
+            if (c === "{") {
+                const end = chars.indexOf("}", i + 1);
+                if (end < 0) {
+                    out += "\\{";
+                    i++;
+                    continue;
+                }
+                const inner = chars.slice(i + 1, end).join("");
+                i = end + 1;
+
+                let body = inner.trim();
+                let kind = "wild";
+                let optional = false;
+                if (body.endsWith("...")) {
+                    kind = "rest";
+                    body = body.slice(0, -3);
+                }
+                if (body.endsWith("?")) {
+                    optional = true;
+                    body = body.slice(0, -1);
+                }
+                if (optional && kind === "wild") kind = "word";
+
+                let name: string | undefined;
+                if (body === "") {
+                    name = undefined;
+                } else if (/^\d+$/.test(body)) {
+                    throw new TypeError(
+                        `Write {} instead of {${body}}. Holes are numbered in the order you write them.`,
+                    );
+                } else {
+                    const m = /^([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z]+))?$/.exec(body);
+                    if (m) {
+                        if (m[2] !== undefined) {
+                            if (m[2] === "word" || m[2] === "number" || m[2] === "rest") {
+                                kind = m[2];
+                            } else {
+                                throw new TypeError(
+                                    `Unknown type in {${body}}. Use :word, :number, or :rest.`,
+                                );
+                            }
+                        }
+                        name = m[1];
+                    } else {
+                        // Not a hole: the braces and their original text are literal.
+                        out += "\\{";
+                        pushLiteralText(inner);
+                        out += "\\}";
+                        continue;
+                    }
+                }
+
+                const group = kind === "wild"
+                    ? (somethingFollows(si, chars, i) ? ".*?" : ".*")
+                    : kind === "word"
+                    ? "\\S+"
+                    : kind === "number"
+                    ? "-?\\d+(?:\\.\\d+)?"
+                    : ".+";
+                const open = name === undefined ? "(" : `(?<${name}>`;
+                if (optional && out.endsWith("\\s+")) {
+                    // Fold the preceding space into the optional group.
+                    out = out.slice(0, -3) + `(?:\\s+${open}${group}))?`;
+                } else {
+                    out += `${open}${group})`;
+                    if (optional) out += "?";
+                }
+                continue;
+            }
+
+            if (c === "/") {
+                // A /.../ island: raw regex inserted verbatim, grouped.
+                let j = i + 1;
+                let found = -1;
+                while (j < chars.length) {
+                    if (chars[j] === "\\") j += 2;
+                    else if (chars[j] === "/") {
+                        found = j;
+                        break;
+                    } else j++;
+                }
+                if (found >= 0) {
+                    out += "(?:" + chars.slice(i + 1, found).join("") + ")";
+                    i = found + 1;
+                } else {
+                    out += "\\/";
+                    i++;
+                }
+                continue;
+            }
+
+            if (c === "*") {
+                out += ".*";
+                i++;
+                continue;
+            }
+
+            if (/\s/.test(c)) {
+                out += "\\s+";
+                while (i < chars.length && /\s/.test(chars[i])) i++;
+                continue;
+            }
+
+            pushLiteral(c);
+            i++;
+        }
+    }
+
+    return (anchorStart ? "^" : "") + out + (anchorEnd ? "$" : "");
+}
+
+type PatternAnchors = "both" | "start" | "end" | "none";
+
+/**
+ * One anchor form of the `pattern` tag. Raw strings feed the compiler -- a
+ * backslash means the backslash character, so `/\d/` in an island is the
+ * regex digit class, never a cooked-string casualty. Interpolated values are
+ * always literal text. The result is an ordinary RegExp (`Pattern` already
+ * accepts one); what was written rides along on two non-enumerable
+ * properties for display.
+ */
+function makePatternTag(anchors: PatternAnchors) {
+    return (strings: TemplateStringsArray, ...values: unknown[]): RegExp => {
+        const segments: PatternSegment[] = [];
+        let written = "";
+        for (let i = 0; i < strings.raw.length; i++) {
+            segments.push({ text: strings.raw[i] });
+            written += strings.raw[i];
+            if (i < values.length) {
+                const value = String(values[i]);
+                segments.push({ splice: value });
+                written += value;
+            }
+        }
+        const source = compilePatternSegments(
+            segments,
+            anchors === "both" || anchors === "start",
+            anchors === "both" || anchors === "end",
+        );
+        const regex = new RegExp(source);
+        Object.defineProperty(regex, "patternSource", { value: written });
+        Object.defineProperty(regex, "patternAnchors", { value: anchors });
+        return regex;
+    };
+}
+
+/**
+ * The `pattern` tagged template: friendly Simple-pattern syntax evaluating to
+ * a RegExp. Four forms, one per anchor combination:
+ *
+ *     pattern`You are {state}.`            // the whole line
+ *     pattern.startsWith`You are`          // anchored at the front
+ *     pattern.endsWith`is hungry.`         // anchored at the end
+ *     pattern.contains`is hun`             // anywhere in the line
+ *
+ * Pure: no session or isolate state, so it is safe at module top level.
+ */
+const pattern = Object.assign(makePatternTag("both"), {
+    startsWith: makePatternTag("start"),
+    endsWith: makePatternTag("end"),
+    contains: makePatternTag("none"),
+});
+
 /** Normalizes the patterns for a trigger. */
 function normalizePatterns(patterns: Pattern | TriggerPatterns): {
     patterns: string[];
@@ -2918,17 +3170,11 @@ function normalizePatterns(patterns: Pattern | TriggerPatterns): {
     };
 
     if (typeof patterns === "string" || patterns instanceof RegExp) {
-        normalized.patterns = [patterns instanceof RegExp ? patterns.source : patterns];
+        normalized.patterns = [patternSource(patterns)];
     } else if (typeof patterns === "object") {
-        normalized.patterns = (patterns.patterns || []).map((p) =>
-            p instanceof RegExp ? p.source : p,
-        );
-        normalized.rawPatterns = (patterns.rawPatterns || []).map((p) =>
-            p instanceof RegExp ? p.source : p,
-        );
-        normalized.antiPatterns = (patterns.antiPatterns || []).map((p) =>
-            p instanceof RegExp ? p.source : p,
-        );
+        normalized.patterns = (patterns.patterns || []).map(patternSource);
+        normalized.rawPatterns = (patterns.rawPatterns || []).map(patternSource);
+        normalized.antiPatterns = (patterns.antiPatterns || []).map(patternSource);
     }
 
     return normalized;
@@ -4779,6 +5025,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         echo,
         style,
         link,
+        pattern,
         reload,
         capture,
         fallthrough,

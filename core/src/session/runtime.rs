@@ -88,7 +88,11 @@ use crate::session::{
     ui_command::{UiCommandBus, UiCommandProducer},
 };
 
-use super::{SessionId, TaggedSessionEvent, connection::Connection, styled_line::StyledLine};
+use super::{
+    SessionId, TaggedSessionEvent,
+    connection::Connection,
+    styled_line::{LineFragments, StyledLine},
+};
 
 use super::{BufferUpdate, SessionEvent};
 use futures::{SinkExt, channel::mpsc::Sender};
@@ -632,7 +636,8 @@ impl Runtime {
                 // count bump records.
                 main_open_line: emitted_line_count.get() == 0,
                 replacing_main_open_line: false,
-                open_line: None,
+                fragmented_completion_in_flight: false,
+                open_line: LineFragments::None,
                 log_open_line: Vec::new(),
                 log_committed_len: 0,
                 log_open_on_disk: false,
@@ -669,7 +674,7 @@ impl Runtime {
                 // completion action belonged to the discarded action stack.
                 let old_main_open_line = inner.main_open_line;
                 debug_assert!(!inner.replacing_main_open_line);
-                let old_open_line = inner.open_line.take();
+                let old_open_line = std::mem::take(&mut inner.open_line);
                 let old_connection = inner.connection.take();
                 let old_connection_generation = inner.connection_generation;
                 let old_pending_send_on_connect = inner.pending_send_on_connect.take();
@@ -929,6 +934,7 @@ impl Runtime {
                     main_open_line: old_main_open_line
                         && emitted_line_count.get() == count_before_rebuild,
                     replacing_main_open_line: false,
+                    fragmented_completion_in_flight: false,
                     open_line: old_open_line,
                     log_open_line: Vec::new(), // The reload flushed the old log; the new file starts a fresh line
                     log_committed_len: 0,      // A new log file is opened on reconnect
@@ -1153,11 +1159,16 @@ struct Inner<'a> {
     /// the exact transformed replacement can finish the transaction after a
     /// flush or intervening trigger output.
     replacing_main_open_line: bool,
+    /// A complete logical line is running normal triggers while a transport-
+    /// batch prefix remains provisionally visible. A reload can discard the
+    /// local completion frame, so its abort path must retract that prefix just
+    /// as it closes a carriage-return replacement transaction.
+    fragmented_completion_in_flight: bool,
     /// The in-flight server line's transformed fragments, accumulated so a non-main sink can
     /// receive one WHOLE line at routing time (complete-line events only carry the remainder
     /// since the last partial flush). Cleared when the line completes; consumed early when a
     /// partial-line routing delivers the line-so-far.
-    open_line: Option<Arc<StyledLine>>,
+    open_line: LineFragments,
     /// The line-structured log's current-line accumulator: main fragments buffer here and
     /// are written as one line on `EnsureNewLine`; `RetractOpenLine` discards it; routed
     /// (`AppendTo`) lines are written whole, in completion order, as they flush.
@@ -1368,10 +1379,10 @@ impl Inner<'_> {
         if !sinks.is_empty() {
             // Non-main sinks receive one WHOLE line: the accumulated partial
             // prefix (if any) glued to this completion fragment.
-            let whole = match self.open_line.as_ref() {
-                Some(prefix) => Arc::new(prefix.append(&processed)),
-                None => processed.clone(),
-            };
+            let whole = self
+                .open_line
+                .take_joined_with(&processed)
+                .unwrap_or_else(|| processed.clone());
             for key in &sinks {
                 self.pending_buffer_updates
                     .push(BufferUpdate::AppendTo(*key, whole.clone()));
@@ -1399,7 +1410,77 @@ impl Inner<'_> {
             self.main_open_line = false;
         }
 
-        self.open_line = None;
+        self.open_line.clear();
+    }
+
+    /// Route a complete logical line whose prefix was already displayed at a
+    /// transport-batch boundary. Normal triggers ran against `processed` (the
+    /// assembled whole); when they left it untouched, main needs only the
+    /// unseen `completion_fragment`. A transform instead replaces the
+    /// provisional open UI line atomically so edits anywhere in the assembled
+    /// text — including across the old batch boundary — are visible.
+    #[cold]
+    fn route_fragmented_complete_line(
+        &mut self,
+        processed: Arc<StyledLine>,
+        completion_fragment: Arc<StyledLine>,
+        transformed: bool,
+        routing: &LineRouting,
+    ) {
+        let replacing_open_line = std::mem::take(&mut self.replacing_main_open_line);
+        let (main_included, sinks) = if routing.is_default() {
+            (true, Vec::new())
+        } else {
+            self.resolve_sinks(routing)
+        };
+
+        // Unlike the legacy completion-fragment path, the connection has
+        // already assembled the exact logical whole. Pane delivery therefore
+        // neither folds immutable lines nor depends on the optional routing
+        // accumulator.
+        for key in &sinks {
+            self.pending_buffer_updates
+                .push(BufferUpdate::AppendTo(*key, processed.clone()));
+        }
+
+        if main_included {
+            self.emitted_line_count
+                .set(self.emitted_line_count.get() + 1);
+            self.record_emitted_line(&processed);
+
+            if replacing_open_line {
+                self.pending_buffer_updates
+                    .push(BufferUpdate::FinishOpenLineReplacement(Some(processed)));
+            } else if transformed && self.main_open_line {
+                self.pending_buffer_updates
+                    .push(BufferUpdate::BeginOpenLineReplacement);
+                self.pending_buffer_updates
+                    .push(BufferUpdate::FinishOpenLineReplacement(Some(processed)));
+            } else if self.main_open_line {
+                // Zero-transform fast path for a fragmented line: the prefix
+                // is already in the UI and log, so send only the new suffix.
+                self.pending_buffer_updates
+                    .push(BufferUpdate::Append(completion_fragment));
+            } else {
+                // A partial-line trigger may have routed/gagged the provisional
+                // prefix. If complete-line routing includes main again, deliver
+                // the complete result rather than silently losing that prefix.
+                self.pending_buffer_updates
+                    .push(BufferUpdate::Append(processed));
+            }
+            self.pending_buffer_updates
+                .push(BufferUpdate::EnsureNewLine);
+            self.main_open_line = false;
+        } else if replacing_open_line {
+            self.pending_buffer_updates
+                .push(BufferUpdate::FinishOpenLineReplacement(None));
+        } else if self.main_open_line {
+            self.pending_buffer_updates
+                .push(BufferUpdate::RetractOpenLine);
+            self.main_open_line = false;
+        }
+
+        self.open_line.clear();
     }
 
     /// Route one **partial** (prompt) fragment. A redirect/copy decided on a partial routes
@@ -1411,16 +1492,14 @@ impl Inner<'_> {
         if routing.is_default() {
             // Fast path: no routing on this fragment. The whole-line
             // accumulator exists only to feed pane sinks, so with no non-main
-            // panes it is dead weight — skip the per-fragment deep copy
-            // (`StyledLine::append`) entirely. A stale accumulator can't be
-            // consumed (sinks require live panes) and is cleared at completion.
+            // panes it is dead weight. With panes, accumulation stores `Arc`s
+            // and flattens at most once rather than copying the growing prefix
+            // per fragment. A stale accumulator can't be consumed (sinks
+            // require live panes) and is cleared at completion.
             if self.pane_registry.lock().unwrap().has_non_main_panes() {
-                self.open_line = Some(match self.open_line.take() {
-                    Some(prev) => Arc::new(prev.append(&processed)),
-                    None => processed.clone(),
-                });
+                self.open_line.push(processed.clone());
             } else {
-                self.open_line = None;
+                self.open_line.clear();
             }
             self.pending_buffer_updates.push(if replacing_open_line {
                 BufferUpdate::FinishOpenLineReplacement(Some(processed))
@@ -1433,22 +1512,23 @@ impl Inner<'_> {
 
         // Routing decided on this partial: assemble the whole line so far so
         // the pane sink receives it as one line.
-        let accumulated = match self.open_line.take() {
-            Some(prev) => Arc::new(prev.append(&processed)),
-            None => processed.clone(),
-        };
+        self.open_line.push(processed.clone());
+        let accumulated = self
+            .open_line
+            .take_joined()
+            .expect("the just-pushed partial must be present");
 
         let (main_included, sinks) = self.resolve_sinks(routing);
 
         if sinks.is_empty() {
-            self.open_line = Some(accumulated);
+            self.open_line.push(accumulated);
         } else {
             for key in &sinks {
                 self.pending_buffer_updates
                     .push(BufferUpdate::AppendTo(*key, accumulated.clone()));
             }
             // Consumed: the delivered prefix never re-routes.
-            self.open_line = None;
+            self.open_line.clear();
         }
 
         if main_included {
@@ -1481,7 +1561,7 @@ impl Inner<'_> {
             self.main_open_line = false;
             self.replacing_main_open_line = true;
         }
-        self.open_line = None;
+        self.open_line.clear();
     }
 
     /// Abandon an incoming-line pipeline that will never reach its normal
@@ -1497,7 +1577,12 @@ impl Inner<'_> {
         self.script_engine.set_current_line(None);
         self.pending_line_operations.borrow_mut().clear();
         self.line_routing.borrow_mut().take();
-        self.open_line = None;
+        self.open_line.clear();
+        if std::mem::take(&mut self.fragmented_completion_in_flight) && self.main_open_line {
+            self.pending_buffer_updates
+                .push(BufferUpdate::RetractOpenLine);
+            self.main_open_line = false;
+        }
         if std::mem::take(&mut self.replacing_main_open_line) {
             self.pending_buffer_updates
                 .push(BufferUpdate::FinishOpenLineReplacement(None));
@@ -2160,7 +2245,7 @@ impl Inner<'_> {
                         // trigger queued Reload ahead of its line-completion action,
                         // close the replacement transaction now rather than letting
                         // the rebuilt runtime finish the next unrelated server line.
-                        if self.replacing_main_open_line {
+                        if self.replacing_main_open_line || self.fragmented_completion_in_flight {
                             self.abort_incoming_line_sync();
                         }
                         return RunAction::Reload;

@@ -254,6 +254,7 @@ fn collect_ingest(wire_bytes: &[u8]) -> (Vec<Arc<StyledLine>>, usize) {
     while let Ok(action) = rx.try_recv() {
         match action {
             RuntimeAction::HandleIncomingLine(line) => complete.push(line),
+            RuntimeAction::HandleIncomingFragmentedLine { line, .. } => complete.push(line),
             RuntimeAction::HandleIncomingPartialLine(_) => partials += 1,
             _ => {}
         }

@@ -6,6 +6,7 @@ pub mod hotkeys;
 pub mod input_history;
 pub mod local_packages;
 pub mod map_scopes;
+pub mod matchers;
 pub mod modules;
 pub mod naming;
 pub mod observed;

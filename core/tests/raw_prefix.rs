@@ -80,6 +80,7 @@ async fn raw_prefix_bypasses_splitting_and_alias_matching() {
             priority: 0,
             fallthrough: true,
             language: ScriptLang::Plaintext,
+            matcher: None,
         },
         fire_limit: None,
     })

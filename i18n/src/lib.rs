@@ -291,41 +291,27 @@ mod tests {
     }
 
     #[test]
-    fn secondary_catalogs_may_be_incremental_but_matching_keys_keep_variables() {
-        let fallback = catalog_variables(manifest::CATALOGS[*FALLBACK_INDEX].source);
+    fn translated_catalogs_match_english_keys_and_variables() {
+        let english = &manifest::CATALOGS[*FALLBACK_INDEX];
+        let english_ids = catalog_ids(english.source);
+        let english_variables = catalog_variables(english.source);
         for source in manifest::CATALOGS
             .iter()
             .filter(|source| source.tag != manifest::FALLBACK_TAG)
         {
-            for (id, variables) in catalog_variables(source.source) {
-                assert_eq!(
-                    fallback.get(&id),
-                    Some(&variables),
-                    "{id} in {} must match the fallback variables",
-                    source.tag
-                );
-            }
+            assert_eq!(
+                catalog_ids(source.source),
+                english_ids,
+                "{} must contain every English message ID",
+                source.tag
+            );
+            assert_eq!(
+                catalog_variables(source.source),
+                english_variables,
+                "{} must use the same variables as English",
+                source.tag
+            );
         }
-    }
-
-    #[test]
-    fn traditional_chinese_catalog_matches_english_keys_and_variables() {
-        let english = manifest::CATALOGS
-            .iter()
-            .find(|source| source.tag == "en-US")
-            .unwrap();
-        let traditional_chinese = manifest::CATALOGS
-            .iter()
-            .find(|source| source.tag == "zh-TW")
-            .unwrap();
-        assert_eq!(
-            catalog_ids(english.source),
-            catalog_ids(traditional_chinese.source)
-        );
-        assert_eq!(
-            catalog_variables(english.source),
-            catalog_variables(traditional_chinese.source)
-        );
     }
 
     fn rust_sources(root: &Path, out: &mut Vec<PathBuf>) {

@@ -62,6 +62,8 @@ use crate::session::{
     styled_line::StyledLine,
 };
 
+// The bools are independent dirty/recording gates, not an encodable state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct Manager {
     spawned_actions: ActionQueue,
@@ -114,6 +116,12 @@ pub struct Manager {
     /// this is set. Kept true across enable/disable so a disabled raw trigger's
     /// re-enable never races the capture of in-flight lines.
     raw_wanted: Arc<AtomicBool>,
+    /// Set by every alias mutation; gates the [`Self::command_names_update`]
+    /// recompute so the common no-Command profile pays one bool per mutation.
+    command_names_dirty: bool,
+    /// The last command-name list handed to the UI, for change detection —
+    /// unrelated alias churn must not re-send an identical list.
+    last_command_names: Vec<Arc<String>>,
 }
 
 /// Feature-gated observation handle for trigger benchmarks.
@@ -334,7 +342,33 @@ impl Manager {
             automation_deltas: Vec::new(),
             automation_registry,
             raw_wanted: Arc::new(AtomicBool::new(false)),
+            command_names_dirty: false,
+            last_command_names: Vec::new(),
         }
+    }
+
+    /// The enabled Command-alias names for tab completion, when they changed
+    /// since the last take; `None` means no change. Dirty-gated on alias
+    /// mutations and compared against the last take, so unrelated alias churn
+    /// never re-sends an identical list.
+    pub fn command_names_update(&mut self) -> Option<Arc<Vec<Arc<String>>>> {
+        if !self.command_names_dirty {
+            return None;
+        }
+        self.command_names_dirty = false;
+        let mut names: Vec<Arc<String>> = self
+            .aliases
+            .iter()
+            .filter(|alias| alias.enabled)
+            .filter_map(|alias| alias.command.as_ref().map(|c| Arc::new(c.name.clone())))
+            .collect();
+        names.sort();
+        names.dedup();
+        if names == self.last_command_names {
+            return None;
+        }
+        self.last_command_names.clone_from(&names);
+        Some(Arc::new(names))
     }
 
     /// Construct the real trigger manager plus its feature-gated queue
@@ -573,6 +607,7 @@ impl Manager {
         // debug builds), a large profile/package alias set could stall the
         // runtime for tens of seconds at session start, delaying `Connect`.
         self.alias_regex_set_dirty = true;
+        self.command_names_dirty = true;
         if let Some(delta) = delta {
             self.automation_deltas.push(delta);
         }
@@ -622,6 +657,7 @@ impl Manager {
         fallthrough: bool,
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
+        command: Option<crate::models::matchers::CommandSpec>,
     ) -> Result<()> {
         self.add_or_update_alias(
             Trigger::new_alias(
@@ -634,7 +670,8 @@ impl Manager {
                 fallthrough,
                 fire_limit,
             )?
-            .with_source(source),
+            .with_source(source)
+            .with_command(command),
         );
         Ok(())
     }
@@ -690,6 +727,7 @@ impl Manager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push_simple_alias(
         &mut self,
         isolate: IsolateId,
@@ -700,17 +738,21 @@ impl Manager {
         priority: i32,
         fallthrough: bool,
         fire_limit: Option<u32>,
+        command: Option<crate::models::matchers::CommandSpec>,
     ) -> Result<()> {
-        self.add_or_update_alias(Trigger::new_alias(
-            isolate,
-            origin,
-            name.to_string(),
-            patterns.iter(),
-            ScriptAction::SendSimple(script),
-            priority,
-            fallthrough,
-            fire_limit,
-        )?);
+        self.add_or_update_alias(
+            Trigger::new_alias(
+                isolate,
+                origin,
+                name.to_string(),
+                patterns.iter(),
+                ScriptAction::SendSimple(script),
+                priority,
+                fallthrough,
+                fire_limit,
+            )?
+            .with_command(command),
+        );
         Ok(())
     }
 
@@ -739,6 +781,7 @@ impl Manager {
             changed = true;
         }
         if changed {
+            self.command_names_dirty = true;
             self.registry_set_enabled(AutomationKind::Alias, isolate, origin, name, enabled);
         }
         if changed && self.is_watched() && *origin != Origin::User {
@@ -804,6 +847,7 @@ impl Manager {
             name,
         ) {
             self.alias_regex_set_dirty = true;
+            self.command_names_dirty = true;
             self.registry_remove(AutomationKind::Alias, isolate, origin, name);
             if self.is_watched() && *origin != Origin::User {
                 self.automation_deltas.push(AutomationDelta::Removed {
@@ -1063,6 +1107,14 @@ impl Manager {
             .collect();
     }
 
+    /// Match one subject string against one `PatternSet` tier and queue the matched
+    /// automations' actions.
+    ///
+    /// `fired` carries the indices (into `triggers`) that have already queued a
+    /// `RunAutomation` for the current line. The incoming-line paths share one list across
+    /// their raw and normal passes, so an automation matching in both fires **once per
+    /// line** — raw first, which is the documented precedence — rather than once per pass.
+    /// Each automation queued here is recorded into the list.
     #[allow(clippy::too_many_arguments)]
     fn process_line_inner(
         &self,
@@ -1075,6 +1127,7 @@ impl Manager {
         match_type: TriggerMatchType,
         is_captured: Option<Arc<AtomicBool>>,
         fallthrough_scopes: &mut FallthroughScopes,
+        fired: &mut Vec<usize>,
     ) -> Result<()> {
         if depth > 100 {
             bail!(
@@ -1096,11 +1149,13 @@ impl Manager {
                     == regex_set_to_triggers_map.get(*b).unwrap()
             }) {
                 let match_idx = match_indices[0];
-                let trigger = triggers
-                    .get(*regex_set_to_triggers_map.get(match_idx).unwrap())
-                    .unwrap();
+                let trigger_idx = *regex_set_to_triggers_map.get(match_idx).unwrap();
+                let trigger = triggers.get(trigger_idx).unwrap();
 
-                if !trigger.enabled || trigger.anti_patterns.is_match(line) {
+                if !trigger.enabled
+                    || fired.contains(&trigger_idx)
+                    || trigger.anti_patterns.is_match(line)
+                {
                     continue;
                 }
 
@@ -1124,6 +1179,7 @@ impl Manager {
                     &self.spawned_actions,
                     depth + 1,
                 )?;
+                fired.push(trigger_idx);
             }
         }
         Ok(())
@@ -1188,6 +1244,9 @@ impl Manager {
     pub fn process_nested_outgoing_line(&self, line: &str, depth: u32) -> Result<()> {
         let is_captured = Arc::new(AtomicBool::new(false));
         let mut fallthrough_scopes = FallthroughScopes::new();
+        // Aliases evaluate in a single pass, so the fired list is inert here; it exists
+        // for the two-pass incoming paths.
+        let mut fired = Vec::new();
 
         self.process_line_inner(
             line,
@@ -1199,6 +1258,7 @@ impl Manager {
             TriggerMatchType::Normal,
             Some(is_captured.clone()),
             &mut fallthrough_scopes,
+            &mut fired,
         )?;
 
         self.spawned_actions
@@ -1277,6 +1337,9 @@ impl Manager {
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
 
         let mut fallthrough_scopes = FallthroughScopes::new();
+        // Shared across the raw and normal passes (the same per-line lifetime as
+        // `fallthrough_scopes`): a trigger matching in both fires once, on the raw pass.
+        let mut fired = Vec::new();
         if let Some(line) = line.raw() {
             debug!("Processing raw line: {line:?}");
             self.process_line_inner(
@@ -1289,6 +1352,7 @@ impl Manager {
                 TriggerMatchType::Raw,
                 None,
                 &mut fallthrough_scopes,
+                &mut fired,
             )?;
         }
 
@@ -1302,6 +1366,7 @@ impl Manager {
             TriggerMatchType::Normal,
             None,
             &mut fallthrough_scopes,
+            &mut fired,
         )?;
 
         // Self-limit: one tested-line tick per incoming complete line for every
@@ -1325,6 +1390,10 @@ impl Manager {
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
 
         let mut fallthrough_scopes = FallthroughScopes::new();
+        // The prompt path has the same two-pass shape as `process_incoming_line` and gets
+        // the same one-fire-per-line treatment. Each call owns its list, so a partial
+        // line and its later completed line count as different lines.
+        let mut fired = Vec::new();
         if let Some(line) = line.raw() {
             self.process_line_inner(
                 line,
@@ -1336,6 +1405,7 @@ impl Manager {
                 TriggerMatchType::Raw,
                 None,
                 &mut fallthrough_scopes,
+                &mut fired,
             )?;
         }
 
@@ -1349,6 +1419,7 @@ impl Manager {
             TriggerMatchType::Normal,
             None,
             &mut fallthrough_scopes,
+            &mut fired,
         )?;
 
         if let Some(start) = timer {
@@ -1405,6 +1476,10 @@ struct Trigger {
     /// `None` for plaintext bodies (recoverable from `script`) or when none was supplied.
     /// Never executed — purely what the UI renders.
     source: Option<Arc<str>>,
+    /// A Command alias's argument parser (alias-only, from the editor's sidecar). When
+    /// set, the stored regex is only a prefilter: [`Trigger::run`] hands the line to the
+    /// parser, which decides firing and produces the captures.
+    command: Option<crate::models::matchers::CommandSpec>,
 }
 
 impl Trigger {
@@ -1465,6 +1540,7 @@ impl Trigger {
             fires: Cell::new(0),
             lines_tested: Cell::new(0),
             source: None,
+            command: None,
         })
     }
 
@@ -1510,6 +1586,13 @@ impl Trigger {
         self
     }
 
+    /// Attaches a Command alias's argument parser (see [`Trigger::command`]).
+    #[must_use]
+    fn with_command(mut self, command: Option<crate::models::matchers::CommandSpec>) -> Self {
+        self.command = command;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
@@ -1521,6 +1604,12 @@ impl Trigger {
         spawned_actions: &ActionQueue,
         depth: u32,
     ) -> Result<()> {
+        // A Command alias's stored regex is only a prefilter: the parser decides
+        // whether it actually fires, and produces the captures when it does.
+        if let Some(command) = &self.command {
+            return self.run_command(command, line, is_captured, stopped, spawned_actions, depth);
+        }
+
         let pattern = match match_type {
             TriggerMatchType::Normal => self.patterns.get(pattern_idx).unwrap(),
             TriggerMatchType::Raw => self.raw_patterns.get(pattern_idx).unwrap(),
@@ -1553,6 +1642,70 @@ impl Trigger {
                 fallthrough: self.fallthrough,
                 is_alias: self.is_alias,
             });
+        Ok(())
+    }
+
+    /// The Command path of [`Trigger::run`]: tokenize and assign per the spec.
+    /// `Fired` queues the automation with the parser's captures (index 0 is the
+    /// trimmed input, then one capture per argument in declaration order — an
+    /// absent optional is empty, the same convention as a non-participating
+    /// regex group). A missing required argument queues the usage echo (D10).
+    /// Every other miss queues nothing, which leaves `is_captured` unset so
+    /// `SendRawUnless` sends the line the user actually typed.
+    fn run_command(
+        &self,
+        command: &crate::models::matchers::CommandSpec,
+        line: &str,
+        is_captured: &Option<Arc<AtomicBool>>,
+        stopped: Arc<AtomicBool>,
+        spawned_actions: &ActionQueue,
+        depth: u32,
+    ) -> Result<()> {
+        use crate::models::matchers::{CommandMiss, CommandOutcome, assign, usage_line};
+
+        match assign(line, &command.name, &command.args, command.parse) {
+            CommandOutcome::Fired { args } => {
+                let mut captures = Vec::with_capacity(args.len() + 1);
+                captures.push(MatchCapture {
+                    name: None,
+                    value: line.trim().to_string(),
+                });
+                for (name, value) in args {
+                    captures.push(MatchCapture {
+                        name: Some(std::borrow::Cow::Owned(name)),
+                        value: value.unwrap_or_default(),
+                    });
+                }
+                spawned_actions
+                    .borrow_mut()
+                    .push_back(RuntimeAction::RunAutomation {
+                        isolate: self.isolate.clone(),
+                        origin: self.origin.clone(),
+                        name: Arc::new(self.name.clone()),
+                        script: self.script.clone(),
+                        matches: Arc::new(captures),
+                        depth,
+                        is_captured: is_captured.clone(),
+                        stopped,
+                        fallthrough: self.fallthrough,
+                        is_alias: self.is_alias,
+                    });
+            }
+            CommandOutcome::NotFired(CommandMiss::MissingRequired { .. }) => {
+                spawned_actions
+                    .borrow_mut()
+                    .push_back(RuntimeAction::EchoUsage {
+                        text: Arc::new(format!(
+                            "Usage: {}",
+                            usage_line(&command.name, &command.args)
+                        )),
+                        is_captured: is_captured.clone(),
+                        stopped,
+                        fallthrough: self.fallthrough,
+                    });
+            }
+            CommandOutcome::NotFired(_) => {}
+        }
         Ok(())
     }
 
@@ -1652,6 +1805,404 @@ mod tests {
             // …and re-registration into the NEW manager raises the OLD clone.
             push(&mut fresh, "raw", vec!["raw".to_string()]);
             assert!(connection_clone.load(Ordering::Relaxed));
+        }
+    }
+
+    mod one_fire_per_line {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use super::super::{ActionQueue, Manager, PushTriggerParams, ScriptAction};
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+        use crate::session::styled_line::StyledLine;
+
+        fn manager() -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            (
+                Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default()),
+                queue,
+            )
+        }
+
+        fn push(
+            manager: &mut Manager,
+            name: &str,
+            patterns: Vec<String>,
+            raw_patterns: Vec<String>,
+            prompt: bool,
+        ) {
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin: Origin::User,
+                    name: &Arc::new(name.to_string()),
+                    patterns: &Arc::new(patterns),
+                    raw_patterns: &Arc::new(raw_patterns),
+                    anti_patterns: &Arc::new(Vec::new()),
+                    action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
+                    prompt,
+                    enabled: true,
+                    priority: 0,
+                    fallthrough: true,
+                    fire_limit: None,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+        }
+
+        fn drain_fires(queue: &ActionQueue) -> Vec<RuntimeAction> {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+                .collect()
+        }
+
+        fn line_with_raw(text: &str, raw: &str) -> Arc<StyledLine> {
+            Arc::new(StyledLine::new_with_raw(
+                text,
+                Vec::new(),
+                Some(raw.as_bytes()),
+            ))
+        }
+
+        /// Whether the queued automation's captures came from a pattern with a named
+        /// `hp` group — the raw patterns below have one, the normal patterns none, so
+        /// this identifies which pass produced the fire.
+        fn captured_hp(action: &RuntimeAction) -> bool {
+            let RuntimeAction::RunAutomation { matches, .. } = action else {
+                return false;
+            };
+            matches
+                .iter()
+                .any(|capture| capture.name.as_deref() == Some("hp"))
+        }
+
+        #[test]
+        fn double_match_fires_once_and_raw_wins() {
+            let (mut manager, queue) = manager();
+            push(
+                &mut manager,
+                "both",
+                vec!["42hp".to_string()],
+                vec![r"\x1b\[31m(?<hp>\d+)hp".to_string()],
+                false,
+            );
+
+            manager
+                .process_incoming_line(&line_with_raw("42hp", "\x1b[31m42hp"))
+                .unwrap();
+
+            let fires = drain_fires(&queue);
+            assert_eq!(fires.len(), 1, "one fire per trigger per line");
+            assert!(
+                captured_hp(&fires[0]),
+                "raw runs first, so raw wins the fire"
+            );
+        }
+
+        #[test]
+        fn normal_pass_still_fires_when_raw_missed() {
+            let (mut manager, queue) = manager();
+            push(
+                &mut manager,
+                "both",
+                vec!["42hp".to_string()],
+                vec![r"\x1b\[99m".to_string()],
+                false,
+            );
+
+            manager
+                .process_incoming_line(&line_with_raw("42hp", "\x1b[31m42hp"))
+                .unwrap();
+
+            let fires = drain_fires(&queue);
+            assert_eq!(fires.len(), 1);
+            assert!(
+                !captured_hp(&fires[0]),
+                "the normal pattern produced the fire"
+            );
+        }
+
+        #[test]
+        fn distinct_triggers_are_not_suppressed_by_each_other() {
+            let (mut manager, queue) = manager();
+            push(
+                &mut manager,
+                "raw-only",
+                Vec::new(),
+                vec![r"\x1b\[31m(?<hp>\d+)hp".to_string()],
+                false,
+            );
+            push(
+                &mut manager,
+                "normal-only",
+                vec!["42hp".to_string()],
+                Vec::new(),
+                false,
+            );
+
+            manager
+                .process_incoming_line(&line_with_raw("42hp", "\x1b[31m42hp"))
+                .unwrap();
+
+            assert_eq!(
+                drain_fires(&queue).len(),
+                2,
+                "the fired list is per trigger, not global"
+            );
+        }
+
+        #[test]
+        fn prompt_path_fires_once_across_its_passes() {
+            let (mut manager, queue) = manager();
+            push(
+                &mut manager,
+                "prompt-both",
+                vec!["42hp".to_string()],
+                vec![r"\x1b\[31m(?<hp>\d+)hp".to_string()],
+                true,
+            );
+
+            // The prompt PatternSets rebuild at the complete-line dirty check; run a
+            // non-matching complete line through first, as a live session would.
+            manager
+                .process_incoming_line(&line_with_raw("nothing here", "nothing here"))
+                .unwrap();
+            queue.borrow_mut().drain(..).for_each(drop);
+
+            manager
+                .process_partial_line(line_with_raw("42hp", "\x1b[31m42hp"))
+                .unwrap();
+
+            let fires = drain_fires(&queue);
+            assert_eq!(fires.len(), 1, "one fire per trigger per prompt line");
+            assert!(captured_hp(&fires[0]), "raw wins on the prompt path too");
+        }
+
+        /// The JS-side flag helper bakes a flagged `RegExp`'s flags in as a
+        /// non-capturing `(?i:...)` wrapper. Positional capture materialization in
+        /// `Trigger::run` — index in the vec is the group number — must see the same
+        /// numbering as the unwrapped source.
+        #[test]
+        fn inline_flag_wrapper_is_transparent_to_group_numbering() {
+            let (mut manager, queue) = manager();
+            manager
+                .push_simple_alias(
+                    super::super::super::origin::IsolateId::Main,
+                    super::super::super::origin::Origin::User,
+                    std::sync::Arc::new("num".to_string()),
+                    std::sync::Arc::new(vec![r"(?i:^num (\w+) (?<who>\w+)$)".to_string()]),
+                    std::sync::Arc::new("say $1 $who".to_string()),
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            manager.process_outgoing_line("NUM One Two").unwrap();
+
+            let captures = queue
+                .borrow_mut()
+                .drain(..)
+                .find_map(|action| match action {
+                    crate::session::runtime::RuntimeAction::RunAutomation { matches, .. } => {
+                        Some(matches)
+                    }
+                    _ => None,
+                })
+                .expect("the (?i:) alias fires on differently-cased input");
+            assert_eq!(captures[0].value, "NUM One Two");
+            assert_eq!(captures[1].value, "One");
+            assert!(captures[1].name.is_none());
+            assert_eq!(captures[2].name.as_deref(), Some("who"));
+            assert_eq!(captures[2].value, "Two");
+        }
+
+        #[test]
+        fn consecutive_lines_each_get_their_own_fire() {
+            let (mut manager, queue) = manager();
+            push(
+                &mut manager,
+                "both",
+                vec!["42hp".to_string()],
+                vec![r"\x1b\[31m(?<hp>\d+)hp".to_string()],
+                false,
+            );
+
+            let line = line_with_raw("42hp", "\x1b[31m42hp");
+            manager.process_incoming_line(&line).unwrap();
+            manager.process_incoming_line(&line).unwrap();
+
+            assert_eq!(
+                drain_fires(&queue).len(),
+                2,
+                "the fired list must not leak across lines"
+            );
+        }
+    }
+
+    mod command_aliases {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use super::super::{ActionQueue, Manager};
+        use crate::models::matchers::{
+            ArgKind, ArgSpec, CommandSpec, ParseMode, command_prefilter,
+        };
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+
+        fn manager_with_command(spec: CommandSpec) -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            let mut manager = Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default());
+            let prefilter = command_prefilter(&spec.name);
+            manager
+                .push_simple_alias(
+                    IsolateId::Main,
+                    Origin::User,
+                    Arc::new("cmd".to_string()),
+                    Arc::new(vec![prefilter]),
+                    Arc::new("say hi to $person".to_string()),
+                    0,
+                    true,
+                    None,
+                    Some(spec),
+                )
+                .unwrap();
+            (manager, queue)
+        }
+
+        fn greet_spec(kind: ArgKind) -> CommandSpec {
+            CommandSpec {
+                name: "greet".to_string(),
+                args: vec![ArgSpec {
+                    name: "person".to_string(),
+                    kind,
+                }],
+                parse: ParseMode::All,
+            }
+        }
+
+        fn drain(queue: &ActionQueue) -> Vec<RuntimeAction> {
+            queue.borrow_mut().drain(..).collect()
+        }
+
+        fn count_runs(actions: &[RuntimeAction]) -> usize {
+            actions
+                .iter()
+                .filter(|a| matches!(a, RuntimeAction::RunAutomation { .. }))
+                .count()
+        }
+
+        #[test]
+        fn fired_command_produces_parser_captures() {
+            let (mut manager, queue) = manager_with_command(greet_spec(ArgKind::Required));
+            manager
+                .process_outgoing_line(r#"greet "big ugly troll""#)
+                .unwrap();
+
+            let actions = drain(&queue);
+            let matches = actions
+                .iter()
+                .find_map(|a| match a {
+                    RuntimeAction::RunAutomation { matches, .. } => Some(matches),
+                    _ => None,
+                })
+                .expect("the command fires");
+            assert_eq!(matches[0].value, r#"greet "big ugly troll""#);
+            assert_eq!(matches[1].name.as_deref(), Some("person"));
+            assert_eq!(matches[1].value, "big ugly troll");
+        }
+
+        #[test]
+        fn missing_required_echoes_usage_and_captures() {
+            let (mut manager, queue) = manager_with_command(greet_spec(ArgKind::Required));
+            manager.process_outgoing_line("greet").unwrap();
+
+            let actions = drain(&queue);
+            assert_eq!(count_runs(&actions), 0, "no fire on a missing required arg");
+            let usage = actions
+                .iter()
+                .find_map(|a| match a {
+                    RuntimeAction::EchoUsage {
+                        text, is_captured, ..
+                    } => Some((text.clone(), is_captured.clone())),
+                    _ => None,
+                })
+                .expect("the usage echo is queued");
+            assert_eq!(usage.0.as_str(), "Usage: greet <person>");
+            assert!(usage.1.is_some(), "the echo can mark the input captured");
+        }
+
+        #[test]
+        fn unclaimed_tokens_fall_through() {
+            let (mut manager, queue) = manager_with_command(greet_spec(ArgKind::Required));
+            manager.process_outgoing_line("greet Mira Bob").unwrap();
+
+            let actions = drain(&queue);
+            assert_eq!(count_runs(&actions), 0);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, RuntimeAction::EchoUsage { .. })),
+                "unclaimed tokens are not an arity failure"
+            );
+            // The trailing SendRawUnless still carries the typed line.
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, RuntimeAction::SendRawUnless(_, line) if line.as_str() == "greet Mira Bob")),
+            );
+        }
+
+        #[test]
+        fn command_names_update_tracks_enabled_command_aliases() {
+            let (mut manager, _queue) = manager_with_command(greet_spec(ArgKind::Optional));
+            let names = manager
+                .command_names_update()
+                .expect("the first take sees the new alias");
+            assert_eq!(
+                names.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+                ["greet"]
+            );
+            assert!(
+                manager.command_names_update().is_none(),
+                "no change, no re-send"
+            );
+
+            manager.enable_alias(&IsolateId::Main, &Origin::User, "cmd", false);
+            let names = manager
+                .command_names_update()
+                .expect("a disable changes the list");
+            assert!(names.is_empty());
+        }
+
+        #[test]
+        fn stale_sidecar_first_word_mismatch_cannot_fire() {
+            // A hand-edited pattern (`^greetz...`) with a sidecar naming `greet`:
+            // the prefilter matches `greetz hi`, but the parser re-checks the
+            // first word and refuses, so the line falls through.
+            let queue: ActionQueue = Rc::default();
+            let mut manager = Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default());
+            manager
+                .push_simple_alias(
+                    IsolateId::Main,
+                    Origin::User,
+                    Arc::new("cmd".to_string()),
+                    Arc::new(vec![command_prefilter("greetz")]),
+                    Arc::new("say hi".to_string()),
+                    0,
+                    true,
+                    None,
+                    Some(greet_spec(ArgKind::Optional)),
+                )
+                .unwrap();
+            manager.process_outgoing_line("greetz hi").unwrap();
+            assert_eq!(count_runs(&drain(&queue)), 0);
         }
     }
 

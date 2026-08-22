@@ -42,6 +42,7 @@ use crate::update::Update;
 mod common;
 mod dashboard;
 mod editors;
+mod highlight;
 mod manifest;
 mod model;
 mod packages;
@@ -127,8 +128,8 @@ pub enum EditNode {
         priority: i32,
         fallthrough: bool,
         package: Option<String>,
-        /// The unified, ordered pattern list (Match/Anti/Raw per row).
-        rows: Vec<(PatternKind, String)>,
+        /// The unified, ordered matcher row list (role + syntax per row).
+        rows: Vec<model::TriggerRow>,
     },
 }
 
@@ -279,7 +280,34 @@ pub enum Message {
 
     // ---- editor fields -----------------------------------------------------
     SetName(String),
-    SetAliasPattern(String),
+    /// An edit in the alias Regex field's one-line editor.
+    AliasRegexAction(text_editor::Action),
+    // alias matcher draft
+    SetAliasKind(model::AliasKind),
+    SetCommandName(String),
+    /// Reveal the command-word override row (the alias name drives the
+    /// command until then).
+    RevealCommandOverride,
+    SetArgName(usize, String),
+    SetArgKind(usize, smudgy_core::models::matchers::ArgKind),
+    AddArg,
+    RemoveArg(usize),
+    SetCmdMode(smudgy_core::models::matchers::CmdMode),
+    SetParseMode(smudgy_core::models::matchers::ParseMode),
+    /// Open/close the Parsing picker's floating list.
+    OpenParsingPicker,
+    CloseParsingPicker,
+    /// Move the Parsing picker's keyboard cursor by a delta.
+    MoveParsingCursor(i32),
+    /// An edit in the alias Simple-pattern field's one-line editor.
+    AliasPatternAction(text_editor::Action),
+    ToggleAnchorStart,
+    ToggleAnchorEnd,
+    TogglePrompt,
+    RevealOrder,
+    HideOrder,
+    /// Insert a capture reference at the caret in the action body.
+    InsertReference(String),
     /// Move the open script to a folder (`None` = top level). Also dispatched by
     /// the palette's "Move to…" group for the selected script.
     SetScriptFolder(Option<String>),
@@ -287,14 +315,32 @@ pub enum Message {
     AdjustPriority(i32),
     ToggleFallthrough,
     ScriptEditorAction(text_editor::Action),
+    /// An edit in the send-text action draft.
+    SendTextAction(text_editor::Action),
+    /// Expand/collapse the Try-it accordion (collapsed by default).
+    ToggleTryIt,
     SetTestInput(String),
     ToggleEnabled,
     MarkHotkeyState(Vec<MaybePhysicalKey>),
     // trigger patterns
     AddPattern,
+    /// Add an exception row (Pattern syntax by default).
+    AddExceptionRow,
+    /// Add a raw row (always Regex syntax).
+    AddRawRow,
+    /// A click on one of the trigger pane's matcher cards: creates the first
+    /// matcher row at the teaching state, or re-shapes the single existing
+    /// matcher at the selector state (README §4).
+    SetTriggerCard(model::TriggerCard),
     RemovePattern(usize),
-    SetPatternKind(usize, PatternKind),
-    SetPatternText(usize, String),
+    /// Move a row up/down within its role group (the phase order is fixed).
+    MoveRowUp(usize),
+    MoveRowDown(usize),
+    /// An edit in a trigger row's one-line source editor.
+    RowSourceAction(usize, text_editor::Action),
+    SetRowSyntax(usize, smudgy_core::models::matchers::MatcherSyntax),
+    ToggleRowAnchorStart(usize),
+    ToggleRowAnchorEnd(usize),
 
     // ---- save bar ----------------------------------------------------------
     Save,
@@ -574,7 +620,41 @@ pub struct AutomationsWindow {
 
     // ---- shared editor buffers --------------------------------------------
     pub(super) editor_content: text_editor::Content,
+    /// The send-text action draft, held separately from the script draft so
+    /// switching action tabs never destroys work. Save writes whichever tab
+    /// is active.
+    pub(super) send_text_content: text_editor::Content,
+    /// Whether the send-text draft has been edited (or came from disk). An
+    /// unpinned draft is regenerated from the live matcher on every edit.
+    pub(super) action_text_pinned: bool,
+    /// As [`Self::action_text_pinned`], for the script draft.
+    pub(super) action_script_pinned: bool,
+    /// The language the Run JavaScript tab writes: `JS`, or `TS` when the
+    /// automation opened as TypeScript (a TS alias stays TS on save).
+    pub(super) action_script_lang: ScriptLang,
+    /// The alias Simple-pattern field's buffer; `alias_draft.pattern_source`
+    /// mirrors it after every edit (the draft stays the compile input).
+    pub(super) alias_pattern_content: text_editor::Content,
+    /// The alias Regex field's buffer, mirrored into `alias_draft.regex_source`.
+    pub(super) alias_regex_content: text_editor::Content,
+    /// One buffer per trigger matcher row, kept index-aligned with the open
+    /// trigger's `rows` through every add/remove/reorder.
+    pub(super) trigger_row_contents: Vec<text_editor::Content>,
     pub(super) hotkey_state: Vec<MaybePhysicalKey>,
+    /// The alias editor's matcher draft (kind + every kind's buffers), seeded
+    /// on open/create like `hotkey_state` and consumed at save.
+    pub(super) alias_draft: model::AliasMatcherDraft,
+    /// Whether the "When it runs" module is disclosed by the user's click.
+    /// Non-default values force it open regardless (and it cannot re-hide
+    /// while they hold); reset when an editor opens.
+    pub(super) order_revealed: bool,
+    /// Whether the Try-it accordion is expanded; collapsed when an editor opens.
+    pub(super) try_it_open: bool,
+    /// Whether the Parsing picker's floating list is open.
+    pub(super) parsing_open: bool,
+    /// The Parsing picker's keyboard cursor (an index into
+    /// `ParseModeChoice::ALL`).
+    pub(super) parsing_cursor: usize,
     pub(super) test_input: String,
     pub(super) dirty: bool,
     pub(super) pending_nav: Option<Box<Message>>,
@@ -805,7 +885,19 @@ impl AutomationsWindow {
             chip: Chip::All,
             new_menu_open: false,
             editor_content: text_editor::Content::new(),
+            send_text_content: text_editor::Content::new(),
+            action_text_pinned: false,
+            action_script_pinned: false,
+            action_script_lang: ScriptLang::JS,
+            alias_pattern_content: text_editor::Content::new(),
+            alias_regex_content: text_editor::Content::new(),
+            trigger_row_contents: Vec::new(),
             hotkey_state: Vec::new(),
+            alias_draft: model::AliasMatcherDraft::default(),
+            order_revealed: false,
+            try_it_open: false,
+            parsing_open: false,
+            parsing_cursor: 0,
             test_input: String::new(),
             dirty: false,
             pending_nav: None,
@@ -952,6 +1044,10 @@ impl AutomationsWindow {
     }
 
     pub fn update(&mut self, message: Message) -> Update<Message, Event> {
+        // Message tracing for GUI debugging: run with
+        // `SMUDGY_LOG=smudgy_ui::windows::automations_window=trace` to watch
+        // every message this window handles.
+        log::trace!("{message:?}");
         // Unsaved-changes guard: defer navigation away from a dirty editor or an edited but
         // unsaved manifest draft (the rich manifest editor tracks its own dirty flag).
         if (self.dirty || self.manifest_dirty) && Self::is_guarded_navigation(&message) {
@@ -961,7 +1057,8 @@ impl AutomationsWindow {
         if Self::is_edit_message(&message) {
             self.dirty = true;
         }
-        match message {
+        let refresh_generated = Self::affects_captures(&message);
+        let update = match message {
             // -------- loading ----------------------------------------------
             Message::ScriptsLoaded(scripts, errors) => {
                 self.scripts = scripts;
@@ -1137,11 +1234,129 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
-            Message::SetAliasPattern(pattern) => {
-                if let Pane::Editor(state) = &mut self.pane
-                    && let EditNode::Alias(alias) = &mut state.node
+            Message::AliasRegexAction(action) => {
+                // The Regex kind's source buffer; `pattern` on the definition is
+                // written from the draft at save time.
+                editors::perform_single_line(&mut self.alias_regex_content, action);
+                self.alias_draft.regex_source =
+                    editors::single_line_text(&self.alias_regex_content);
+                Update::none()
+            }
+            Message::SetAliasKind(kind) => {
+                self.alias_draft.kind = kind;
+                Update::none()
+            }
+            Message::SetCommandName(name) => {
+                self.alias_draft.command_override = Some(name);
+                Update::none()
+            }
+            Message::RevealCommandOverride => {
+                self.alias_draft
+                    .command_override
+                    .get_or_insert_with(String::new);
+                Update::none()
+            }
+            Message::SetArgName(i, name) => {
+                if let Some(arg) = self.alias_draft.args.get_mut(i) {
+                    arg.name = name;
+                }
+                Update::none()
+            }
+            Message::SetArgKind(i, kind) => {
+                if let Some(arg) = self.alias_draft.args.get_mut(i) {
+                    arg.kind = kind;
+                    self.alias_draft.normalize_args();
+                }
+                Update::none()
+            }
+            Message::AddArg => {
+                self.alias_draft
+                    .args
+                    .push(smudgy_core::models::matchers::ArgSpec {
+                        name: format!("arg{}", self.alias_draft.args.len() + 1),
+                        kind: smudgy_core::models::matchers::ArgKind::Required,
+                    });
+                self.alias_draft.normalize_args();
+                Update::none()
+            }
+            Message::RemoveArg(i) => {
+                if i < self.alias_draft.args.len() {
+                    self.alias_draft.args.remove(i);
+                    self.alias_draft.normalize_args();
+                }
+                Update::none()
+            }
+            Message::SetCmdMode(mode) => {
+                self.alias_draft.cmd_mode = mode;
+                self.alias_draft.normalize_args();
+                Update::none()
+            }
+            Message::SetParseMode(parse) => {
+                self.alias_draft.parse = parse;
+                self.parsing_open = false;
+                Update::none()
+            }
+            Message::OpenParsingPicker => {
+                self.parsing_open = true;
+                // The cursor starts on the current choice.
+                self.parsing_cursor = model::ParseModeChoice::ALL
+                    .iter()
+                    .position(|choice| choice.0 == self.alias_draft.parse)
+                    .unwrap_or(0);
+                Update::none()
+            }
+            Message::CloseParsingPicker => {
+                self.parsing_open = false;
+                Update::none()
+            }
+            Message::MoveParsingCursor(delta) => {
+                let len = model::ParseModeChoice::ALL.len() as i32;
+                let cursor = self.parsing_cursor as i32 + delta;
+                self.parsing_cursor = cursor.rem_euclid(len) as usize;
+                Update::none()
+            }
+            Message::AliasPatternAction(action) => {
+                editors::perform_single_line(&mut self.alias_pattern_content, action);
+                self.alias_draft.pattern_source =
+                    editors::single_line_text(&self.alias_pattern_content);
+                Update::none()
+            }
+            Message::ToggleAnchorStart => {
+                self.alias_draft.anchor_start = !self.alias_draft.anchor_start;
+                Update::none()
+            }
+            Message::ToggleAnchorEnd => {
+                self.alias_draft.anchor_end = !self.alias_draft.anchor_end;
+                Update::none()
+            }
+            Message::TogglePrompt => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { prompt, .. },
+                    ..
+                }) = &mut self.pane
                 {
-                    alias.pattern = pattern;
+                    *prompt = !*prompt;
+                }
+                Update::none()
+            }
+            Message::RevealOrder => {
+                self.order_revealed = true;
+                Update::none()
+            }
+            Message::HideOrder => {
+                self.order_revealed = false;
+                Update::none()
+            }
+            Message::InsertReference(reference) => {
+                // The badge inserts into whichever action tab is active.
+                let paste =
+                    text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(reference)));
+                if self.open_action_language() == Some(ScriptLang::Plaintext) {
+                    self.action_text_pinned = true;
+                    self.send_text_content.perform(paste);
+                } else {
+                    self.action_script_pinned = true;
+                    self.editor_content.perform(paste);
                 }
                 Update::none()
             }
@@ -1183,7 +1398,21 @@ impl AutomationsWindow {
                 Update::none()
             }
             Message::ScriptEditorAction(action) => {
+                if action.is_edit() {
+                    self.action_script_pinned = true;
+                }
                 self.editor_content.perform(action);
+                Update::none()
+            }
+            Message::SendTextAction(action) => {
+                if action.is_edit() {
+                    self.action_text_pinned = true;
+                }
+                self.send_text_content.perform(action);
+                Update::none()
+            }
+            Message::ToggleTryIt => {
+                self.try_it_open = !self.try_it_open;
                 Update::none()
             }
             Message::SetTestInput(value) => {
@@ -1201,8 +1430,89 @@ impl AutomationsWindow {
                     ..
                 }) = &mut self.pane
                 {
-                    rows.push((PatternKind::Match, String::new()));
+                    // "Another" means another of what you have: the new row
+                    // copies the last Match row's syntax, defaulting to the
+                    // Simple pattern for the first one.
+                    let syntax = rows
+                        .iter()
+                        .rev()
+                        .find(|row| row.role == PatternKind::Match)
+                        .map_or(
+                            smudgy_core::models::matchers::MatcherSyntax::Pattern,
+                            |row| row.syntax,
+                        );
+                    rows.push(model::TriggerRow {
+                        syntax,
+                        ..model::TriggerRow::new(PatternKind::Match)
+                    });
+                    self.trigger_row_contents.push(text_editor::Content::new());
                 }
+                Update::none()
+            }
+            Message::AddExceptionRow => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                {
+                    rows.push(model::TriggerRow {
+                        syntax: smudgy_core::models::matchers::MatcherSyntax::Pattern,
+                        ..model::TriggerRow::new(PatternKind::Anti)
+                    });
+                    self.trigger_row_contents.push(text_editor::Content::new());
+                }
+                Update::none()
+            }
+            Message::AddRawRow => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                {
+                    rows.push(model::TriggerRow::new(PatternKind::Raw));
+                    self.trigger_row_contents.push(text_editor::Content::new());
+                }
+                Update::none()
+            }
+            Message::SetTriggerCard(card) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                {
+                    let (syntax, role) = card.shape();
+                    let matcher_indexes: Vec<usize> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| row.role != PatternKind::Anti)
+                        .map(|(i, _)| i)
+                        .collect();
+                    match matcher_indexes[..] {
+                        [] => {
+                            rows.push(model::TriggerRow {
+                                syntax,
+                                ..model::TriggerRow::new(role)
+                            });
+                            self.trigger_row_contents.push(text_editor::Content::new());
+                        }
+                        [index] => {
+                            if let Some(row) = rows.get_mut(index) {
+                                row.syntax = syntax;
+                                row.role = role;
+                            }
+                        }
+                        // The cards are not shown at two or more matchers.
+                        _ => {}
+                    }
+                }
+                Update::none()
+            }
+            Message::MoveRowUp(i) => {
+                self.move_trigger_row(i, false);
+                Update::none()
+            }
+            Message::MoveRowDown(i) => {
+                self.move_trigger_row(i, true);
                 Update::none()
             }
             Message::RemovePattern(i) => {
@@ -1213,28 +1523,63 @@ impl AutomationsWindow {
                     && i < rows.len()
                 {
                     rows.remove(i);
+                    if i < self.trigger_row_contents.len() {
+                        self.trigger_row_contents.remove(i);
+                    }
                 }
                 Update::none()
             }
-            Message::SetPatternKind(i, kind) => {
+            Message::RowSourceAction(i, action) => {
+                if let Some(content) = self.trigger_row_contents.get_mut(i) {
+                    editors::perform_single_line(content, action);
+                    let source = editors::single_line_text(content);
+                    if let Pane::Editor(EditorState {
+                        node: EditNode::Trigger { rows, .. },
+                        ..
+                    }) = &mut self.pane
+                        && let Some(row) = rows.get_mut(i)
+                    {
+                        row.source = source;
+                    }
+                }
+                Update::none()
+            }
+            Message::SetRowSyntax(i, syntax) => {
                 if let Pane::Editor(EditorState {
                     node: EditNode::Trigger { rows, .. },
                     ..
                 }) = &mut self.pane
                     && let Some(row) = rows.get_mut(i)
                 {
-                    row.0 = kind;
+                    row.syntax = syntax;
+                    // Raw implies Regex: choosing Pattern demotes the role.
+                    if syntax == smudgy_core::models::matchers::MatcherSyntax::Pattern
+                        && row.role == PatternKind::Raw
+                    {
+                        row.role = PatternKind::Match;
+                    }
                 }
                 Update::none()
             }
-            Message::SetPatternText(i, text) => {
+            Message::ToggleRowAnchorStart(i) => {
                 if let Pane::Editor(EditorState {
                     node: EditNode::Trigger { rows, .. },
                     ..
                 }) = &mut self.pane
                     && let Some(row) = rows.get_mut(i)
                 {
-                    row.1 = text;
+                    row.anchor_start = !row.anchor_start;
+                }
+                Update::none()
+            }
+            Message::ToggleRowAnchorEnd(i) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    row.anchor_end = !row.anchor_end;
                 }
                 Update::none()
             }
@@ -1654,25 +1999,96 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
+        };
+        // An unpinned action draft follows the live matcher: any edit that can
+        // change what is captured regenerates the example bodies.
+        if refresh_generated {
+            self.refresh_generated_actions();
         }
+        update
     }
 
     // ---- guards ------------------------------------------------------------
 
     fn is_edit_message(message: &Message) -> bool {
         match message {
-            Message::ScriptEditorAction(action) => matches!(action, text_editor::Action::Edit(_)),
+            Message::ScriptEditorAction(action)
+            | Message::SendTextAction(action)
+            | Message::AliasPatternAction(action)
+            | Message::AliasRegexAction(action)
+            | Message::RowSourceAction(_, action) => {
+                matches!(action, text_editor::Action::Edit(_))
+            }
             Message::SetName(_)
-            | Message::SetAliasPattern(_)
+            | Message::SetAliasKind(_)
+            | Message::SetCommandName(_)
+            | Message::RevealCommandOverride
+            | Message::SetArgName(_, _)
+            | Message::SetArgKind(_, _)
+            | Message::AddArg
+            | Message::RemoveArg(_)
+            | Message::SetCmdMode(_)
+            | Message::SetParseMode(_)
+            | Message::ToggleAnchorStart
+            | Message::ToggleAnchorEnd
+            | Message::TogglePrompt
             | Message::SetBehavior(_)
             | Message::AdjustPriority(_)
             | Message::ToggleFallthrough
             | Message::AddPattern
+            | Message::AddExceptionRow
+            | Message::AddRawRow
+            | Message::SetTriggerCard(_)
             | Message::RemovePattern(_)
-            | Message::SetPatternKind(_, _)
-            | Message::SetPatternText(_, _)
+            | Message::MoveRowUp(_)
+            | Message::MoveRowDown(_)
+            | Message::SetRowSyntax(_, _)
+            | Message::ToggleRowAnchorStart(_)
+            | Message::ToggleRowAnchorEnd(_)
+            | Message::InsertReference(_)
             | Message::MarkHotkeyState(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether a message can change what the open matcher captures — the
+    /// signal to regenerate any unpinned action draft.
+    fn affects_captures(message: &Message) -> bool {
+        match message {
+            Message::AliasPatternAction(action)
+            | Message::AliasRegexAction(action)
+            | Message::RowSourceAction(_, action) => {
+                matches!(action, text_editor::Action::Edit(_))
+            }
+            Message::SetAliasKind(_)
+            | Message::SetCommandName(_)
+            | Message::RevealCommandOverride
+            | Message::SetArgName(_, _)
+            | Message::SetArgKind(_, _)
+            | Message::AddArg
+            | Message::RemoveArg(_)
+            | Message::SetCmdMode(_)
+            | Message::AddPattern
+            | Message::AddExceptionRow
+            | Message::AddRawRow
+            | Message::SetTriggerCard(_)
+            | Message::RemovePattern(_)
+            | Message::MoveRowUp(_)
+            | Message::MoveRowDown(_)
+            | Message::SetRowSyntax(_, _) => true,
+            _ => false,
+        }
+    }
+
+    /// The action language of the open alias/trigger editor, if one is open.
+    fn open_action_language(&self) -> Option<ScriptLang> {
+        match &self.pane {
+            Pane::Editor(EditorState { node, .. }) => match node {
+                EditNode::Alias(alias) => Some(alias.language),
+                EditNode::Trigger { language, .. } => Some(*language),
+                EditNode::Hotkey(_) => None,
+            },
+            _ => None,
         }
     }
 
@@ -1695,6 +2111,34 @@ impl AutomationsWindow {
                 | Message::NewModule
                 | Message::NewPackage
         )
+    }
+
+    /// Swaps a trigger row with its neighbor **within its role group** — the
+    /// phase order (exceptions, raw, matches) is fixed, so reordering never
+    /// crosses roles. The row buffers move with the rows.
+    fn move_trigger_row(&mut self, i: usize, down: bool) {
+        if let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &mut self.pane
+            && i < rows.len()
+        {
+            let role = rows[i].role;
+            let neighbor = if down {
+                rows[i + 1..]
+                    .iter()
+                    .position(|row| row.role == role)
+                    .map(|offset| i + 1 + offset)
+            } else {
+                rows[..i].iter().rposition(|row| row.role == role)
+            };
+            if let Some(j) = neighbor {
+                rows.swap(i, j);
+                if i < self.trigger_row_contents.len() && j < self.trigger_row_contents.len() {
+                    self.trigger_row_contents.swap(i, j);
+                }
+            }
+        }
     }
 
     /// Resets per-pane selection scaffolding before opening a new pane.

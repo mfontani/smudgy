@@ -105,6 +105,14 @@ pub enum RuntimeAction {
     /// drop. A no-op when there is no live connection.
     Disconnect,
     HandleIncomingLine(Arc<StyledLine>),
+    /// A newline completed a logical line whose prefix was already emitted as
+    /// one or more transport-batch partials. `line` is the assembled whole
+    /// used for normal triggers; `completion_fragment` is the not-yet-shown
+    /// suffix, retained so an unmodified line can finish with a cheap append.
+    HandleIncomingFragmentedLine {
+        line: Arc<StyledLine>,
+        completion_fragment: Arc<StyledLine>,
+    },
     HandleIncomingPartialLine(Arc<StyledLine>),
     /// A decoded telnet GA/EOR boundary, ordered behind its prompt text.
     PromptBoundary,
@@ -113,6 +121,12 @@ pub enum RuntimeAction {
     /// it). Emitted by the VT layer before the replacement frame's bytes.
     RetractIncomingPartialLine,
     CompleteLineTriggersProcessed(Arc<StyledLine>),
+    /// Cold-path completion frame paired with
+    /// [`Self::HandleIncomingFragmentedLine`].
+    CompleteFragmentedLineTriggersProcessed {
+        line: Arc<StyledLine>,
+        completion_fragment: Arc<StyledLine>,
+    },
     PartialLineTriggersProcessed(Arc<StyledLine>),
     PerformLineOperation {
         line_number: usize,
@@ -165,6 +179,19 @@ pub enum RuntimeAction {
         is_alias: bool,
     },
     Echo(Arc<String>),
+    /// A Command alias matched its first word but a required argument was
+    /// missing (D10's third outcome): echo the usage line locally and mark the
+    /// input captured, so nothing reaches the MUD and no script runs. Not a
+    /// fire — `record_fire` is never called, so `fireLimit` does not tick —
+    /// but it participates in fallthrough exactly as a fire would: it honors
+    /// `stopped` and applies the alias's own `fallthrough`. Queued by
+    /// `Trigger::run` in place of [`Self::RunAutomation`].
+    EchoUsage {
+        text: Arc<String>,
+        is_captured: Option<Arc<AtomicBool>>,
+        stopped: Arc<AtomicBool>,
+        fallthrough: bool,
+    },
     /// Echo pre-styled whole lines (a styled `echo`): each element is one on-screen
     /// line whose spans were built — tiling, gap-free — at the op boundary. Takes the
     /// same counted Append path as [`RuntimeAction::Echo`].

@@ -206,6 +206,15 @@ pub struct SessionInput {
     /// completion sources (suggestions and the scrollback scan),
     /// case-insensitively.
     blacklist: Arc<HashSet<String>>,
+    /// The names of every enabled Command-kind alias, host-derived and
+    /// replaced wholesale by `SessionEvent::CommandNames`. Offered ahead of
+    /// the registered suggestions, but only while the word under the caret is
+    /// in command position (start of input, or right after the command
+    /// separator). Main input only; the blacklist filters these too.
+    command_names: Arc<Vec<Arc<String>>>,
+    /// The session's command separator, for the command-position test. May be
+    /// multi-character; empty means only the start of input qualifies.
+    command_separator: String,
     /// Hint text shown while the input is empty. Empty for the main input;
     /// pane inputs carry their spec's `placeholder`.
     placeholder: String,
@@ -326,6 +335,8 @@ impl SessionInput {
             post_submit_selected: false,
             suggestions: Arc::new(Vec::new()),
             blacklist: Arc::new(HashSet::new()),
+            command_names: Arc::new(Vec::new()),
+            command_separator: String::new(),
             placeholder: String::new(),
             escape_to_main: false,
             obscured_blur_pending: false,
@@ -412,6 +423,32 @@ impl SessionInput {
     ) {
         self.suggestions = suggestions;
         self.blacklist = blacklist;
+    }
+
+    /// Replace the Command-alias name list (`SessionEvent::CommandNames`).
+    pub fn set_command_names(&mut self, names: Arc<Vec<Arc<String>>>) {
+        self.command_names = names;
+    }
+
+    /// The session's command separator, for the command-position test.
+    pub fn set_command_separator(&mut self, separator: String) {
+        self.command_separator = separator;
+    }
+
+    /// Whether the word starting at byte `word_start` is in command position:
+    /// everything between the nearest preceding boundary — the start of the
+    /// input, or an occurrence of the command separator — and the word start
+    /// is whitespace.
+    fn in_command_position(&self, word_start: usize) -> bool {
+        let before = &self.value[..word_start];
+        let boundary_end = if self.command_separator.is_empty() {
+            0
+        } else {
+            before
+                .rfind(&self.command_separator)
+                .map_or(0, |i| i + self.command_separator.len())
+        };
+        before[boundary_end..].chars().all(char::is_whitespace)
     }
 
     /// What caused the most recent state change (rides the mirror update).
@@ -640,12 +677,24 @@ impl SessionInput {
             return Task::none();
         }
 
-        // Find the word at cursor position
+        // Find the word at cursor position. A word breaks at whitespace and
+        // also at the command separator, so `north;gre` completes `gre` —
+        // without the separator break, separator-adjacent command position
+        // could never offer anything.
         let cursor_pos = self.value.len(); // Assuming cursor is at end
-        let word_start = self.value[..cursor_pos]
+        let ws_start = self.value[..cursor_pos]
             .rfind(|c: char| c.is_whitespace())
             .map(|i| i + 1)
             .unwrap_or(0);
+        let sep_start = if self.command_separator.is_empty() {
+            0
+        } else {
+            self.value[..cursor_pos]
+                .rfind(&self.command_separator)
+                .map(|i| i + self.command_separator.len())
+                .unwrap_or(0)
+        };
+        let word_start = ws_start.max(sep_start);
 
         if word_start >= cursor_pos {
             return Task::none();
@@ -655,6 +704,10 @@ impl SessionInput {
         if word_prefix.is_empty() {
             return Task::none();
         }
+
+        // The position test reads the buffer, so it runs before the
+        // completion state takes its borrow.
+        let command_position = self.in_command_position(word_start);
 
         // Initialize or update completion state
         let completion_state = self
@@ -666,23 +719,37 @@ impl SessionInput {
                 suggested_folded: HashSet::new(),
             });
 
-        // Candidate order: script-registered suggestions first, in merge
-        // order (creators in first-contribution order, words in insertion
-        // order), then the scrollback recency scan. The blacklist filters
-        // both sources; prefix matching and blacklisting are
-        // case-insensitive, and a registered word is inserted with its
-        // registered casing. The scrollback scan skips offered words by
-        // exact match, folding only against the blacklist and the offered
-        // REGISTERED suggestions — with empty word sets, cycling is the
-        // plain scrollback behavior, casing pairs and all.
+        // Candidate order: Command-alias names first (only in command
+        // position), then script-registered suggestions in merge order
+        // (creators in first-contribution order, words in insertion order),
+        // then the scrollback recency scan. The blacklist filters every
+        // source; prefix matching and blacklisting are case-insensitive, and
+        // a registered word is inserted with its registered casing. The
+        // scrollback scan skips offered words by exact match, folding only
+        // against the blacklist and the offered REGISTERED words — with empty
+        // word sets, cycling is the plain scrollback behavior, casing pairs
+        // and all.
         let folded_prefix = completion_state.prefix.to_lowercase();
-        let mut candidate = self.suggestions.iter().find_map(|word| {
-            let folded = word.to_lowercase();
-            (folded.starts_with(&folded_prefix)
-                && !self.blacklist.contains(&folded)
-                && !completion_state.suggested_folded.contains(&folded))
-            .then(|| word.as_str().to_string())
-        });
+        let mut candidate = command_position
+            .then(|| {
+                self.command_names.iter().find_map(|word| {
+                    let folded = word.to_lowercase();
+                    (folded.starts_with(&folded_prefix)
+                        && !self.blacklist.contains(&folded)
+                        && !completion_state.suggested_folded.contains(&folded))
+                    .then(|| word.as_str().to_string())
+                })
+            })
+            .flatten();
+        if candidate.is_none() {
+            candidate = self.suggestions.iter().find_map(|word| {
+                let folded = word.to_lowercase();
+                (folded.starts_with(&folded_prefix)
+                    && !self.blacklist.contains(&folded)
+                    && !completion_state.suggested_folded.contains(&folded))
+                .then(|| word.as_str().to_string())
+            });
+        }
         // The scrollback scan needs a buffer; an input without one (a
         // widgets-only pane's) completes from the suggestion sets alone.
         let from_suggestions = candidate.is_some();
@@ -1152,6 +1219,41 @@ mod tests {
     fn pane_font_size_overrides_the_global_input_size() {
         assert_eq!(effective_font_size(Some(23.0), 14.0), 23.0);
         assert_eq!(effective_font_size(None, 14.0), 14.0);
+    }
+
+    /// The command-position table from the design plan's fixtures §12,
+    /// asserted at the observable level: does Tab offer a Command-alias name
+    /// for this input? (Everything between the caret's word start and the
+    /// nearest boundary — start of input, or the command separator — must be
+    /// whitespace.)
+    #[test]
+    fn command_names_complete_only_in_command_position() {
+        let mut input = SessionInput::new();
+        input.set_command_names(Arc::new(vec![Arc::new("greet".to_string())]));
+        let mut offers = |separator: &str, value: &str| -> bool {
+            input.set_command_separator(separator.to_string());
+            input.completion_state = None;
+            input.value = value.to_string();
+            let _ = input.handle_tab_completion();
+            // With no scrollback buffer and no word sets, the only possible
+            // completion source is the command-name list.
+            input.value != value
+        };
+
+        assert!(offers(";", "gre"));
+        assert!(!offers(";", "say gre"));
+        assert!(offers(";", "north;gre"));
+        assert!(
+            offers(";", "north; gre"),
+            "whitespace after the boundary is fine"
+        );
+        assert!(offers(";;", "north;;gre"));
+        assert!(!offers(";;", "north;gre"), "the separator is ;;, not ;");
+        assert!(
+            !offers("", "north;gre"),
+            "empty separator: only the start qualifies"
+        );
+        assert!(offers("", "gre"));
     }
 
     /// Submit a command unmasked (seeding history) via the real submit path.

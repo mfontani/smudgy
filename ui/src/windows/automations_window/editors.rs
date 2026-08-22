@@ -6,10 +6,14 @@ use std::sync::Arc;
 
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, Space, button, column, container, pick_list, radio, row, text, text_editor, text_input,
+    Column, Space, button, checkbox, column, container, pick_list, radio, row, text, text_editor,
+    text_input,
 };
 use iced::{Element, Font, Length, Padding};
 
+use smudgy_core::models::matchers::{
+    self, ArgKind, CmdMode, CommandOutcome, CommandSpec, MatcherSyntax,
+};
 use smudgy_core::models::server;
 use smudgy_core::models::{ScriptLang, aliases, hotkeys, naming, packages, triggers};
 
@@ -18,12 +22,15 @@ use crate::keymap::{self as hotkey_helpers, MaybePhysicalKey};
 use crate::theme::Theme;
 use crate::theme::builtins::button as button_style;
 use crate::update::Update;
+use crate::widgets::dropdown::Dropdown;
 use crate::widgets::hotkey_input::HotkeyInput;
 
 use super::common;
+use super::highlight;
 use super::model::{
-    NodeStatus, PatternKind, Script, ScriptKey, rows_into_trigger, trigger_rows,
-    upsert_script_folder,
+    AliasKind, AliasMatcherDraft, ArgKindChoice, NodeStatus, ParseModeChoice, PatternKind, Script,
+    ScriptKey, SyntaxChoice, TriggerCard, TriggerRow, pattern_error_text, rows_into_trigger,
+    trigger_rows, upsert_script_folder,
 };
 use super::{
     AutomationsWindow, EditNode, EditorMode, EditorState, Elem, Event, FolderState, Message,
@@ -84,30 +91,55 @@ impl AutomationsWindow {
         self.clear_selection();
         self.selection = Selection::Script(key.clone());
         self.test_input.clear();
+        self.order_revealed = false;
+        self.try_it_open = false;
+        self.parsing_open = false;
 
-        let body = match &script {
-            Script::Alias(a) => a.script.clone().unwrap_or_default(),
-            Script::Hotkey(h) => h.script.clone().unwrap_or_default(),
-            Script::Trigger(t) => t.script.clone().unwrap_or_default(),
+        match &script {
+            Script::Alias(a) => self.seed_action_buffers(a.language, a.script.as_deref()),
+            Script::Trigger(t) => self.seed_action_buffers(t.language, t.script.as_deref()),
+            Script::Hotkey(h) => {
+                self.editor_content =
+                    text_editor::Content::with_text(h.script.as_deref().unwrap_or_default());
+            }
             Script::Folder(_, _) => return Update::none(),
-        };
-        self.editor_content = text_editor::Content::with_text(&body);
+        }
 
         let node = match script {
-            Script::Alias(a) => EditNode::Alias(a),
+            Script::Alias(a) => {
+                self.alias_draft = AliasMatcherDraft::from_definition(&a, &key.script_name);
+                if self.alias_draft.degraded {
+                    log::info!(
+                        "alias {}: stored pattern no longer matches its sidecar; showing as regex",
+                        key.script_name
+                    );
+                }
+                self.alias_pattern_content =
+                    text_editor::Content::with_text(&self.alias_draft.pattern_source);
+                self.alias_regex_content =
+                    text_editor::Content::with_text(&self.alias_draft.regex_source);
+                EditNode::Alias(a)
+            }
             Script::Hotkey(h) => {
                 self.hotkey_state = hotkey_definition_to_keys(&h);
                 EditNode::Hotkey(h)
             }
-            Script::Trigger(t) => EditNode::Trigger {
-                enabled: t.enabled,
-                language: t.language,
-                prompt: t.prompt,
-                priority: t.priority,
-                fallthrough: t.fallthrough,
-                package: t.package.clone(),
-                rows: trigger_rows(&t),
-            },
+            Script::Trigger(t) => {
+                let rows = trigger_rows(&t);
+                self.trigger_row_contents = rows
+                    .iter()
+                    .map(|row| text_editor::Content::with_text(&row.source))
+                    .collect();
+                EditNode::Trigger {
+                    enabled: t.enabled,
+                    language: t.language,
+                    prompt: t.prompt,
+                    priority: t.priority,
+                    fallthrough: t.fallthrough,
+                    package: t.package.clone(),
+                    rows,
+                }
+            }
             Script::Folder(_, _) => return Update::none(),
         };
         self.pane = Pane::Editor(EditorState {
@@ -117,14 +149,108 @@ impl AutomationsWindow {
             node,
             error: None,
         });
+        // The inactive action tab starts with a generated example body.
+        self.refresh_generated_actions();
         Update::none()
+    }
+
+    /// Seeds the two action drafts from a stored automation: the stored body
+    /// lands in its language's tab, pinned (saved work is never regenerated
+    /// over — a file-backed body, `script: None`, pins as empty for the same
+    /// reason); the other tab starts unpinned so it can carry a generated
+    /// example until edited.
+    fn seed_action_buffers(&mut self, language: ScriptLang, body: Option<&str>) {
+        self.action_script_lang = if language == ScriptLang::TS {
+            ScriptLang::TS
+        } else {
+            ScriptLang::JS
+        };
+        let stored = body.unwrap_or_default();
+        if language == ScriptLang::Plaintext {
+            self.send_text_content = text_editor::Content::with_text(stored);
+            self.editor_content = text_editor::Content::new();
+            self.action_text_pinned = true;
+            self.action_script_pinned = false;
+        } else {
+            self.editor_content = text_editor::Content::with_text(stored);
+            self.send_text_content = text_editor::Content::new();
+            self.action_script_pinned = true;
+            self.action_text_pinned = false;
+        }
+    }
+
+    /// Resets both action drafts for a create pane: unpinned, so they carry
+    /// generated example bodies until the user edits one.
+    fn reset_action_buffers(&mut self) {
+        self.editor_content = text_editor::Content::new();
+        self.send_text_content = text_editor::Content::new();
+        self.action_text_pinned = false;
+        self.action_script_pinned = false;
+        self.action_script_lang = ScriptLang::JS;
+    }
+
+    /// Regenerates any unpinned action draft from the live matcher
+    /// (`matching-logic.md` §8): until the user edits a draft, its example
+    /// body tracks the captures, so it can never reference one that doesn't
+    /// exist. Any edit pins the draft and ends the tracking.
+    pub(super) fn refresh_generated_actions(&mut self) {
+        let computed = match &self.pane {
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(_),
+                ..
+            }) => {
+                let kind = if self.alias_draft.kind == AliasKind::Pattern {
+                    ExampleKind::AliasEmote
+                } else {
+                    ExampleKind::AliasSay
+                };
+                Some((
+                    kind,
+                    self.alias_capture_references(ScriptLang::Plaintext),
+                    self.alias_capture_references(ScriptLang::JS),
+                ))
+            }
+            Pane::Editor(EditorState {
+                node: EditNode::Trigger { rows, .. },
+                ..
+            }) => Some((
+                ExampleKind::Trigger,
+                Self::trigger_capture_references(rows, ScriptLang::Plaintext),
+                Self::trigger_capture_references(rows, ScriptLang::JS),
+            )),
+            _ => None,
+        };
+        let Some((kind, text_references, script_references)) = computed else {
+            return;
+        };
+        if !self.action_text_pinned {
+            self.send_text_content = text_editor::Content::with_text(&generated_body(
+                kind,
+                text_references.first().map(String::as_str),
+                false,
+            ));
+        }
+        if !self.action_script_pinned {
+            self.editor_content = text_editor::Content::with_text(&generated_body(
+                kind,
+                script_references.first().map(String::as_str),
+                true,
+            ));
+        }
     }
 
     pub(super) fn new_alias(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
-        self.editor_content = text_editor::Content::new();
+        self.reset_action_buffers();
         self.test_input.clear();
+        self.order_revealed = false;
+        self.try_it_open = false;
+        self.parsing_open = false;
+        // Command is the default kind for new aliases.
+        self.alias_draft = AliasMatcherDraft::default();
+        self.alias_pattern_content = text_editor::Content::new();
+        self.alias_regex_content = text_editor::Content::new();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -137,17 +263,24 @@ impl AutomationsWindow {
                 priority: 0,
                 fallthrough: true,
                 language: ScriptLang::Plaintext,
+                matcher: None,
             }),
             error: None,
         });
+        self.refresh_generated_actions();
         Update::none()
     }
 
     pub(super) fn new_trigger(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
-        self.editor_content = text_editor::Content::new();
+        self.reset_action_buffers();
         self.test_input.clear();
+        self.order_revealed = false;
+        self.try_it_open = false;
+        self.parsing_open = false;
+        // No rows yet: the pane opens at the teaching-cards state.
+        self.trigger_row_contents = Vec::new();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -159,10 +292,11 @@ impl AutomationsWindow {
                 priority: 0,
                 fallthrough: true,
                 package: self.current_folder(),
-                rows: vec![(PatternKind::Match, String::new())],
+                rows: Vec::new(),
             },
             error: None,
         });
+        self.refresh_generated_actions();
         Update::none()
     }
 
@@ -388,14 +522,60 @@ impl AutomationsWindow {
             return Update::none();
         }
 
-        let body = self.editor_content.text();
+        // The alias matcher persists from the draft: the compiled pattern plus
+        // the authoring sidecar (absent for the Regex kind). A compile error
+        // blocks the save with its message.
+        let alias_matcher = if matches!(
+            &self.pane,
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(_),
+                ..
+            })
+        ) {
+            match self.alias_draft.to_pattern(&name) {
+                Ok(pattern) => Some((pattern, self.alias_draft.to_matcher())),
+                Err(message) => {
+                    if let Pane::Editor(state) = &mut self.pane {
+                        state.error = Some(message);
+                    }
+                    return Update::none();
+                }
+            }
+        } else {
+            None
+        };
+
+        // The body comes from whichever action tab is active: the send-text
+        // draft for a Plaintext action, the script draft otherwise. Hotkeys
+        // and modules only ever use the script buffer.
+        let body = match &self.pane {
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(a),
+                ..
+            }) if a.language == ScriptLang::Plaintext => self.send_text_content.text(),
+            Pane::Editor(EditorState {
+                node:
+                    EditNode::Trigger {
+                        language: ScriptLang::Plaintext,
+                        ..
+                    },
+                ..
+            }) => self.send_text_content.text(),
+            _ => self.editor_content.text(),
+        };
         let body = body.trim_end_matches('\n').to_string();
         let final_script = match &self.pane {
             Pane::Editor(EditorState { node, .. }) => match node {
-                EditNode::Alias(a) => Script::Alias(aliases::AliasDefinition {
-                    script: (!body.is_empty()).then_some(body),
-                    ..a.clone()
-                }),
+                EditNode::Alias(a) => {
+                    let (pattern, matcher) =
+                        alias_matcher.expect("computed above for the alias arm");
+                    Script::Alias(aliases::AliasDefinition {
+                        script: (!body.is_empty()).then_some(body),
+                        pattern,
+                        matcher,
+                        ..a.clone()
+                    })
+                }
                 EditNode::Hotkey(h) => {
                     let mut h = h.clone();
                     if !self.hotkey_state.is_empty() {
@@ -429,8 +609,17 @@ impl AutomationsWindow {
                         prompt: *prompt,
                         priority: *priority,
                         fallthrough: *fallthrough,
+                        matchers: None,
                     };
-                    rows_into_trigger(rows, &mut t);
+                    if let Err((i, message)) = rows_into_trigger(rows, &mut t) {
+                        let message = crate::i18n::t!(
+                            "editor-row-error", "row" => (i + 1).to_string(), "error" => message
+                        );
+                        if let Pane::Editor(state) = &mut self.pane {
+                            state.error = Some(message);
+                        }
+                        return Update::none();
+                    }
                     Script::Trigger(t)
                 }
             },
@@ -919,12 +1108,16 @@ impl AutomationsWindow {
             .into()
     }
 
-    /// The sticky save bar shown for dirty editors / create panes.
+    /// The sticky save bar shown for dirty editors / create panes. A
+    /// `delete_link` label renders the destructive affordance as the deck's
+    /// red underlined text link (with `Cancel` beside `Save`); `None` keeps
+    /// the plain `Delete` button the other panes use.
     pub(super) fn save_bar<'a>(
         &self,
         create: bool,
         can_delete: bool,
         save_label: &str,
+        delete_link: Option<&str>,
     ) -> Option<Elem<'a>> {
         if !create && !self.dirty && !can_delete {
             return None;
@@ -939,11 +1132,13 @@ impl AutomationsWindow {
                 right: 0.0,
             });
         if can_delete {
-            bar = bar.push(
-                button(text(crate::i18n::t!("editor-delete")).size(13.0))
+            bar = bar.push(match delete_link {
+                Some(label) => danger_link(label.to_string(), Message::Delete),
+                None => button(text(crate::i18n::t!("editor-delete")).size(13.0))
                     .style(button_style::secondary)
-                    .on_press(Message::Delete),
-            );
+                    .on_press(Message::Delete)
+                    .into(),
+            });
         }
         if self.dirty {
             bar = bar.push(text("\u{25CF}").size(9.0).style(common::accent));
@@ -953,8 +1148,13 @@ impl AutomationsWindow {
                     .style(common::muted),
             );
             bar = bar.push(iced::widget::space::horizontal());
+            let cancel = if delete_link.is_some() {
+                crate::i18n::t!("action-cancel")
+            } else {
+                crate::i18n::t!("editor-discard")
+            };
             bar = bar.push(
-                button(text(crate::i18n::t!("editor-discard")).size(13.0))
+                button(text(cancel).size(13.0))
                     .style(button_style::secondary)
                     .on_press(Message::Discard),
             );
@@ -987,49 +1187,200 @@ impl AutomationsWindow {
         .into()
     }
 
-    fn matching_options<'a>(&self, priority: i32, fallthrough: bool) -> Elem<'a> {
-        column![
-            field_row(
-                "Priority",
-                row![
-                    button(text("-").size(14.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::AdjustPriority(-1))
-                        .padding([5, 10]),
-                    container(text(priority.to_string()).size(13.0))
-                        .width(Length::Fixed(44.0))
-                        .align_x(iced::alignment::Horizontal::Center),
-                    button(text("+").size(14.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::AdjustPriority(1))
-                        .padding([5, 10]),
-                    text(crate::i18n::t!("editor-priority-order-help"))
-                        .size(12.0)
-                        .style(common::muted),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center)
-                .into(),
-            ),
-            field_row(
-                "Continue",
-                row![
-                    common::pill_switch(fallthrough, false, Some(Message::ToggleFallthrough),),
-                    text(if fallthrough {
-                        "Check later matches from this script or package."
-                    } else {
-                        "Stop after this automation runs."
-                    })
-                    .size(12.0)
-                    .style(common::muted),
-                ]
-                .spacing(10.0)
-                .align_y(Vertical::Center)
-                .into(),
-            ),
+    /// The "When it runs" module behind its disclosure: hidden as a text link
+    /// (its grid label rendered empty) until clicked, forced open — and not
+    /// re-hideable — while any value is non-default (`prompt` included), with
+    /// a hide link when open on pure defaults.
+    fn order_module<'a>(
+        &self,
+        priority: i32,
+        fallthrough: bool,
+        prompt: Option<bool>,
+        trigger: bool,
+    ) -> Elem<'a> {
+        let non_default = priority != 0 || !fallthrough || prompt == Some(true);
+        if !non_default && !self.order_revealed {
+            let label = if trigger {
+                crate::i18n::t!("editor-reveal-order-triggers")
+            } else {
+                crate::i18n::t!("editor-reveal-order-aliases")
+            };
+            return field_row("", text_link(label, Message::RevealOrder));
+        }
+
+        // The priority stepper: a collapsed-border [-|value|+] segment.
+        let stepper = container(
+            row![
+                button(text("-").size(14.0))
+                    .style(button_style::toolbar)
+                    .on_press(Message::AdjustPriority(-1))
+                    .padding(Padding {
+                        top: 2.0,
+                        bottom: 2.0,
+                        left: 10.0,
+                        right: 10.0,
+                    }),
+                container(text(priority.to_string()).size(13.0))
+                    .width(Length::Fixed(40.0))
+                    .align_x(iced::alignment::Horizontal::Center),
+                button(text("+").size(14.0))
+                    .style(button_style::toolbar)
+                    .on_press(Message::AdjustPriority(1))
+                    .padding(Padding {
+                        top: 2.0,
+                        bottom: 2.0,
+                        left: 10.0,
+                        right: 10.0,
+                    }),
+            ]
+            .align_y(Vertical::Center),
+        )
+        .style(common::outline_box_style);
+
+        let priority_row = row![
+            text(crate::i18n::ts!("editor-priority"))
+                .size(13.0)
+                .style(common::muted),
+            stepper,
+            text(if trigger {
+                crate::i18n::ts!("editor-priority-note-triggers")
+            } else {
+                crate::i18n::ts!("editor-priority-note-aliases")
+            })
+            .size(12.0)
+            .style(common::muted),
         ]
-        .spacing(6.0)
-        .into()
+        .spacing(10.0)
+        .align_y(Vertical::Center);
+
+        let continue_row = checkbox(fallthrough)
+            .label(if trigger {
+                crate::i18n::ts!("editor-continue-triggers")
+            } else {
+                crate::i18n::ts!("editor-continue-aliases")
+            })
+            .on_toggle(|_| Message::ToggleFallthrough)
+            .size(14.0)
+            .text_size(13.0);
+
+        let mut inner = column![priority_row, continue_row].spacing(10.0);
+        if let Some(prompt) = prompt {
+            inner = inner.push(
+                column![
+                    checkbox(prompt)
+                        .label(crate::i18n::ts!("editor-prompt"))
+                        .on_toggle(|_| Message::TogglePrompt)
+                        .size(14.0)
+                        .text_size(13.0),
+                    container(
+                        text(crate::i18n::ts!("editor-prompt-note"))
+                            .size(12.0)
+                            .style(common::muted),
+                    )
+                    .padding(Padding {
+                        top: 0.0,
+                        bottom: 0.0,
+                        left: 22.0,
+                        right: 0.0,
+                    }),
+                ]
+                .spacing(2.0),
+            );
+        }
+        if !non_default {
+            inner = inner.push(text_link(
+                crate::i18n::t!("editor-hide-order"),
+                Message::HideOrder,
+            ));
+        }
+        field_row(crate::i18n::ts!("editor-when-it-runs"), inner.into())
+    }
+
+    /// The Matched-values rail: one clickable badge per capture the current
+    /// matcher provides, inserting its reference at the caret in the action
+    /// body. Absent entirely when nothing is captured.
+    fn matched_values_rail<'a>(&self, references: Vec<String>) -> Option<Elem<'a>> {
+        if references.is_empty() {
+            return None;
+        }
+        let mut rail = row![].spacing(6.0).align_y(Vertical::Center);
+        for reference in references {
+            rail = rail.push(
+                button(
+                    text(reference.clone())
+                        .size(12.0)
+                        .font(fonts::GEIST_MONO_VF),
+                )
+                .style(capture_badge_style)
+                .on_press(Message::InsertReference(reference))
+                .padding([3, 8]),
+            );
+        }
+        Some(
+            column![
+                common::section_label(crate::i18n::ts!("editor-matched-values")),
+                rail,
+            ]
+            .spacing(4.0)
+            .into(),
+        )
+    }
+
+    /// The capture references the open alias's draft provides, rendered in the
+    /// action language's vocabulary (`$name` for text, `matches.name` for JS).
+    fn alias_capture_references(&self, language: ScriptLang) -> Vec<String> {
+        let draft = &self.alias_draft;
+        let captures: Vec<Option<String>> = match draft.kind {
+            AliasKind::Command => draft
+                .args
+                .iter()
+                .map(|arg| Some(arg.name.clone()))
+                .collect(),
+            AliasKind::Pattern => {
+                let compiled = matchers::compile_pattern(
+                    &draft.pattern_source,
+                    draft.anchor_start,
+                    draft.anchor_end,
+                );
+                if compiled.errors.is_empty() {
+                    compiled.captures
+                } else {
+                    Vec::new()
+                }
+            }
+            AliasKind::Regex => regex::Regex::new(&draft.regex_source)
+                .map(|re| {
+                    re.capture_names()
+                        .skip(1)
+                        .map(|n| n.map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        render_references(&captures, language)
+    }
+
+    /// The capture references a trigger's Match/Raw rows provide (the union,
+    /// in row order).
+    fn trigger_capture_references(rows: &[TriggerRow], language: ScriptLang) -> Vec<String> {
+        let mut captures: Vec<Option<String>> = Vec::new();
+        for row in rows {
+            if row.role == PatternKind::Anti || row.source.trim().is_empty() {
+                continue;
+            }
+            let Ok(source) = row.compiled() else { continue };
+            let Ok(re) = regex::Regex::new(&source) else {
+                continue;
+            };
+            for name in re.capture_names().skip(1) {
+                let name = name.map(str::to_string);
+                if name.is_some() && captures.contains(&name) {
+                    continue;
+                }
+                captures.push(name);
+            }
+        }
+        render_references(&captures, language)
     }
 
     /// The "Folder" control in a script editor: a `pick_list` of every folder
@@ -1059,6 +1410,98 @@ impl AutomationsWindow {
             right: 6.0,
         })
         .into()
+    }
+
+    /// The action module: the `Send text | Run JavaScript` tab strip fused to
+    /// the body editor it labels — the tab IS the field's label. Each tab has
+    /// its own draft, so switching never destroys work; a TS automation opens
+    /// under (and saves from) the JavaScript tab as TS.
+    fn action_module<'a>(&'a self, language: ScriptLang, references: Vec<String>) -> Elem<'a> {
+        let text_active = language == ScriptLang::Plaintext;
+        let tab = |label: &'static str, active: bool, message: Message| {
+            button(
+                column![
+                    text(label).size(13.0).style(if active {
+                        common::regular
+                    } else {
+                        common::muted
+                    }),
+                    container(Space::new())
+                        .height(Length::Fixed(2.0))
+                        .width(Length::Fill)
+                        .style(move |_theme: &Theme| iced::widget::container::Style {
+                            background: Some(iced::Background::Color(if active {
+                                common::KIND_PATTERN
+                            } else {
+                                iced::Color::TRANSPARENT
+                            })),
+                            ..Default::default()
+                        }),
+                ]
+                .spacing(4.0),
+            )
+            .style(|_theme: &Theme, _status| iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding(Padding {
+                top: 4.0,
+                bottom: 0.0,
+                left: 2.0,
+                right: 2.0,
+            })
+            .on_press(message)
+        };
+        let strip = row![
+            tab(
+                crate::i18n::ts!("editor-tab-send-text"),
+                text_active,
+                Message::SetBehavior(ScriptLang::Plaintext),
+            ),
+            tab(
+                crate::i18n::ts!("editor-tab-run-js"),
+                !text_active,
+                Message::SetBehavior(self.action_script_lang),
+            ),
+        ]
+        .spacing(16.0);
+
+        let editor: Elem<'a> = if text_active {
+            let mut known = references;
+            known.push("$0".to_string());
+            text_editor(&self.send_text_content)
+                .highlight_with::<highlight::PatternHighlighter>(
+                    highlight::FieldSyntax::SendText { known },
+                    token_format,
+                )
+                .font(fonts::GEIST_MONO_VF)
+                .size(13.0)
+                .padding(10.0)
+                .on_action(Message::SendTextAction)
+                .min_height(120.0)
+                .into()
+        } else {
+            let token = match self.action_script_lang {
+                ScriptLang::TS => "ts",
+                _ => "js",
+            }
+            .to_string();
+            text_editor(&self.editor_content)
+                .highlight_with::<iced::highlighter::Highlighter>(
+                    iced::highlighter::Settings {
+                        theme: iced::highlighter::Theme::SolarizedDark,
+                        token,
+                    },
+                    |h: &iced::highlighter::Highlight, _| h.to_format(),
+                )
+                .font(fonts::GEIST_MONO_VF)
+                .on_action(Message::ScriptEditorAction)
+                .height(Length::Fixed(220.0))
+                .into()
+        };
+        column![strip, container(editor).style(common::code_surface_style)]
+            .spacing(0.0)
+            .into()
     }
 
     /// The syntax-highlighted code body editor.
@@ -1103,13 +1546,20 @@ impl AutomationsWindow {
             EditNode::Trigger {
                 enabled,
                 language,
+                prompt,
                 priority,
                 fallthrough,
                 rows,
                 ..
-            } => {
-                self.view_trigger_editor(state, *enabled, *language, *priority, *fallthrough, rows)
-            }
+            } => self.view_trigger_editor(
+                state,
+                *enabled,
+                *language,
+                *prompt,
+                *priority,
+                *fallthrough,
+                rows,
+            ),
         }
     }
 
@@ -1155,10 +1605,10 @@ impl AutomationsWindow {
         alias: &'a aliases::AliasDefinition,
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
-        let badge_label = if alias.language == ScriptLang::JS {
-            "JavaScript"
-        } else {
+        let badge_label = if alias.language == ScriptLang::Plaintext {
             crate::i18n::ts!("editor-text")
+        } else {
+            "JavaScript"
         };
         let title = if create {
             crate::i18n::ts!("editor-new-alias")
@@ -1181,6 +1631,12 @@ impl AutomationsWindow {
         ),]
         .spacing(16.0);
 
+        body = body.push(
+            text(crate::i18n::ts!("editor-deck-alias"))
+                .size(13.0)
+                .style(common::muted),
+        );
+
         if let Some(error) = &state.error {
             body = body.push(error_bar(error));
         }
@@ -1193,23 +1649,70 @@ impl AutomationsWindow {
                 .into(),
         ));
         body = body.push(field_row(
-            crate::i18n::ts!("editor-pattern"),
-            text_input(
-                crate::i18n::ts!("editor-example-alias-pattern"),
-                &alias.pattern,
-            )
-            .on_input(Message::SetAliasPattern)
-            .size(14.0)
-            .into(),
+            crate::i18n::ts!("editor-match-input-as"),
+            self.alias_kind_cards(),
         ));
-        body = body.push(self.tester_box(
-            crate::i18n::ts!("editor-test-command"),
-            &alias.pattern,
-            true,
-        ));
-        body = body.push(self.matching_options(alias.priority, alias.fallthrough));
-        body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
-        body = body.push(self.code_editor(alias.language));
+        match self.alias_draft.kind {
+            AliasKind::Command => {
+                body = self.alias_command_fields(body, state.name.trim());
+            }
+            AliasKind::Pattern => {
+                body = body.push(field_row(
+                    crate::i18n::ts!("editor-pattern"),
+                    matcher_field(
+                        &self.alias_pattern_content,
+                        crate::i18n::ts!("editor-example-alias-simple"),
+                        highlight::FieldSyntax::Pattern,
+                        (!self.alias_draft.anchor_start, !self.alias_draft.anchor_end),
+                        true,
+                        Message::AliasPatternAction,
+                    ),
+                ));
+                body = body.push(field_row(
+                    "",
+                    row![
+                        checkbox(!self.alias_draft.anchor_start)
+                            .label(crate::i18n::ts!("editor-allow-before"))
+                            .on_toggle(|_| Message::ToggleAnchorStart)
+                            .size(14.0)
+                            .text_size(13.0),
+                        checkbox(!self.alias_draft.anchor_end)
+                            .label(crate::i18n::ts!("editor-allow-after"))
+                            .on_toggle(|_| Message::ToggleAnchorEnd)
+                            .size(14.0)
+                            .text_size(13.0),
+                    ]
+                    .spacing(16.0)
+                    .into(),
+                ));
+                if let Some(warning) = self.alias_pattern_warning() {
+                    body = body.push(field_row(
+                        "",
+                        text(warning).size(12.0).style(common::warning).into(),
+                    ));
+                }
+            }
+            AliasKind::Regex => {
+                body = body.push(field_row(
+                    crate::i18n::ts!("editor-regex"),
+                    matcher_field(
+                        &self.alias_regex_content,
+                        crate::i18n::ts!("editor-example-alias-regex"),
+                        highlight::FieldSyntax::Regex,
+                        regex_loose_sides(&self.alias_draft.regex_source),
+                        false,
+                        Message::AliasRegexAction,
+                    ),
+                ));
+            }
+        }
+        body = body.push(self.tester_box(true, false));
+        body = body.push(self.order_module(alias.priority, alias.fallthrough, None, false));
+        let references = self.alias_capture_references(alias.language);
+        if let Some(rail) = self.matched_values_rail(references.clone()) {
+            body = body.push(rail);
+        }
+        body = body.push(self.action_module(alias.language, references));
         if let Some(bar) = self.save_bar(
             create,
             !create,
@@ -1218,6 +1721,7 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::ts!("action-save")
             },
+            Some(crate::i18n::ts!("editor-delete-this-alias")),
         ) {
             body = body.push(bar);
         }
@@ -1287,20 +1791,23 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::ts!("action-save")
             },
+            None,
         ) {
             body = body.push(bar);
         }
         pane_scroll(body)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn view_trigger_editor<'a>(
         &'a self,
         state: &'a EditorState,
         enabled: bool,
         language: ScriptLang,
+        prompt: bool,
         priority: i32,
         fallthrough: bool,
-        rows: &'a [(PatternKind, String)],
+        rows: &'a [TriggerRow],
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
         let title = if create {
@@ -1315,14 +1822,19 @@ impl AutomationsWindow {
         );
         let any_invalid = rows
             .iter()
-            .any(|(_, p)| !p.is_empty() && regex::Regex::new(p).is_err());
+            .any(|row| !row.source.trim().is_empty() && row.compiled().is_err());
         let status = Self::editor_status(create, enabled, any_invalid);
+        let badge_label = if language == ScriptLang::Plaintext {
+            crate::i18n::ts!("editor-text")
+        } else {
+            "JavaScript"
+        };
 
         let mut body = column![self.scene_header_with_aside(
             Some(status),
             title,
             Some(subtitle),
-            Some(self.header_actions("JavaScript", enabled)),
+            Some(self.header_actions(badge_label, enabled)),
             self.folder_aside(trigger_package(state)),
         )]
         .spacing(16.0);
@@ -1335,6 +1847,12 @@ impl AutomationsWindow {
             .error
             .as_deref()
             .or_else(|| any_invalid.then(|| crate::i18n::ts!("editor-patterns-invalid")));
+
+        body = body.push(
+            text(crate::i18n::ts!("editor-deck-trigger"))
+                .size(13.0)
+                .style(common::muted),
+        );
         body = body.push(error_slot(error));
 
         body = body.push(field_row(
@@ -1345,73 +1863,160 @@ impl AutomationsWindow {
                 .into(),
         ));
 
-        // The unified pattern list.
-        let mut patterns = Column::new().spacing(6.0);
-        for (i, (kind, pattern)) in rows.iter().enumerate() {
-            let valid = if pattern.is_empty() {
-                NodeStatus::Disabled
-            } else if regex::Regex::new(pattern).is_err() {
-                NodeStatus::Error
-            } else if !self.test_input.is_empty()
-                && regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&self.test_input))
-                    .unwrap_or(false)
-            {
-                NodeStatus::Ok
-            } else {
-                NodeStatus::Disabled
-            };
-            patterns = patterns.push(
-                row![
-                    pick_list(PatternKind::ALL.to_vec(), Some(*kind), move |k| {
-                        Message::SetPatternKind(i, k)
-                    }),
-                    text_input("\\bpattern\\b", pattern)
-                        .on_input(move |v| Message::SetPatternText(i, v))
-                        .size(14.0)
-                        .width(Length::Fill),
-                    container(common::status_dot(valid)).padding(Padding {
-                        top: 0.0,
-                        bottom: 0.0,
-                        left: 4.0,
-                        right: 4.0,
-                    }),
-                    button(
-                        text(bootstrap_icons::TRASH_3)
-                            .font(fonts::BOOTSTRAP_ICONS)
-                            .size(14.0)
+        // The matcher module (README §4): teaching cards at zero matchers, the
+        // same cards as a selector plus one full-width field at one, compact
+        // role-grouped rows at two or more. Exceptions and Raw render as
+        // labeled groups only when populated; every adder is a text link.
+        let match_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Match);
+        let anti_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Anti);
+        let raw_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Raw);
+        let matcher_count = match_ids.len() + raw_ids.len();
+
+        let mut matchers = Column::new().spacing(12.0);
+        match matcher_count {
+            0 => {
+                matchers = matchers.push(self.trigger_cards(None, true));
+            }
+            1 => {
+                let index = match_ids
+                    .first()
+                    .or_else(|| raw_ids.first())
+                    .copied()
+                    .expect("exactly one matcher row");
+                let trigger_row = &rows[index];
+                matchers = matchers
+                    .push(self.trigger_cards(Some(TriggerCard::of_row(trigger_row)), false));
+                if let Some(content) = self.trigger_row_contents.get(index) {
+                    matchers = matchers.push(
+                        row![
+                            trigger_row_field(index, trigger_row, content),
+                            dot_with_tooltip(self.row_status(trigger_row), trigger_row.role),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Vertical::Center),
+                    );
+                }
+                if trigger_row.syntax == MatcherSyntax::Pattern {
+                    matchers = matchers.push(anchors_row(index, trigger_row));
+                }
+                if trigger_row.role == PatternKind::Raw && trigger_row.source.trim().is_empty() {
+                    matchers = matchers.push(raw_hint());
+                }
+                // "Another" means another of what you have.
+                matchers = matchers.push(if trigger_row.role == PatternKind::Raw {
+                    Elem::from(
+                        row![
+                            text_link(
+                                crate::i18n::t!("editor-add-raw-another"),
+                                Message::AddRawRow
+                            ),
+                            text_link(crate::i18n::t!("editor-add-normal"), Message::AddPattern),
+                        ]
+                        .spacing(16.0),
                     )
-                    .style(button_style::secondary)
-                    .on_press(Message::RemovePattern(i))
-                    .padding(8),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            );
+                } else {
+                    text_link(crate::i18n::t!("editor-add-pattern"), Message::AddPattern)
+                });
+            }
+            _ => {
+                // The Matches group carries no header.
+                let mut group = Column::new().spacing(6.0);
+                for (nth, &index) in match_ids.iter().enumerate() {
+                    group = group.push(self.trigger_compact_row(
+                        index,
+                        &rows[index],
+                        nth,
+                        match_ids.len(),
+                    ));
+                }
+                group = group.push(if match_ids.is_empty() {
+                    text_link(crate::i18n::t!("editor-add-normal"), Message::AddPattern)
+                } else {
+                    text_link(crate::i18n::t!("editor-add-pattern"), Message::AddPattern)
+                });
+                matchers = matchers.push(group);
+            }
         }
-        patterns = patterns.push(
-            button(
-                row![
-                    text(bootstrap_icons::PLUS_LG)
-                        .font(fonts::BOOTSTRAP_ICONS)
-                        .size(12.0),
-                    text(crate::i18n::t!("editor-add-pattern")).size(13.0),
-                ]
-                .spacing(6.0)
-                .align_y(Vertical::Center),
-            )
-            .style(button_style::secondary)
-            .on_press(Message::AddPattern),
-        );
+
+        if !anti_ids.is_empty() {
+            let mut group = Column::new().spacing(6.0).push(group_header(
+                crate::i18n::ts!("editor-group-exceptions"),
+                crate::i18n::ts!("editor-group-exceptions-note"),
+                |theme: &Theme| iced::widget::text::Style {
+                    color: Some(theme.styles.text.error),
+                },
+            ));
+            for (nth, &index) in anti_ids.iter().enumerate() {
+                group =
+                    group.push(self.trigger_compact_row(index, &rows[index], nth, anti_ids.len()));
+            }
+            group = group.push(text_link(
+                crate::i18n::t!("editor-add-exception-another"),
+                Message::AddExceptionRow,
+            ));
+            matchers = matchers.push(group);
+        }
+
+        // At one matcher the lone raw row already renders under the cards; the
+        // labeled Raw group appears once the compact layout takes over.
+        if !raw_ids.is_empty() && matcher_count >= 2 {
+            let mut group = Column::new().spacing(6.0).push(group_header(
+                crate::i18n::ts!("editor-group-raw"),
+                crate::i18n::ts!("editor-group-raw-note"),
+                |_theme: &Theme| iced::widget::text::Style {
+                    color: Some(common::KIND_RAW),
+                },
+            ));
+            for (nth, &index) in raw_ids.iter().enumerate() {
+                group =
+                    group.push(self.trigger_compact_row(index, &rows[index], nth, raw_ids.len()));
+            }
+            group = group.push(text_link(
+                crate::i18n::t!("editor-add-raw-another"),
+                Message::AddRawRow,
+            ));
+            matchers = matchers.push(group);
+        }
+
+        // Disclosure links for the groups that do not exist yet.
+        let mut disclosures = row![].spacing(16.0);
+        let mut any_disclosure = false;
+        if anti_ids.is_empty() {
+            disclosures = disclosures.push(tip(
+                text_link(
+                    crate::i18n::t!("editor-add-exception"),
+                    Message::AddExceptionRow,
+                ),
+                crate::i18n::t!("editor-add-exception-tip"),
+            ));
+            any_disclosure = true;
+        }
+        if raw_ids.is_empty() {
+            disclosures = disclosures.push(tip(
+                text_link(crate::i18n::t!("editor-match-raw"), Message::AddRawRow),
+                crate::i18n::t!("editor-match-raw-tip"),
+            ));
+            any_disclosure = true;
+        }
+        if any_disclosure {
+            matchers = matchers.push(disclosures);
+        }
+
         body = body.push(field_row(
             crate::i18n::ts!("editor-patterns"),
-            patterns.into(),
+            matchers.into(),
         ));
 
-        body = body.push(self.tester_box(crate::i18n::ts!("editor-test-line"), "", false));
-        body = body.push(self.matching_options(priority, fallthrough));
-        body = body.push(field_row("Behavior", self.behavior_radios(language)));
-        body = body.push(self.code_editor(language));
+        let has_raw = rows
+            .iter()
+            .any(|row| row.role == PatternKind::Raw && !row.source.trim().is_empty());
+        body = body.push(self.tester_box(false, has_raw));
+        body = body.push(self.order_module(priority, fallthrough, Some(prompt), true));
+        let references = Self::trigger_capture_references(rows, language);
+        if let Some(rail) = self.matched_values_rail(references.clone()) {
+            body = body.push(rail);
+        }
+        body = body.push(self.action_module(language, references));
         if let Some(bar) = self.save_bar(
             create,
             !create,
@@ -1420,40 +2025,577 @@ impl AutomationsWindow {
             } else {
                 crate::i18n::ts!("action-save")
             },
+            Some(crate::i18n::ts!("editor-delete-this-trigger")),
         ) {
             body = body.push(bar);
         }
         pane_scroll(body)
     }
 
-    /// The live tester box. `alias` true → single-pattern verdict (matches what
-    /// you type); false → trigger verdict over the open trigger's rows.
-    fn tester_box<'a>(&self, label: &str, alias_pattern: &str, alias: bool) -> Elem<'a> {
+    /// The three alias type cards, styled per the kind palette. Selection is
+    /// the draft's kind; every kind's buffers survive a switch.
+    fn alias_kind_cards<'a>(&self) -> Elem<'a> {
+        let selected = self.alias_draft.kind;
+        row![
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-command"),
+                example: crate::i18n::ts!("editor-card-example-command"),
+                badge: None,
+                blurb: None,
+                hue: common::KIND_COMMAND,
+                selected: selected == AliasKind::Command,
+                message: Message::SetAliasKind(AliasKind::Command),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-pattern"),
+                example: crate::i18n::ts!("editor-example-alias-simple"),
+                badge: None,
+                blurb: None,
+                hue: common::KIND_PATTERN,
+                selected: selected == AliasKind::Pattern,
+                message: Message::SetAliasKind(AliasKind::Pattern),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-regex"),
+                example: crate::i18n::ts!("editor-example-alias-regex"),
+                badge: Some(crate::i18n::ts!("editor-badge-advanced")),
+                blurb: None,
+                hue: common::KIND_REGEX,
+                selected: selected == AliasKind::Regex,
+                message: Message::SetAliasKind(AliasKind::Regex),
+            }),
+        ]
+        .spacing(12.0)
+        .into()
+    }
+
+    /// The trigger pane's three matcher cards: teaching cards (with blurbs)
+    /// while no matcher exists, a selector for the single matcher's kind+role
+    /// while exactly one does.
+    fn trigger_cards<'a>(&self, selected: Option<TriggerCard>, teach: bool) -> Elem<'a> {
+        let blurb = |key: &'static str| teach.then_some(key);
+        row![
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-pattern"),
+                example: crate::i18n::ts!("editor-example-trigger-pattern"),
+                badge: None,
+                blurb: blurb(crate::i18n::ts!("editor-card-blurb-pattern")),
+                hue: common::KIND_PATTERN,
+                selected: selected == Some(TriggerCard::Pattern),
+                message: Message::SetTriggerCard(TriggerCard::Pattern),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-regex"),
+                example: crate::i18n::ts!("editor-example-trigger-regex"),
+                badge: Some(crate::i18n::ts!("editor-badge-advanced")),
+                blurb: blurb(crate::i18n::ts!("editor-card-blurb-regex")),
+                hue: common::KIND_REGEX,
+                selected: selected == Some(TriggerCard::Regex),
+                message: Message::SetTriggerCard(TriggerCard::Regex),
+            }),
+            kind_card(KindCard {
+                title: crate::i18n::ts!("editor-kind-raw"),
+                example: crate::i18n::ts!("editor-example-trigger-raw"),
+                badge: Some(crate::i18n::ts!("editor-badge-wizardry")),
+                blurb: blurb(crate::i18n::ts!("editor-card-blurb-raw")),
+                hue: common::KIND_RAW,
+                selected: selected == Some(TriggerCard::Raw),
+                message: Message::SetTriggerCard(TriggerCard::Raw),
+            }),
+        ]
+        .spacing(12.0)
+        .into()
+    }
+
+    /// A row's status dot value against the current test line.
+    fn row_status(&self, trigger_row: &TriggerRow) -> NodeStatus {
+        if trigger_row.source.trim().is_empty() {
+            return NodeStatus::Disabled;
+        }
+        let raw_subject = raw_of(&self.test_input);
+        let subject = if trigger_row.role == PatternKind::Raw {
+            raw_subject.clone()
+        } else {
+            plain_of(&raw_subject)
+        };
+        match trigger_row.compiled().map(|s| regex::Regex::new(&s)) {
+            Err(_) | Ok(Err(_)) => NodeStatus::Error,
+            Ok(Ok(re)) if !self.test_input.is_empty() && re.is_match(&subject) => {
+                // A matching exception is what BLOCKS the trigger.
+                if trigger_row.role == PatternKind::Anti {
+                    NodeStatus::Error
+                } else {
+                    NodeStatus::Ok
+                }
+            }
+            Ok(Ok(_)) => NodeStatus::Disabled,
+        }
+    }
+
+    /// One compact matcher row (the 2+ layout): kind control, source field,
+    /// status dot, reorder scoped within the role group, and remove — behind
+    /// a 3px left bar in the row's kind hue, with the Pattern anchors (and
+    /// the raw teaching hint) on following lines.
+    fn trigger_compact_row<'a>(
+        &'a self,
+        index: usize,
+        trigger_row: &'a TriggerRow,
+        nth: usize,
+        group_len: usize,
+    ) -> Elem<'a> {
+        let Some(content) = self.trigger_row_contents.get(index) else {
+            return Column::new().into();
+        };
+        let kind_control: Elem<'a> = if trigger_row.role == PatternKind::Raw {
+            // Raw is always regex; the label is fixed.
+            container(
+                text(crate::i18n::ts!("editor-syntax-regex"))
+                    .size(13.0)
+                    .style(common::muted),
+            )
+            .padding(Padding {
+                top: 6.0,
+                bottom: 6.0,
+                left: 8.0,
+                right: 8.0,
+            })
+            .into()
+        } else {
+            pick_list(
+                SyntaxChoice::ALL.to_vec(),
+                Some(SyntaxChoice(trigger_row.syntax)),
+                move |choice| Message::SetRowSyntax(index, choice.0),
+            )
+            .text_size(13.0)
+            .into()
+        };
+
+        let mut lines = Column::new().spacing(4.0).push(
+            row![
+                kind_control,
+                trigger_row_field(index, trigger_row, content),
+                dot_with_tooltip(self.row_status(trigger_row), trigger_row.role),
+                icon_button(
+                    bootstrap_icons::CHEVRON_UP,
+                    crate::i18n::t!("editor-move-up"),
+                    (nth > 0).then_some(Message::MoveRowUp(index)),
+                ),
+                icon_button(
+                    bootstrap_icons::CHEVRON_DOWN,
+                    crate::i18n::t!("editor-move-down"),
+                    (nth + 1 < group_len).then_some(Message::MoveRowDown(index)),
+                ),
+                icon_button(
+                    bootstrap_icons::TRASH_3,
+                    crate::i18n::t!("editor-remove-line"),
+                    Some(Message::RemovePattern(index)),
+                ),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+        );
+        if trigger_row.syntax == MatcherSyntax::Pattern {
+            lines = lines.push(anchors_row(index, trigger_row));
+        }
+        if trigger_row.role == PatternKind::Raw && trigger_row.source.trim().is_empty() {
+            lines = lines.push(raw_hint());
+        }
+
+        let hue = row_kind_hue(trigger_row);
+        // As in `matcher_field`: the bar's Fill height must stay internal, or
+        // `Row::push`'s size-enclosing would make the whole row report Fill
+        // and collapse the group it sits in.
+        row![
+            container(Space::new())
+                .width(Length::Fixed(3.0))
+                .height(Length::Fill)
+                .style(move |_theme: &Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(hue)),
+                    border: iced::Border::default().rounded(2.0),
+                    ..Default::default()
+                }),
+            lines,
+        ]
+        .spacing(8.0)
+        .height(Length::Shrink)
+        .into()
+    }
+
+    /// The Command kind's field block: the mode radio (with the command-word
+    /// override beside it once revealed), the argument rows, the generated
+    /// usage line, and (Advanced only) the parsing picker.
+    ///
+    /// The alias's name *is* the command, so there is normally no command
+    /// field at all. `alias_name` is that name, already trimmed.
+    fn alias_command_fields<'a>(
+        &'a self,
+        mut body: Column<'a, Message, Theme>,
+        alias_name: &'a str,
+    ) -> Column<'a, Message, Theme> {
+        let draft = &self.alias_draft;
+        let mode_radios = || {
+            row![
+                radio(
+                    crate::i18n::ts!("editor-cmd-simple"),
+                    CmdMode::Simple,
+                    Some(draft.cmd_mode),
+                    Message::SetCmdMode,
+                )
+                .size(14.0)
+                .text_size(13.0),
+                radio(
+                    crate::i18n::ts!("editor-cmd-advanced"),
+                    CmdMode::Advanced,
+                    Some(draft.cmd_mode),
+                    Message::SetCmdMode,
+                )
+                .size(14.0)
+                .text_size(13.0),
+            ]
+            .spacing(12.0)
+            .align_y(Vertical::Center)
+        };
+
+        if draft.shows_command_override(alias_name) {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-command"),
+                row![
+                    text_input(
+                        crate::i18n::ts!("editor-example-command"),
+                        draft.command_override.as_deref().unwrap_or_default(),
+                    )
+                    .on_input(Message::SetCommandName)
+                    .size(14.0)
+                    .width(Length::Fill),
+                    mode_radios(),
+                ]
+                .spacing(12.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ));
+        } else {
+            // No override: the row shows the word inherited from the name —
+            // read-only, because the Name field above is where it is edited —
+            // with the escape hatch for words a name cannot spell.
+            let inherited = if alias_name.is_empty() {
+                text(crate::i18n::t!("editor-command-name-empty"))
+                    .size(13.0)
+                    .style(common::muted)
+            } else {
+                text(alias_name).size(14.0).font(fonts::GEIST_MONO_VF)
+            };
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-command"),
+                row![
+                    inherited,
+                    mode_radios(),
+                    Space::new().width(Length::Fill),
+                    button(text(crate::i18n::t!("editor-command-override")).size(13.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::RevealCommandOverride)
+                        .padding(6),
+                ]
+                .spacing(12.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ));
+        }
+
+        let mut args = Column::new().spacing(6.0);
+        let last = draft.args.len().saturating_sub(1);
+        for (i, arg) in draft.args.iter().enumerate() {
+            let mut arg_row = row![
+                text_input(crate::i18n::ts!("editor-example-arg-name"), &arg.name)
+                    .on_input(move |v| Message::SetArgName(i, v))
+                    .size(14.0)
+                    .width(Length::Fill),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center);
+            if draft.cmd_mode == CmdMode::Advanced {
+                // Rest of line is offered only on the last row.
+                let options: Vec<ArgKindChoice> = if i == last {
+                    vec![
+                        ArgKindChoice(ArgKind::Required),
+                        ArgKindChoice(ArgKind::Optional),
+                        ArgKindChoice(ArgKind::Rest),
+                    ]
+                } else {
+                    vec![
+                        ArgKindChoice(ArgKind::Required),
+                        ArgKindChoice(ArgKind::Optional),
+                    ]
+                };
+                arg_row = arg_row.push(
+                    pick_list(options, Some(ArgKindChoice(arg.kind)), move |choice| {
+                        Message::SetArgKind(i, choice.0)
+                    })
+                    .text_size(13.0),
+                );
+            }
+            arg_row = arg_row.push(
+                button(
+                    text(bootstrap_icons::TRASH_3)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(14.0),
+                )
+                .style(button_style::secondary)
+                .on_press(Message::RemoveArg(i))
+                .padding(8),
+            );
+            args = args.push(arg_row);
+        }
+        args = args.push(
+            button(
+                row![
+                    text(bootstrap_icons::PLUS_LG)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(12.0),
+                    text(crate::i18n::t!("editor-add-argument")).size(13.0),
+                ]
+                .spacing(6.0)
+                .align_y(Vertical::Center),
+            )
+            .style(button_style::secondary)
+            .on_press(Message::AddArg),
+        );
+        body = body.push(field_row(crate::i18n::ts!("editor-arguments"), args.into()));
+
+        // The Usage row (label included) is omitted while the command word is
+        // empty — an unnamed new alias has nothing to show yet.
+        let word = draft.command_word(alias_name);
+        if !word.is_empty() {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-usage"),
+                column![
+                    text(matchers::usage_line(word, &draft.args))
+                        .size(13.0)
+                        .font(fonts::GEIST_MONO_VF),
+                    text(crate::i18n::t!("editor-command-completion-note"))
+                        .size(12.0)
+                        .style(common::muted),
+                ]
+                .spacing(4.0)
+                .into(),
+            ));
+        }
+        if draft.cmd_mode == CmdMode::Advanced {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-parsing"),
+                self.parsing_picker(),
+            ));
+        }
+        body
+    }
+
+    /// The Parsing picker (D7): a custom overlay dropdown, because the rows
+    /// are two lines — the label over `example → GETS → result` — and that
+    /// pairing is the whole point of the control. The floating list escapes
+    /// the scrollable; Escape/click-outside/selection dismiss it, and
+    /// up/down/enter drive the keyboard cursor.
+    fn parsing_picker<'a>(&self) -> Elem<'a> {
+        use smudgy_core::models::matchers::ParseMode;
+
+        let current = self.alias_draft.parse;
+        let (current_label, current_example, _) = parse_mode_strings(current);
+        let anchor = button(
+            row![
+                text(current_label).size(13.0),
+                text(current_example)
+                    .size(12.0)
+                    .font(fonts::GEIST_MONO_VF)
+                    .style(common::faint),
+                text("\u{25BE}").size(10.0).style(common::muted),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+        )
+        .style(button_style::subtle)
+        .padding(Padding {
+            top: 6.0,
+            bottom: 6.0,
+            left: 10.0,
+            right: 10.0,
+        })
+        .on_press(if self.parsing_open {
+            Message::CloseParsingPicker
+        } else {
+            Message::OpenParsingPicker
+        });
+
+        let content: Option<Elem<'a>> = self.parsing_open.then(|| {
+            let mut list = Column::new().spacing(2.0);
+            for (index, choice) in ParseModeChoice::ALL.iter().enumerate() {
+                let (label, example, gets) = parse_mode_strings(choice.0);
+                let selected = choice.0 == current;
+                let at_cursor = index == self.parsing_cursor;
+                let inner = column![
+                    text(label).size(13.0),
+                    row![
+                        text(example)
+                            .size(12.0)
+                            .font(fonts::GEIST_MONO_VF)
+                            .style(common::muted),
+                        common::section_label(crate::i18n::ts!("editor-gets")),
+                        text(gets).size(12.0).font(fonts::GEIST_MONO_VF),
+                    ]
+                    .spacing(8.0)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(2.0);
+                list = list.push(
+                    button(inner)
+                        .width(Length::Fill)
+                        .style(move |theme: &Theme, status| {
+                            let background = if selected {
+                                Some(theme.styles.general.accent.scale_alpha(0.35))
+                            } else if at_cursor || status == iced::widget::button::Status::Hovered {
+                                Some(theme.styles.text.normal.scale_alpha(0.06))
+                            } else {
+                                None
+                            };
+                            iced::widget::button::Style {
+                                background: background.map(iced::Background::Color),
+                                border: iced::Border::default().rounded(4.0),
+                                text_color: theme.styles.text.normal,
+                                ..Default::default()
+                            }
+                        })
+                        .padding(Padding {
+                            top: 6.0,
+                            bottom: 6.0,
+                            left: 10.0,
+                            right: 10.0,
+                        })
+                        .on_press(Message::SetParseMode(choice.0)),
+                );
+            }
+            container(list)
+                .width(Length::Fixed(460.0))
+                .padding(6.0)
+                .style(|theme: &Theme| iced::widget::container::Style {
+                    background: Some(theme.styles.modal.body_background),
+                    border: theme.styles.modal.body_border,
+                    shadow: theme.styles.modal.shadow,
+                    ..Default::default()
+                })
+                .into()
+        });
+
+        let cursor_mode: ParseMode =
+            ParseModeChoice::ALL[self.parsing_cursor.min(ParseModeChoice::ALL.len() - 1)].0;
+        Dropdown::new(anchor, content, Message::CloseParsingPicker)
+            .on_key(move |key| match key {
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp) => {
+                    Some(Message::MoveParsingCursor(-1))
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown) => {
+                    Some(Message::MoveParsingCursor(1))
+                }
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
+                    Some(Message::SetParseMode(cursor_mode))
+                }
+                _ => None,
+            })
+            .into()
+    }
+
+    /// The non-blocking matches-every-line warning for the Pattern kind.
+    fn alias_pattern_warning(&self) -> Option<String> {
+        let draft = &self.alias_draft;
+        let compiled =
+            matchers::compile_pattern(&draft.pattern_source, draft.anchor_start, draft.anchor_end);
+        (compiled.errors.is_empty()
+            && compiled
+                .warnings
+                .contains(&matchers::PatternWarning::MatchesEveryLine)
+            && !draft.pattern_source.trim().is_empty())
+        .then(|| crate::i18n::t!("editor-matches-every-line"))
+    }
+
+    /// The Try-it module: a collapsed accordion whose header is a call to
+    /// action; expanded, the test field, its verdict, and (triggers, when a
+    /// raw row exists) the byte view of the simulated raw line.
+    fn tester_box<'a>(&self, alias: bool, show_bytes: bool) -> Elem<'a> {
+        let header = |chevron: &'static str, label: String| {
+            button(
+                row![text(chevron).size(11.0), text(label).size(13.0)]
+                    .spacing(8.0)
+                    .align_y(Vertical::Center),
+            )
+            .style(button_style::quiet_link)
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Message::ToggleTryIt)
+        };
+
+        if !self.try_it_open {
+            let label = if alias {
+                crate::i18n::t!("editor-try-alias-cta")
+            } else {
+                crate::i18n::t!("editor-try-trigger-cta")
+            };
+            let body = container(header("\u{25B8}", label))
+                .padding(12.0)
+                .width(Length::Fill)
+                .style(common::banner_style);
+            return field_row("", body.into());
+        }
+
+        let mut inner = column![header("\u{25BE}", crate::i18n::t!("editor-try-it"))].spacing(8.0);
+        if alias {
+            inner = inner.push(
+                row![
+                    text("\u{276F}")
+                        .size(13.0)
+                        .font(fonts::GEIST_MONO_VF)
+                        .style(common::capture_accent),
+                    text_input(
+                        crate::i18n::ts!("editor-test-placeholder-alias"),
+                        &self.test_input
+                    )
+                    .on_input(Message::SetTestInput)
+                    .size(13.0),
+                ]
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+            );
+        } else {
+            inner = inner.push(common::section_label(crate::i18n::ts!("editor-game-sent")));
+            inner = inner.push(
+                text_input(
+                    crate::i18n::ts!("editor-test-placeholder-trigger"),
+                    &self.test_input,
+                )
+                .on_input(Message::SetTestInput)
+                .size(13.0),
+            );
+            if show_bytes && !self.test_input.is_empty() {
+                let bytes = raw_of(&self.test_input).replace('\x1b', "\u{241B}");
+                inner = inner.push(
+                    text(format!(
+                        "{} {bytes}",
+                        crate::i18n::t!("editor-try-bytes-prefix")
+                    ))
+                    .size(11.0)
+                    .font(fonts::GEIST_MONO_VF)
+                    .style(common::faint),
+                );
+            }
+        }
         let (verdict, status): (String, NodeStatus) = if alias {
-            alias_verdict(alias_pattern, &self.test_input)
+            self.alias_draft_verdict()
         } else {
             self.trigger_verdict()
         };
-        let placeholder = if alias {
-            "k goblin"
-        } else {
-            "You are badly hurt and bleeding."
-        };
-        let inner = column![
-            row![text(label.to_uppercase()).size(10.0).style(common::faint),],
-            text_input(placeholder, &self.test_input)
-                .on_input(Message::SetTestInput)
-                .size(13.0),
-            container(
-                row![
-                    common::status_dot(status),
-                    text(verdict).size(12.0).style(verdict_style(status)),
-                ]
-                .spacing(6.0)
-                .align_y(Vertical::Center)
-            ),
-        ]
-        .spacing(8.0);
+        inner = inner.push(container(
+            row![
+                common::status_dot(status),
+                text(verdict).size(12.0).style(verdict_style(status)),
+            ]
+            .spacing(6.0)
+            .align_y(Vertical::Center),
+        ));
         let body = container(inner)
             .padding(12.0)
             .width(Length::Fill)
@@ -1461,6 +2603,90 @@ impl AutomationsWindow {
         field_row("", body.into())
     }
 
+    /// The alias tester's verdict, per the draft's kind.
+    fn alias_draft_verdict(&self) -> (String, NodeStatus) {
+        let draft = &self.alias_draft;
+        let sample = &self.test_input;
+        let alias_name = match &self.pane {
+            Pane::Editor(state) => state.name.trim(),
+            _ => "",
+        };
+        match draft.kind {
+            AliasKind::Regex => alias_verdict(&draft.regex_source, sample),
+            AliasKind::Pattern => {
+                if draft.pattern_source.trim().is_empty() {
+                    return (
+                        crate::i18n::t!("editor-verdict-no-pattern"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                let compiled = matchers::compile_pattern(
+                    &draft.pattern_source,
+                    draft.anchor_start,
+                    draft.anchor_end,
+                );
+                if let Some(error) = compiled.errors.first() {
+                    return (
+                        crate::i18n::t!(
+                            "editor-verdict-compile-error", "error" => pattern_error_text(error)
+                        ),
+                        NodeStatus::Error,
+                    );
+                }
+                if sample.is_empty() {
+                    return (
+                        crate::i18n::t!("editor-enter-command"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                match compiled.regex {
+                    Some(re) if re.is_match(sample) => {
+                        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+                    }
+                    _ => (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled),
+                }
+            }
+            AliasKind::Command => {
+                let name = draft.command_word(alias_name);
+                if name.is_empty() {
+                    return (
+                        crate::i18n::t!("editor-verdict-no-command"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                // The parser matches the first whitespace-delimited token, so
+                // say why a spaced word can never fire rather than reporting
+                // an ordinary miss.
+                if name.contains(char::is_whitespace) {
+                    return (
+                        crate::i18n::t!("editor-verdict-command-spaces"),
+                        NodeStatus::Error,
+                    );
+                }
+                if sample.is_empty() {
+                    return (
+                        crate::i18n::t!("editor-enter-command"),
+                        NodeStatus::Disabled,
+                    );
+                }
+                let spec = CommandSpec {
+                    name: name.to_string(),
+                    args: draft.args.clone(),
+                    parse: draft.parse,
+                };
+                match matchers::assign(sample, &spec.name, &spec.args, spec.parse) {
+                    CommandOutcome::Fired { .. } => {
+                        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+                    }
+                    CommandOutcome::NotFired(miss) => command_miss_verdict(name, &miss),
+                }
+            }
+        }
+    }
+
+    /// The trigger tester's verdict: exceptions veto against each phase's own
+    /// subject, then raw rows in order, then normal rows — first hit wins,
+    /// one fire per line (the runtime's semantics, told truthfully).
     fn trigger_verdict(&self) -> (String, NodeStatus) {
         let rows = match &self.pane {
             Pane::Editor(EditorState {
@@ -1472,33 +2698,84 @@ impl AutomationsWindow {
             }
         };
         let line = &self.test_input;
-        let mut any = false;
-        for (kind, pattern) in rows {
-            if pattern.is_empty() {
-                continue;
-            }
-            any = true;
-            let re = match regex::Regex::new(pattern) {
-                Ok(re) => re,
-                Err(_) => {
-                    return (crate::i18n::t!("editor-invalid-pattern"), NodeStatus::Error);
-                }
-            };
-            let matches = re.is_match(line);
-            match kind {
-                PatternKind::Match | PatternKind::Raw if !matches => {
-                    return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
-                }
-                PatternKind::Anti if matches => {
-                    return (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled);
-                }
-                _ => {}
-            }
-        }
-        if !any || line.is_empty() {
+        let filled: Vec<(usize, &TriggerRow)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.source.trim().is_empty())
+            .collect();
+        if line.is_empty() {
             return (crate::i18n::t!("editor-enter-line"), NodeStatus::Disabled);
         }
-        (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
+        if !filled.iter().any(|(_, row)| row.role != PatternKind::Anti) {
+            return (
+                crate::i18n::t!("editor-verdict-no-matchers"),
+                NodeStatus::Disabled,
+            );
+        }
+
+        let raw_subject = raw_of(line);
+        let plain_subject = plain_of(&raw_subject);
+        let compile = |row: &TriggerRow| -> Result<regex::Regex, String> {
+            let source = row.compiled()?;
+            regex::Regex::new(&source)
+                .map_err(|e| crate::i18n::t!("editor-invalid-regex", "error" => e.to_string()))
+        };
+
+        // Any compile error surfaces first, as a failing verdict.
+        for (_, row) in &filled {
+            if let Err(message) = row.compiled() {
+                return (
+                    crate::i18n::t!("editor-verdict-compile-error", "error" => message),
+                    NodeStatus::Error,
+                );
+            }
+        }
+
+        let blocked_in = |subject: &str| -> Option<usize> {
+            filled
+                .iter()
+                .filter(|(_, row)| row.role == PatternKind::Anti)
+                .enumerate()
+                .find_map(|(nth, (_, row))| compile(row).ok()?.is_match(subject).then_some(nth + 1))
+        };
+
+        let mut first_block = None;
+        for role in [PatternKind::Raw, PatternKind::Match] {
+            let subject = if role == PatternKind::Raw {
+                raw_subject.as_str()
+            } else {
+                plain_subject.as_str()
+            };
+            let phase: Vec<&TriggerRow> = filled
+                .iter()
+                .filter(|(_, row)| row.role == role)
+                .map(|(_, row)| *row)
+                .collect();
+            if phase.is_empty() {
+                continue;
+            }
+            if let Some(nth) = blocked_in(subject) {
+                first_block.get_or_insert(nth);
+                continue;
+            }
+            for (nth, row) in phase.iter().enumerate() {
+                if compile(row).is_ok_and(|re| re.is_match(subject)) {
+                    let key = if role == PatternKind::Raw {
+                        crate::i18n::t!("editor-fires-on-raw", "n" => (nth + 1).to_string())
+                    } else {
+                        crate::i18n::t!("editor-fires-on-match", "n" => (nth + 1).to_string())
+                    };
+                    return (key, NodeStatus::Ok);
+                }
+            }
+        }
+        if let Some(nth) = first_block {
+            return (
+                crate::i18n::t!("editor-blocked-by", "n" => nth.to_string()),
+                NodeStatus::Error,
+            );
+        }
+        (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled)
     }
 
     // ---- folder + module views --------------------------------------------
@@ -1817,6 +3094,469 @@ fn field_row<'a>(label: &str, control: Elem<'a>) -> Elem<'a> {
         .into()
 }
 
+/// An underlined text link (D8): quiet at rest, full-strength on hover. The
+/// underline rule and both colors come from the theme crate so every link in
+/// these panes reads the same.
+fn text_link<'a>(label: String, message: Message) -> Elem<'a> {
+    button(button_style::underlined(text(label).size(12.0)))
+        .style(button_style::quiet_link)
+        .padding(0)
+        .on_press(message)
+        .into()
+}
+
+/// The destructive underlined link (the `Delete this alias/trigger` footer).
+fn danger_link<'a>(label: String, message: Message) -> Elem<'a> {
+    button(button_style::underlined(text(label).size(13.0)))
+        .style(button_style::danger_link)
+        .padding(0)
+        .on_press(message)
+        .into()
+}
+
+// ---- one-line matcher fields ------------------------------------------------
+
+/// Applies an action to a one-line field's buffer: Enter is dropped and
+/// pasted newlines flatten to spaces, so the buffer never grows a second line.
+pub(super) fn perform_single_line(content: &mut text_editor::Content, action: text_editor::Action) {
+    use text_editor::{Action, Edit};
+    let action = match action {
+        Action::Edit(Edit::Enter) => return,
+        Action::Edit(Edit::Paste(pasted)) if pasted.contains('\n') || pasted.contains('\r') => {
+            Action::Edit(Edit::Paste(Arc::new(
+                pasted.replace("\r\n", "\n").replace(['\r', '\n'], " "),
+            )))
+        }
+        other => other,
+    };
+    content.perform(action);
+}
+
+/// A one-line buffer's text, without the trailing newline `Content::text`
+/// always appends.
+pub(super) fn single_line_text(content: &text_editor::Content) -> String {
+    let mut text = content.text();
+    while text.ends_with('\n') || text.ends_with('\r') {
+        text.pop();
+    }
+    text
+}
+
+/// Which sides of a regex source are unanchored (fixtures §10): left iff no
+/// leading `^`, right iff no unescaped trailing `$`; neither while empty.
+fn regex_loose_sides(source: &str) -> (bool, bool) {
+    let source = source.trim();
+    if source.is_empty() {
+        return (false, false);
+    }
+    let anchored_end =
+        source.ends_with('$') && (source.len() == 1 || !source[..source.len() - 1].ends_with('\\'));
+    (!source.starts_with('^'), !anchored_end)
+}
+
+/// A small tooltip chip.
+fn tip<'a>(content: Elem<'a>, label: String) -> Elem<'a> {
+    iced::widget::tooltip(
+        content,
+        container(text(label).size(11.0))
+            .padding(6.0)
+            .style(common::banner_style),
+        iced::widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
+/// A `. . .` gutter cell (visual-contract §6): the literal spaced string in
+/// the mono font on a faint wash, flush against the field inside the
+/// composite's single border.
+///
+/// The cell is ALWAYS in the composite's widget tree; a hidden side keeps
+/// its slot and collapses to nothing (empty text, no padding — NOT a
+/// `Fixed(0)` width, which `Row::push` treats as void and silently drops
+/// from the child list, defeating the whole point). Mounting and unmounting
+/// the cell would shift the editor's position among the row's children
+/// whenever typing flips the anchor derivation (the first unanchored
+/// character, adding or removing `^`/`$`), and iced's positional tree diff
+/// would then rebuild the editor's state mid-keystroke — dropping focus and
+/// swallowing everything typed after it. A collapsed cell has no hoverable
+/// area, so a hidden side's tooltip can never fire.
+fn gutter_cell<'a>(shown: bool, tooltip_label: String) -> Elem<'a> {
+    let cell = container(
+        text(if shown { ". . ." } else { "" })
+            .size(11.0)
+            .font(fonts::GEIST_MONO_VF)
+            .style(|theme: &Theme| iced::widget::text::Style {
+                color: Some(theme.styles.text.normal.scale_alpha(0.32)),
+            }),
+    )
+    .padding(if shown {
+        Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 8.0,
+            right: 8.0,
+        }
+    } else {
+        Padding::ZERO
+    })
+    .height(Length::Fill)
+    .align_y(Vertical::Center)
+    .style(move |theme: &Theme| iced::widget::container::Style {
+        background: shown
+            .then(|| iced::Background::Color(theme.styles.text.normal.scale_alpha(0.04))),
+        ..Default::default()
+    });
+    tip(cell.into(), tooltip_label)
+}
+
+/// The color a highlighted run takes (visual-contract §1). The island run is
+/// specified as ink on a wash; a highlighter `Format` has no background
+/// channel, so the island borrows the Regex kind hue instead — the
+/// in-language way to mark "this run is raw regex".
+fn token_format(
+    token: &highlight::Token,
+    theme: &Theme,
+) -> iced::advanced::text::highlighter::Format<Font> {
+    use highlight::Token;
+    let color = match token {
+        Token::Hole | Token::GroupOpen | Token::Escape | Token::KnownRef => common::KIND_PATTERN,
+        Token::Wildcard => common::KIND_PATTERN.scale_alpha(0.65),
+        Token::Island => common::KIND_REGEX,
+        Token::UnknownRef => theme.styles.text.error,
+    };
+    iced::advanced::text::highlighter::Format {
+        color: Some(color),
+        font: None,
+    }
+}
+
+/// One matcher source field: `[gutter | editor | gutter]` composed inside a
+/// single bordered container (README §5.3) — the editor is chromeless, the
+/// composite owns the one border, and the `. . .` gutters appear per `loose`.
+/// The editor is a real `text_editor` with highlighted runs and a true caret;
+/// Enter is swallowed at the key-binding layer and again in the update path.
+fn matcher_field<'a>(
+    content: &'a text_editor::Content,
+    placeholder: &'a str,
+    syntax: highlight::FieldSyntax,
+    loose: (bool, bool),
+    pattern_tips: bool,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Elem<'a> {
+    let editor = text_editor(content)
+        .placeholder(placeholder)
+        .size(13.0)
+        .padding(8.0)
+        .font(fonts::GEIST_MONO_VF)
+        .class(crate::theme::TextEditorClass::Inline)
+        .key_binding(|key_press| {
+            match text_editor::Binding::from_key_press(key_press) {
+                // Swallow the break: captured, but edits nothing.
+                Some(text_editor::Binding::Enter) => {
+                    Some(text_editor::Binding::Sequence(Vec::new()))
+                }
+                other => other,
+            }
+        })
+        .highlight_with::<highlight::PatternHighlighter>(syntax, token_format)
+        .on_action(on_action);
+
+    let (left_tip, right_tip) = if pattern_tips {
+        (
+            crate::i18n::t!("editor-gutter-before-pattern"),
+            crate::i18n::t!("editor-gutter-after-pattern"),
+        )
+    } else {
+        (
+            crate::i18n::t!("editor-gutter-before-regex"),
+            crate::i18n::t!("editor-gutter-after-regex"),
+        )
+    };
+    // Both gutters stay mounted in every anchor state (see [`gutter_cell`]) so
+    // the editor's tree position — and with it its focus — survives typing.
+    //
+    // The explicit Shrink heights keep the gutters' `Fill` INTERNAL to the
+    // composite: `Row::push` encloses child size hints (one Fill-height child
+    // makes the row report Fill), and `Container::new` derives its fluidity
+    // from its content's hint — without the pins the whole field would report
+    // Fill height, and a Fill-height field next to no fixed-size sibling (the
+    // trigger matcher module) measures against nothing and collapses the
+    // section.
+    let inner = row![
+        gutter_cell(loose.0, left_tip),
+        editor,
+        gutter_cell(loose.1, right_tip),
+    ]
+    .height(Length::Shrink);
+    container(inner)
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .style(|theme: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(
+                theme.styles.general.container_background,
+            )),
+            border: iced::Border {
+                color: theme.styles.general.border,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+// ---- trigger matcher rows ---------------------------------------------------
+
+/// Indexes of the rows carrying `role`, in list order.
+fn row_ids_with_role(rows: &[TriggerRow], role: PatternKind) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.role == role)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A trigger row's kind hue (visual-contract §1): the card kind that made it —
+/// raw rows the Raw hue, otherwise the syntax's hue. Role stays out of the hue
+/// channel; it is position plus a wash.
+fn row_kind_hue(trigger_row: &TriggerRow) -> iced::Color {
+    if trigger_row.role == PatternKind::Raw {
+        common::KIND_RAW
+    } else if trigger_row.syntax == MatcherSyntax::Pattern {
+        common::KIND_PATTERN
+    } else {
+        common::KIND_REGEX
+    }
+}
+
+/// The source field for one trigger row: placeholder, grammar, gutters, and
+/// role wash all derived from the row.
+fn trigger_row_field<'a>(
+    index: usize,
+    trigger_row: &'a TriggerRow,
+    content: &'a text_editor::Content,
+) -> Elem<'a> {
+    let pattern = trigger_row.syntax == MatcherSyntax::Pattern;
+    matcher_field(
+        content,
+        if pattern {
+            crate::i18n::ts!("editor-example-trigger-pattern")
+        } else if trigger_row.role == PatternKind::Raw {
+            crate::i18n::ts!("editor-example-trigger-raw")
+        } else {
+            crate::i18n::ts!("editor-example-trigger-regex")
+        },
+        if pattern {
+            highlight::FieldSyntax::Pattern
+        } else {
+            highlight::FieldSyntax::Regex
+        },
+        if pattern {
+            (!trigger_row.anchor_start, !trigger_row.anchor_end)
+        } else {
+            regex_loose_sides(&trigger_row.source)
+        },
+        pattern,
+        move |action| Message::RowSourceAction(index, action),
+    )
+}
+
+/// The anchor checkboxes a Pattern-syntax row carries on its second line.
+fn anchors_row<'a>(index: usize, trigger_row: &TriggerRow) -> Elem<'a> {
+    row![
+        checkbox(!trigger_row.anchor_start)
+            .label(crate::i18n::ts!("editor-allow-before"))
+            .on_toggle(move |_| Message::ToggleRowAnchorStart(index))
+            .size(14.0)
+            .text_size(12.0),
+        checkbox(!trigger_row.anchor_end)
+            .label(crate::i18n::ts!("editor-allow-after"))
+            .on_toggle(move |_| Message::ToggleRowAnchorEnd(index))
+            .size(14.0)
+            .text_size(12.0),
+    ]
+    .spacing(16.0)
+    .into()
+}
+
+/// The raw kind's teaching hint, shown only while its field is blank.
+fn raw_hint<'a>() -> Elem<'a> {
+    text(crate::i18n::ts!("editor-raw-hint"))
+        .size(12.0)
+        .style(common::muted)
+        .into()
+}
+
+/// A status dot with its deck tooltip: matches / does not match / blocks.
+fn dot_with_tooltip<'a>(status: NodeStatus, role: PatternKind) -> Elem<'a> {
+    let dot = container(common::status_dot(status)).padding(Padding {
+        top: 0.0,
+        bottom: 0.0,
+        left: 4.0,
+        right: 4.0,
+    });
+    let label = match status {
+        NodeStatus::Ok => crate::i18n::t!("editor-dot-matches"),
+        NodeStatus::Error if role == PatternKind::Anti => crate::i18n::t!("editor-dot-blocks"),
+        NodeStatus::Disabled => crate::i18n::t!("editor-dot-no-match"),
+        // A compile error already reads inline; the dot stays bare.
+        NodeStatus::Error | NodeStatus::Warning => return dot.into(),
+    };
+    tip(dot.into(), label)
+}
+
+/// A small quiet icon button with a tooltip; renders disabled with no
+/// `on_press` (the ends of a role group's reorder range).
+fn icon_button<'a>(icon: &'a str, tooltip_label: String, on_press: Option<Message>) -> Elem<'a> {
+    let mut control = button(text(icon).font(fonts::BOOTSTRAP_ICONS).size(13.0))
+        .style(button_style::toolbar)
+        .padding(6);
+    if let Some(message) = on_press {
+        control = control.on_press(message);
+    }
+    tip(control.into(), tooltip_label)
+}
+
+/// A labeled group header: the colored title plus its precedence note.
+fn group_header<'a>(
+    title: &'a str,
+    note: &'a str,
+    title_style: impl Fn(&Theme) -> iced::widget::text::Style + 'a,
+) -> Elem<'a> {
+    row![
+        text(title)
+            .size(12.0)
+            .font(Font {
+                weight: iced::font::Weight::Semibold,
+                ..fonts::GEIST_VF
+            })
+            .style(title_style),
+        text(note).size(12.0).style(common::muted),
+    ]
+    .spacing(10.0)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+// ---- kind cards -------------------------------------------------------------
+
+/// One selectable kind card's content (visual-contract §1–2).
+struct KindCard<'a> {
+    title: &'a str,
+    example: &'a str,
+    badge: Option<&'a str>,
+    blurb: Option<&'a str>,
+    hue: iced::Color,
+    selected: bool,
+    message: Message,
+}
+
+/// The kind dot on a card: a small filled circle in the kind hue.
+fn kind_dot<'a>(hue: iced::Color) -> Elem<'a> {
+    container(Space::new())
+        .width(Length::Fixed(8.0))
+        .height(Length::Fixed(8.0))
+        .style(move |_theme: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(hue)),
+            border: iced::Border::default().rounded(4.0),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A difficulty badge (`Advanced` / `Wizardry`): a small uppercase pill
+/// outlined in the kind hue.
+fn kind_badge<'a>(label: &str, hue: iced::Color) -> Elem<'a> {
+    container(
+        text(label.to_uppercase())
+            .size(10.0)
+            .style(move |_theme: &Theme| iced::widget::text::Style { color: Some(hue) }),
+    )
+    .padding(Padding {
+        top: 1.0,
+        bottom: 1.0,
+        left: 6.0,
+        right: 6.0,
+    })
+    .style(move |_theme: &Theme| iced::widget::container::Style {
+        border: iced::Border {
+            color: hue,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// One selectable kind card. Hue is identity, value is state: selected takes
+/// the kind hue at full strength (border, dot, example, badge) over a 10%
+/// tint; unselected keeps the hue at 50% alpha on a neutral body with a
+/// hairline border — never grey. Hover is a faint wash, no hue change.
+fn kind_card<'a>(card: KindCard<'a>) -> Elem<'a> {
+    let strength = if card.selected {
+        card.hue
+    } else {
+        card.hue.scale_alpha(0.5)
+    };
+    let mut title_row = row![
+        kind_dot(strength),
+        text(card.title).size(13.0).font(Font {
+            weight: iced::font::Weight::Semibold,
+            ..fonts::GEIST_VF
+        }),
+    ]
+    .spacing(8.0)
+    .align_y(Vertical::Center);
+    if let Some(badge) = card.badge {
+        title_row = title_row.push(iced::widget::space::horizontal());
+        title_row = title_row.push(kind_badge(badge, strength));
+    }
+    let mut inner = column![
+        title_row,
+        text(card.example)
+            .size(12.0)
+            .font(fonts::GEIST_MONO_VF)
+            .style(move |_theme: &Theme| iced::widget::text::Style {
+                color: Some(strength),
+            }),
+    ]
+    .spacing(6.0);
+    if let Some(blurb) = card.blurb {
+        inner = inner.push(text(blurb).size(12.0).style(common::muted));
+    }
+    let hue = card.hue;
+    let selected = card.selected;
+    button(inner)
+        .style(move |theme: &Theme, status| {
+            let background = if selected {
+                hue.scale_alpha(0.10)
+            } else if status == iced::widget::button::Status::Hovered {
+                theme.styles.text.normal.scale_alpha(0.04)
+            } else {
+                iced::Color::TRANSPARENT
+            };
+            iced::widget::button::Style {
+                background: Some(iced::Background::Color(background)),
+                border: iced::Border {
+                    color: if selected {
+                        hue
+                    } else {
+                        theme.styles.general.border
+                    },
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                text_color: theme.styles.text.normal,
+                ..Default::default()
+            }
+        })
+        .padding(12)
+        .width(Length::FillPortion(1))
+        .on_press(card.message)
+        .into()
+}
+
 fn error_bar<'a>(message: &str) -> Elem<'a> {
     container(
         row![
@@ -1873,15 +3613,182 @@ fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style 
     }
 }
 
+/// The Parsing picker's per-mode strings: `(label, example, what it gets)`.
+fn parse_mode_strings(
+    mode: smudgy_core::models::matchers::ParseMode,
+) -> (&'static str, &'static str, &'static str) {
+    use smudgy_core::models::matchers::ParseMode;
+    match mode {
+        ParseMode::Spaces => (
+            crate::i18n::ts!("editor-parse-spaces"),
+            crate::i18n::ts!("editor-parse-spaces-example"),
+            crate::i18n::ts!("editor-parse-spaces-gets"),
+        ),
+        ParseMode::Quotes => (
+            crate::i18n::ts!("editor-parse-quotes"),
+            crate::i18n::ts!("editor-parse-quotes-example"),
+            crate::i18n::ts!("editor-parse-quotes-gets"),
+        ),
+        ParseMode::Braces => (
+            crate::i18n::ts!("editor-parse-braces"),
+            crate::i18n::ts!("editor-parse-braces-example"),
+            crate::i18n::ts!("editor-parse-braces-gets"),
+        ),
+        ParseMode::All => (
+            crate::i18n::ts!("editor-parse-all"),
+            crate::i18n::ts!("editor-parse-all-example"),
+            crate::i18n::ts!("editor-parse-all-gets"),
+        ),
+        ParseMode::Raw => (
+            crate::i18n::ts!("editor-parse-raw"),
+            crate::i18n::ts!("editor-parse-raw-example"),
+            crate::i18n::ts!("editor-parse-raw-gets"),
+        ),
+    }
+}
+
+/// A capture badge on the Matched-values rail (visual-contract §5): the
+/// lavender-family fill and border that mean "a value the script receives",
+/// lifted on hover.
+fn capture_badge_style(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let fill = iced::Color::from_rgb8(0x7C, 0x57, 0xFF);
+    let hovered = matches!(
+        status,
+        iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+    );
+    iced::widget::button::Style {
+        background: Some(iced::Background::Color(fill.scale_alpha(if hovered {
+            0.3
+        } else {
+            0.14
+        }))),
+        border: iced::Border {
+            color: iced::Color::from_rgb8(0x4E, 0x37, 0x83),
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: theme.styles.text.normal,
+        ..Default::default()
+    }
+}
+
+/// Which generated example a pane shows (`matching-logic.md` §8).
+#[derive(Clone, Copy)]
+enum ExampleKind {
+    /// Alias, Command or Regex kind: the `say Hello` example.
+    AliasSay,
+    /// Alias, Simple-pattern kind: the `emote` example.
+    AliasEmote,
+    /// Trigger: the `say I heard about` example.
+    Trigger,
+}
+
+/// One generated action body, in the deck's words: the example line with the
+/// first capture reference interpolated (or the no-captures variant), wrapped
+/// in ``send(`…`);`` for the script tab.
+fn generated_body(kind: ExampleKind, reference: Option<&str>, script: bool) -> String {
+    let hole = reference.map(|reference| {
+        if script {
+            format!("${{{reference}}}")
+        } else {
+            reference.to_string()
+        }
+    });
+    let line = match (kind, hole) {
+        (ExampleKind::AliasSay, Some(hole)) => {
+            crate::i18n::t!("editor-gen-alias-hello", "hole" => hole)
+        }
+        (ExampleKind::AliasSay, None) => crate::i18n::t!("editor-gen-alias-hello-none"),
+        (ExampleKind::AliasEmote, Some(hole)) => {
+            crate::i18n::t!("editor-gen-alias-emote", "hole" => hole)
+        }
+        (ExampleKind::AliasEmote, None) => crate::i18n::t!("editor-gen-alias-emote-none"),
+        (ExampleKind::Trigger, Some(hole)) => {
+            crate::i18n::t!("editor-gen-trigger", "hole" => hole)
+        }
+        (ExampleKind::Trigger, None) => crate::i18n::t!("editor-gen-trigger-none"),
+    };
+    if script {
+        format!("send(`{line}`);")
+    } else {
+        line
+    }
+}
+
+/// Renders capture references in the action language's vocabulary: `$name` /
+/// `$N` for a text body, `matches.name` / `matches[N]` for JavaScript.
+fn render_references(captures: &[Option<String>], language: ScriptLang) -> Vec<String> {
+    captures
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match (name, language) {
+            (Some(name), ScriptLang::Plaintext) => format!("${name}"),
+            (Some(name), _) => format!("matches.{name}"),
+            (None, ScriptLang::Plaintext) => format!("${}", i + 1),
+            (None, _) => format!("matches[{}]", i + 1),
+        })
+        .collect()
+}
+
+/// The Try-it verdict for a Command miss, in the deck's words.
+fn command_miss_verdict(name: &str, miss: &matchers::CommandMiss) -> (String, NodeStatus) {
+    use matchers::{CommandMiss, TokenizeError};
+    match miss {
+        CommandMiss::Empty => (
+            crate::i18n::t!("editor-enter-command"),
+            NodeStatus::Disabled,
+        ),
+        CommandMiss::WrongFirstWord => (
+            crate::i18n::t!("editor-wrong-first-word", "name" => name),
+            NodeStatus::Disabled,
+        ),
+        CommandMiss::MissingRequired { name } => (
+            crate::i18n::t!("editor-missing-arg", "name" => name.clone()),
+            NodeStatus::Error,
+        ),
+        CommandMiss::Unclaimed { text } => (
+            crate::i18n::t!("editor-unclaimed", "text" => text.clone()),
+            NodeStatus::Disabled,
+        ),
+        CommandMiss::Tokenize(TokenizeError::UnterminatedQuote) => (
+            crate::i18n::t!("editor-unterminated-quote"),
+            NodeStatus::Error,
+        ),
+        CommandMiss::Tokenize(TokenizeError::UnbalancedBraces) => (
+            crate::i18n::t!("editor-unbalanced-braces"),
+            NodeStatus::Error,
+        ),
+    }
+}
+
+/// The Try-it field's raw-line simulation: `\e` means the ESC byte, so escape
+/// sequences can be typed into the tester (`matching-logic.md` §6).
+fn raw_of(test: &str) -> String {
+    test.replace("\\e", "\x1b")
+}
+
+/// The ANSI-stripped subject normal matchers see.
+fn plain_of(raw: &str) -> String {
+    static ANSI: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new("\x1b\\[[0-9;]*[A-Za-z]").unwrap());
+    ANSI.replace_all(raw, "").into_owned()
+}
+
 fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {
     if pattern.is_empty() {
         return (
-            crate::i18n::t!("editor-enter-pattern"),
+            crate::i18n::t!("editor-verdict-no-regex"),
             NodeStatus::Disabled,
         );
     }
     match regex::Regex::new(pattern) {
-        Err(_) => (crate::i18n::t!("editor-invalid-pattern"), NodeStatus::Error),
+        Err(e) => (
+            crate::i18n::t!("editor-verdict-invalid-regex", "error" => e.to_string()),
+            NodeStatus::Error,
+        ),
         Ok(re) => {
             if sample.is_empty() {
                 (
@@ -1889,7 +3796,7 @@ fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {
                     NodeStatus::Disabled,
                 )
             } else if re.is_match(sample) {
-                (crate::i18n::t!("editor-matches"), NodeStatus::Ok)
+                (crate::i18n::t!("editor-would-fire"), NodeStatus::Ok)
             } else {
                 (crate::i18n::t!("editor-no-match"), NodeStatus::Disabled)
             }
@@ -1922,7 +3829,7 @@ mod tests {
         let value = String::new();
         let valid = iced::widget::column![
             error_slot(None),
-            text_input("pattern", &value).on_input(Message::SetAliasPattern)
+            text_input("pattern", &value).on_input(Message::SetName)
         ];
         let mut tree = Tree::new(&valid as &dyn Widget<Message, Theme, iced::Renderer>);
 
@@ -1934,7 +3841,7 @@ mod tests {
 
         let invalid = iced::widget::column![
             error_slot(Some("invalid regular expression")),
-            text_input("pattern", &value).on_input(Message::SetAliasPattern)
+            text_input("pattern", &value).on_input(Message::SetName)
         ];
         tree.diff(&invalid as &dyn Widget<Message, Theme, iced::Renderer>);
 
@@ -1942,5 +3849,83 @@ mod tests {
             .state
             .downcast_ref::<iced::widget::text_input::State<Paragraph>>();
         assert!(input_state.is_focused());
+    }
+
+    /// The fixtures §10 gutter-derivation table for regex sources.
+    #[test]
+    fn regex_gutters_derive_from_the_source_anchors() {
+        assert_eq!(regex_loose_sides("^greet$"), (false, false));
+        assert_eq!(regex_loose_sides("greet$"), (true, false));
+        assert_eq!(regex_loose_sides("^greet"), (false, true));
+        assert_eq!(regex_loose_sides("greet"), (true, true));
+        // An escaped `$` is not an anchor.
+        assert_eq!(regex_loose_sides(r"costs 5\$"), (true, true));
+        assert_eq!(regex_loose_sides(""), (false, false));
+        assert_eq!(regex_loose_sides("$"), (true, false));
+    }
+
+    /// The field composite's widget tree must be identical in every anchor
+    /// state. iced diffs children positionally, so a gutter cell mounting or
+    /// unmounting would shift the editor's tree position and reset its state
+    /// — focus included — on the very keystroke that flips the derivation
+    /// (the first unanchored character, adding or removing `^`/`$`), leaving
+    /// the field unfocused and swallowing everything typed after it.
+    #[test]
+    fn matcher_field_tree_is_stable_across_anchor_states() {
+        fn topology(tree: &Tree, depth: usize, out: &mut Vec<String>) {
+            out.push(format!("{depth}:{:?}", tree.tag));
+            for child in &tree.children {
+                topology(child, depth + 1, out);
+            }
+        }
+
+        let content = iced::widget::text_editor::Content::with_text("You are (hungry");
+        let mut shapes: Vec<Vec<String>> = Vec::new();
+        for loose in [(false, false), (true, false), (false, true), (true, true)] {
+            let field = matcher_field(
+                &content,
+                "placeholder",
+                highlight::FieldSyntax::Regex,
+                loose,
+                false,
+                Message::AliasRegexAction,
+            );
+            // The composite must report a Shrink height in every state: the
+            // gutters are Fill-height internally, and if that fluidity leaks
+            // into the composite's own size hint (`Row::push` encloses child
+            // hints; `Container::new` derives from its content's), the field
+            // measures against nothing in rows with no fixed-size sibling and
+            // the whole matcher section collapses.
+            assert_eq!(
+                field.as_widget().size(),
+                iced::Size::new(Length::Fill, Length::Shrink),
+                "the field composite must not inherit the gutters' Fill height"
+            );
+            let tree = Tree::new(field.as_widget());
+            let mut tags = Vec::new();
+            topology(&tree, 0, &mut tags);
+            shapes.push(tags);
+        }
+        assert_eq!(
+            shapes[0], shapes[1],
+            "gutter states must not change the composite's tree shape"
+        );
+        assert_eq!(shapes[1], shapes[2]);
+        assert_eq!(shapes[2], shapes[3]);
+    }
+
+    /// Enter never reaches a one-line buffer, and pasted newlines flatten.
+    #[test]
+    fn single_line_fields_stay_single_line() {
+        use iced::widget::text_editor::{Action, Content, Edit};
+
+        let mut content = Content::new();
+        perform_single_line(&mut content, Action::Edit(Edit::Insert('a')));
+        perform_single_line(&mut content, Action::Edit(Edit::Enter));
+        perform_single_line(
+            &mut content,
+            Action::Edit(Edit::Paste(Arc::new("b\r\nc\nd".to_string()))),
+        );
+        assert_eq!(single_line_text(&content), "ab c d");
     }
 }
