@@ -107,7 +107,7 @@ jobs:
         if: matrix.mode == 'default'
         run: python bin/test-iced-accessibility-patches.py
 
-      - name: Check hardware-free default product
+      - name: Check hardware-free opt-out build
         if: matrix.mode == 'default'
         run: >-
           cargo check -p smudgy_ui --all-targets

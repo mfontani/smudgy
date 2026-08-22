@@ -103,13 +103,17 @@ winapi = { workspace = true, features = [
 ] }
 
 [features]
+# Desktop builds ship with physical Web Audio output by default. Embedders and
+# hardware-free CI lanes opt out with --no-default-features; the hosted silent
+# path remains fully supported there.
+default = ["web-audio-cpal"]
 # Hardware-independent integration for explicit audio-scoped test/embedding paths. It keeps
 # `sinkId: "none"` available without acquiring a device; by itself it does not make ordinary
 # desktop sessions audio-scoped.
 web-audio = ["smudgy_core/web-audio"]
 # Desktop coordinator and direct CPAL output (WASAPI/ALSA/CoreAudio) through
-# `smudgy_audio/physical-output`. Production packaging selects this feature
-# explicitly while crate defaults remain hardware-independent for embedders and tests.
+# `smudgy_audio/physical-output`. Production packaging still selects this
+# feature explicitly, and it is also the crate default.
 web-audio-cpal = [
     "web-audio",
     "dep:futures",

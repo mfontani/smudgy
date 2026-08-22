@@ -268,8 +268,11 @@ def main() -> None:
         "cargo-about target union must exactly cover every shipped release target",
     )
 
+    require(
+        ui.get("features", {}).get("default") == ["web-audio-cpal"],
+        "smudgy_ui default must be exactly the product web-audio-cpal feature",
+    )
     for crate, manifest in (
-        ("smudgy_ui", ui),
         ("smudgy_core", core),
         ("smudgy_script", script),
         ("smudgy_audio", audio),
