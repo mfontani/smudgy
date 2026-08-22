@@ -112,6 +112,43 @@ async fn carriage_return_transaction_survives_flush_and_intervening_echo() {
         }
     }
 
+    // Finishing that provisional replacement without a line transform must
+    // keep the fragmented-line suffix-only delivery path: the runtime already
+    // has "20%" on screen, so it appends only the unseen suffix and commits.
+    tx.send(RuntimeAction::HandleIncomingFragmentedLine {
+        line: line("20% done"),
+        completion_fragment: line(" done"),
+    })
+    .unwrap();
+    tx.send(RuntimeAction::RequestRepaint).unwrap();
+    let mut saw_suffix = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("timed out waiting for fragmented completion")
+            .expect("event stream ended before fragmented completion");
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            assert!(
+                !updates.iter().any(|update| matches!(
+                    update,
+                    BufferUpdate::BeginOpenLineReplacement
+                        | BufferUpdate::FinishOpenLineReplacement(_)
+                )),
+                "an untransformed fragmented line must not replace its displayed prefix"
+            );
+            saw_suffix |= updates
+                .iter()
+                .any(|update| matches!(update, BufferUpdate::Append(line) if line.text == " done"));
+            if saw_suffix
+                && updates
+                    .iter()
+                    .any(|update| matches!(update, BufferUpdate::EnsureNewLine))
+            {
+                break;
+            }
+        }
+    }
+
     tx.send(RuntimeAction::Shutdown).ok();
 }
 

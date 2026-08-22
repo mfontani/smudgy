@@ -9,10 +9,10 @@ use crate::models::server::link_url_host;
 use crate::session::{
     runtime::RuntimeAction,
     styled_line::{
-        InvisiblePolicy, LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem,
-        LinkMenuTitle, LinkProtocol, LinkSelection, LinkSpan, LinkStyle, LinkTextStyle,
-        LinkTooltip, LinkTooltipText, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
-        Style, StyledLine, VtSpan, deceptive_invisible, push_escaped_char,
+        InvisiblePolicy, LineFragments, LinkAction, LinkColor, LinkDecoration, LinkMenu,
+        LinkMenuItem, LinkMenuTitle, LinkProtocol, LinkSelection, LinkSpan, LinkStyle,
+        LinkTextStyle, LinkTooltip, LinkTooltipText, LinkVisibility, LinkVisibilityAction,
+        LinkVisibilityExpire, Style, StyledLine, VtSpan, deceptive_invisible, push_escaped_char,
     },
 };
 
@@ -765,6 +765,11 @@ pub struct VtProcessor {
     /// clears it, so CRLF stays an ordinary commit. Persists across reads
     /// like the rest of the parse state.
     pending_cr: Option<usize>,
+    /// A line prefix emitted only because a socket read batch ended. This is
+    /// deliberately separate from `buf`: the UI gets prompt-like immediacy,
+    /// while a later newline still presents the assembled logical line to
+    /// normal triggers.
+    open_logical_line: LineFragments,
     session_runtime_tx: UnboundedSender<RuntimeAction>,
     /// Identifies the connection that owns this processor. Packet-completion
     /// markers carry it back to the runtime so a replaced socket cannot
@@ -820,6 +825,7 @@ impl VtProcessor {
             cursor_link: None,
             link_open_pos: 0,
             pending_cr: None,
+            open_logical_line: LineFragments::None,
             session_runtime_tx,
             connection_generation,
             packet_has_displayable_text: false,
@@ -863,9 +869,10 @@ impl VtProcessor {
     /// [`Self::capture_raw`] once per run: a mid-run FALL is safe under either
     /// hoisted branch (the push re-checks per byte, and a fallen commit
     /// attaches nothing), but a mid-run RISE would attach a torn raw suffix
-    /// pushed only from the flip onward. Rises therefore wait for the batch
-    /// boundary ([`Self::notify_end_of_buffer`]), where no run is in flight
-    /// and the buffers are empty.
+    /// pushed only from the flip onward. Rises therefore wait for a batch
+    /// boundary with no fragmented logical line open
+    /// ([`Self::notify_end_of_buffer`]), where no run is in flight and the
+    /// next line can be captured from its first byte.
     fn refresh_capture_raw(&mut self) {
         if let Some(flag) = &self.raw_wanted {
             self.capture_raw = self.capture_raw && flag.load(std::sync::atomic::Ordering::Relaxed);
@@ -925,6 +932,7 @@ impl VtProcessor {
         self.link_info.clear();
         self.link_open_pos = 0;
         self.buf_raw.drain(..raw_mark.min(self.buf_raw.len()));
+        self.open_logical_line.clear();
         self.session_runtime_tx
             .send(RuntimeAction::RetractIncomingPartialLine)
             .unwrap();
@@ -970,6 +978,7 @@ impl VtProcessor {
         let pending_line = Arc::new(self.consume_into_pending_line());
         if !self.buf.is_empty() {
             self.packet_has_displayable_text = true;
+            self.open_logical_line.push(pending_line.clone());
             self.session_runtime_tx
                 .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
                 .ok();
@@ -1003,11 +1012,14 @@ impl VtProcessor {
                 })
                 .ok();
         }
-        // The batch boundary is the one place capture may RISE: no parse run is
-        // in flight (the reader calls this between batches) and the line buffers
-        // are empty, so the next batch starts a fresh line under the new value
-        // and `TelnetBridge::on_data` re-hoists it before any byte flows.
-        if let Some(flag) = &self.raw_wanted {
+        // A batch boundary with no fragmented logical line open is the one
+        // place capture may RISE: no parse run is in flight, the next batch
+        // starts a fresh line under the new value, and `TelnetBridge::on_data`
+        // re-hoists it before any byte flows. Across a fragmented line the old
+        // value stays latched, keeping raw text complete-or-absent.
+        if !self.open_logical_line.has_fragments()
+            && let Some(flag) = &self.raw_wanted
+        {
             self.capture_raw = flag.load(std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -1026,6 +1038,7 @@ impl VtProcessor {
         // not overwrite what follows.
         self.pending_cr = None;
         if self.buf.is_empty() {
+            self.open_logical_line.clear();
             self.session_runtime_tx
                 .send(RuntimeAction::PromptBoundary)
                 .ok();
@@ -1039,6 +1052,10 @@ impl VtProcessor {
         self.session_runtime_tx
             .send(RuntimeAction::PromptBoundary)
             .ok();
+        // GA/EOR is an explicit semantic prompt boundary, unlike an arbitrary
+        // read-batch flush. The prompt remains visually open, but it must not
+        // become the prefix of the next normal trigger line.
+        self.open_logical_line.clear();
         self.buf.clear();
         self.buf_raw.clear();
         self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
@@ -1051,9 +1068,22 @@ impl VtProcessor {
         if !pending_line.text.is_empty() {
             self.packet_has_displayable_text = true;
         }
-        self.session_runtime_tx
-            .send(RuntimeAction::HandleIncomingLine(pending_line))
-            .ok();
+        if self.open_logical_line.has_fragments() {
+            let line = self
+                .open_logical_line
+                .take_joined_with(&pending_line)
+                .expect("fragmented completion requires an open prefix");
+            self.session_runtime_tx
+                .send(RuntimeAction::HandleIncomingFragmentedLine {
+                    line,
+                    completion_fragment: pending_line,
+                })
+                .ok();
+        } else {
+            self.session_runtime_tx
+                .send(RuntimeAction::HandleIncomingLine(pending_line))
+                .ok();
+        }
         self.buf.clear();
         self.buf_raw.clear();
         self.refresh_capture_raw();
@@ -1250,6 +1280,9 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 RuntimeAction::HandleIncomingLine(line) => Some(format!("line:{}", line.text)),
+                RuntimeAction::HandleIncomingFragmentedLine { line, .. } => {
+                    Some(format!("line:{}", line.text))
+                }
                 RuntimeAction::HandleIncomingPartialLine(line) => {
                     Some(format!("partial:{}", line.text))
                 }
@@ -1273,7 +1306,63 @@ mod tests {
     fn crlf_commits_normally() {
         let mut h = harness();
         h.feed(b"a\r\nb\r\n");
-        assert_eq!(transcript(&h.actions()), ["line:a", "line:b"]);
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["line:a", "line:b"]);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, RuntimeAction::HandleIncomingLine(_)))
+                .count(),
+            2,
+            "CRLF-complete lines must retain the direct hot-path action"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, RuntimeAction::HandleIncomingFragmentedLine { .. }))
+        );
+    }
+
+    #[test]
+    fn read_batch_fragments_reassemble_once_at_the_real_line_boundary() {
+        let mut h = harness();
+        h.feed(b"\x1b[31m[AU");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"TO");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"LOOT]\x1b[0m rest\r\n");
+
+        let actions = h.actions();
+        assert_eq!(
+            transcript(&actions),
+            ["partial:[AU", "partial:TO", "line:[AUTOLOOT] rest"]
+        );
+        let (line, completion_fragment) = actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::HandleIncomingFragmentedLine {
+                    line,
+                    completion_fragment,
+                } => Some((line, completion_fragment)),
+                _ => None,
+            })
+            .expect("fragmented completion action");
+        assert_eq!(line.text, "[AUTOLOOT] rest");
+        assert_eq!(completion_fragment.text, "LOOT] rest");
+        assert_eq!(line.raw(), Some("\x1b[31m[AUTOLOOT]\x1b[0m rest"));
+        assert_eq!(line.spans.first().map(|span| span.begin_pos), Some(0));
+        assert_eq!(
+            line.spans.last().map(|span| span.end_pos),
+            Some(line.text.len())
+        );
+        assert!(line.spans.iter().any(|span| matches!(
+            span.style.fg,
+            Color::Ansi {
+                color: super::sgr::AnsiColor::Red,
+                bold: false
+            }
+        ) && &line.text[span.begin_pos..span.end_pos]
+            == "LOOT]"));
     }
 
     #[test]
@@ -1439,6 +1528,17 @@ mod tests {
         assert_eq!(transcript(&h.actions()), ["partial:> ", "line:ok"]);
     }
 
+    #[test]
+    fn explicit_prompt_boundary_closes_a_previously_flushed_batch_fragment() {
+        let mut h = harness();
+        h.feed(b"> ");
+        h.processor.notify_end_of_buffer();
+        // GA/EOR may arrive in the next socket batch with no additional text.
+        h.processor.commit_prompt();
+        h.feed(b"ok\n");
+        assert_eq!(transcript(&h.actions()), ["partial:> ", "line:ok"]);
+    }
+
     use crate::session::styled_line::{
         LinkAction, LinkColor, LinkDecoration, LinkMenuItem, LinkStyleState, LinkTooltip,
         LinkVisibilityAction, StyledLine,
@@ -1449,6 +1549,7 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 RuntimeAction::HandleIncomingLine(line) => Some(line.clone()),
+                RuntimeAction::HandleIncomingFragmentedLine { line, .. } => Some(line.clone()),
                 _ => None,
             })
             .collect()

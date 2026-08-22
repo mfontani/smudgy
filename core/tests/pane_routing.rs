@@ -58,7 +58,7 @@ createTrigger("^SPLITREDIR$", () => {
     const fresh = session.mainPane.split("right", { name: "fresh" });
     line.redirect(fresh);
 });
-createTrigger("^REDIR-REST$", () => { line.redirect(chat); });
+createTrigger("REDIR-REST$", () => { line.redirect(chat); });
 createTrigger("^NOISE$", () => { chat.echo("noise-a\nnoise-b"); });
 createTrigger("^PARITY ", () => { vars.parityNumber = line.number; });
 createTrigger("^PARITYCHECK$", () => { echo("PARITY_AT=" + vars.parityNumber); });
@@ -251,7 +251,12 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
                 tx.send(RuntimeAction::HandleIncomingPartialLine(sl("PROMPT>")))
                     .unwrap();
                 tx.send(RuntimeAction::RequestRepaint).unwrap();
-                send_line("REDIR-REST");
+                tx.send(RuntimeAction::HandleIncomingFragmentedLine {
+                    line: sl("PROMPT>REDIR-REST"),
+                    completion_fragment: sl("REDIR-REST"),
+                })
+                .unwrap();
+                tx.send(RuntimeAction::RequestRepaint).unwrap();
                 true
             }
             4 if has_append_to("PROMPT>REDIR-REST") => {

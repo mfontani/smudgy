@@ -92,6 +92,10 @@ mod linux {
                         complete += 1;
                         black_box(line);
                     }
+                    RuntimeAction::HandleIncomingFragmentedLine { line, .. } => {
+                        complete += 1;
+                        black_box(line);
+                    }
                     RuntimeAction::HandleIncomingPartialLine(line) => {
                         partial += 1;
                         black_box(line);

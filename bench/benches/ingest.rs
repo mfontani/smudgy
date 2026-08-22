@@ -197,6 +197,10 @@ impl Pipeline {
                     complete += 1;
                     black_box(line);
                 }
+                RuntimeAction::HandleIncomingFragmentedLine { line, .. } => {
+                    complete += 1;
+                    black_box(line);
+                }
                 RuntimeAction::HandleIncomingPartialLine(line) => {
                     partial += 1;
                     black_box(line);
@@ -214,6 +218,7 @@ impl Pipeline {
         while let Ok(action) = self.rx.try_recv() {
             match action {
                 RuntimeAction::HandleIncomingLine(line) => complete.push(line),
+                RuntimeAction::HandleIncomingFragmentedLine { line, .. } => complete.push(line),
                 RuntimeAction::HandleIncomingPartialLine(line) => partial.push(line),
                 _ => {}
             }

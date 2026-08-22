@@ -105,6 +105,14 @@ pub enum RuntimeAction {
     /// drop. A no-op when there is no live connection.
     Disconnect,
     HandleIncomingLine(Arc<StyledLine>),
+    /// A newline completed a logical line whose prefix was already emitted as
+    /// one or more transport-batch partials. `line` is the assembled whole
+    /// used for normal triggers; `completion_fragment` is the not-yet-shown
+    /// suffix, retained so an unmodified line can finish with a cheap append.
+    HandleIncomingFragmentedLine {
+        line: Arc<StyledLine>,
+        completion_fragment: Arc<StyledLine>,
+    },
     HandleIncomingPartialLine(Arc<StyledLine>),
     /// A decoded telnet GA/EOR boundary, ordered behind its prompt text.
     PromptBoundary,
@@ -113,6 +121,12 @@ pub enum RuntimeAction {
     /// it). Emitted by the VT layer before the replacement frame's bytes.
     RetractIncomingPartialLine,
     CompleteLineTriggersProcessed(Arc<StyledLine>),
+    /// Cold-path completion frame paired with
+    /// [`Self::HandleIncomingFragmentedLine`].
+    CompleteFragmentedLineTriggersProcessed {
+        line: Arc<StyledLine>,
+        completion_fragment: Arc<StyledLine>,
+    },
     PartialLineTriggersProcessed(Arc<StyledLine>),
     PerformLineOperation {
         line_number: usize,
