@@ -244,7 +244,7 @@ async fn regexp_flags_are_honored() {
     std::fs::write(modules_dir.join("flags.ts"), FLAGS_TS).unwrap();
 
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(7013),
+        session_id: SessionId::from(7006),
         server_name: Arc::new(server.to_string()),
         profile_name: Arc::new("Test".to_string()),
         profile_subtext: Arc::new(String::new()),
