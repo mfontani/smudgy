@@ -96,7 +96,16 @@ pub struct ArgSpec {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum AliasMatcherSource {
     Command {
-        name: String,
+        /// The command word, when the author pinned one that differs from the
+        /// alias's own name. `None` — the ordinary case — means the alias name
+        /// *is* the command, so renaming the alias renames the command.
+        ///
+        /// The override exists for the words a name cannot spell: `*` and `?`
+        /// are commands players actually type but are illegal filename
+        /// characters (see [`crate::models::naming`]), and a name may contain
+        /// spaces while a command word is a single token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<ArgSpec>,
         #[serde(default)]
@@ -484,14 +493,26 @@ pub struct CommandSpec {
 }
 
 impl AliasMatcherSource {
-    /// The runtime [`CommandSpec`] this sidecar implies; `None` for a Pattern.
+    /// The word this sidecar matches on: the pinned override, or — the
+    /// ordinary case — the alias's own name. `None` for a Pattern.
     #[must_use]
-    pub fn command_spec(&self) -> Option<CommandSpec> {
+    pub fn command_word<'a>(&'a self, alias_name: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Command { name, .. } => Some(name.as_deref().unwrap_or(alias_name)),
+            Self::Pattern { .. } => None,
+        }
+    }
+
+    /// The runtime [`CommandSpec`] this sidecar implies; `None` for a Pattern.
+    /// The spec's `name` is the *resolved* command word, so the runtime never
+    /// has to know an override was involved.
+    #[must_use]
+    pub fn command_spec(&self, alias_name: &str) -> Option<CommandSpec> {
         match self {
             Self::Command {
                 name, args, parse, ..
             } => Some(CommandSpec {
-                name: name.clone(),
+                name: name.as_deref().unwrap_or(alias_name).to_string(),
                 args: args.clone(),
                 parse: *parse,
             }),
@@ -770,13 +791,20 @@ pub fn usage_line(name: &str, args: &[ArgSpec]) -> String {
 }
 
 /// The stored `pattern` derived from an alias sidecar — what a save writes.
+/// `alias_name` supplies the command word for a Command with no override, so
+/// a rename recompiles the prefilter.
 ///
 /// # Errors
 ///
 /// Returns the pattern's compile errors; a Command prefilter cannot fail.
-pub fn alias_pattern(matcher: &AliasMatcherSource) -> Result<String, Vec<PatternError>> {
+pub fn alias_pattern(
+    matcher: &AliasMatcherSource,
+    alias_name: &str,
+) -> Result<String, Vec<PatternError>> {
     match matcher {
-        AliasMatcherSource::Command { name, .. } => Ok(command_prefilter(name)),
+        AliasMatcherSource::Command { name, .. } => {
+            Ok(command_prefilter(name.as_deref().unwrap_or(alias_name)))
+        }
         AliasMatcherSource::Pattern {
             source,
             anchor_start,
@@ -1368,22 +1396,39 @@ mod tests {
                 anchor_start: true,
                 anchor_end: true,
             };
-            let stored = alias_pattern(&pattern).unwrap();
+            let stored = alias_pattern(&pattern, "greet").unwrap();
             assert_eq!(stored, r"^greet\s+(?<person>.*)$");
             // save(compile(source)) == stored: recompiling yields the same
             // string, so an untouched matcher never perturbs the file.
-            assert_eq!(alias_pattern(&pattern).unwrap(), stored);
+            assert_eq!(alias_pattern(&pattern, "greet").unwrap(), stored);
 
-            let command = AliasMatcherSource::Command {
-                name: "obe".to_string(),
-                args: vec![ArgSpec {
-                    name: "target".to_string(),
-                    kind: ArgKind::Required,
-                }],
+            let args = vec![ArgSpec {
+                name: "target".to_string(),
+                kind: ArgKind::Required,
+            }];
+            // No override: the alias name is the command, so a rename
+            // recompiles the prefilter.
+            let inherited = AliasMatcherSource::Command {
+                name: None,
+                args: args.clone(),
                 parse: ParseMode::All,
                 mode: CmdMode::Advanced,
             };
-            assert_eq!(alias_pattern(&command).unwrap(), r"^obe(?:\s|$)");
+            assert_eq!(alias_pattern(&inherited, "obe").unwrap(), r"^obe(?:\s|$)");
+            assert_eq!(alias_pattern(&inherited, "bash").unwrap(), r"^bash(?:\s|$)");
+
+            // An override pins the word a name cannot spell, and the name
+            // stops feeding the prefilter.
+            let pinned = AliasMatcherSource::Command {
+                name: Some("*".to_string()),
+                args,
+                parse: ParseMode::All,
+                mode: CmdMode::Advanced,
+            };
+            assert_eq!(
+                alias_pattern(&pinned, "star-emote").unwrap(),
+                r"^\*(?:\s|$)"
+            );
         }
 
         #[test]
@@ -1394,7 +1439,7 @@ mod tests {
                 anchor_end: true,
             };
             assert!(matches!(
-                alias_pattern(&bad).unwrap_err().as_slice(),
+                alias_pattern(&bad, "hit").unwrap_err().as_slice(),
                 [PatternError::NumberedHole { .. }]
             ));
         }
@@ -1480,7 +1525,7 @@ mod tests {
         #[test]
         fn command_sidecar_round_trips() {
             let matcher = AliasMatcherSource::Command {
-                name: "obe".to_string(),
+                name: Some("obe".to_string()),
                 args: vec![
                     ArgSpec {
                         name: "target".to_string(),
@@ -1504,15 +1549,31 @@ mod tests {
         #[test]
         fn minimal_command_json_fills_defaults() {
             let matcher: AliasMatcherSource =
-                serde_json::from_str(r#"{"kind":"command","name":"greet"}"#).unwrap();
+                serde_json::from_str(r#"{"kind":"command"}"#).unwrap();
             assert_eq!(
                 matcher,
                 AliasMatcherSource::Command {
-                    name: "greet".to_string(),
+                    name: None,
                     args: Vec::new(),
                     parse: ParseMode::All,
                     mode: CmdMode::Simple,
                 }
+            );
+            // An absent override inherits the alias name; the field only
+            // reappears on disk once one is pinned.
+            assert_eq!(matcher.command_word("greet"), Some("greet"));
+            assert_eq!(
+                serde_json::to_string(&matcher).unwrap(),
+                r#"{"kind":"command","parse":"all","mode":"simple"}"#
+            );
+
+            let pinned: AliasMatcherSource =
+                serde_json::from_str(r#"{"kind":"command","name":"*"}"#).unwrap();
+            assert_eq!(pinned.command_word("star-emote"), Some("*"));
+            assert!(
+                serde_json::to_string(&pinned)
+                    .unwrap()
+                    .contains(r#""name":"*""#)
             );
         }
 

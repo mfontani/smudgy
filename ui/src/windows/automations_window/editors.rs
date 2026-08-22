@@ -107,7 +107,7 @@ impl AutomationsWindow {
 
         let node = match script {
             Script::Alias(a) => {
-                self.alias_draft = AliasMatcherDraft::from_definition(&a);
+                self.alias_draft = AliasMatcherDraft::from_definition(&a, &key.script_name);
                 if self.alias_draft.degraded {
                     log::info!(
                         "alias {}: stored pattern no longer matches its sidecar; showing as regex",
@@ -532,7 +532,7 @@ impl AutomationsWindow {
                 ..
             })
         ) {
-            match self.alias_draft.to_pattern() {
+            match self.alias_draft.to_pattern(&name) {
                 Ok(pattern) => Some((pattern, self.alias_draft.to_matcher())),
                 Err(message) => {
                     if let Pane::Editor(state) = &mut self.pane {
@@ -1654,7 +1654,7 @@ impl AutomationsWindow {
         ));
         match self.alias_draft.kind {
             AliasKind::Command => {
-                body = self.alias_command_fields(body);
+                body = self.alias_command_fields(body, state.name.trim());
             }
             AliasKind::Pattern => {
                 body = body.push(field_row(
@@ -2221,20 +2221,20 @@ impl AutomationsWindow {
         .into()
     }
 
-    /// The Command kind's field block: name + mode, the argument rows, the
-    /// generated usage line, and (Advanced only) the parsing picker.
+    /// The Command kind's field block: the mode radio (with the command-word
+    /// override beside it once revealed), the argument rows, the generated
+    /// usage line, and (Advanced only) the parsing picker.
+    ///
+    /// The alias's name *is* the command, so there is normally no command
+    /// field at all. `alias_name` is that name, already trimmed.
     fn alias_command_fields<'a>(
         &'a self,
         mut body: Column<'a, Message, Theme>,
+        alias_name: &'a str,
     ) -> Column<'a, Message, Theme> {
         let draft = &self.alias_draft;
-        body = body.push(field_row(
-            crate::i18n::ts!("editor-command"),
+        let mode_radios = || {
             row![
-                text_input(crate::i18n::ts!("editor-example-command"), &draft.command)
-                    .on_input(Message::SetCommandName)
-                    .size(14.0)
-                    .width(Length::Fill),
                 radio(
                     crate::i18n::ts!("editor-cmd-simple"),
                     CmdMode::Simple,
@@ -2254,8 +2254,52 @@ impl AutomationsWindow {
             ]
             .spacing(12.0)
             .align_y(Vertical::Center)
-            .into(),
-        ));
+        };
+
+        if draft.shows_command_override(alias_name) {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-command"),
+                row![
+                    text_input(
+                        crate::i18n::ts!("editor-example-command"),
+                        draft.command_override.as_deref().unwrap_or_default(),
+                    )
+                    .on_input(Message::SetCommandName)
+                    .size(14.0)
+                    .width(Length::Fill),
+                    mode_radios(),
+                ]
+                .spacing(12.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ));
+        } else {
+            // No override: the row shows the word inherited from the name —
+            // read-only, because the Name field above is where it is edited —
+            // with the escape hatch for words a name cannot spell.
+            let inherited = if alias_name.is_empty() {
+                text(crate::i18n::t!("editor-command-name-empty"))
+                    .size(13.0)
+                    .style(common::muted)
+            } else {
+                text(alias_name).size(14.0).font(fonts::GEIST_MONO_VF)
+            };
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-command"),
+                row![
+                    inherited,
+                    mode_radios(),
+                    Space::new().width(Length::Fill),
+                    button(text(crate::i18n::t!("editor-command-override")).size(13.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::RevealCommandOverride)
+                        .padding(6),
+                ]
+                .spacing(12.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ));
+        }
 
         let mut args = Column::new().spacing(6.0);
         let last = draft.args.len().saturating_sub(1);
@@ -2317,12 +2361,14 @@ impl AutomationsWindow {
         );
         body = body.push(field_row(crate::i18n::ts!("editor-arguments"), args.into()));
 
-        // The Usage row (label included) is omitted while the name is empty.
-        if !draft.command.trim().is_empty() {
+        // The Usage row (label included) is omitted while the command word is
+        // empty — an unnamed new alias has nothing to show yet.
+        let word = draft.command_word(alias_name);
+        if !word.is_empty() {
             body = body.push(field_row(
                 crate::i18n::ts!("editor-usage"),
                 column![
-                    text(matchers::usage_line(draft.command.trim(), &draft.args))
+                    text(matchers::usage_line(word, &draft.args))
                         .size(13.0)
                         .font(fonts::GEIST_MONO_VF),
                     text(crate::i18n::t!("editor-command-completion-note"))
@@ -2561,6 +2607,10 @@ impl AutomationsWindow {
     fn alias_draft_verdict(&self) -> (String, NodeStatus) {
         let draft = &self.alias_draft;
         let sample = &self.test_input;
+        let alias_name = match &self.pane {
+            Pane::Editor(state) => state.name.trim(),
+            _ => "",
+        };
         match draft.kind {
             AliasKind::Regex => alias_verdict(&draft.regex_source, sample),
             AliasKind::Pattern => {
@@ -2597,11 +2647,20 @@ impl AutomationsWindow {
                 }
             }
             AliasKind::Command => {
-                let name = draft.command.trim();
+                let name = draft.command_word(alias_name);
                 if name.is_empty() {
                     return (
                         crate::i18n::t!("editor-verdict-no-command"),
                         NodeStatus::Disabled,
+                    );
+                }
+                // The parser matches the first whitespace-delimited token, so
+                // say why a spaced word can never fire rather than reporting
+                // an ordinary miss.
+                if name.contains(char::is_whitespace) {
+                    return (
+                        crate::i18n::t!("editor-verdict-command-spaces"),
+                        NodeStatus::Error,
                     );
                 }
                 if sample.is_empty() {

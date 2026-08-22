@@ -285,6 +285,9 @@ pub enum Message {
     // alias matcher draft
     SetAliasKind(model::AliasKind),
     SetCommandName(String),
+    /// Reveal the command-word override row (the alias name drives the
+    /// command until then).
+    RevealCommandOverride,
     SetArgName(usize, String),
     SetArgKind(usize, smudgy_core::models::matchers::ArgKind),
     AddArg,
@@ -1244,7 +1247,13 @@ impl AutomationsWindow {
                 Update::none()
             }
             Message::SetCommandName(name) => {
-                self.alias_draft.command = name;
+                self.alias_draft.command_override = Some(name);
+                Update::none()
+            }
+            Message::RevealCommandOverride => {
+                self.alias_draft
+                    .command_override
+                    .get_or_insert_with(String::new);
                 Update::none()
             }
             Message::SetArgName(i, name) => {
@@ -2013,6 +2022,7 @@ impl AutomationsWindow {
             Message::SetName(_)
             | Message::SetAliasKind(_)
             | Message::SetCommandName(_)
+            | Message::RevealCommandOverride
             | Message::SetArgName(_, _)
             | Message::SetArgKind(_, _)
             | Message::AddArg
@@ -2052,6 +2062,7 @@ impl AutomationsWindow {
             }
             Message::SetAliasKind(_)
             | Message::SetCommandName(_)
+            | Message::RevealCommandOverride
             | Message::SetArgName(_, _)
             | Message::SetArgKind(_, _)
             | Message::AddArg

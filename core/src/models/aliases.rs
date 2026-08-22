@@ -49,9 +49,14 @@ pub struct AliasDefinition {
     #[serde(default)]
     pub language: ScriptLang,
     /// Authoring intent behind `pattern` (a Simple pattern or a Command).
-    /// Editor-only: the runtime never reads it, and `pattern` is recompiled
-    /// from it on every save. Absent means `pattern` is a hand-written regex
-    /// shown verbatim — the pre-sidecar behavior.
+    /// `pattern` is recompiled from it on every save, resolved against this
+    /// alias's own name — a Command inherits that name as its command word
+    /// unless the sidecar pins an override. Absent means `pattern` is a
+    /// hand-written regex shown verbatim — the pre-sidecar behavior.
+    ///
+    /// Otherwise editor-only, with one exception: a Command's argument parser
+    /// rides into the runtime matcher at load time (see
+    /// [`matchers::AliasMatcherSource::command_spec`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<super::matchers::AliasMatcherSource>,
 }

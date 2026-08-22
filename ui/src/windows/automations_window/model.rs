@@ -318,7 +318,11 @@ impl TriggerCard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasMatcherDraft {
     pub kind: AliasKind,
-    pub command: String,
+    /// The pinned command word, when the author chose one that differs from
+    /// the alias's name. `None` — the ordinary case — inherits the name, and
+    /// the Command row stays out of the deck entirely. `Some("")` is the row
+    /// revealed but not yet filled, which still inherits.
+    pub command_override: Option<String>,
     pub args: Vec<ArgSpec>,
     pub parse: ParseMode,
     pub cmd_mode: CmdMode,
@@ -337,7 +341,7 @@ impl Default for AliasMatcherDraft {
             // Command is the default for NEW aliases; opening an existing one
             // reseeds via `from_definition`.
             kind: AliasKind::Command,
-            command: String::new(),
+            command_override: None,
             args: Vec::new(),
             parse: ParseMode::All,
             cmd_mode: CmdMode::Simple,
@@ -355,7 +359,7 @@ impl AliasMatcherDraft {
     /// only while it still compiles to the stored pattern; on a mismatch (a
     /// hand-edited `pattern`, or a lying package sidecar) the matcher degrades
     /// to Regex showing the stored pattern verbatim — the hand edit wins.
-    pub fn from_definition(alias: &aliases::AliasDefinition) -> Self {
+    pub fn from_definition(alias: &aliases::AliasDefinition, alias_name: &str) -> Self {
         let mut draft = Self {
             kind: AliasKind::Regex,
             regex_source: alias.pattern.clone(),
@@ -364,7 +368,8 @@ impl AliasMatcherDraft {
         let Some(source) = &alias.matcher else {
             return draft;
         };
-        let fresh = matchers::alias_pattern(source).is_ok_and(|derived| derived == alias.pattern);
+        let fresh = matchers::alias_pattern(source, alias_name)
+            .is_ok_and(|derived| derived == alias.pattern);
         if !fresh {
             draft.degraded = true;
             return draft;
@@ -377,7 +382,7 @@ impl AliasMatcherDraft {
                 mode,
             } => {
                 draft.kind = AliasKind::Command;
-                draft.command.clone_from(name);
+                draft.command_override.clone_from(name);
                 draft.args.clone_from(args);
                 draft.parse = *parse;
                 draft.cmd_mode = *mode;
@@ -402,7 +407,14 @@ impl AliasMatcherDraft {
         match self.kind {
             AliasKind::Regex => None,
             AliasKind::Command => Some(AliasMatcherSource::Command {
-                name: self.command.trim().to_string(),
+                // A revealed-but-blank override is no override: clearing the
+                // field collapses back to inheriting the name.
+                name: self
+                    .command_override
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_string),
                 args: self.args.clone(),
                 parse: self.parse,
                 mode: self.cmd_mode,
@@ -415,16 +427,41 @@ impl AliasMatcherDraft {
         }
     }
 
+    /// The word a Command draft matches on: its override, or the alias's own
+    /// name. Both are trimmed, and a blank override inherits.
+    pub fn command_word<'a>(&'a self, alias_name: &'a str) -> &'a str {
+        self.command_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .unwrap_or_else(|| alias_name.trim())
+    }
+
+    /// Whether the Command row belongs in the deck: once an override is
+    /// pinned it stays visible, and it reveals itself unasked when the name
+    /// cannot serve as a command word — otherwise the alias could never fire
+    /// and nothing would say why.
+    pub fn shows_command_override(&self, alias_name: &str) -> bool {
+        self.command_override.is_some() || alias_name.trim().contains(char::is_whitespace)
+    }
+
     /// The stored pattern this draft saves, or a display-ready error.
-    pub fn to_pattern(&self) -> Result<String, String> {
-        if self.kind == AliasKind::Command && self.command.trim().is_empty() {
-            return Err(crate::i18n::t!("editor-command-name-empty"));
+    pub fn to_pattern(&self, alias_name: &str) -> Result<String, String> {
+        if self.kind == AliasKind::Command {
+            let word = self.command_word(alias_name);
+            if word.is_empty() {
+                return Err(crate::i18n::t!("editor-command-name-empty"));
+            }
+            // The parser compares the first whitespace-delimited token, so a
+            // word with a space in it can never match anything.
+            if word.contains(char::is_whitespace) {
+                return Err(crate::i18n::t!("editor-command-name-spaces"));
+            }
         }
         match self.to_matcher() {
             None => Ok(self.regex_source.clone()),
-            Some(matcher) => {
-                matchers::alias_pattern(&matcher).map_err(|errors| pattern_error_text(&errors[0]))
-            }
+            Some(matcher) => matchers::alias_pattern(&matcher, alias_name)
+                .map_err(|errors| pattern_error_text(&errors[0])),
         }
     }
 
@@ -993,13 +1030,14 @@ mod tests {
                 anchor_start: true,
                 anchor_end: true,
             };
-            let stored = matchers::alias_pattern(&source).unwrap();
-            let draft = AliasMatcherDraft::from_definition(&alias(&stored, Some(source.clone())));
+            let stored = matchers::alias_pattern(&source, "greet").unwrap();
+            let draft =
+                AliasMatcherDraft::from_definition(&alias(&stored, Some(source.clone())), "greet");
             assert_eq!(draft.kind, AliasKind::Pattern);
             assert_eq!(draft.pattern_source, "greet {person}");
             assert!(!draft.degraded);
             // save(compile(sidecar)) == stored, and the sidecar re-emerges.
-            assert_eq!(draft.to_pattern().unwrap(), stored);
+            assert_eq!(draft.to_pattern("greet").unwrap(), stored);
             assert_eq!(draft.to_matcher(), Some(source));
         }
 
@@ -1010,21 +1048,82 @@ mod tests {
                 anchor_start: true,
                 anchor_end: true,
             };
-            let draft =
-                AliasMatcherDraft::from_definition(&alias(r"^greetz\s+(.*)$", Some(source)));
+            let draft = AliasMatcherDraft::from_definition(
+                &alias(r"^greetz\s+(.*)$", Some(source)),
+                "greet",
+            );
             assert_eq!(draft.kind, AliasKind::Regex);
             assert!(draft.degraded);
             assert_eq!(draft.regex_source, r"^greetz\s+(.*)$");
             // Saving keeps the hand edit and drops the lying sidecar.
-            assert_eq!(draft.to_pattern().unwrap(), r"^greetz\s+(.*)$");
+            assert_eq!(draft.to_pattern("greet").unwrap(), r"^greetz\s+(.*)$");
             assert_eq!(draft.to_matcher(), None);
+        }
+
+        #[test]
+        fn the_alias_name_is_the_command_until_an_override_is_pinned() {
+            let draft = AliasMatcherDraft {
+                kind: AliasKind::Command,
+                ..AliasMatcherDraft::default()
+            };
+            // Renaming the alias renames the command, prefilter and all.
+            assert_eq!(draft.command_word("obe"), "obe");
+            assert_eq!(draft.to_pattern("obe").unwrap(), r"^obe(?:\s|$)");
+            assert_eq!(draft.to_pattern("bash").unwrap(), r"^bash(?:\s|$)");
+            assert!(matches!(
+                draft.to_matcher(),
+                Some(AliasMatcherSource::Command { name: None, .. })
+            ));
+            assert!(!draft.shows_command_override("obe"));
+
+            // A pinned override wins and keeps its row on screen.
+            let pinned = AliasMatcherDraft {
+                command_override: Some("*".to_string()),
+                ..draft.clone()
+            };
+            assert_eq!(pinned.command_word("star-emote"), "*");
+            assert_eq!(pinned.to_pattern("star-emote").unwrap(), r"^\*(?:\s|$)");
+            assert!(pinned.shows_command_override("star-emote"));
+
+            // Revealed but blank is no override: it still inherits, and it
+            // still saves as an absent field.
+            let blank = AliasMatcherDraft {
+                command_override: Some("  ".to_string()),
+                ..draft.clone()
+            };
+            assert_eq!(blank.command_word("obe"), "obe");
+            assert!(matches!(
+                blank.to_matcher(),
+                Some(AliasMatcherSource::Command { name: None, .. })
+            ));
+            assert!(blank.shows_command_override("obe"));
+        }
+
+        #[test]
+        fn a_name_that_cannot_be_a_command_word_blocks_the_save() {
+            let draft = AliasMatcherDraft {
+                kind: AliasKind::Command,
+                ..AliasMatcherDraft::default()
+            };
+            // Names may contain spaces; command words are one token, so the
+            // override row reveals itself and the save refuses until it is
+            // filled in.
+            assert!(draft.to_pattern("guild tell").is_err());
+            assert!(draft.shows_command_override("guild tell"));
+            assert!(draft.to_pattern("   ").is_err());
+
+            let rescued = AliasMatcherDraft {
+                command_override: Some("gt".to_string()),
+                ..draft
+            };
+            assert_eq!(rescued.to_pattern("guild tell").unwrap(), r"^gt(?:\s|$)");
         }
 
         #[test]
         fn simple_mode_normalizes_args_to_optional_then_rest() {
             let mut draft = AliasMatcherDraft {
                 kind: AliasKind::Command,
-                command: "greet".to_string(),
+                command_override: None,
                 args: vec![
                     ArgSpec {
                         name: "a".to_string(),

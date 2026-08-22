@@ -1078,10 +1078,12 @@ impl Inner<'_> {
             } => {
                 // The one place the runtime reads authoring state: a Command
                 // sidecar's parser spec rides into the matcher at load time.
+                // The alias name resolves the command word unless the sidecar
+                // pins an override.
                 let command = alias
                     .matcher
                     .as_ref()
-                    .and_then(crate::models::matchers::AliasMatcherSource::command_spec);
+                    .and_then(|matcher| matcher.command_spec(name.as_str()));
                 match alias.language {
                     ScriptLang::Plaintext => {
                         self.trigger_manager.push_simple_alias(
