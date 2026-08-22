@@ -140,6 +140,15 @@ pub enum SessionEvent {
     /// hold the new values and the widget render closures read them lock-free,
     /// so the UI needs no state change — processing the message redraws the view.
     StoreBindingsChanged,
+    /// A sandboxed package successfully prepared its first online Web Audio
+    /// context for this isolate generation. The UI records the versionless
+    /// package observation in `smudgy.lock.json` and may then expose its
+    /// package-specific gain row. Best-effort and advisory: playback itself
+    /// never waits for persistence.
+    PackageAudioUsed {
+        owner: Arc<str>,
+        name: Arc<str>,
+    },
     /// A lazy script-link tooltip resolved into the shared cell held by the
     /// rendered line. Pure repaint wake; no UI-owned state changes.
     LinkTooltipChanged,

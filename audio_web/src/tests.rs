@@ -24,6 +24,36 @@ const TEST_RATE: u32 = 48_000;
 const TEST_RATE_F32: f32 = 48_000.0;
 const INPUT_CAPACITY: usize = 32;
 
+#[test]
+fn package_audio_usage_observer_retries_until_first_accepted_prepare() {
+    let reports = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&reports);
+    let output: Arc<dyn AudioOutputFactory> = observe_audio_use(
+        Arc::new(SilentAudioOutput::new()),
+        Some(Arc::new(move || {
+            observed.fetch_add(1, Ordering::AcqRel) > 0
+        })),
+    );
+
+    let named = AudioContext::builder(Arc::clone(&output))
+        .options(AudioContextOptions {
+            sink_id: "named-device".into(),
+            ..AudioContextOptions::default()
+        })
+        .build();
+    assert!(named.is_err());
+    assert_eq!(reports.load(Ordering::Acquire), 0);
+
+    let first = AudioContext::builder(Arc::clone(&output)).build().unwrap();
+    assert_eq!(reports.load(Ordering::Acquire), 1);
+    let second = AudioContext::builder(Arc::clone(&output)).build().unwrap();
+    let third = AudioContext::builder(output).build().unwrap();
+    assert_eq!(reports.load(Ordering::Acquire), 2);
+    first.close_sync();
+    second.close_sync();
+    third.close_sync();
+}
+
 struct HostilePayload;
 
 impl Drop for HostilePayload {

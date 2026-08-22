@@ -318,6 +318,7 @@ toolbar-automations = 自動化
 toolbar-map-editor = 地圖編輯器
 toolbar-layouts = 版面配置
 toolbar-settings = 設定
+toolbar-audio = 音訊
 
 # Named layouts menu
 layouts-apply-hint = 點選版面配置即可套用。
@@ -345,6 +346,7 @@ audio-output-unavailable = 實體音訊輸出無法使用（{ $cause }）。終�
 audio-output-failed = 本次啟動的音訊輸出失敗（{ $cause }）。終端機仍可使用；重新啟動前無法套用或儲存控制設定。
 audio-panel-open = 音訊控制 ▲（{ $shortcut }）
 audio-panel-closed = 音訊控制 ▼（{ $shortcut }）
+audio-panel-title = 音訊控制（{ $shortcut }）
 audio-panel-keyboard-help = 使用 Tab/Shift+Tab 在控制項間移動；方向鍵每次調整 5%；Home/End 設為極限；空白鍵切換靜音。
 audio-master-label = 主音量
 audio-state-muted = 已靜音

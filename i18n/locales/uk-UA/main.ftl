@@ -329,6 +329,7 @@ toolbar-automations = Автоматизації
 toolbar-map-editor = Редактор мап
 toolbar-layouts = Розкладки
 toolbar-settings = Налаштування
+toolbar-audio = Аудіо
 
 # Named layouts menu
 layouts-apply-hint = Натисніть на розкладку, щоб застосувати її.
@@ -356,6 +357,7 @@ audio-output-unavailable = Фізичний аудіовихід недосту�
 audio-output-failed = Аудіовихід відмовив під час цього запуску ({ $cause }). Термінал продовжує працювати; до перезапуску елементи керування не можна застосувати або зберегти.
 audio-panel-open = Керування аудіо ▲ ({ $shortcut })
 audio-panel-closed = Керування аудіо ▼ ({ $shortcut })
+audio-panel-title = Керування аудіо ({ $shortcut })
 audio-panel-keyboard-help = Tab/Shift+Tab переходить між елементами; стрілки змінюють на 5%; Home/End задають межі; Пробіл перемикає вимкнення звуку.
 audio-master-label = Загальна гучність
 audio-state-muted = Звук вимкнено

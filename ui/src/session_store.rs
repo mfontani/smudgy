@@ -540,6 +540,10 @@ pub struct AudioPackageRow {
     pub owner: Arc<str>,
     pub name: Arc<str>,
     pub trusted: bool,
+    /// Persisted evidence that this versionless package root has successfully
+    /// prepared Web Audio at least once. Rows without this evidence stay out
+    /// of the audio-controls modal.
+    pub audio_used: bool,
     pub gain: AudioGainSettings,
     /// True only after an exact live package controller acknowledged a UI
     /// mutation. Startup/reload staging alone does not prove an active root.
@@ -576,6 +580,7 @@ fn load_audio_package_rows(server: &str) -> Result<Vec<AudioPackageRow>, String>
                 owner: Arc::from(owner.to_ascii_lowercase()),
                 name: Arc::from(name.to_ascii_lowercase()),
                 trusted: package.trusted,
+                audio_used: package.audio_used,
                 gain: AudioGainSettings::default(),
                 applied: false,
             })
@@ -584,6 +589,19 @@ fn load_audio_package_rows(server: &str) -> Result<Vec<AudioPackageRow>, String>
     rows.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
     rows.dedup_by(|left, right| left.owner == right.owner && left.name == right.name);
     Ok(rows)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn mark_package_audio_used(rows: &mut [AudioPackageRow], owner: &str, name: &str) -> Option<bool> {
+    let Some(row) = rows
+        .iter_mut()
+        .find(|row| row.owner.eq_ignore_ascii_case(owner) && row.name.eq_ignore_ascii_case(name))
+    else {
+        return None;
+    };
+    let changed = !row.audio_used;
+    row.audio_used = true;
+    Some(changed)
 }
 
 #[cfg(feature = "web-audio-cpal")]
@@ -2750,6 +2768,28 @@ impl ManagedSession {
                         // update here — processing the message redraws the view.
                         Task::none()
                     }
+                    SessionEvent::PackageAudioUsed { owner, name } => {
+                        #[cfg(feature = "web-audio-cpal")]
+                        {
+                            let needs_persistence =
+                                mark_package_audio_used(&mut self.audio_packages, &owner, &name)
+                                    .unwrap_or(true);
+                            if needs_persistence
+                                && let Err(error) = shared_packages::record_audio_use(
+                                    &self.server_name,
+                                    &owner,
+                                    &name,
+                                )
+                            {
+                                log::warn!(
+                                    "could not persist Web Audio use for {owner}/{name}: {error:#}"
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "web-audio-cpal"))]
+                        let _ = (owner, name);
+                        Task::none()
+                    }
                     SessionEvent::LinkTooltipChanged => Task::none(),
                     SessionEvent::InputOp { key, op } => {
                         // The op layer refuses targets without an input, so a
@@ -3444,6 +3484,7 @@ mod tests {
             owner: Arc::from(owner),
             name: Arc::from(name),
             trusted: false,
+            audio_used: true,
             gain: AudioGainSettings {
                 volume: 35,
                 muted: true,
@@ -3470,6 +3511,37 @@ mod tests {
 
     #[cfg(feature = "web-audio-cpal")]
     #[test]
+    fn observed_package_audio_use_reveals_only_the_matching_versionless_row() {
+        let row = |owner: &str, name: &str| AudioPackageRow {
+            ui_key: 1,
+            action_key: 1,
+            owner: Arc::from(owner),
+            name: Arc::from(name),
+            trusted: false,
+            audio_used: false,
+            gain: AudioGainSettings::default(),
+            applied: false,
+        };
+        let mut rows = vec![row("wbk", "earcon"), row("wbk", "mapper")];
+
+        assert_eq!(
+            mark_package_audio_used(&mut rows, "WBK", "EARCON"),
+            Some(true)
+        );
+        assert!(rows[0].audio_used);
+        assert!(!rows[1].audio_used);
+        assert_eq!(
+            mark_package_audio_used(&mut rows, "wbk", "earcon"),
+            Some(false)
+        );
+        assert_eq!(
+            mark_package_audio_used(&mut rows, "unknown", "package"),
+            None
+        );
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
     fn output_failed_reload_retains_last_acknowledged_session_and_package_values() {
         let row = |ui_key, action_key, owner: &str, volume| AudioPackageRow {
             ui_key,
@@ -3477,6 +3549,7 @@ mod tests {
             owner: Arc::from(owner),
             name: Arc::from("bell"),
             trusted: false,
+            audio_used: true,
             gain: AudioGainSettings {
                 volume,
                 muted: false,

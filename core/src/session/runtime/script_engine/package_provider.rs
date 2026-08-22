@@ -381,6 +381,7 @@ impl SmudgyPackageProvider {
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         };
         let known_install = {
             let mut lock = self.lock.borrow_mut();

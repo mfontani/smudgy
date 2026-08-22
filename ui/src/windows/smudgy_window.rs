@@ -162,7 +162,7 @@ pub enum Event {
     /// runtime shutdown, grid cleanup across all windows, the empty-window
     /// rule — is the daemon's job.
     CloseSession(SessionId),
-    /// A focused command input invoked the reserved audio-panel shortcut.
+    /// The toolbar or reserved keyboard shortcut requested the audio modal.
     #[cfg(feature = "web-audio-cpal")]
     OpenAudioPanel,
     /// The user clicked a pane's title-bar eyeball. The window already
@@ -656,10 +656,6 @@ fn target_overlay_rects(target: Option<&ClassifiedTarget>) -> Vec<drag_overlay::
 }
 
 impl SmudgyWindow {
-    #[cfg(feature = "web-audio-cpal")]
-    pub fn has_modal(&self) -> bool {
-        self.modal.is_some()
-    }
     pub fn new(window_id: window::Id, cloud: CloudHandles) -> Self {
         Self {
             window_id,
@@ -2775,6 +2771,8 @@ impl SmudgyWindow {
                     Update::none()
                 }
                 toolbar::Message::SettingsPressed => Update::with_event(Event::OpenSettingsWindow),
+                #[cfg(feature = "web-audio-cpal")]
+                toolbar::Message::AudioPressed => Update::with_event(Event::OpenAudioPanel),
                 toolbar::Message::DragWindow => Update::with_task(window::drag(self.window_id)),
                 toolbar::Message::MinimizePressed => {
                     Update::with_task(window::minimize(self.window_id, true))
@@ -4022,6 +4020,18 @@ mod tests {
 
     fn test_window() -> SmudgyWindow {
         SmudgyWindow::new(window::Id::unique(), crate::cloud_account::test_handles())
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn toolbar_audio_action_requests_the_window_modal() {
+        let mut window = test_window();
+        let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
+        let update = window.update(
+            Message::ToolbarAction(toolbar::Message::AudioPressed),
+            &mut sessions,
+        );
+        assert!(matches!(update.event, Some(Event::OpenAudioPanel)));
     }
 
     #[cfg(feature = "web-audio-cpal")]

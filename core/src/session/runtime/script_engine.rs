@@ -1141,8 +1141,25 @@ impl<'a> ScriptEngine<'a> {
                     let options = match &isolate_id {
                         IsolateId::Main => audio_scope.extension_options(),
                         IsolateId::Package { owner, name, .. } => {
+                            let observed_owner: Arc<str> = Arc::from(owner.to_owned());
+                            let observed_name: Arc<str> = Arc::from(name.to_owned());
+                            let observed_ui = params.ui_tx.clone();
                             let (options, binding) = audio_scope
-                                .extension_options_for_sandbox_root(owner, name)
+                                .extension_options_for_sandbox_root_with_usage_observer(
+                                    owner,
+                                    name,
+                                    Arc::new(move || {
+                                        let mut ui = observed_ui.clone();
+                                        ui.try_send(TaggedSessionEvent {
+                                            session_id,
+                                            event: SessionEvent::PackageAudioUsed {
+                                                owner: Arc::clone(&observed_owner),
+                                                name: Arc::clone(&observed_name),
+                                            },
+                                        })
+                                        .is_ok()
+                                    }),
+                                )
                                 .map_err(|error| format!("{error:?}"))?;
                             package_audio_binding = binding;
                             options

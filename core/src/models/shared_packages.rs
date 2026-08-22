@@ -107,12 +107,23 @@ pub struct LockedPackage {
     /// user-installed entries are never treated as orphans. See `script/REQUIRED-PACKAGES.md`.
     #[serde(default)]
     pub installed_as_requirement: bool,
+    /// Whether this package has successfully prepared at least one Web Audio
+    /// context while sandboxed. This is observed behavior, not a declared
+    /// permission: it only controls whether package-specific gain controls
+    /// are worth showing. The versionless bit survives package updates and
+    /// defaults to `false` for pre-audio lockfiles.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub audio_used: bool,
 }
 
 /// The serde default for [`LockedPackage::enabled`] — `true`, so a lock entry written before this
 /// field existed (or by any path that doesn't set it) is treated as enabled and keeps running.
 fn default_enabled() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl LockedPackage {
@@ -129,6 +140,7 @@ impl LockedPackage {
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         }
     }
 
@@ -517,6 +529,31 @@ pub fn set_enabled(server_name: &str, specifier: &str, enabled: bool) -> Result<
     save_lock(server_name, &lock)
 }
 
+/// Records that one installed package successfully prepared a sandboxed Web
+/// Audio context. Returns `true` only when the durable bit changed.
+///
+/// Matching is ASCII case-insensitive because package-audio policy is keyed
+/// by the same versionless folded `(owner, name)` identity. Repeated reports
+/// are no-ops and avoid rewriting the lockfile.
+///
+/// # Errors
+/// Returns an error if the package is absent or the lockfile cannot be saved.
+pub fn record_audio_use(server_name: &str, owner: &str, name: &str) -> Result<bool> {
+    let specifier = format!("smudgy://{owner}/{name}");
+    let mut lock = load_lock(server_name)?;
+    let package = lock
+        .packages
+        .iter_mut()
+        .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
+        .with_context(|| format!("package {specifier} is not installed"))?;
+    if package.audio_used {
+        return Ok(false);
+    }
+    package.audio_used = true;
+    save_lock(server_name, &lock)?;
+    Ok(true)
+}
+
 /// Records the deno-native permission union the user consented to for an already-installed
 /// package (`script/PACKAGE-ISOLATES-CONSENT-TRUST.md`) — the all-or-nothing grant the
 /// install/update confirmation captures. Store the whole *closure* union; the engine
@@ -566,6 +603,7 @@ pub fn record_resolution(
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         });
     }
     save_lock(server_name, &lock)
@@ -949,6 +987,7 @@ mod tests {
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         });
 
         save_lock_in(&dir, &lock).expect("save");
@@ -961,6 +1000,31 @@ mod tests {
         let dir = temp_dir("lock-missing");
         assert_eq!(load_lock_in(&dir).unwrap(), SharedPackageLock::default());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn package_audio_use_is_versionless_case_folded_and_idempotent() {
+        use_temp_smudgy_home();
+        let server = "package-audio-use";
+        let mut lock = SharedPackageLock::default();
+        lock.upsert(LockedPackage::new(
+            "smudgy://wbk/earcon",
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        ));
+        lock.upsert(LockedPackage::new(
+            "smudgy://wbk/unrelated",
+            UpdateMode::Auto,
+        ));
+        save_lock(server, &lock).unwrap();
+
+        assert!(record_audio_use(server, "WBK", "EARCON").unwrap());
+        assert!(!record_audio_use(server, "wbk", "earcon").unwrap());
+
+        let saved = load_lock(server).unwrap();
+        assert!(saved.find("smudgy://wbk/earcon").unwrap().audio_used);
+        assert!(!saved.find("smudgy://wbk/unrelated").unwrap().audio_used);
     }
 
     #[test]

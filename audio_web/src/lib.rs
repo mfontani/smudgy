@@ -1078,6 +1078,35 @@ impl SessionAudioScope {
         name: &str,
     ) -> Result<(AudioExtensionOptions, Option<PackageAudioScopeBinding>), PackageAudioScopeError>
     {
+        self.extension_options_for_sandbox_root_inner(owner, name, None)
+    }
+
+    /// Builds sandbox-root options and reports the first successfully
+    /// observed online context for this isolate generation.
+    ///
+    /// The observer runs on the script thread, after output preparation has
+    /// succeeded and before the context is returned to JavaScript. It must be
+    /// quick and nonblocking; returning `true` confirms that the observation
+    /// was accepted. A `false` result is retried after the next successful
+    /// context preparation, so bounded-channel pressure cannot permanently
+    /// hide a package that uses audio.
+    pub fn extension_options_for_sandbox_root_with_usage_observer(
+        &self,
+        owner: &str,
+        name: &str,
+        on_audio_used: Arc<dyn Fn() -> bool + Send + Sync + 'static>,
+    ) -> Result<(AudioExtensionOptions, Option<PackageAudioScopeBinding>), PackageAudioScopeError>
+    {
+        self.extension_options_for_sandbox_root_inner(owner, name, Some(on_audio_used))
+    }
+
+    fn extension_options_for_sandbox_root_inner(
+        &self,
+        owner: &str,
+        name: &str,
+        on_audio_used: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+    ) -> Result<(AudioExtensionOptions, Option<PackageAudioScopeBinding>), PackageAudioScopeError>
+    {
         let app = lock_gate(&self.inner.app.gate);
         let session = lock_gate(&self.inner.session_gate);
         if !app.open || !session.open {
@@ -1085,7 +1114,11 @@ impl SessionAudioScope {
         }
         let root = PackageAudioRoot::new(owner, name)?;
         let Some(registry) = &self.inner.package_audio else {
-            return Ok((self.extension_options(), None));
+            let output = observe_audio_use(Arc::clone(&self.inner.output), on_audio_used);
+            let options = AudioExtensionOptions::new(Arc::clone(&self.inner.app.host))
+                .permissions(Arc::clone(&self.inner.permissions))
+                .output_factory(output);
+            return Ok((options, None));
         };
         let (gain, binding) = registry.bind_root(root)?;
         let output: Arc<dyn AudioOutputFactory> = Arc::new(GatedSessionAudioOutputFactory {
@@ -1102,6 +1135,7 @@ impl SessionAudioScope {
                 ),
             ),
         });
+        let output = observe_audio_use(output, on_audio_used);
         let options = AudioExtensionOptions::new(Arc::clone(&self.inner.app.host))
             .permissions(Arc::clone(&self.inner.permissions))
             .output_factory(output);
@@ -1109,6 +1143,38 @@ impl SessionAudioScope {
         drop(app);
         Ok((options, Some(binding)))
     }
+}
+
+struct ObservedAudioOutputFactory {
+    delegate: Arc<dyn AudioOutputFactory>,
+    observed: AtomicBool,
+    on_audio_used: Arc<dyn Fn() -> bool + Send + Sync + 'static>,
+}
+
+impl AudioOutputFactory for ObservedAudioOutputFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        let prepared = self.delegate.prepare(request)?;
+        if !self.observed.load(Ordering::Acquire) && (self.on_audio_used)() {
+            self.observed.store(true, Ordering::Release);
+        }
+        Ok(prepared)
+    }
+}
+
+fn observe_audio_use(
+    delegate: Arc<dyn AudioOutputFactory>,
+    observer: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+) -> Arc<dyn AudioOutputFactory> {
+    observer.map_or(delegate.clone(), |on_audio_used| {
+        Arc::new(ObservedAudioOutputFactory {
+            delegate,
+            observed: AtomicBool::new(false),
+            on_audio_used,
+        })
+    })
 }
 
 /// Unique lifetime owner for one registered mixer-session generation.

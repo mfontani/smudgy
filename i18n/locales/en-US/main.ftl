@@ -325,6 +325,7 @@ toolbar-automations = Automations
 toolbar-map-editor = Map Editor
 toolbar-layouts = Layouts
 toolbar-settings = Settings
+toolbar-audio = Audio
 
 # Named layouts menu
 layouts-apply-hint = Click a layout to apply it.
@@ -352,6 +353,7 @@ audio-output-unavailable = Physical audio output is unavailable ({ $cause }). Th
 audio-output-failed = Audio output failed for this launch ({ $cause }). The terminal remains usable; controls cannot be applied or saved until restart.
 audio-panel-open = Audio controls ▲ ({ $shortcut })
 audio-panel-closed = Audio controls ▼ ({ $shortcut })
+audio-panel-title = Audio controls ({ $shortcut })
 audio-panel-keyboard-help = Tab/Shift+Tab moves between controls; arrows adjust 5%; Home/End set limits; Space mutes.
 audio-master-label = Master
 audio-state-muted = Muted

@@ -327,6 +327,7 @@ toolbar-automations = Automatyzacje
 toolbar-map-editor = Edytor map
 toolbar-layouts = Układy
 toolbar-settings = Ustawienia
+toolbar-audio = Dźwięk
 
 # Named layouts menu
 layouts-apply-hint = Kliknij układ, aby go zastosować.
@@ -354,6 +355,7 @@ audio-output-unavailable = Fizyczne wyjście dźwięku jest niedostępne ({ $cau
 audio-output-failed = Wyjście dźwięku uległo awarii w tym uruchomieniu ({ $cause }). Terminal nadal działa; do ponownego uruchomienia nie można stosować ani zapisywać ustawień dźwięku.
 audio-panel-open = Sterowanie dźwiękiem ▲ ({ $shortcut })
 audio-panel-closed = Sterowanie dźwiękiem ▼ ({ $shortcut })
+audio-panel-title = Sterowanie dźwiękiem ({ $shortcut })
 audio-panel-keyboard-help = Tab/Shift+Tab przełącza kontrolki; strzałki zmieniają o 5%; Home/End ustawia skrajne wartości; Spacja wycisza.
 audio-master-label = Głośność główna
 audio-state-muted = Wyciszony

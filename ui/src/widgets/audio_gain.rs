@@ -289,6 +289,7 @@ where
 pub struct AudioPanelRoot<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_open: Box<dyn Fn() -> Message + 'a>,
+    on_close: Option<Box<dyn Fn() -> Message + 'a>>,
 }
 
 impl<'a, Message, Theme, Renderer> AudioPanelRoot<'a, Message, Theme, Renderer> {
@@ -299,7 +300,15 @@ impl<'a, Message, Theme, Renderer> AudioPanelRoot<'a, Message, Theme, Renderer> 
         Self {
             content: content.into(),
             on_open: Box::new(on_open),
+            on_close: None,
         }
+    }
+
+    /// Close the panel before an underlying modal or focused child can
+    /// consume Escape.
+    pub fn on_close(mut self, on_close: impl Fn() -> Message + 'a) -> Self {
+        self.on_close = Some(Box::new(on_close));
+        self
     }
 }
 
@@ -374,6 +383,14 @@ where
                 if !repeat {
                     shell.publish((self.on_open)());
                 }
+                shell.capture_event();
+                return;
+            }
+            if !repeat
+                && matches!(key, Key::Named(Named::Escape))
+                && let Some(on_close) = self.on_close.as_ref()
+            {
+                shell.publish(on_close());
                 shell.capture_event();
                 return;
             }
