@@ -24,7 +24,7 @@ use std::sync::Arc;
 use smudgy_cloud::{CloudError, PackageApiClient, ResolvedDependency, ResolvedModuleWire};
 use smudgy_script::{
     PackageError, PackageKey, PackageManifest, PackageModuleSource, PackageParameter,
-    PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage,
+    PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage, canonical_url,
 };
 
 use super::package_cache::{CachedModule, CachedResolution, PackageCache, is_code_module};
@@ -1115,6 +1115,22 @@ impl PackageProvider for SmudgyPackageProvider {
     fn get_resolved(&self, key: &PackageKey) -> Option<Rc<ResolvedPackage>> {
         let version = self.resolved_versions.borrow().get(key).cloned()?;
         self.cache.borrow().get(&(key.clone(), version)).cloned()
+    }
+
+    /// Copy the package archives fetched for this isolate into an owned, `Send` source map.
+    /// `cache` contains code-load resolutions only (not solve-prepass or interop-stub fetches),
+    /// and its versioned keys preserve intra-isolate coexistence.
+    fn snapshot_module_sources(&self) -> HashMap<String, String> {
+        let mut sources = HashMap::new();
+        for ((key, version), package) in self.cache.borrow().iter() {
+            for module in &package.modules {
+                sources.insert(
+                    canonical_url(key, version, &module.subpath).to_string(),
+                    module.text.clone(),
+                );
+            }
+        }
+        sources
     }
 
     /// The closure permission union folded by the last `solve_closure` over this isolate's

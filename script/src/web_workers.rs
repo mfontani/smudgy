@@ -22,13 +22,14 @@
 //! `unimplemented!()`: every module-worker construction spawns an OS thread
 //! that immediately panics.
 
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::{
     Extension, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, ResolutionKind,
+    ModuleSource, ModuleSourceCode, ModuleSpecifier, ResolutionKind,
 };
 use deno_error::JsErrorBox;
 use deno_fs::RealFs;
@@ -193,13 +194,19 @@ fn worker_realm_guard_extension() -> Extension {
     }
 }
 
-/// Module loader for worker realms: `file:` modules (transpiled like the main
-/// loader's file path) and `data:` JavaScript modules only. No npm/jsr/https,
-/// no `smudgy:*` schemes — a worker imports no registry code and no smudgy
-/// API. `data:` bodies are percent-decoded plain JavaScript (the common
-/// inline-worker form); base64 `data:` URLs and `blob:` workers are not
-/// supported in v1.
-struct WorkerModuleLoader;
+/// Immutable package sources published by a parent isolate after its initial module graph
+/// has loaded. The provider that supplied them is `!Send`; this owned map is the intentionally
+/// narrow, `Send` channel into off-thread worker realms.
+pub(crate) type WorkerModuleSourceChannel = Arc<OnceLock<HashMap<String, String>>>;
+
+/// Module loader for worker realms: `file:` modules (transpiled like the main loader's file
+/// path), `data:` JavaScript modules, and canonical `smudgy-pkg:` sources snapshotted from the
+/// parent isolate. No npm/jsr/https or smudgy virtual/API schemes. `data:` bodies are
+/// percent-decoded plain JavaScript (the common inline-worker form); base64 `data:` URLs and
+/// `blob:` workers are not supported in v1.
+struct WorkerModuleLoader {
+    package_sources: WorkerModuleSourceChannel,
+}
 
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -229,11 +236,11 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn loader_error(message: String) -> ModuleLoaderError {
-    JsErrorBox::generic(message).into()
+    JsErrorBox::generic(message)
 }
 
 impl WorkerModuleLoader {
-    fn load_source(specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
+    fn load_source(&self, specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
         let source = match specifier.scheme() {
             "file" => {
                 let path = specifier
@@ -260,9 +267,19 @@ impl WorkerModuleLoader {
                 }
                 percent_decode(payload)
             }
+            crate::package_resolver::CANONICAL_SCHEME => self
+                .package_sources
+                .get()
+                .and_then(|sources| sources.get(specifier.as_str()))
+                .cloned()
+                .ok_or_else(|| {
+                    loader_error(format!(
+                        "package worker module was not present in the parent isolate's source snapshot: {specifier}"
+                    ))
+                })?,
             scheme => {
                 return Err(loader_error(format!(
-                    "worker modules may only load file: or data: sources; \
+                    "worker modules may only load file:, data:, or snapshotted smudgy-pkg: sources; \
                      {scheme}: is not available inside a worker ({specifier})"
                 )));
             }
@@ -270,7 +287,7 @@ impl WorkerModuleLoader {
 
         let (code, _source_map) = transpile(specifier, &source).map_err(JsErrorBox::from_err)?;
         Ok(ModuleSource::new(
-            ModuleType::JavaScript,
+            crate::package_resolver::module_type_for(specifier.path()),
             ModuleSourceCode::String(code.into()),
             specifier,
             None,
@@ -285,7 +302,7 @@ impl ModuleLoader for WorkerModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        deno_core::resolve_import(specifier, referrer).map_err(|e| JsErrorBox::from_err(e).into())
+        deno_core::resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
     }
 
     fn load(
@@ -294,7 +311,7 @@ impl ModuleLoader for WorkerModuleLoader {
         _maybe_referrer: Option<&ModuleLoadReferrer>,
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        ModuleLoadResponse::Sync(Self::load_source(specifier))
+        ModuleLoadResponse::Sync(self.load_source(specifier))
     }
 }
 
@@ -311,13 +328,19 @@ impl ModuleLoader for WorkerModuleLoader {
 /// worker therefore always boots the parent's snapshot; on the audio blob it
 /// registers a matching state-free deno_audio extension (options-default,
 /// exactly like the snapshot build) whose ops the realm guard disables.
-pub(crate) fn create_web_worker_callback(web_audio: bool) -> Arc<CreateWebWorkerCb> {
-    Arc::new(move |args: CreateWebWorkerArgs| create_compute_worker(args, web_audio))
+pub(crate) fn create_web_worker_callback(
+    web_audio: bool,
+    package_sources: WorkerModuleSourceChannel,
+) -> Arc<CreateWebWorkerCb> {
+    Arc::new(move |args: CreateWebWorkerArgs| {
+        create_compute_worker(args, web_audio, Arc::clone(&package_sources))
+    })
 }
 
 fn create_compute_worker(
     args: CreateWebWorkerArgs,
     web_audio: bool,
+    package_sources: WorkerModuleSourceChannel,
 ) -> (WebWorker, deno_runtime::web_worker::SendableWebWorkerHandle) {
     let parser = Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
     // No authority, not inherited authority: the spawning isolate's forwarded
@@ -326,22 +349,23 @@ fn create_compute_worker(
     // realm's contract is compute plus the message bridge, nothing else.
     let permissions = PermissionsContainer::new(parser, Permissions::none_without_prompt());
 
-    let services = WebWorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
-        blob_store: Arc::new(deno_web::BlobStore::default()),
-        broadcast_channel: deno_web::InMemoryBroadcastChannel::default(),
-        deno_rt_native_addon_loader: None,
-        compiled_wasm_module_store: None,
-        feature_checker: crate::quiet_feature_checker(),
-        fs: Arc::new(RealFs),
-        main_inspector_session_tx: MainInspectorSessionChannel::new(),
-        module_loader: Rc::new(WorkerModuleLoader),
-        node_services: None,
-        npm_process_state_provider: None,
-        permissions,
-        root_cert_store_provider: None,
-        shared_array_buffer_store: None,
-        bundle_provider: None,
-    };
+    let services =
+        WebWorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
+            blob_store: Arc::new(deno_web::BlobStore::default()),
+            broadcast_channel: deno_web::InMemoryBroadcastChannel::default(),
+            deno_rt_native_addon_loader: None,
+            compiled_wasm_module_store: None,
+            feature_checker: crate::quiet_feature_checker(),
+            fs: Arc::new(RealFs),
+            main_inspector_session_tx: MainInspectorSessionChannel::new(),
+            module_loader: Rc::new(WorkerModuleLoader { package_sources }),
+            node_services: None,
+            npm_process_state_provider: None,
+            permissions,
+            root_cert_store_provider: None,
+            shared_array_buffer_store: None,
+            bundle_provider: None,
+        };
 
     #[cfg(feature = "web-audio")]
     let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = if web_audio {
@@ -359,7 +383,10 @@ fn create_compute_worker(
     };
     #[cfg(not(feature = "web-audio"))]
     let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = {
-        debug_assert!(!web_audio, "audio-snapshot parents require the web-audio feature");
+        debug_assert!(
+            !web_audio,
+            "audio-snapshot parents require the web-audio feature"
+        );
         (
             crate::STARTUP_SNAPSHOT,
             crate::RESIDUAL_LAZY_JS_SOURCES,
@@ -372,15 +399,17 @@ fn create_compute_worker(
     // ESM never imported (no bootstrap side-module runs in workers), ops
     // disabled by the realm guard, default (state-free) options exactly like
     // the snapshot build's instance.
-    let mut extensions = Vec::new();
+    let extensions = vec![worker_realm_guard_extension()];
     #[cfg(feature = "web-audio")]
-    if web_audio {
-        let mut audio =
-            deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
+    let extensions = if web_audio {
+        let mut audio = deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
         crate::prepare_deferred_web_audio_extension(&mut audio);
-        extensions.push(audio);
-    }
-    extensions.push(worker_realm_guard_extension());
+        let mut extensions = extensions;
+        extensions.insert(0, audio);
+        extensions
+    } else {
+        extensions
+    };
 
     let mut options = WebWorkerOptions {
         name: args.name,

@@ -871,9 +871,8 @@ async fn gmcp_send_is_its_own_capability() {
 
 /// The `workers` capability (`workers: ["spawn"]`, declared in the manifest's wire shape and
 /// consented) gates Web Worker construction. Granted: a data:-URL module worker constructs,
-/// round-trips one postMessage, and terminates — data: because the worker loader serves
-/// file:/data: only and package sources are not files. Ungated: `new Worker` is the facade's
-/// catchable TypeError, naming the capability.
+/// round-trips one `postMessage`, and terminates. Ungated: `new Worker` is the facade's catchable
+/// `TypeError`, naming the capability.
 #[tokio::test]
 async fn workers_capability_gates_worker_construction() {
     // A worker boot spawns a thread and initializes a fresh realm, which can outlast the
@@ -997,7 +996,7 @@ async fn worker_constructions_pass_the_cap_guard() {
 }
 
 /// A relative Worker specifier resolves against the CALLING module, not the synthetic
-/// `file:///smudgy-main.js` location deno_runtime would otherwise use: a local module's
+/// `file:///smudgy-main.js` location `deno_runtime` would otherwise use: a local module's
 /// `new Worker("./workers/worker.ts")` names its on-disk sibling. This is the trusted
 /// main isolate (local modules), with no packages installed.
 #[tokio::test]
@@ -1083,5 +1082,70 @@ async fn worker_relative_specifier_resolves_against_the_calling_module() {
     assert!(
         !has_line(&lines, "WORKER_REL_ERROR:"),
         "no worker error on the relative path; transcript:\n{lines:#?}"
+    );
+}
+
+/// A sandboxed package's relative worker URL resolves to `smudgy-pkg:` and loads from the
+/// immutable source snapshot published after the parent graph load. The worker entry is not
+/// imported by the parent graph, and it imports another package-relative TypeScript module, so
+/// this covers the full fetched archive rather than only modules V8 already instantiated.
+#[tokio::test]
+async fn sandboxed_package_worker_loads_relative_package_modules() {
+    let package_src = r#"
+        import { echo } from "smudgy:core";
+        const worker = new Worker("./workers/worker.ts", { type: "module" });
+        const keepalive = setInterval(() => echo("WAITING"), 200);
+        const done = () => clearInterval(keepalive);
+        setTimeout(done, 15000);
+        worker.onmessage = (e) => {
+            done();
+            echo("PKG_WORKER_REPLY:" + e.data);
+            worker.terminate();
+        };
+        worker.onerror = (e) => {
+            e.preventDefault();
+            done();
+            echo("PKG_WORKER_ERROR:" + e.message);
+        };
+        worker.postMessage("ping");
+    "#;
+    let mut package = make_package_declaring(
+        "wbk",
+        "workerarchive",
+        "1.0.0",
+        r#"{ "workers": ["spawn"], "session": ["echo"] }"#,
+        package_src,
+    );
+    package.modules.extend([
+        PackageModuleSource {
+            subpath: "workers/worker.ts".to_string(),
+            text: r#"
+                import { reply } from "./reply.ts";
+                onmessage = (e: MessageEvent<string>) => postMessage(reply(e.data));
+            "#
+            .to_string(),
+        },
+        PackageModuleSource {
+            subpath: "workers/reply.ts".to_string(),
+            text: "export const reply = (value: string): string => `pong:${value}`;\n".to_string(),
+        },
+    ]);
+
+    let lines = run_capability_case(
+        9650,
+        "pi_caps_workers_package_relative",
+        "smudgy://wbk/workerarchive",
+        Some(consent_with(|s| s.workers = true)),
+        package,
+    )
+    .await;
+
+    assert!(
+        has_line(&lines, "PKG_WORKER_REPLY:pong:ping"),
+        "a sandboxed package worker loads its entry and relative dependency from the source snapshot; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "PKG_WORKER_ERROR:"),
+        "no package worker load error; transcript:\n{lines:#?}"
     );
 }

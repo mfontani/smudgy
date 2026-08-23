@@ -1641,6 +1641,20 @@ pub trait PackageProvider {
     /// modules evaluate, without re-resolving.
     fn get_resolved(&self, key: &PackageKey) -> Option<Rc<ResolvedPackage>>;
 
+    /// Snapshot every module source fetched for code loading in this provider's isolate,
+    /// keyed by its version-pinned [`CANONICAL_SCHEME`] URL. The host calls this on the
+    /// isolate thread after the parent module graph has loaded, then publishes the owned,
+    /// `Send` map to that isolate's Web Worker callback. Worker threads must never capture
+    /// the provider itself: provider implementations are deliberately `!Send`.
+    ///
+    /// Each entry is the authored source text, not a V8 module or provider handle. The
+    /// worker loader transpiles it independently in the worker realm. The default exposes
+    /// no package sources, which keeps custom providers fail-closed unless they explicitly
+    /// implement this channel.
+    fn snapshot_module_sources(&self) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     /// The deno-native permission union across **this provider's isolate closure** — the
     /// `permissions` of the root package merged with every transitive `smudgy://`
     /// dependency (`script/PACKAGE-ISOLATES-ENFORCEMENT.md`). The per-package isolate
@@ -2724,9 +2738,10 @@ fn subpath_candidates(sub: &str) -> Vec<String> {
 pub struct InMemoryPackageProvider {
     by_version: HashMap<(PackageKey, String), Rc<ResolvedPackage>>,
     latest: HashMap<PackageKey, String>,
-    /// Packages served through this provider (resolve or canonical-load hits), in first-served
-    /// order — the [`PackageProvider::loaded_packages`] view of the owning isolate's package set.
-    served: std::cell::RefCell<Vec<PackageKey>>,
+    /// Package instances served through this provider (resolve or canonical-load hits), in
+    /// first-served order. Version stays in the key so a worker-source snapshot preserves
+    /// coexisting versions; [`PackageProvider::loaded_packages`] folds it back to package keys.
+    served: std::cell::RefCell<Vec<(PackageKey, String)>>,
     /// The packages whose interop home is this provider's isolate (folded keys). `None`
     /// means homes were never configured: every load is home, nothing is scrubbed.
     homes: std::cell::RefCell<Option<std::collections::HashSet<PackageKey>>>,
@@ -2750,11 +2765,12 @@ impl InMemoryPackageProvider {
         self.by_version.insert((key, version), Rc::new(package));
     }
 
-    /// Record `key` as served through this provider (deduplicated, first-served order).
-    fn note_served(&self, key: &PackageKey) {
+    /// Record one concrete package instance as served (deduplicated, first-served order).
+    fn note_served(&self, key: &PackageKey, version: &str) {
+        let instance = (key.clone(), version.to_string());
         let mut served = self.served.borrow_mut();
-        if !served.contains(key) {
-            served.push(key.clone());
+        if !served.contains(&instance) {
+            served.push(instance);
         }
     }
 }
@@ -2775,7 +2791,7 @@ impl PackageProvider for InMemoryPackageProvider {
             .get(&(key.clone(), version.clone()))
             .cloned()
             .ok_or_else(|| PackageError::NotFound(key.to_user_specifier()))?;
-        self.note_served(key);
+        self.note_served(key, version);
         Ok(resolved)
     }
 
@@ -2784,7 +2800,7 @@ impl PackageProvider for InMemoryPackageProvider {
             .by_version
             .get(&(key.clone(), version.to_string()))
             .cloned()?;
-        self.note_served(key);
+        self.note_served(key, version);
         Some(cached)
     }
 
@@ -2793,6 +2809,22 @@ impl PackageProvider for InMemoryPackageProvider {
         self.by_version
             .get(&(key.clone(), version.clone()))
             .cloned()
+    }
+
+    fn snapshot_module_sources(&self) -> HashMap<String, String> {
+        let mut sources = HashMap::new();
+        for (key, version) in self.served.borrow().iter() {
+            let Some(package) = self.by_version.get(&(key.clone(), version.clone())) else {
+                continue;
+            };
+            for module in &package.modules {
+                sources.insert(
+                    canonical_url(key, version, &module.subpath).to_string(),
+                    module.text.clone(),
+                );
+            }
+        }
+        sources
     }
 
     /// Union the `permissions` of **every** package version this provider holds. The
@@ -2808,7 +2840,13 @@ impl PackageProvider for InMemoryPackageProvider {
     }
 
     fn loaded_packages(&self) -> Vec<PackageKey> {
-        self.served.borrow().clone()
+        let mut keys = Vec::new();
+        for (key, _) in self.served.borrow().iter() {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys
     }
 
     /// A stub fetch is a read of the producer's declarations, not a code load — serve it

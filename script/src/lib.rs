@@ -7,6 +7,7 @@ mod package_resolver;
 mod transpiler;
 mod web_workers;
 
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,7 +44,6 @@ use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
-pub use web_workers::{WorkerMode, worker_host_denied_extension};
 pub use package_resolver::{
     CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy, InMemoryPackageProvider,
     IpcEntry, IpcEntryIssue, IpcGrants, MARKER_SCHEME, PARAMS_SCHEME, PackageDependency,
@@ -54,6 +54,7 @@ pub use package_resolver::{
     native_ipc_grants, native_ipc_path, params_module_url, parse_canonical, parse_params_url,
     platform_event_catalog, platform_state_producer,
 };
+pub use web_workers::{WorkerMode, worker_host_denied_extension};
 
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
 pub mod dts;
@@ -195,6 +196,10 @@ pub struct ScriptRuntime {
     /// A clone of the loader's package provider so [`Self::load_modules`] can build a
     /// [`LoadReport`] (resolved versions, declared parameters) after evaluation.
     package_provider: Option<Rc<dyn PackageProvider>>,
+    /// Owned package-source handoff captured by this isolate's off-thread worker callback.
+    /// The `!Send` provider fills it exactly once after graph loading and before evaluation;
+    /// worker realms see only this immutable map, never the provider.
+    worker_module_sources: web_workers::WorkerModuleSourceChannel,
 }
 
 /// The set of modules to load into the shared isolate on session start: local
@@ -344,6 +349,7 @@ impl ScriptRuntime {
             .context("failed to parse smudgy main module specifier")?;
         let (npm_services, node_services) = SmudgyNpmServices::new(data_dir.clone())?;
         let package_provider = options.package_provider.clone();
+        let worker_module_sources = Arc::new(std::sync::OnceLock::new());
         let loader = Rc::new(ScriptModuleLoader::with_npm_and_packages(
             std::env::current_dir().context("failed to get current directory")?,
             options.module_policy,
@@ -452,8 +458,10 @@ impl ScriptRuntime {
         if options.workers == WorkerMode::ComputeOnly {
             // Workers must boot the same snapshot blob as this (parent) runtime:
             // V8's shared heap is process-global and blob-verified per isolate.
-            worker_options.create_web_worker_cb =
-                web_workers::create_web_worker_callback(initialize_web_audio);
+            worker_options.create_web_worker_cb = web_workers::create_web_worker_callback(
+                initialize_web_audio,
+                Arc::clone(&worker_module_sources),
+            );
         }
         worker_options.bootstrap.inspect = inspector_server.is_some();
         worker_options.should_break_on_first_statement = false;
@@ -502,6 +510,7 @@ impl ScriptRuntime {
             _inspector_server: inspector_server,
             _tokio: options.tokio,
             package_provider,
+            worker_module_sources,
         })
     }
 
@@ -553,6 +562,19 @@ impl ScriptRuntime {
             .load_main_es_module_from_code(&main, code)
             .await
             .context("failed to load smudgy module set")?;
+        // Graph loading has now resolved and fetched every statically imported package, but
+        // none of its top-level code has evaluated yet. Freeze the complete fetched archives
+        // here so a package may construct `new Worker('./worker.ts')` during evaluation: the
+        // callback runs on another OS thread and can read this owned map without capturing the
+        // per-isolate provider (`!Send`). Each ScriptRuntime loads one module set, so the
+        // single-assignment channel also makes the worker view immutable for the isolate's life.
+        let sources = self
+            .package_provider
+            .as_ref()
+            .map_or_else(HashMap::new, |provider| provider.snapshot_module_sources());
+        self.worker_module_sources
+            .set(sources)
+            .expect("worker module sources are published once per ScriptRuntime");
         let mut receiver = deno.mod_evaluate(module_id);
         let evaluation = tokio::select! {
             biased;
