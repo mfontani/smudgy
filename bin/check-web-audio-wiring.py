@@ -193,6 +193,11 @@ def main() -> None:
         crate="smudgy_script build",
         name="deno_audio",
     )
+    require_optional_workspace_edge(
+        script["dependencies"]["deno_audio"],
+        crate="smudgy_script runtime",
+        name="deno_audio",
+    )
     require(
         script["dev-dependencies"]["deno_audio"] == {"workspace": True},
         "smudgy_script test-only deno_audio edge drifted",
@@ -213,6 +218,7 @@ def main() -> None:
             "audio_web:dependencies",
             "core:dependencies",
             "script:build-dependencies",
+            "script:dependencies",
             "script:dev-dependencies",
         },
     }
