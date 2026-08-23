@@ -6769,10 +6769,8 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
         // window and lands on the Settings window's Audio pane.
         #[cfg(feature = "web-audio-cpal")]
         let window_content: Element<'_, Message> =
-            widgets::audio_gain::AudioPanelRoot::new(window_content, || {
-                Message::OpenAudioSettings
-            })
-            .into();
+            widgets::audio_gain::AudioPanelRoot::new(window_content, || Message::OpenAudioSettings)
+                .into();
         let content = center(window_content);
         return if client_rounded_frame() {
             // The window surface is transparent and this container paints the

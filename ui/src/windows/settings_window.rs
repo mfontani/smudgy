@@ -994,14 +994,22 @@ impl SettingsWindow {
         ];
         #[cfg(feature = "web-audio-cpal")]
         {
-            nav = nav.push(nav_button(t!("nav-audio"), self.tab == Tab::Audio, Tab::Audio));
+            nav = nav.push(nav_button(
+                t!("nav-audio"),
+                self.tab == Tab::Audio,
+                Tab::Audio,
+            ));
         }
         nav = nav.push(nav_button(
             t!("nav-security"),
             self.tab == Tab::Security,
             Tab::Security,
         ));
-        nav = nav.push(nav_button(t!("nav-friends"), self.tab == Tab::Friends, Tab::Friends));
+        nav = nav.push(nav_button(
+            t!("nav-friends"),
+            self.tab == Tab::Friends,
+            Tab::Friends,
+        ));
         nav = nav.push(nav_button(
             t!("nav-licenses"),
             self.tab == Tab::Licenses,
