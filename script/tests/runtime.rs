@@ -59,6 +59,7 @@ fn script_runtime_with_broadcast(
         package_provider: None,
         permissions: None,
         broadcast_channel,
+        workers: smudgy_script::WorkerMode::Disabled,
     })?;
     Ok((tokio, runtime))
 }
@@ -112,6 +113,7 @@ fn custom_extension_layers_on_startup_snapshot() -> Result<()> {
         package_provider: None,
         permissions: None,
         broadcast_channel: None,
+        workers: smudgy_script::WorkerMode::Disabled,
     })?;
     assert!(eval_bool_in_tokio(
         &tokio,
@@ -147,6 +149,7 @@ fn runtime_with_extensions(
         package_provider: None,
         permissions: None,
         broadcast_channel: None,
+        workers: smudgy_script::WorkerMode::Disabled,
     })?;
     Ok((tokio, runtime))
 }
@@ -292,6 +295,7 @@ fn inspector_script_runtime(
         package_provider: None,
         permissions: None,
         broadcast_channel: None,
+        workers: smudgy_script::WorkerMode::Disabled,
     })?;
     Ok((tokio, runtime))
 }

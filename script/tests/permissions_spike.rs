@@ -68,6 +68,7 @@ fn restricted_runtime(
         package_provider: None,
         permissions: Some(container),
         broadcast_channel: None,
+        workers: smudgy_script::WorkerMode::Disabled,
     })?;
     Ok((tokio, runtime))
 }

@@ -70,6 +70,7 @@ fn runtime_with_packages(
         package_provider: Some(Rc::new(provider)),
         permissions: None,
         broadcast_channel: None,
+        workers: smudgy_script::WorkerMode::Disabled,
     })?;
     Ok((tokio, runtime))
 }

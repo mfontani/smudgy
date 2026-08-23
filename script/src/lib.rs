@@ -5,6 +5,7 @@ mod module_loader;
 mod npm_resolver;
 mod package_resolver;
 mod transpiler;
+mod web_workers;
 
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
@@ -39,6 +40,7 @@ use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
+pub use web_workers::{WorkerMode, worker_host_denied_extension};
 pub use package_resolver::{
     CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy, InMemoryPackageProvider,
     IpcEntry, IpcEntryIssue, IpcGrants, MARKER_SCHEME, PARAMS_SCHEME, PackageDependency,
@@ -169,6 +171,14 @@ pub struct ScriptRuntimeOptions {
     /// Server-entry scoped BroadcastChannel backend. `None` creates an
     /// isolated backend (primarily for standalone runtime tests).
     pub broadcast_channel: Option<InMemoryBroadcastChannel>,
+    /// Web `Worker` policy for this isolate. The default [`WorkerMode::Disabled`]
+    /// disables the worker-host ops so `new Worker(...)` — including through the
+    /// `node:worker_threads` shim — throws a catchable error instead of reaching
+    /// deno_runtime's panicking default callback. [`WorkerMode::ComputeOnly`]
+    /// (the trusted main isolate) makes workers real: reduced-op, off-thread
+    /// compute realms with a none-permissions container whose only I/O is the
+    /// message bridge (see `web_workers.rs`).
+    pub workers: WorkerMode,
 }
 
 pub struct ScriptRuntime {
@@ -264,6 +274,23 @@ pub fn permission_descriptor_parser() -> Arc<dyn PermissionDescriptorParser> {
     Arc::new(RuntimePermissionDescriptorParser::new(RealSys))
 }
 
+/// deno's default `FeatureChecker` callback is `std::process::exit(70)`, and
+/// unstable-gated ops consult the checker BEFORE any permission check — the vsock net
+/// ops (compiled on Linux/Android/macOS) reach it straight from
+/// `Deno.connect({ transport: "vsock" })`. Script code must never be able to
+/// terminate the host process via a feature gate, so this checker enables no unstable
+/// features and swaps the exit callback for a log: the op falls through to the
+/// deny-by-default permission check (or its own unsupported-platform error) and
+/// surfaces as a catchable JS error instead of killing the app. Shared by the main
+/// runtime and every worker realm (each worker builds its own on its own thread).
+pub(crate) fn quiet_feature_checker() -> Arc<deno_runtime::FeatureChecker> {
+    let mut checker = deno_runtime::FeatureChecker::default();
+    checker.set_exit_cb(Box::new(|feature, api_name| {
+        log::warn!("smudgy: denied unstable Deno feature '{feature}' requested by '{api_name}'");
+    }));
+    Arc::new(checker)
+}
+
 /// Install the process-global rustls `CryptoProvider` exactly once. deno_tls is
 /// built against aws-lc-rs, so we install that provider; calling more than once
 /// (multiple sessions) is a no-op via `Once`. Errors from a competing install are
@@ -284,6 +311,12 @@ impl ScriptRuntime {
         install_default_crypto_provider();
 
         let initialize_web_audio = preflight_web_audio_extension(&options.extensions)?;
+        let mut extensions = options.extensions;
+        // Appending after the preflight keeps any deno_audio extension at
+        // custom index 0, where the frozen snapshot prefix expects it.
+        if options.workers == WorkerMode::Disabled {
+            extensions.push(web_workers::worker_host_denied_extension());
+        }
         let data_dir = options.data_dir;
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("failed to create script data dir {}", data_dir.display()))?;
@@ -327,23 +360,7 @@ impl ScriptRuntime {
             )))
         });
 
-        // deno's default `FeatureChecker` callback is `std::process::exit(70)`, and
-        // unstable-gated ops consult the checker BEFORE any permission check — the vsock net
-        // ops (compiled on Linux/Android/macOS) reach it straight from
-        // `Deno.connect({ transport: "vsock" })`. Sandboxed script code must never be able to
-        // terminate the host process via a feature gate, so this checker enables no unstable
-        // features and swaps the exit callback for a log: the op falls through to the
-        // deny-by-default permission check (or its own unsupported-platform error) and
-        // surfaces as a catchable JS error instead of killing the app.
-        let feature_checker = {
-            let mut checker = deno_runtime::FeatureChecker::default();
-            checker.set_exit_cb(Box::new(|feature, api_name| {
-                log::warn!(
-                    "smudgy: denied unstable Deno feature '{feature}' requested by '{api_name}'"
-                );
-            }));
-            Arc::new(checker)
-        };
+        let feature_checker = quiet_feature_checker();
 
         let services =
             WorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
@@ -408,7 +425,7 @@ impl ScriptRuntime {
         );
 
         let mut worker_options = WorkerOptions {
-            extensions: options.extensions,
+            extensions,
             // Select the exact frozen extension prefix. A feature-enabled
             // application may still construct a legacy runtime with no Web
             // Audio extension, so the base and audio snapshots coexist.
@@ -429,6 +446,9 @@ impl ScriptRuntime {
         // empty `<data_dir>/node_modules` from earlier builds may exist on disk;
         // it is unused and must not be sniffed here.
         worker_options.bootstrap.has_node_modules_dir = false;
+        if options.workers == WorkerMode::ComputeOnly {
+            worker_options.create_web_worker_cb = web_workers::create_web_worker_callback();
+        }
         worker_options.bootstrap.inspect = inspector_server.is_some();
         worker_options.should_break_on_first_statement = false;
         worker_options.should_wait_for_inspector_session = false;
