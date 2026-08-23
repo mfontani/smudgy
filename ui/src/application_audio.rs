@@ -3972,8 +3972,25 @@ mod tests {
             );
             assert!(!report.is_clean(), "spawn failure/panic must stay visible");
             let events = events.lock().unwrap();
-            assert_eq!(events[0], "shutdown:40");
-            assert_eq!(events[1], "join:40");
+            let shutdown = events
+                .iter()
+                .position(|event| event == "shutdown:40")
+                .unwrap();
+            let join = events.iter().position(|event| event == "join:40").unwrap();
+            assert!(
+                shutdown < join,
+                "runtime shutdown must precede its exact join"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| *event == "shutdown:40")
+                    .count(),
+                1
+            );
+            // Rollback starts retirement before application shutdown, so its
+            // exact join can race with the global I/O-quiesce boundary.
+            assert_eq!(events.iter().filter(|event| *event == "io").count(), 1);
             assert_eq!(events.iter().filter(|event| *event == "join:40").count(), 1);
         }
     }
