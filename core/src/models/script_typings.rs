@@ -56,8 +56,17 @@ const SMUDGY_WIDGETS_DTS: &str = include_str!("script_typings/smudgy-widgets.d.t
 /// alone is not runtime availability.
 const SMUDGY_WEB_AUDIO_DTS: &str = include_str!("script_typings/smudgy-web-audio.d.ts");
 
+/// The managed ambient declarations for the global `Worker` surface: main-isolate
+/// background workers, always available, so this file is written unconditionally.
+/// The vendored Deno lib's own `Worker` declarations are trimmed at vendor time
+/// (see [`DENO_LIB`]) so this narrower contract — module workers only, options
+/// required — is the single global declaration.
+const SMUDGY_WORKERS_DTS: &str = include_str!("script_typings/smudgy-workers.d.ts");
+
 /// The vendored Deno runtime lib (`Deno` namespace + web globals like `fetch`/`Response`),
-/// with the `/// <reference>` directives stripped so they're plain ambient declarations.
+/// with the `/// <reference>` directives stripped so they're plain ambient declarations,
+/// and the global `Worker` declarations trimmed — the sibling `smudgy-workers.d.ts`
+/// ([`SMUDGY_WORKERS_DTS`]) is the authoritative, narrower contract for that surface.
 /// Materialized to `<server>/.smudgy/types/deno/` (covered by the user tsconfig's
 /// `.smudgy/types/**` include).
 static DENO_LIB: Dir =
@@ -71,7 +80,7 @@ static NODE_TYPES: Dir =
 
 /// Bumped whenever the vendored Deno lib / `@types/node` change, so the runtime typings are
 /// (re)written only on first run or after a re-vendor — not on every session start.
-const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.5+node-26.0.1+1";
+const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.5+node-26.0.1+2";
 
 const MANAGED_README: &str = "\
 This folder is generated and managed by smudgy. It gives VS Code (and any\n\
@@ -587,6 +596,7 @@ fn ensure_script_tsconfig_in_with_web_audio(
     write_if_changed(&types_dir.join("smudgy-params.d.ts"), SMUDGY_PARAMS_DTS)?;
     write_if_changed(&types_dir.join("smudgy-mapper.d.ts"), SMUDGY_MAPPER_DTS)?;
     write_if_changed(&types_dir.join("smudgy-widgets.d.ts"), SMUDGY_WIDGETS_DTS)?;
+    write_if_changed(&types_dir.join("smudgy-workers.d.ts"), SMUDGY_WORKERS_DTS)?;
     let web_audio_types = types_dir.join("smudgy-web-audio.d.ts");
     if web_audio_available {
         write_if_changed(&web_audio_types, SMUDGY_WEB_AUDIO_DTS)?;
@@ -735,6 +745,10 @@ mod tests {
         assert!(dir.join(".smudgy/types/smudgy-mapper.d.ts").is_file());
         assert!(dir.join(".smudgy/types/smudgy-widgets.d.ts").is_file());
         assert!(
+            dir.join(".smudgy/types/smudgy-workers.d.ts").is_file(),
+            "the Worker surface is unconditional: main-isolate workers always exist"
+        );
+        assert!(
             !dir.join(".smudgy/types/smudgy-web-audio.d.ts").exists(),
             "an audio-free engine must not advertise Web Audio"
         );
@@ -763,6 +777,9 @@ mod tests {
         assert!(widgets.contains("declare module \"smudgy:widgets\""));
         assert!(widgets.contains("declare module \"smudgy:widgets/jsx-runtime\""));
         assert!(widgets.contains("namespace JSX"));
+        let workers = fs::read_to_string(dir.join(".smudgy/types/smudgy-workers.d.ts")).unwrap();
+        assert!(workers.contains("interface Worker extends EventTarget"));
+        assert!(workers.contains("declare var Worker"));
 
         // The base tsconfig wires the automatic JSX runtime for `.tsx` widget authoring.
         let base = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
@@ -890,6 +907,100 @@ mod tests {
                 output.diagnostics
             );
         }
+    }
+
+    /// The shipped worker declarations: a consumer exercising the whole
+    /// parent-side bridge (construction, both `postMessage` shapes, the handler
+    /// properties, the listener overloads, `terminate`) compiles cleanly, while
+    /// the unsupported spellings (an options-less construction, a "classic"
+    /// worker) stay compile errors. The vendored Deno lib's own `Worker` global
+    /// is trimmed so this contract is the single declaration; the last assertion
+    /// keeps a re-vendor from silently reintroducing the wide one.
+    #[test]
+    fn worker_typings_compile_and_stay_narrow() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        // The declaration emitter normally uses lib.esnext.full (including DOM,
+        // whose own `Worker` would mask drift). Suppress that default and add
+        // only ESNext plus stubs for the event/URL seams the contract references
+        // — in the editor project these come from the vendored runtime typings.
+        ambient.insert(
+            "000-runtime.d.ts".to_string(),
+            "/// <reference no-default-lib=\"true\" />\n\
+             /// <reference lib=\"esnext\" />\n\
+             interface Event {}\n\
+             interface EventTarget {}\n\
+             interface MessageEvent extends Event { readonly data: any; }\n\
+             interface ErrorEvent extends Event { readonly message: string; }\n\
+             interface URL {}\n\
+             type Transferable = ArrayBuffer;\n\
+             interface AddEventListenerOptions { once?: boolean; }\n\
+             interface EventListenerOptions { capture?: boolean; }\n"
+                .to_string(),
+        );
+        ambient.insert(
+            "smudgy-workers.d.ts".to_string(),
+            SMUDGY_WORKERS_DTS.to_string(),
+        );
+
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "worker_consumer.ts".to_string(),
+            "const tally = new Worker(\n\
+               \"data:text/javascript,self.onmessage = () => {};\",\n\
+               { type: \"module\", name: \"tally\" },\n\
+             );\n\
+             tally.postMessage([\"a slime is DEAD!\"]);\n\
+             const buffer = new ArrayBuffer(8);\n\
+             tally.postMessage(buffer, [buffer]);\n\
+             tally.onmessage = (e) => { void e.data; };\n\
+             tally.onmessageerror = (e) => { void e.data; };\n\
+             tally.onerror = (e) => { const m: string = e.message; void m; };\n\
+             tally.addEventListener(\"message\", (e) => { void e.data; }, { once: true });\n\
+             tally.addEventListener(\"messageerror\", (e) => { void e.data; });\n\
+             tally.addEventListener(\"error\", (e) => { void e.message; });\n\
+             tally.removeEventListener(\"message\", (e) => { void e.data; });\n\
+             tally.terminate();\n\
+             export {};\n"
+                .to_string(),
+        );
+        let output = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("compile the worker consumer against the hosted declarations");
+        assert!(
+            output.diagnostics.is_empty(),
+            "the shipped smudgy-workers.d.ts produced diagnostics:\n{:#?}",
+            output.diagnostics
+        );
+
+        let mut unsupported = BTreeMap::new();
+        unsupported.insert(
+            "unsupported.ts".to_string(),
+            "new Worker(\"data:text/javascript,;\");\n\
+             new Worker(\"data:text/javascript,;\", { type: \"classic\" });\n\
+             export {};\n"
+                .to_string(),
+        );
+        let output = smudgy_script::dts::generate_declarations(&unsupported, &ambient)
+            .expect("unsupported surface produces ordinary diagnostics");
+        assert_eq!(
+            output.diagnostics.len(),
+            2,
+            "only the two deliberate unsupported constructions should diagnose: {:#?}",
+            output.diagnostics
+        );
+
+        let deno_shared = DENO_LIB
+            .get_file("lib.deno.shared_globals.d.ts")
+            .expect("the vendored Deno lib ships its shared globals")
+            .contents_utf8()
+            .expect("the vendored Deno lib is UTF-8");
+        assert!(
+            !deno_shared.contains("declare var Worker")
+                && !deno_shared.contains("interface Worker extends EventTarget"),
+            "the vendored Deno lib declares a global `Worker` again — trim it so \
+             smudgy-workers.d.ts stays the single (narrower) declaration"
+        );
     }
 
     #[test]
