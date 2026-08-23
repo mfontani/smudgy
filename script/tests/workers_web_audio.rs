@@ -19,9 +19,7 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use deno_core::{FastString, PollEventLoopOptions, serde_v8};
-use smudgy_script::{
-    ImportPolicy, ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode,
-};
+use smudgy_script::{ImportPolicy, ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode};
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
     Rc::new(
@@ -126,7 +124,10 @@ fn worker_boots_beside_a_live_audio_snapshot_parent() -> Result<()> {
         }
     })()"#;
     let ok = eval_async_bool(&tokio, &mut rt, source)?;
-    assert!(ok, "a worker beside an audio-snapshot parent echoes normally");
+    assert!(
+        ok,
+        "a worker beside an audio-snapshot parent echoes normally"
+    );
     Ok(())
 }
 

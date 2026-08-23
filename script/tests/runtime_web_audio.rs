@@ -16,9 +16,7 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use deno_core::{FastString, serde_v8};
-use smudgy_script::{
-    ImportPolicy, ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode,
-};
+use smudgy_script::{ImportPolicy, ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode};
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
     Rc::new(

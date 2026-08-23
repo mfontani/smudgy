@@ -24,9 +24,9 @@ use smudgy_cloud::{Mapper, PackageApiClient};
 use smudgy_script::{
     ImportPolicy, InspectorConfig, LoadReport, LoadedModuleKind, ModulePolicy, ModuleSet,
     PackagePermissions, PackageProvider, Permissions, PermissionsContainer, PermissionsOptions,
-    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, WorkerMode,
-    is_local_transport_net_entry, is_windows_pipe_namespace_entry, native_ipc_grants,
-    parse_canonical, permission_descriptor_parser,
+    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, WorkerMode, is_local_transport_net_entry,
+    is_windows_pipe_namespace_entry, native_ipc_grants, parse_canonical,
+    permission_descriptor_parser,
 };
 
 use crate::{
