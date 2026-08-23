@@ -24,9 +24,9 @@ use smudgy_cloud::{Mapper, PackageApiClient};
 use smudgy_script::{
     ImportPolicy, InspectorConfig, LoadReport, LoadedModuleKind, ModulePolicy, ModuleSet,
     PackagePermissions, PackageProvider, Permissions, PermissionsContainer, PermissionsOptions,
-    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, is_local_transport_net_entry,
-    is_windows_pipe_namespace_entry, native_ipc_grants, parse_canonical,
-    permission_descriptor_parser,
+    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, WorkerMode,
+    is_local_transport_net_entry, is_windows_pipe_namespace_entry, native_ipc_grants,
+    parse_canonical, permission_descriptor_parser,
 };
 
 use crate::{
@@ -1125,6 +1125,9 @@ impl<'a> ScriptEngine<'a> {
                 let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
                 let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
                     Rc::new(RefCell::new(Vec::new()));
+                // Must agree with the `WorkerMode` this isolate's runtime is built with
+                // below: main = ComputeOnly, sandboxes = Disabled (W2 adds the capability).
+                let workers_enabled = matches!(isolate_id, IsolateId::Main);
                 let mut extensions = Vec::new();
                 #[cfg(feature = "web-audio")]
                 let mut package_audio_binding = None;
@@ -1246,6 +1249,10 @@ impl<'a> ScriptEngine<'a> {
                         // <Image> build ops to resolve + gate `src` strings (a bridge type in
                         // `smudgy_cloud`, like `WidgetsEnabled`).
                         image_policy,
+                        // Mirrors this isolate's `WorkerMode` (main = ComputeOnly, sandboxes =
+                        // Disabled until the W2 `workers` capability) so `smudgy.ts` can shadow
+                        // `Worker` with a clear TypeError where the worker-host ops are disabled.
+                        workers_enabled,
                     ),
                     mapper_api::smudgy_mapper::init(mapper.clone()),
                 ]);
@@ -1410,6 +1417,9 @@ impl<'a> ScriptEngine<'a> {
             ImportPolicy::Any,
             params.tokio_runtime.clone(),
             broadcast_channel.clone(),
+            // Trusted user code may spawn workers: off-thread reduced-op compute
+            // realms with a message-only bridge (no smudgy API inside them).
+            WorkerMode::ComputeOnly,
         )
         .expect("Failed to create JS runtime");
         // Surface the v8 inspector endpoint (main only) so it can be debugged via the bundled
@@ -1762,6 +1772,11 @@ impl<'a> ScriptEngine<'a> {
                     effective.import,
                     params.tokio_runtime.clone(),
                     isolate_broadcast_channel,
+                    // Sandboxed packages cannot spawn workers until the `workers`
+                    // capability exists (smudgy-worker tracker, slice W2). Disabled
+                    // means the worker-host ops are inert: a catchable error with
+                    // no thread spawn, including via `node:worker_threads`.
+                    WorkerMode::Disabled,
                 ) {
                     Ok(runtime) => runtime,
                     Err(e) => {
@@ -3077,6 +3092,7 @@ fn build_script_runtime(
     import_policy: ImportPolicy,
     tokio_runtime: Rc<tokio::runtime::Runtime>,
     broadcast_channel: smudgy_script::InMemoryBroadcastChannel,
+    workers: WorkerMode,
 ) -> Result<ScriptRuntime> {
     let mut runtime = ScriptRuntime::new(ScriptRuntimeOptions {
         extensions,
@@ -3093,6 +3109,7 @@ fn build_script_runtime(
         data_dir,
         webstorage_dir,
         broadcast_channel: Some(broadcast_channel),
+        workers,
     })?;
     // rusty_v8 enters the isolate when its `OwnedIsolate` is constructed and leaves it current.
     // With an isolate *set* on one thread that would make every isolate but the last "current"

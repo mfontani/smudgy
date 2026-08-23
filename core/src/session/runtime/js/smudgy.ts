@@ -164,6 +164,7 @@ const {
     op_smudgy_procedure_post,
     op_smudgy_interop_declare,
     op_smudgy_broadcast_allowed,
+    op_smudgy_workers_allowed,
 } = __smudgy_ops as any;
 
 if (!op_smudgy_broadcast_allowed()) {
@@ -174,6 +175,25 @@ if (!op_smudgy_broadcast_allowed()) {
             constructor(_name: string) {
                 throw new TypeError(
                     "smudgy: this package did not request the 'interop:broadcast' capability",
+                );
+            }
+        },
+    });
+}
+
+// The clear-error facade for isolates whose worker-host ops are disabled. The
+// ops middleware (smudgy_script web_workers.rs) is the enforcement -- it also
+// covers the node:worker_threads path, which reaches the same op without this
+// constructor -- but its generic disabled-op error names no cause, so shadow
+// the global with one that does.
+if (!op_smudgy_workers_allowed()) {
+    Object.defineProperty(globalThis, "Worker", {
+        configurable: true,
+        writable: true,
+        value: class Worker {
+            constructor(_specifier: string | URL, _options?: unknown) {
+                throw new TypeError(
+                    "smudgy: Worker is not available in this isolate (sandboxed packages cannot spawn workers yet)",
                 );
             }
         },

@@ -168,6 +168,7 @@ deno_core::extension!(
     op_smudgy_interop_declare,
     op_smudgy_data_dir,
     op_smudgy_broadcast_allowed,
+    op_smudgy_workers_allowed,
     ],
   esm_entry_point = "ext:smudgy_ops/smudgy.ts",
   esm = [ dir "src/session/runtime/js", "smudgy.ts" ],
@@ -282,6 +283,10 @@ deno_core::extension!(
     // same crate-DAG bridge as `WidgetsEnabled`. `trusted` for main; the consented grants +
     // own-package membership for a sandbox.
     image_policy: smudgy_cloud::image_source::ImageSourcePolicy,
+    // Whether this isolate's `ScriptRuntime` was built with `WorkerMode::ComputeOnly`.
+    // Mirrored so `smudgy.ts` can shadow `Worker` with a clear TypeError in isolates
+    // whose worker-host ops are disabled; the op middleware remains the enforcement.
+    workers_enabled: bool,
   },
   state = |state, options| {
     state.put::<SessionId>(options.session_id);
@@ -323,6 +328,7 @@ deno_core::extension!(
     // Bridge the `widgets` grant to the `smudgy_widgets` ops, which live in a leaf crate that cannot
     // name `SmudgyGrants` (`smudgy_cloud` is the crate both share — see its `WidgetsEnabled`).
     state.put::<WidgetsEnabled>(WidgetsEnabled(options.smudgy_grants.widgets));
+    state.put::<WorkersEnabled>(WorkersEnabled(options.workers_enabled));
     state.put::<EventRegistry>(options.event_registry);
     state.put::<crate::session::runtime::SharedSessionStore>(options.session_store);
     state.put::<crate::session::runtime::SharedRemoteStateRegistry>(options.remote_state_registry);
@@ -1064,6 +1070,16 @@ pub struct EventSubscriber {
 #[op2(fast)]
 fn op_smudgy_broadcast_allowed(state: &OpState) -> bool {
     grants(state).interop_broadcast
+}
+
+/// Whether this isolate may construct Web `Worker`s (`WorkerMode::ComputeOnly`).
+/// Not a `SmudgyGrants` capability yet: v1 enables workers for the trusted main
+/// isolate only; the sandbox `workers` capability is tracker slice W2.
+pub(crate) struct WorkersEnabled(pub bool);
+
+#[op2(fast)]
+fn op_smudgy_workers_allowed(state: &OpState) -> bool {
+    state.borrow::<WorkersEnabled>().0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
