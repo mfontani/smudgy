@@ -1092,9 +1092,11 @@ fn op_smudgy_workers_allowed(state: &OpState) -> bool {
 }
 
 /// Per-isolate live-worker ceiling, enforced by the `smudgy.ts` constructor wrap
-/// (the `Worker` shadow refuses to construct a ninth). The `node:worker_threads`
-/// path in the trusted main isolate is not cap-checked.
-pub(crate) const WORKER_CAP: u32 = 8;
+/// (the `Worker` shadow refuses to construct past it). Sized as a runaway
+/// backstop — each worker is an OS thread plus a V8 isolate — not as a working
+/// budget. The `node:worker_threads` path in the trusted main isolate is not
+/// cap-checked.
+pub(crate) const WORKER_CAP: u32 = 128;
 
 #[op2(fast)]
 fn op_smudgy_worker_count(state: &OpState) -> u32 {

@@ -116,8 +116,8 @@ declare var Worker: {
    * naming a module on disk, or a `data:` URL carrying the JavaScript itself
    * (as in the example above). `options` must include `type: "module"`;
    * `name` is an optional label, readable inside the worker as `self.name`.
-   * Up to 8 workers can be running at once; creating another while 8 are
-   * live throws.
+   * Up to 128 workers can be running at once; creating another while 128
+   * are live throws.
    */
   new (specifier: string | URL, options: { type: "module"; name?: string }): Worker;
 };
