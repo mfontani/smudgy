@@ -24,7 +24,7 @@ use smudgy_cloud::{Mapper, PackageApiClient};
 use smudgy_script::{
     ImportPolicy, InspectorConfig, LoadReport, LoadedModuleKind, ModulePolicy, ModuleSet,
     PackagePermissions, PackageProvider, Permissions, PermissionsContainer, PermissionsOptions,
-    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, is_local_transport_net_entry,
+    ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, WorkerMode, is_local_transport_net_entry,
     is_windows_pipe_namespace_entry, native_ipc_grants, parse_canonical,
     permission_descriptor_parser,
 };
@@ -178,6 +178,15 @@ pub struct ScriptEngineParams<'a> {
     /// `OpState` so the `get`/`list`/`exists` ops read the live automation set without crossing
     /// into the (non-`OpState`) `Manager`.
     pub automation_registry: SharedAutomationRegistry,
+    /// Opaque application/session authority cloned unchanged across reloads.
+    #[cfg_attr(
+        not(feature = "web-audio"),
+        allow(
+            dead_code,
+            reason = "the feature-disabled placeholder preserves constructor shape"
+        )
+    )]
+    pub audio_scope: Option<crate::session::RuntimeAudioScope>,
 }
 
 /// Shared "which isolates have a pending wakeup" set for the per-isolate waker demux
@@ -236,6 +245,11 @@ fn build_demux_waker(id: IsolateId, ready: &ReadySet, parent: &ParentSlot) -> Wa
 /// value a malformed widget token parses to, and must never be allocated.
 static NEXT_ISOLATE_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "web-audio")]
+type PackageAudioBinding = Option<smudgy_audio_web::PackageAudioScopeBinding>;
+#[cfg(not(feature = "web-audio"))]
+type PackageAudioBinding = ();
+
 /// One V8 isolate and everything bound to it. `v8::Global` handles are isolate-bound, so
 /// the registries that hold them (`script_functions`, `compiled_scripts`) live *here*, one
 /// set per isolate, and never leave (`PACKAGE-ISOLATES-ENGINE.md`). `script_functions`
@@ -248,6 +262,9 @@ static NEXT_ISOLATE_INSTANCE: AtomicU64 = AtomicU64::new(1);
 /// separate heap + registries.
 struct Isolate {
     runtime: ScriptRuntime,
+    /// Exact package-audio lease for a successfully loaded sandbox root.
+    /// Main and mixer-free unavailable sessions retain no such authority.
+    _package_audio_binding: PackageAudioBinding,
     /// This instantiation's nonce (from [`NEXT_ISOLATE_INSTANCE`]). An `IsolateId` names a
     /// *role* that an engine reload recreates; this names the exact heap. Widget callbacks
     /// carry it in their routing token, and [`ScriptEngine::execute_javascript_function`]
@@ -320,6 +337,11 @@ pub struct ScriptEngine<'a> {
     ui_tx: Sender<TaggedSessionEvent>,
     #[allow(dead_code)]
     mapper: Option<Mapper>,
+    /// Unique lifecycle authority for every Web Audio extension in this exact engine
+    /// generation. The runtime consumes it before reload teardown so the replacement cannot
+    /// contend with a still-draining predecessor for application host permits.
+    #[cfg(feature = "web-audio")]
+    audio_lifecycle_owner: Option<deno_audio::AudioLifecycleOwner>,
     /// Per-isolate waker demux (`EVENT-LOOP-READINESS-DEMUX.md`): ids of isolates whose
     /// `DemuxWaker` has fired (a completed op/timer) or that were seeded (on insert, or after
     /// synchronous dispatch) since the last pump. `poll_event_loop` drains this and polls ONLY
@@ -649,15 +671,18 @@ impl<'a> ScriptEngine<'a> {
     /// becomes its own sandboxed isolate. Trust is the per-profile `LockedPackage::trusted`
     /// flag (default `false` — sandboxed until the user trusts it). Loading itself is done by
     /// [`ScriptRuntime::load_modules`] into each target isolate.
-    fn build_isolate_plan(server_name: &str) -> IsolatePlan {
+    fn build_isolate_plan(server_name: &str, web_audio_available: bool) -> IsolatePlan {
         // Best-effort: refresh the managed VS Code TypeScript project so authors get
         // `smudgy:core` types — plus the `.d.ts` shipped by installed `smudgy://` packages —
         // in their editor. Pure-disk; never blocks session start.
         let installed_typings = materialize_installed_typings(server_name);
-        if let Err(e) = crate::models::script_typings::ensure_script_tsconfig_with_packages(
-            server_name,
-            &installed_typings,
-        ) {
+        if let Err(e) =
+            crate::models::script_typings::ensure_script_tsconfig_with_packages_and_web_audio(
+                server_name,
+                &installed_typings,
+                web_audio_available,
+            )
+        {
             warn!("Failed to write script tsconfig for {server_name}: {e:#}");
         }
 
@@ -989,6 +1014,21 @@ impl<'a> ScriptEngine<'a> {
         let pane_input_callbacks = params.pane_input_callbacks.clone();
         let mapper = params.mapper.clone();
         let extra_extensions = params.extra_script_extensions.clone();
+        // Explicit application/session authority. Absence is intentional:
+        // legacy constructors install no Web Audio extension or fallback.
+        #[cfg(feature = "web-audio")]
+        let audio_scope = params.audio_scope.clone();
+        #[cfg(feature = "web-audio")]
+        let web_audio_available = audio_scope.is_some();
+        #[cfg(not(feature = "web-audio"))]
+        let web_audio_available = false;
+        #[cfg(feature = "web-audio")]
+        let (audio_lifecycle_owner, audio_lifecycle_registrar) = if audio_scope.is_some() {
+            let (owner, registrar) = deno_audio::AudioLifecycleOwner::new();
+            (Some(owner), Some(registrar))
+        } else {
+            (None, None)
+        };
         let current_line_for_ext = current_line.clone();
         // The same introspection mirror the `Manager` writes; bound into every isolate's ops.
         let automation_registry = params.automation_registry.clone();
@@ -1019,7 +1059,7 @@ impl<'a> ScriptEngine<'a> {
         // which every isolate's ops receive and which must be complete before ANY module
         // evaluates (a trusted package's top-level `set()` passes the home gate only if its
         // entry is already registered).
-        let plan = Self::build_isolate_plan(params.server_name.as_str());
+        let plan = Self::build_isolate_plan(params.server_name.as_str(), web_audio_available);
         let home_registry: crate::session::runtime::store::HomeRegistry =
             Rc::new(std::cell::RefCell::new(plan.homes));
 
@@ -1085,7 +1125,57 @@ impl<'a> ScriptEngine<'a> {
                 let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
                 let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
                     Rc::new(RefCell::new(Vec::new()));
-                let mut extensions = vec![
+                // Must agree with the `WorkerMode` this isolate's runtime is built with
+                // below: main = ComputeOnly, sandboxes = ComputeOnly only with the
+                // consented `workers` capability (mirrored into `smudgy_grants`).
+                let workers_enabled =
+                    matches!(isolate_id, IsolateId::Main) || smudgy_grants.workers;
+                let mut extensions = Vec::new();
+                #[cfg(feature = "web-audio")]
+                let mut package_audio_binding = None;
+                #[cfg(not(feature = "web-audio"))]
+                let package_audio_binding = ();
+                // Register native state and embedded JS sources now; smudgy_script evaluates
+                // the entry point only after deno_runtime bootstrap installs URL/Event globals.
+                #[cfg(feature = "web-audio")]
+                if let Some(audio_scope) = audio_scope.as_ref() {
+                    let lifecycle_registrar = audio_lifecycle_registrar
+                        .as_ref()
+                        .expect("an audio-enabled engine generation must own its registrar")
+                        .clone();
+                    let options = match &isolate_id {
+                        IsolateId::Main => audio_scope.extension_options(),
+                        IsolateId::Package { owner, name, .. } => {
+                            let observed_owner: Arc<str> = Arc::from(owner.to_owned());
+                            let observed_name: Arc<str> = Arc::from(name.to_owned());
+                            let observed_ui = params.ui_tx.clone();
+                            let (options, binding) = audio_scope
+                                .extension_options_for_sandbox_root_with_usage_observer(
+                                    owner,
+                                    name,
+                                    Arc::new(move || {
+                                        let mut ui = observed_ui.clone();
+                                        ui.try_send(TaggedSessionEvent {
+                                            session_id,
+                                            event: SessionEvent::PackageAudioUsed {
+                                                owner: Arc::clone(&observed_owner),
+                                                name: Arc::clone(&observed_name),
+                                            },
+                                        })
+                                        .is_ok()
+                                    }),
+                                )
+                                .map_err(|error| format!("{error:?}"))?;
+                            package_audio_binding = binding;
+                            options
+                        }
+                    }
+                    .lifecycle_registrar(lifecycle_registrar);
+                    let mut extension = deno_audio::deno_audio::init(options);
+                    smudgy_script::prepare_deferred_web_audio_extension(&mut extension);
+                    extensions.push(extension);
+                }
+                extensions.extend([
                     ops::smudgy_ops::init(
                         session_id,
                         Arc::clone(&server_name),
@@ -1161,11 +1251,20 @@ impl<'a> ScriptEngine<'a> {
                         // <Image> build ops to resolve + gate `src` strings (a bridge type in
                         // `smudgy_cloud`, like `WidgetsEnabled`).
                         image_policy,
+                        // Mirrors this isolate's `WorkerMode` (main = ComputeOnly, sandboxes =
+                        // Disabled until the W2 `workers` capability) so `smudgy.ts` can shadow
+                        // `Worker` with a clear TypeError where the worker-host ops are disabled.
+                        workers_enabled,
                     ),
                     mapper_api::smudgy_mapper::init(mapper.clone()),
-                ];
+                ]);
                 extensions.extend((extra_extensions)());
-                (extensions, script_functions, instance)
+                Ok::<_, String>((
+                    extensions,
+                    script_functions,
+                    instance,
+                    package_audio_binding,
+                ))
             };
 
         // `smudgy://` resolution is PER-ISOLATE (`PACKAGE-ISOLATES-RESOLUTION.md`):
@@ -1285,7 +1384,12 @@ impl<'a> ScriptEngine<'a> {
         if let Some(provider) = &smudgy_provider {
             provider.set_image_hosted(main_image_hosted.clone());
         }
-        let (main_extensions, main_script_functions, main_instance) =
+        let (
+            main_extensions,
+            main_script_functions,
+            main_instance,
+            main_package_audio_binding,
+        ) =
             // Main-isolate `getDataDir()` returns the shared server data dir. Trusted: no
             // net/read gates.
             make_extensions(
@@ -1300,7 +1404,8 @@ impl<'a> ScriptEngine<'a> {
                     &[],
                     &[],
                 ),
-            );
+            )
+            .expect("Main never binds a sandbox-root audio scope");
         let mut main_runtime = build_script_runtime(
             main_extensions,
             server_path.clone(),
@@ -1314,6 +1419,9 @@ impl<'a> ScriptEngine<'a> {
             ImportPolicy::Any,
             params.tokio_runtime.clone(),
             broadcast_channel.clone(),
+            // Trusted user code may spawn workers: off-thread reduced-op compute
+            // realms with a message-only bridge (no smudgy API inside them).
+            WorkerMode::ComputeOnly,
         )
         .expect("Failed to create JS runtime");
         // Surface the v8 inspector endpoint (main only) so it can be debugged via the bundled
@@ -1372,6 +1480,7 @@ impl<'a> ScriptEngine<'a> {
             IsolateId::Main,
             Isolate {
                 runtime: main_runtime,
+                _package_audio_binding: main_package_audio_binding,
                 instance: main_instance,
                 script_functions: main_script_functions,
                 compiled_scripts: Vec::new(),
@@ -1597,12 +1706,29 @@ impl<'a> ScriptEngine<'a> {
                     &effective.net,
                     &expand_data_paths(&effective.read, &fs_data_dir),
                 );
-                let (extensions, script_functions, instance) = make_extensions(
-                    isolate_id.clone(),
-                    smudgy_grants,
-                    fs_data_dir.clone(),
-                    image_policy,
-                );
+                let (extensions, script_functions, instance, package_audio_binding) =
+                    match make_extensions(
+                        isolate_id.clone(),
+                        smudgy_grants,
+                        fs_data_dir.clone(),
+                        image_policy,
+                    ) {
+                        Ok(built) => built,
+                        Err(error) => {
+                            Self::emit_session_notice(
+                                &params.ui_tx,
+                                params.session_id,
+                                &params.emitted_line_count,
+                                &format!(
+                                    "[package] {} failed to bind its bounded audio scope \u{2014} {error}",
+                                    spec.name
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                #[cfg(feature = "web-audio")]
+                let mut package_audio_binding = package_audio_binding;
                 let data_dir = sandbox_data_dir(&server_path, &spec.owner, &spec.name, &version);
                 // Sandbox this isolate with a restricted container built from the enforced union
                 // (`PACKAGE-ISOLATES-ENFORCEMENT.md`); `$DATA` in `read`/`write` expands to `fs_data_dir`.
@@ -1648,6 +1774,16 @@ impl<'a> ScriptEngine<'a> {
                     effective.import,
                     params.tokio_runtime.clone(),
                     isolate_broadcast_channel,
+                    // A sandboxed package spawns workers only with the consented `workers`
+                    // capability (the same grant `make_extensions` mirrored into
+                    // `workers_enabled` above, so the facade and the ops agree). Disabled
+                    // means the worker-host ops are inert: a catchable error with
+                    // no thread spawn, including via `node:worker_threads`.
+                    if smudgy_grants.workers {
+                        WorkerMode::ComputeOnly
+                    } else {
+                        WorkerMode::Disabled
+                    },
                 ) {
                     Ok(runtime) => runtime,
                     Err(e) => {
@@ -1825,6 +1961,31 @@ impl<'a> ScriptEngine<'a> {
                         continue;
                     }
                 }
+                #[cfg(feature = "web-audio")]
+                if let Some(binding) = &mut package_audio_binding {
+                    // Publish control only after the sandbox entry completed
+                    // construction and top-level evaluation. A failed load
+                    // above drops the pending lease and returns capacity.
+                    if let Err(error) = binding.commit() {
+                        Self::emit_session_notice(
+                            &params.ui_tx,
+                            params.session_id,
+                            &params.emitted_line_count,
+                            &format!(
+                                "[package] {} could not publish its audio scope \u{2014} {error:?}",
+                                spec.name
+                            ),
+                        );
+                        // Admission sealed while this package was loading. It
+                        // cannot be published into the closing engine; make
+                        // its own isolate current for exact in-place drop.
+                        unsafe {
+                            runtime.deno_runtime().v8_isolate().enter();
+                        }
+                        drop(runtime);
+                        continue;
+                    }
+                }
                 let package_waker = build_demux_waker(isolate_id.clone(), &ready, &parent);
                 // Seed before insert (set order is irrelevant): arm this isolate on the first
                 // pump. Construction-time insert (no parked task yet), so like `Main`
@@ -1838,6 +1999,7 @@ impl<'a> ScriptEngine<'a> {
                     isolate_id,
                     Isolate {
                         runtime,
+                        _package_audio_binding: package_audio_binding,
                         instance,
                         script_functions,
                         compiled_scripts: Vec::new(),
@@ -1989,9 +2151,22 @@ impl<'a> ScriptEngine<'a> {
             pending_line_operations: params.pending_line_operations,
             current_line,
             mapper: params.mapper,
+            #[cfg(feature = "web-audio")]
+            audio_lifecycle_owner,
             ready,
             parent,
         }
+    }
+
+    /// Seal this exact engine generation against new online contexts and return its drain
+    /// receipt. The caller must drop every isolate before awaiting the receipt.
+    #[cfg(feature = "web-audio")]
+    pub(super) fn retire_audio_generation(
+        &mut self,
+    ) -> Option<deno_audio::AudioLifecycleRetirement> {
+        self.audio_lifecycle_owner
+            .take()
+            .map(deno_audio::AudioLifecycleOwner::retire)
     }
 
     /// Deliver a host-native (`sys:`/`map:`) event to its subscribers: one `CallJavascriptFunction`
@@ -2924,6 +3099,7 @@ fn build_script_runtime(
     import_policy: ImportPolicy,
     tokio_runtime: Rc<tokio::runtime::Runtime>,
     broadcast_channel: smudgy_script::InMemoryBroadcastChannel,
+    workers: WorkerMode,
 ) -> Result<ScriptRuntime> {
     let mut runtime = ScriptRuntime::new(ScriptRuntimeOptions {
         extensions,
@@ -2940,6 +3116,7 @@ fn build_script_runtime(
         data_dir,
         webstorage_dir,
         broadcast_channel: Some(broadcast_channel),
+        workers,
     })?;
     // rusty_v8 enters the isolate when its `OwnedIsolate` is constructed and leaves it current.
     // With an isolate *set* on one thread that would make every isolate but the last "current"

@@ -58,12 +58,27 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+# Runtime construction of the deferred deno_audio extension for WORKER realms
+# whose parent booted the audio snapshot: every concurrently-live isolate in a
+# process must boot the same snapshot blob (V8's shared heap — string table
+# included — is initialized by the first isolate and verified by every later
+# one; a mismatched blob is a fatal `index < size()` check). The worker's
+# instance uses `AudioExtensionOptions::default()` exactly like the snapshot
+# build; its ops are disabled by the worker realm guard.
+deno_audio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+deno_audio = { workspace = true }
+
+[features]
+# Build an additional startup snapshot containing the published deno_audio
+# schema. The base snapshot remains embedded for explicit no-audio runtimes;
+# runtime state is supplied separately for every audio isolate by smudgy_core.
+web-audio = ["dep:deno_audio"]
 
 # build.rs creates the V8 startup snapshot (deno_runtime base extension set) at
-# compile time and emits the residual lazy-source table; see build.rs. Resolved
+# compile time and emits the residual lazy-source tables; see build.rs. Resolved
 # for the HOST (resolver 2 keeps its features separate from the target graph).
 [build-dependencies]
 deno_runtime = { version = "0.265", features = ["snapshot"] }
@@ -71,3 +86,4 @@ deno_runtime = { version = "0.265", features = ["snapshot"] }
 # engine-backend choice to the embedder (the workspace's direct deno_core dep
 # does that for the target graph). Default features here = the V8 backend.
 deno_core = "0.410"
+deno_audio = { workspace = true, optional = true }

@@ -140,6 +140,15 @@ pub enum SessionEvent {
     /// hold the new values and the widget render closures read them lock-free,
     /// so the UI needs no state change — processing the message redraws the view.
     StoreBindingsChanged,
+    /// A sandboxed package successfully prepared its first online Web Audio
+    /// context for this isolate generation. The UI records the versionless
+    /// package observation in `smudgy.lock.json` and may then expose its
+    /// package-specific gain row. Best-effort and advisory: playback itself
+    /// never waits for persistence.
+    PackageAudioUsed {
+        owner: Arc<str>,
+        name: Arc<str>,
+    },
     /// A lazy script-link tooltip resolved into the shared cell held by the
     /// rendered line. Pure repaint wake; no UI-owned state changes.
     LinkTooltipChanged,
@@ -254,6 +263,46 @@ pub type EngineResetHook = Arc<dyn Fn() + Send + Sync>;
 pub type PackageProviderFactory =
     Arc<dyn Fn() -> std::rc::Rc<dyn smudgy_script::PackageProvider> + Send + Sync>;
 
+#[cfg(feature = "web-audio")]
+pub(crate) type RuntimeAudioScope = smudgy_audio_web::SessionAudioScope;
+#[cfg(not(feature = "web-audio"))]
+pub(crate) type RuntimeAudioScope = ();
+
+/// An explicit audio scope did not belong to the session being spawned.
+#[cfg(feature = "web-audio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("session {session_id} cannot use audio scope for session {audio_session_id}")]
+pub struct SessionAudioScopeMismatch {
+    /// Core session requested by the caller.
+    pub session_id: SessionId,
+    /// Numeric mixer session carried by the opaque audio scope.
+    pub audio_session_id: u64,
+}
+
+/// Typed failure for the UI's transactional audio-session spawn boundary.
+#[cfg(feature = "web-audio")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AudioSessionSpawnError {
+    /// The supplied Web Audio scope belongs to another session.
+    #[error(transparent)]
+    Scope(#[from] SessionAudioScopeMismatch),
+    /// The operating system refused to create the runtime thread.
+    #[error(transparent)]
+    RuntimeThread(#[from] runtime::RuntimeThreadSpawnError),
+    /// The spawned worker could not be published and carries its cleanup result.
+    #[error(transparent)]
+    RuntimePublication(#[from] runtime::RuntimeThreadPublicationError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SessionRuntimeSpawnError {
+    #[error(transparent)]
+    Thread(#[from] runtime::RuntimeThreadSpawnError),
+    #[error(transparent)]
+    Publication(#[from] runtime::RuntimeThreadPublicationError),
+}
+
 pub struct SessionParams {
     pub session_id: SessionId,
     pub server_name: Arc<String>,
@@ -350,7 +399,22 @@ pub enum BufferUpdate {
 }
 
 pub fn spawn(params: Arc<SessionParams>) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, None, None)
+    spawn_inner(&params, None, None, None)
+}
+
+/// Spawn a session with one exact application-owned Web Audio scope.
+///
+/// # Errors
+///
+/// Rejects a session-id mismatch before constructing or publishing a runtime
+/// thread. The scope is reused unchanged by replacement engine generations.
+#[cfg(feature = "web-audio")]
+pub fn spawn_with_audio(
+    params: Arc<SessionParams>,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent>, SessionAudioScopeMismatch> {
+    validate_audio_scope(&params, &audio_scope)?;
+    Ok(spawn_inner(&params, None, None, Some(audio_scope)))
 }
 
 /// Like [`spawn`], but resolves `smudgy://` packages through `package_provider` instead of
@@ -361,7 +425,27 @@ pub fn spawn_with_package_provider(
     params: Arc<SessionParams>,
     package_provider: PackageProviderFactory,
 ) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, Some(package_provider), None)
+    spawn_inner(&params, Some(package_provider), None, None)
+}
+
+/// Like [`spawn_with_package_provider`], with one exact Web Audio scope.
+///
+/// # Errors
+///
+/// Rejects a session-id mismatch before runtime-thread publication.
+#[cfg(feature = "web-audio")]
+pub fn spawn_with_package_provider_and_audio(
+    params: Arc<SessionParams>,
+    package_provider: PackageProviderFactory,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent>, SessionAudioScopeMismatch> {
+    validate_audio_scope(&params, &audio_scope)?;
+    Ok(spawn_inner(
+        &params,
+        Some(package_provider),
+        None,
+        Some(audio_scope),
+    ))
 }
 
 /// Spawn a session attached to the UI daemon's ordered command bus.
@@ -372,14 +456,90 @@ pub fn spawn_with_ui_commands(
     params: Arc<SessionParams>,
     ui_commands: ui_command::UiCommandBus,
 ) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, None, Some(ui_commands))
+    spawn_inner(&params, None, Some(ui_commands), None)
+}
+
+/// Like [`spawn_with_ui_commands`], with one exact Web Audio scope.
+///
+/// # Errors
+///
+/// Rejects a session-id mismatch before runtime-thread publication.
+#[cfg(feature = "web-audio")]
+pub fn spawn_with_ui_commands_and_audio(
+    params: Arc<SessionParams>,
+    ui_commands: ui_command::UiCommandBus,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent>, SessionAudioScopeMismatch> {
+    validate_audio_scope(&params, &audio_scope)?;
+    Ok(spawn_inner(
+        &params,
+        None,
+        Some(ui_commands),
+        Some(audio_scope),
+    ))
+}
+
+/// Fallible production UI variant. Unlike compatibility spawn entry points,
+/// an OS-thread creation failure is returned before a session is published.
+/// Its exact `SpawnFailed` join tombstone remains available to the caller's
+/// lifecycle coordinator.
+///
+/// # Errors
+///
+/// Returns [`AudioSessionSpawnError::Scope`] when the supplied audio scope is
+/// not bound to this session, [`AudioSessionSpawnError::RuntimeThread`] when
+/// the operating system refuses the runtime thread, or
+/// [`AudioSessionSpawnError::RuntimePublication`] when the worker was spawned
+/// but could not be published. The publication error owns its one-shot cleanup
+/// report and must be consumed by the lifecycle coordinator.
+#[cfg(feature = "web-audio")]
+pub fn try_spawn_with_ui_commands_and_audio(
+    params: &Arc<SessionParams>,
+    ui_commands: ui_command::UiCommandBus,
+    audio_scope: smudgy_audio_web::SessionAudioScope,
+) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, AudioSessionSpawnError> {
+    validate_audio_scope(params, &audio_scope)?;
+    try_spawn_inner(params, None, Some(ui_commands), Some(audio_scope)).map_err(|error| match error
+    {
+        SessionRuntimeSpawnError::Thread(error) => AudioSessionSpawnError::RuntimeThread(error),
+        SessionRuntimeSpawnError::Publication(error) => {
+            AudioSessionSpawnError::RuntimePublication(error)
+        }
+    })
+}
+
+#[cfg(feature = "web-audio")]
+fn validate_audio_scope(
+    params: &SessionParams,
+    audio_scope: &smudgy_audio_web::SessionAudioScope,
+) -> Result<(), SessionAudioScopeMismatch> {
+    let session_id = u32::from(params.session_id);
+    if u64::from(session_id) == audio_scope.session_id() {
+        Ok(())
+    } else {
+        Err(SessionAudioScopeMismatch {
+            session_id: params.session_id,
+            audio_session_id: audio_scope.session_id(),
+        })
+    }
 }
 
 fn spawn_inner(
-    params: Arc<SessionParams>,
+    params: &SessionParams,
     package_provider_override: Option<PackageProviderFactory>,
     ui_commands: Option<ui_command::UiCommandBus>,
-) -> impl Stream<Item = TaggedSessionEvent> {
+    audio_scope: Option<RuntimeAudioScope>,
+) -> impl Stream<Item = TaggedSessionEvent> + use<> {
+    try_spawn_inner(params, package_provider_override, ui_commands, audio_scope)
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn try_spawn_inner(
+    params: &SessionParams,
+    package_provider_override: Option<PackageProviderFactory>,
+    ui_commands: Option<ui_command::UiCommandBus>,
+    audio_scope: Option<RuntimeAudioScope>,
+) -> Result<impl Stream<Item = TaggedSessionEvent> + use<>, SessionRuntimeSpawnError> {
     let (mut ui_tx, ui_rx) = futures::channel::mpsc::channel::<TaggedSessionEvent>(1024);
 
     if let Err(e) = ui_tx.try_send(TaggedSessionEvent {
@@ -391,7 +551,7 @@ fn spawn_inner(
         error!("Failed to send initial buffer update: {e:?}");
     }
 
-    let runtime = runtime::Runtime::new(
+    let runtime = runtime::Runtime::try_new(
         params.session_id,
         params.server_name.clone(),
         params.profile_name.clone(),
@@ -401,16 +561,68 @@ fn spawn_inner(
         package_provider_override,
         params.extra_script_extensions.clone(),
         params.on_engine_rebuild.clone(),
+        audio_scope,
         ui_tx,
         ui_commands,
-    );
+    )?;
     let shutdown_tx = runtime.tx();
 
     // Register the runtime in the global registry
-    registry::register_session(params.session_id, runtime.into());
+    registry::try_register_session(params.session_id, runtime.into())?;
 
-    SessionEventStream {
+    Ok(SessionEventStream {
         events: ui_rx,
         shutdown_tx,
+    })
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn try_spawn_returns_exact_joined_publication_unwind_without_evaluating_scripts() {
+        let session_id = SessionId::from(92_500);
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let rebuild_count = Arc::clone(&rebuilds);
+        let params = SessionParams {
+            session_id,
+            server_name: Arc::new("publication-unwind".to_string()),
+            profile_name: Arc::new("test".to_string()),
+            profile_subtext: Arc::new(String::new()),
+            mapper: None,
+            package_client: None,
+            extra_script_extensions: Arc::new(Vec::new),
+            on_engine_rebuild: Some(Arc::new(move || {
+                rebuild_count.fetch_add(1, Ordering::AcqRel);
+            })),
+        };
+
+        registry::inject_next_publication_unwind();
+        let result = try_spawn_inner(&params, None, None, None);
+        let SessionRuntimeSpawnError::Publication(error) = result
+            .err()
+            .expect("injected registration unwind rejects spawn")
+        else {
+            panic!("registration unwind returned the wrong spawn error");
+        };
+        assert_eq!(
+            error.failure(),
+            runtime::RuntimeThreadPublicationFailure::PublicationUnwound
+        );
+        assert_eq!(
+            error.cleanup(),
+            runtime::RuntimeThreadJoinOutcome::Clean { session_id }
+        );
+        assert_eq!(rebuilds.load(Ordering::Acquire), 0, "scripts never built");
+        assert!(registry::get_runtime(session_id).is_none());
+        assert!(!runtime::runtime_thread_is_tracked(session_id));
+        assert_eq!(
+            runtime::join_runtime_thread(session_id),
+            runtime::RuntimeThreadJoinOutcome::NotTrackedOrAlreadyJoined { session_id },
+            "the publication transaction consumed the exact join once"
+        );
     }
 }

@@ -31,6 +31,11 @@ first run. Deno 2.9.5's Rust crate family requires Rust 1.95.0 or newer; the
 log — a pre-1.95 SDK fails later during compilation, and the printed version
 is how to diagnose it.
 
+The manifest builds `smudgy_ui/web-audio-cpal`. It uses the host's
+PulseAudio-compatible service (including PipeWire's PulseAudio service) for
+physical output and retains hosted silent, time-advancing default and
+`sinkId: "none"` contexts when compatible output is unavailable.
+
 ### Architectures
 
 The manifest is architecture-agnostic — the `v8` crate downloads the matching
@@ -69,7 +74,7 @@ apps are never on `$PATH` by their bare name; alias it if you want a `smudgy` co
 
 ## Releasing (CI)
 
-Pushing a `v<x.y.z>` tag triggers `.github/workflows/flatpak-release.yml`, which
+Pushing a `v<x.y.z>` tag triggers `.github/workflows/release.yml`, which
 builds both arches on **native** runners (x86_64 + aarch64 — no emulation) and
 publishes `smudgy-v<version>-<arch>.flatpak` to the wiki's `download:` media
 namespace via `bin/dokuwiki-upload.sh`.
@@ -112,6 +117,7 @@ flatpak install --user smudgy-v<version>-<arch>.flatpak
 | `org.smudgy.Smudgy.desktop` | desktop entry (app-menu icon) |
 | `org.smudgy.Smudgy.metainfo.xml` | AppStream metadata |
 | `org.smudgy.Smudgy.png` / `-512.png` | 256/512 icons (installed to `hicolor`) |
+| `../../THIRD-PARTY-NOTICES.md` | feature-matched, five-target union dependency notices installed under `/app/share/doc/smudgy/` |
 
 ## Design decisions
 
@@ -179,6 +185,7 @@ To go **fully offline** later (reproducible / Flathub):
 | `--share=network` | MUD TCP, cloud/package HTTPS, `jsr:`/`npm:` script imports |
 | `--share=ipc` | X11 SHM (render perf); harmless on Wayland |
 | `--socket=wayland` + `--socket=fallback-x11` | display |
+| `--socket=pulseaudio` | physical Web Audio output through the host PulseAudio/PipeWire service |
 | `--device=dri` | GPU for `wgpu` (Vulkan/GL); not `all` |
 | `--filesystem=xdg-documents/smudgy:create` | data dir (scoped, see above) |
 | `--talk-name=org.freedesktop.secrets` | OS keyring (Secret Service is not a portal) |
@@ -186,3 +193,15 @@ To go **fully offline** later (reproducible / Flathub):
 URLs and the data folder open through the OpenURI/OpenDirectory portals, which
 need no extra grant. V8/`deno_core` JIT runs under the default seccomp filter (no
 `--allow=devel`).
+
+**PulseAudio sandbox delta.** `--socket=pulseaudio` is a broad, static
+application-sandbox grant: the PulseAudio protocol can expose both playback and
+capture capabilities to native code in the Flatpak. Smudgy's reviewed CPAL path
+opens output only, and Web Audio exposes no capture API or operation. Sandboxed
+packages gain no module-loading, filesystem, network, subprocess, FFI,
+system-information, or capture authority; their existing capability and
+source-access checks are unchanged. The trusted Main isolate is already
+allow-all, including FFI, so native code it is already authorized to load can
+inherit the Flatpak's new audio-server reachability, including protocol-level
+capture capability. That trusted/native residual is part of the disclosed broad
+static sandbox delta, not a new Web Audio permission or API.

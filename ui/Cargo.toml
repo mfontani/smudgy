@@ -87,6 +87,9 @@ base64 = "0.22"
 # HTTP date parsing (Expires/Last-Modified/Date) for the RFC-9111-subset freshness math.
 httpdate = "1"
 discord-rich-presence = "1.1.0"
+smudgy_audio = { workspace = true, optional = true }
+smudgy_audio_web = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 # Restart Manager cooperation so the installer can upgrade over a running smudgy:
 # a window-proc subclass catches the session-end message and exits. See win_rm.rs.
@@ -100,6 +103,24 @@ winapi = { workspace = true, features = [
 ] }
 
 [features]
+# Desktop builds ship with physical Web Audio output by default. Embedders and
+# hardware-free CI lanes opt out with --no-default-features; the hosted silent
+# path remains fully supported there.
+default = ["web-audio-cpal"]
+# Hardware-independent integration for explicit audio-scoped test/embedding paths. It keeps
+# `sinkId: "none"` available without acquiring a device; by itself it does not make ordinary
+# desktop sessions audio-scoped.
+web-audio = ["smudgy_core/web-audio"]
+# Desktop coordinator and direct CPAL output (WASAPI/ALSA/CoreAudio) through
+# `smudgy_audio/physical-output`. Production packaging still selects this
+# feature explicitly, and it is also the crate default.
+web-audio-cpal = [
+    "web-audio",
+    "dep:futures",
+    "dep:smudgy_audio",
+    "dep:smudgy_audio_web",
+    "smudgy_audio/physical-output",
+]
 # Attach iced's devtools to the running app (iced_debug + the in-app overlay, plus the
 # beacon a running `comet` viewer connects to). Dev-only instrumentation -- keep it out
 # of release builds. Usage: cargo run --features iced-debug
@@ -107,6 +128,7 @@ iced-debug = ["iced/debug"]
 
 [dev-dependencies]
 async-trait = "0.1"
+smudgy_audio = { workspace = true, features = ["test-support"] }
 # Isolated on-disk fixtures for the workspace load/set-aside tests (same
 # version core already pins).
 tempfile = "3"

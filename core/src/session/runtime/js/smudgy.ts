@@ -164,6 +164,9 @@ const {
     op_smudgy_procedure_post,
     op_smudgy_interop_declare,
     op_smudgy_broadcast_allowed,
+    op_smudgy_workers_allowed,
+    op_smudgy_worker_count,
+    op_smudgy_worker_cap,
 } = __smudgy_ops as any;
 
 if (!op_smudgy_broadcast_allowed()) {
@@ -175,6 +178,79 @@ if (!op_smudgy_broadcast_allowed()) {
                 throw new TypeError(
                     "smudgy: this package did not request the 'interop:broadcast' capability",
                 );
+            }
+        },
+    });
+}
+
+// The clear-error facade for isolates whose worker-host ops are disabled. The
+// ops middleware (smudgy_script web_workers.rs) is the enforcement -- it also
+// covers the node:worker_threads path, which reaches the same op without this
+// constructor -- but its generic disabled-op error names no cause, so shadow
+// the global with one that does.
+if (!op_smudgy_workers_allowed()) {
+    Object.defineProperty(globalThis, "Worker", {
+        configurable: true,
+        writable: true,
+        value: class Worker {
+            constructor(_specifier: string | URL, _options?: unknown) {
+                throw new TypeError(
+                    "smudgy: this package did not request the 'workers:spawn' capability",
+                );
+            }
+        },
+    });
+} else {
+    // A relative Worker specifier resolves against the CALLING module, not
+    // the synthetic location (file:///smudgy-main.js) deno_runtime would
+    // use -- an author's "./workers/helper.ts" names a sibling of the module
+    // that spawns it, in local modules and packages alike. The calling
+    // module's URL is recovered from the construction stack: the first frame
+    // whose URL is not an ext: module. Non-relative specifiers, non-string
+    // specifiers, and frames without a module URL (inline alias/trigger
+    // bodies) pass through untouched.
+    const resolveWorkerSpecifier = (specifier: unknown): unknown => {
+        if (typeof specifier !== "string") return specifier;
+        if (!(specifier.startsWith("./") || specifier.startsWith("../"))) {
+            return specifier;
+        }
+        const stack = String(new Error().stack ?? "");
+        for (const frame of stack.split("\n")) {
+            const match = frame.match(
+                /at (?:[^(]*\()?([a-z][a-z0-9+.-]*:[^()\s]+):\d+:\d+\)?\s*$/,
+            );
+            if (!match) continue;
+            const url = match[1];
+            if (url.startsWith("ext:")) continue;
+            try {
+                return new URL(specifier, url).href;
+            } catch {
+                return specifier;
+            }
+        }
+        return specifier;
+    };
+
+    // The per-isolate live-worker cap. The count is the worker-host ops' own
+    // table of live handles (terminate/exit removes an entry), so the ceiling
+    // tracks actual liveness, not construction history.
+    const RealWorker = (globalThis as any).Worker;
+    Object.defineProperty(globalThis, "Worker", {
+        configurable: true,
+        writable: true,
+        value: class Worker extends RealWorker {
+            constructor(...args: unknown[]) {
+                if (op_smudgy_worker_count() >= op_smudgy_worker_cap()) {
+                    throw new Error(
+                        "smudgy: live-worker limit reached (" +
+                            op_smudgy_worker_cap() +
+                            " per isolate); terminate one before spawning another",
+                    );
+                }
+                if (args.length > 0) {
+                    args[0] = resolveWorkerSpecifier(args[0]);
+                }
+                super(...args);
             }
         },
     });

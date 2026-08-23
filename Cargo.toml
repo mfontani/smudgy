@@ -1,6 +1,7 @@
 [workspace]
-members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector"]
-# Everything except `inspector` and `scriptref`. This leaves exactly one bin target (ui's
+members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector", "audio", "audio_web"]
+# Everything except `inspector`, `scriptref`, and the internal `audio_web` integration crate.
+# This leaves exactly one bin target (ui's
 # `smudgy`) in the default set, so a bare `cargo run` / `cargo build` / `cargo
 # test` resolves to the app without needing `-p` or `--bin`. `inspector` is a
 # standalone dev/sidecar helper with its own bin (`smudgy_inspector`); a second
@@ -10,7 +11,7 @@ members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "insp
 # `scriptref` (`smudgy_scriptref`) is likewise a standalone dev tool — the script
 # API reference generator/publisher — excluded for the same reason; run it with
 # `cargo run -p smudgy_scriptref`.
-default-members = ["ui", "core", "cloud", "map_widget", "bench", "script"]
+default-members = ["ui", "core", "cloud", "map_widget", "bench", "script", "audio"]
 resolver = "2"
 
 # Define shared dependencies for the workspace
@@ -83,6 +84,13 @@ smudgy_cloud = { path = "./cloud", features = ["cloud"] }
 smudgy_widgets = { path = "./widgets" }
 smudgy_map_widget = { path = "./map_widget" }
 smudgy_i18n = { path = "./i18n" }
+smudgy_audio = { path = "./audio" }
+smudgy_audio_web = { path = "./audio_web" }
+kira = { version = "0.12.3", default-features = false }
+cpal = { version = "=0.18.2", default-features = false }
+# Published Web Audio extension. Keep the revision immutable: this is the exact
+# reviewed alpha that matches the workspace's Deno 2.9.5 crate tuple.
+deno_audio = { git = "https://github.com/smudgy-mud/deno_audio.git", rev = "80b57870008d09e029b4e79b42c9467686a560ba", default-features = false }
 tokio = { version = "1.44.2", features = ["full"] }
 parking_lot = "0.12.1"
 pretty_env_logger = "0.5.0"
@@ -139,11 +147,24 @@ unic-langid = "0.9.6"
 #   scoped read+write grants can reach them; paired invariant: smudgy rejects
 #   pipe-namespace paths in manifest path axes, so a pipe fs-grant only ever
 #   originates from a consented Critical-tier `ipc` row.
+# - `iced_runtime` (patches/iced_runtime+0.14.0.patch): adds the narrow
+#   per-window announcement action used by the audio control panel.
+# - `iced_winit` (patches/iced_winit+0.14.0.patch): owns the matching bounded
+#   AccessKit live-region bridge and native-window retirement ordering.
 [workspace.metadata.patch]
-crates = ["iced_graphics", "cosmic-text", "vtparse", "deno_permissions"]
+crates = [
+    "iced_graphics",
+    "iced_runtime",
+    "iced_winit",
+    "cosmic-text",
+    "vtparse",
+    "deno_permissions",
+]
 
 [patch.crates-io]
 iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
+iced_runtime = { path = "./target/patch/iced_runtime-0.14.0" }
+iced_winit = { path = "./target/patch/iced_winit-0.14.0" }
 cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
 vtparse = { path = "./target/patch/vtparse-0.7.0" }
 deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }

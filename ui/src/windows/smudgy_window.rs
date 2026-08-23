@@ -162,6 +162,10 @@ pub enum Event {
     /// runtime shutdown, grid cleanup across all windows, the empty-window
     /// rule — is the daemon's job.
     CloseSession(SessionId),
+    /// The toolbar or reserved keyboard shortcut requested the audio
+    /// controls (the Settings window's Audio pane).
+    #[cfg(feature = "web-audio-cpal")]
+    OpenAudioPanel,
     /// The user clicked a pane's title-bar eyeball. The window already
     /// flipped its local state optimistically; the daemon reports the toggle
     /// to the pane's session runtime (`PaneUserHidden`), which owns the def —
@@ -2622,7 +2626,18 @@ impl SmudgyWindow {
         sessions: &mut SessionStore,
     ) -> Task<Message> {
         let session_id =
-            sessions.open_session(server_name.clone(), profile_name.clone(), auto_connect);
+            match sessions.open_session(server_name.clone(), profile_name.clone(), auto_connect) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    log::error!(
+                        "Could not open session for {profile_name} on {server_name}: {error}"
+                    );
+                    if let Some(modal::Modal::Connect(state)) = &mut self.modal {
+                        state.set_session_open_error(error.to_string());
+                    }
+                    return Task::none();
+                }
+            };
 
         // A vacant slot of this server in THIS window (the modal's window —
         // opens-where-you-asked) is adopted with its retained geometry;
@@ -2757,6 +2772,8 @@ impl SmudgyWindow {
                     Update::none()
                 }
                 toolbar::Message::SettingsPressed => Update::with_event(Event::OpenSettingsWindow),
+                #[cfg(feature = "web-audio-cpal")]
+                toolbar::Message::AudioPressed => Update::with_event(Event::OpenAudioPanel),
                 toolbar::Message::DragWindow => Update::with_task(window::drag(self.window_id)),
                 toolbar::Message::MinimizePressed => {
                     Update::with_task(window::minimize(self.window_id, true))
@@ -3016,6 +3033,10 @@ impl SmudgyWindow {
                 }
 
                 match msg {
+                    #[cfg(feature = "web-audio-cpal")]
+                    session_store::Message::OpenAudioPanel => {
+                        Update::new(Task::none(), Some(Event::OpenAudioPanel))
+                    }
                     session_store::Message::SetMapperCurrentLocation(area_id, room_number) => {
                         // Keep the session's own map widgets in step, and bubble
                         // up for the standalone map editor windows.
@@ -4000,6 +4021,79 @@ mod tests {
 
     fn test_window() -> SmudgyWindow {
         SmudgyWindow::new(window::Id::unique(), crate::cloud_account::test_handles())
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn toolbar_audio_action_requests_the_audio_settings_pane() {
+        let mut window = test_window();
+        let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
+        let update = window.update(
+            Message::ToolbarAction(toolbar::Message::AudioPressed),
+            &mut sessions,
+        );
+        assert!(matches!(update.event, Some(Event::OpenAudioPanel)));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn failed_physical_open_keeps_connect_modal_and_publishes_nothing() {
+        let _core_runtime_lock = crate::application_audio::lock_core_runtime_test();
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let _tokio_guard = tokio.enter();
+        let (mut application, probe) =
+            crate::application_audio::test_application_audio_with_core_runtime();
+        let _renderer = crate::application_audio::TestAudioRenderer::start(probe);
+        application.seal_application_for_test();
+        let (ui_commands, _ui_events) = smudgy_core::session::ui_command::channel();
+        let mut sessions = SessionStore::with_ui_commands_and_audio(
+            crate::cloud_account::test_handles(),
+            ui_commands,
+            application.controller(),
+        );
+        let mut window = test_window();
+        window.modal = Some(modal::Modal::Connect(modal::connect::State::default()));
+        let groups_before = window.layout.groups_depth_first().len();
+
+        let _ = window.open_session(
+            "missing-test-server".to_string(),
+            "missing-test-profile".to_string(),
+            false,
+            &mut sessions,
+        );
+
+        assert_eq!(sessions.iter().count(), 0);
+        assert_eq!(window.layout.groups_depth_first().len(), groups_before);
+        assert_eq!(window.active_session_id(), None);
+        let Some(modal::Modal::Connect(connect)) = &window.modal else {
+            panic!("the Connect modal must remain open");
+        };
+        assert!(connect.session_open_error_for_test().is_some());
+        assert_eq!(
+            sessions.next_session_id_for_test(),
+            Some(SessionId::from(1)),
+            "failed id 0 is spent"
+        );
+
+        let _ = window.open_session(
+            "missing-test-server".to_string(),
+            "missing-test-profile".to_string(),
+            false,
+            &mut sessions,
+        );
+        assert_eq!(sessions.iter().count(), 0);
+        assert_eq!(
+            sessions.next_session_id_for_test(),
+            Some(SessionId::from(2)),
+            "a second failure cannot reuse id 0 or 1"
+        );
+
+        let report = application.shutdown();
+        assert!(report.sessions.is_empty());
+        assert!(report.is_clean(), "{report}");
     }
 
     /// Distinct non-main pane references for one session, keyed through a

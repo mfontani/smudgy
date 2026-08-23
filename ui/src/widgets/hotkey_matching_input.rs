@@ -39,6 +39,15 @@ fn is_clipboard_write_shortcut(
     modifiers.command() && matches!(key.to_latin(physical_key), Some('c' | 'x'))
 }
 
+/// Reserved application chord that opens and focuses the audio panel. It is
+/// excluded from user hotkey dispatch so a focused command input cannot
+/// double-fire a script automation and the application action.
+#[cfg(feature = "web-audio-cpal")]
+pub(crate) fn is_audio_panel_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    modifiers == (keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT)
+        && matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("a"))
+}
+
 pub struct HotkeyMatchingInput<'a, Message, Theme, Renderer>
 where
     Message: Clone,
@@ -52,6 +61,8 @@ where
     on_focus: Option<Message>,
     on_unfocus: Option<Message>,
     on_caret_change: Option<Box<dyn Fn(CaretState) -> Message>>,
+    #[cfg(feature = "web-audio-cpal")]
+    on_audio_panel_shortcut: Option<Message>,
     suppress_clipboard_writes: bool,
     _p: PhantomData<(Message, Theme, Renderer)>,
 }
@@ -76,6 +87,8 @@ where
             on_focus: None,
             on_unfocus: None,
             on_caret_change: None,
+            #[cfg(feature = "web-audio-cpal")]
+            on_audio_panel_shortcut: None,
             suppress_clipboard_writes: false,
             _p: PhantomData,
         }
@@ -105,6 +118,14 @@ where
     /// (focus, cursor, selection) differs from the previous event's reading.
     pub fn on_caret_change(mut self, f: impl Fn(CaretState) -> Message + 'static) -> Self {
         self.on_caret_change = Some(Box::new(f));
+        self
+    }
+
+    /// Reserve the application audio-panel chord ahead of both user hotkeys
+    /// and iced's built-in command+A text selection.
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn on_audio_panel_shortcut(mut self, message: Message) -> Self {
+        self.on_audio_panel_shortcut = Some(message);
         self
     }
 
@@ -177,6 +198,10 @@ where
         physical_key: &key::Physical,
         modifiers: &keyboard::Modifiers,
     ) -> Option<HotkeyId> {
+        #[cfg(feature = "web-audio-cpal")]
+        if is_audio_panel_shortcut(key, *modifiers) {
+            return None;
+        }
         // Create a MaybePhysicalKey from the incoming key for lookup
         let maybe_key = MaybePhysicalKey::Key(key.clone());
         let maybe_physical_key = MaybePhysicalKey::Physical(*physical_key);
@@ -357,6 +382,20 @@ where
                 return;
             }
 
+            #[cfg(feature = "web-audio-cpal")]
+            if is_audio_panel_shortcut(key, *modifiers) {
+                if !event_key_repeat(event)
+                    && let Some(message) = self.on_audio_panel_shortcut.as_ref()
+                {
+                    shell.publish(message.clone());
+                }
+                // Capture before TextInput sees command+A. This preserves the
+                // command value/caret and makes one typed component event the
+                // sole owner of opening the panel.
+                shell.capture_event();
+                return;
+            }
+
             if let Some(hook) = self.hooks.get(key)
                 && modifiers.is_empty()
             {
@@ -448,6 +487,14 @@ where
         self.text_input
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn event_key_repeat(event: &iced::Event) -> bool {
+    matches!(
+        event,
+        iced::Event::Keyboard(keyboard::Event::KeyPressed { repeat: true, .. })
+    )
 }
 
 #[cfg(test)]

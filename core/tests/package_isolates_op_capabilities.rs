@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
-use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 use smudgy_core::session::{
     BufferUpdate, PackageProviderFactory, SessionEvent, SessionId, SessionParams,
     spawn_with_package_provider,
@@ -39,6 +39,33 @@ const QUIET_PERIOD: Duration = Duration::from_millis(900);
 /// permissions — these tests gate smudgy ops, not net/fs).
 fn make_package(owner: &str, name: &str, version: &str, src: &str) -> ResolvedPackage {
     let manifest_json = format!(r#"{{ "name": "{name}", "version": "{version}" }}"#);
+    ResolvedPackage {
+        key: PackageKey {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        },
+        resolved_version: version.to_string(),
+        manifest: PackageManifest::parse(&manifest_json).expect("valid manifest"),
+        integrity: format!("test-{name}-{version}"),
+        modules: vec![PackageModuleSource {
+            subpath: "index.js".to_string(),
+            text: src.to_string(),
+        }],
+    }
+}
+
+/// Like [`make_package`], but the manifest also DECLARES a `permissions.smudgy` block — for tests
+/// whose interest includes the manifest wire shape (the recorded consent still drives enforcement).
+fn make_package_declaring(
+    owner: &str,
+    name: &str,
+    version: &str,
+    smudgy_json: &str,
+    src: &str,
+) -> ResolvedPackage {
+    let manifest_json = format!(
+        r#"{{ "name": "{name}", "version": "{version}", "permissions": {{ "smudgy": {smudgy_json} }} }}"#
+    );
     ResolvedPackage {
         key: PackageKey {
             owner: owner.to_string(),
@@ -101,6 +128,7 @@ async fn run_capability_case(
     consent: Option<PackagePermissions>,
     pkg: ResolvedPackage,
 ) -> Vec<String> {
+    let session_id = SessionId::from(session_id);
     prepare_server(server);
     shared_packages::install_package(server, spec, UpdateMode::Auto, true).unwrap();
     if let Some(consent) = consent {
@@ -108,7 +136,7 @@ async fn run_capability_case(
     }
 
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(session_id),
+        session_id,
         server_name: Arc::new(server.to_string()),
         profile_name: Arc::new("test".to_string()),
         profile_subtext: Arc::new(String::new()),
@@ -136,7 +164,14 @@ async fn run_capability_case(
             collect(&updates, &mut lines);
         }
     }
-    tx.send(RuntimeAction::Shutdown).ok();
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
+    drop(tx);
+    drop(events);
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
     lines
 }
 
@@ -831,5 +866,286 @@ async fn gmcp_send_is_its_own_capability() {
     assert!(
         !has_line(&granted, "BADNAME_NO_THROW") && has_line(&granted, "BADNAME_DENIED:"),
         "an invalid GMCP name is rejected loudly at the op; transcript:\n{granted:#?}"
+    );
+}
+
+/// The `workers` capability (`workers: ["spawn"]`, declared in the manifest's wire shape and
+/// consented) gates Web Worker construction. Granted: a data:-URL module worker constructs,
+/// round-trips one `postMessage`, and terminates. Ungated: `new Worker` is the facade's catchable
+/// `TypeError`, naming the capability.
+#[tokio::test]
+async fn workers_capability_gates_worker_construction() {
+    // A worker boot spawns a thread and initializes a fresh realm, which can outlast the
+    // harness's quiet window — the keepalive echo holds the collection loop open until the
+    // reply (or the 15s cap) lands.
+    let granted_src = r#"
+        import { echo } from "smudgy:core";
+        const body = "onmessage = (e) => { postMessage('pong:' + e.data); };";
+        try {
+            const worker = new Worker(
+                "data:text/javascript," + encodeURIComponent(body),
+                { type: "module" },
+            );
+            const keepalive = setInterval(() => echo("WAITING"), 200);
+            const done = () => clearInterval(keepalive);
+            setTimeout(done, 15000);
+            worker.onmessage = (e) => {
+                done();
+                echo("WORKER_REPLY:" + e.data);
+                worker.terminate();
+            };
+            worker.onerror = (e) => {
+                e.preventDefault();
+                done();
+                echo("WORKER_ONERROR:" + e.message);
+            };
+            worker.postMessage("ping");
+            echo("WORKER_SPAWNED");
+        } catch (e) { echo("WORKER_THROW:" + (e?.message ?? String(e))); }
+    "#;
+    let granted = run_capability_case(
+        9646,
+        "pi_caps_workers_granted",
+        "smudgy://wbk/workerful",
+        Some(consent_with(|s| s.workers = true)),
+        make_package_declaring(
+            "wbk",
+            "workerful",
+            "1.0.0",
+            r#"{ "workers": ["spawn"], "session": ["echo"] }"#,
+            granted_src,
+        ),
+    )
+    .await;
+    assert!(
+        has_line(&granted, "WORKER_SPAWNED") && !has_line(&granted, "WORKER_THROW:"),
+        "with workers:spawn the constructor must not throw; transcript:\n{granted:#?}"
+    );
+    assert!(
+        has_line(&granted, "WORKER_REPLY:pong:ping"),
+        "the worker must echo the sentinel back through postMessage; transcript:\n{granted:#?}"
+    );
+
+    // Ungated: the facade shadows the constructor with a TypeError naming the capability.
+    let denied_src = r#"
+        import { echo } from "smudgy:core";
+        try {
+            new Worker("data:text/javascript,", { type: "module" });
+            echo("WORKER_NO_THROW");
+        } catch (e) {
+            echo("WORKER_DENIED:" + (e instanceof TypeError) + ":" + (e?.message ?? String(e)));
+        }
+    "#;
+    let denied = run_capability_case(
+        9647,
+        "pi_caps_workers_denied",
+        "smudgy://wbk/workless",
+        Some(consent_with(|_| {})), // echo only
+        make_package("wbk", "workless", "1.0.0", denied_src),
+    )
+    .await;
+    assert!(
+        !has_line(&denied, "WORKER_NO_THROW") && has_line(&denied, "WORKER_DENIED:true:"),
+        "without workers:spawn the constructor throws a TypeError; transcript:\n{denied:#?}"
+    );
+    assert!(
+        has_line(&denied, "workers:spawn"),
+        "the denial names the missing 'workers:spawn' capability; transcript:\n{denied:#?}"
+    );
+}
+
+/// A batch of constructions passes the live-worker cap guard. The facade's `Worker`
+/// shadow consults the count and cap ops on every construction, so nine successful
+/// spawns prove the accounting returns sane values well under the 128 ceiling. The
+/// throw-at-cap branch itself is not driven: constructing 129 OS threads/V8 isolates
+/// is disproportionate for CI, and the guard is a two-line comparison over exactly
+/// the ops each of these constructions already exercised. (`Deno.core` is hidden
+/// from script realms, so the ops are not directly probeable — by design.)
+#[tokio::test]
+async fn worker_constructions_pass_the_cap_guard() {
+    let src = r#"
+        import { echo } from "smudgy:core";
+        const workers = [];
+        try {
+            for (let i = 0; i < 9; i++) {
+                workers.push(new Worker("data:text/javascript,", { type: "module" }));
+            }
+            echo("CAP_BATCH_OK:" + workers.length);
+        } catch (e) {
+            echo("CAP_UNEXPECTED:" + (e?.message ?? String(e)));
+        } finally {
+            for (const w of workers) w.terminate();
+        }
+    "#;
+    let lines = run_capability_case(
+        9648,
+        "pi_caps_workers_cap",
+        "smudgy://wbk/workcap",
+        Some(consent_with(|s| s.workers = true)),
+        make_package("wbk", "workcap", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        has_line(&lines, "CAP_BATCH_OK:9"),
+        "nine constructions pass the cap guard; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "CAP_UNEXPECTED:"),
+        "no failure in the guard path; transcript:\n{lines:#?}"
+    );
+}
+
+/// A relative Worker specifier resolves against the CALLING module, not the synthetic
+/// `file:///smudgy-main.js` location `deno_runtime` would otherwise use: a local module's
+/// `new Worker("./workers/worker.ts")` names its on-disk sibling. This is the trusted
+/// main isolate (local modules), with no packages installed.
+#[tokio::test]
+async fn worker_relative_specifier_resolves_against_the_calling_module() {
+    let session_id = SessionId::from(9649);
+    let server = "pi_caps_workers_relative";
+    prepare_server(server);
+    let modules_dir = smudgy_core::get_smudgy_home()
+        .expect("smudgy home")
+        .join(server)
+        .join("modules");
+    std::fs::create_dir_all(modules_dir.join("workers")).expect("create workers dir");
+    std::fs::write(
+        modules_dir.join("workertest.ts"),
+        r#"
+            import { echo } from "smudgy:core";
+            const worker = new Worker("./workers/worker.ts", { type: "module" });
+            const keepalive = setInterval(() => echo("WAITING"), 200);
+            const done = () => clearInterval(keepalive);
+            setTimeout(done, 15000);
+            worker.onmessage = (e) => {
+                done();
+                echo("WORKER_REL_REPLY:" + e.data);
+                worker.terminate();
+            };
+            worker.onerror = (e) => {
+                e.preventDefault();
+                done();
+                echo("WORKER_REL_ERROR:" + e.message);
+            };
+            worker.postMessage("ping");
+        "#,
+    )
+    .expect("write workertest module");
+    std::fs::write(
+        modules_dir.join("workers").join("worker.ts"),
+        "onmessage = (e: MessageEvent) => { postMessage('pong:' + e.data); };\n",
+    )
+    .expect("write worker module");
+
+    let params = Arc::new(SessionParams {
+        session_id,
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn_with_package_provider(params, factory_for(Vec::new())));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
+    drop(tx);
+    drop(events);
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
+
+    assert!(
+        has_line(&lines, "WORKER_REL_REPLY:pong:ping"),
+        "a caller-relative worker module loads and echoes; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "WORKER_REL_ERROR:"),
+        "no worker error on the relative path; transcript:\n{lines:#?}"
+    );
+}
+
+/// A sandboxed package's relative worker URL resolves to `smudgy-pkg:` and loads from the
+/// immutable source snapshot published after the parent graph load. The worker entry is not
+/// imported by the parent graph, and it imports another package-relative TypeScript module, so
+/// this covers the full fetched archive rather than only modules V8 already instantiated.
+#[tokio::test]
+async fn sandboxed_package_worker_loads_relative_package_modules() {
+    let package_src = r#"
+        import { echo } from "smudgy:core";
+        const worker = new Worker("./workers/worker.ts", { type: "module" });
+        const keepalive = setInterval(() => echo("WAITING"), 200);
+        const done = () => clearInterval(keepalive);
+        setTimeout(done, 15000);
+        worker.onmessage = (e) => {
+            done();
+            echo("PKG_WORKER_REPLY:" + e.data);
+            worker.terminate();
+        };
+        worker.onerror = (e) => {
+            e.preventDefault();
+            done();
+            echo("PKG_WORKER_ERROR:" + e.message);
+        };
+        worker.postMessage("ping");
+    "#;
+    let mut package = make_package_declaring(
+        "wbk",
+        "workerarchive",
+        "1.0.0",
+        r#"{ "workers": ["spawn"], "session": ["echo"] }"#,
+        package_src,
+    );
+    package.modules.extend([
+        PackageModuleSource {
+            subpath: "workers/worker.ts".to_string(),
+            text: r#"
+                import { reply } from "./reply.ts";
+                onmessage = (e: MessageEvent<string>) => postMessage(reply(e.data));
+            "#
+            .to_string(),
+        },
+        PackageModuleSource {
+            subpath: "workers/reply.ts".to_string(),
+            text: "export const reply = (value: string): string => `pong:${value}`;\n".to_string(),
+        },
+    ]);
+
+    let lines = run_capability_case(
+        9650,
+        "pi_caps_workers_package_relative",
+        "smudgy://wbk/workerarchive",
+        Some(consent_with(|s| s.workers = true)),
+        package,
+    )
+    .await;
+
+    assert!(
+        has_line(&lines, "PKG_WORKER_REPLY:pong:ping"),
+        "a sandboxed package worker loads its entry and relative dependency from the source snapshot; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "PKG_WORKER_ERROR:"),
+        "no package worker load error; transcript:\n{lines:#?}"
     );
 }

@@ -226,6 +226,7 @@ pub enum Cap {
     Panes,
     GmcpSend,
     Input,
+    Workers,
 }
 
 /// A single field-level edit to the open manifest draft. Folded into one [`Message`] variant
@@ -867,6 +868,7 @@ fn set_cap(caps: &mut SmudgyCapabilities, cap: Cap, on: bool) {
         Cap::Panes => caps.panes = on,
         Cap::GmcpSend => caps.gmcp_send = on,
         Cap::Input => caps.input = on,
+        Cap::Workers => caps.workers = on,
     }
 }
 
@@ -1661,6 +1663,9 @@ fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<String> {
     if caps.gmcp_send {
         out.push(cap_summary("gmcp.send", "manifest-cap-gmcp"));
     }
+    if caps.workers {
+        out.push(cap_summary("new Worker", "manifest-cap-workers"));
+    }
     out
 }
 
@@ -2126,6 +2131,7 @@ fn granted_cap_count(caps: SmudgyCapabilities) -> usize {
         caps.interop_broadcast,
         caps.panes,
         caps.gmcp_send,
+        caps.workers,
     ]
     .iter()
     .filter(|granted| **granted)
@@ -2690,6 +2696,15 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
                 crate::i18n::ts!("manifest-cap-gmcp"),
                 caps.gmcp_send,
                 Cap::GmcpSend
+            ),]
+        ),
+        cap_group(
+            crate::i18n::ts!("manifest-cap-group-workers"),
+            vec![cap_check(
+                "new Worker",
+                crate::i18n::ts!("manifest-cap-workers"),
+                caps.workers,
+                Cap::Workers
             ),]
         ),
     ]

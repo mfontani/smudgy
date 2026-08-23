@@ -12,6 +12,8 @@ the scripting reference.
 - TypeScript scripting on an embedded Deno-based runtime — triggers, aliases,
   widgets, GMCP — with a package ecosystem for sharing scripts, sandboxed by
   default
+- Bounded [Web Audio](WEB_AUDIO.md) for accessibility earcons in trusted
+  modules and sandboxed packages, with silent emulation when output is unavailable
 - Works fully offline; a free cloud account adds map sharing, social
   features, and package publishing
 
@@ -28,6 +30,11 @@ commands are a one-time setup: they materialize the workspace's dependency
 source patches (see [patches/](patches/)) under `target/patch/` before the
 first build, and again after a `cargo clean`. See
 [CHANGELOG.md](CHANGELOG.md) for what's new.
+
+Official desktop packages select physical Web Audio explicitly while the crate
+defaults remain hardware-free for tests and embedders. See [Web Audio
+support](WEB_AUDIO.md) for the silent fallback, platform evidence, sandbox
+boundary, and current limitations.
 
 ## License
 

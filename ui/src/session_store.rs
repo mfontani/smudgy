@@ -30,7 +30,11 @@ use smudgy_core::models::map_scopes::MapScopes;
 use smudgy_core::models::observed::{load_observed, save_observed};
 use smudgy_core::models::profile::load_profile;
 use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
+#[cfg(feature = "web-audio-cpal")]
+use smudgy_core::models::settings::AudioGainSettings;
 use smudgy_core::models::settings::{ScriptSettings, Settings, load_settings};
+#[cfg(feature = "web-audio-cpal")]
+use smudgy_core::models::shared_packages;
 use smudgy_core::session::SessionParams;
 use smudgy_core::session::runtime::input::{InputOp, InputSnapshot};
 use smudgy_core::session::runtime::pane::{
@@ -54,7 +58,130 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(feature = "web-audio-cpal")]
+use std::sync::Mutex;
+#[cfg(feature = "web-audio-cpal")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "web-audio-cpal")]
+use std::{panic::AssertUnwindSafe, pin::Pin};
 use tokio::sync::mpsc::{self};
+
+#[cfg(feature = "web-audio-cpal")]
+use crate::application_audio::{
+    AbortedSessionSpawnError, ApplicationAudioController, ApplicationAudioOpenError,
+    ApplicationAudioSessionController, SessionAudioCloseDisposition,
+};
+
+#[cfg(feature = "web-audio-cpal")]
+type BoxSessionEventStream =
+    Pin<Box<dyn iced::futures::Stream<Item = TaggedSessionEvent> + Send + 'static>>;
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone)]
+struct SessionEventSource {
+    session_id: SessionId,
+    stream: Arc<Mutex<Option<BoxSessionEventStream>>>,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl std::hash::Hash for SessionEventSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.session_id, state);
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn take_session_event_stream(source: &SessionEventSource) -> BoxSessionEventStream {
+    source
+        .stream
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_else(|| Box::pin(iced::futures::stream::empty()))
+}
+
+#[derive(Debug)]
+pub enum SessionOpenError {
+    IdExhausted,
+    #[cfg(feature = "web-audio-cpal")]
+    Audio(ApplicationAudioOpenError),
+    #[cfg(feature = "web-audio-cpal")]
+    Runtime(smudgy_core::session::AudioSessionSpawnError),
+    #[cfg(feature = "web-audio-cpal")]
+    RuntimePublication {
+        session_id: SessionId,
+        failure: smudgy_core::session::runtime::RuntimeThreadPublicationFailure,
+    },
+    #[cfg(feature = "web-audio-cpal")]
+    RuntimeConstructionPanicked,
+}
+
+impl std::fmt::Display for SessionOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdExhausted => formatter.write_str("the session id space is exhausted"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::Audio(error) => write!(formatter, "Web Audio session setup failed: {error}"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::Runtime(error) => write!(formatter, "session runtime setup failed: {error}"),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::RuntimePublication {
+                session_id,
+                failure,
+            } => write!(
+                formatter,
+                "session {session_id} runtime publication failed: {failure:?}"
+            ),
+            #[cfg(feature = "web-audio-cpal")]
+            Self::RuntimeConstructionPanicked => {
+                formatter.write_str("session runtime setup panicked before publication")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionOpenError {}
+
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Debug)]
+enum AudioReloadPreparationError {
+    PackageConfiguration(String),
+    Control(crate::application_audio::ApplicationAudioControlError),
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl std::fmt::Display for AudioReloadPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackageConfiguration(error) => {
+                write!(
+                    formatter,
+                    "package configuration could not be loaded: {error}"
+                )
+            }
+            Self::Control(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+impl From<crate::application_audio::ApplicationAudioControlError> for AudioReloadPreparationError {
+    fn from(error: crate::application_audio::ApplicationAudioControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn is_transient_audio_policy_error(
+    error: &crate::application_audio::ApplicationAudioControlError,
+) -> bool {
+    use crate::application_audio::ApplicationAudioControlError;
+    matches!(
+        error,
+        ApplicationAudioControlError::CoordinatorSaturated
+            | ApplicationAudioControlError::MixerQueueSaturated
+    )
+}
 
 /// All live sessions, keyed by id. Windows borrow sessions from here to
 /// render and update their panes; the daemon routes session events here
@@ -64,7 +191,11 @@ pub struct SessionStore {
     cloud: CloudHandles,
     ui_commands: Option<UiCommandBus>,
     sessions: BTreeMap<SessionId, ManagedSession>,
-    next_session_id: SessionId,
+    next_session_id: Option<SessionId>,
+    #[cfg(feature = "web-audio-cpal")]
+    audio: Option<ApplicationAudioController>,
+    #[cfg(feature = "web-audio-cpal")]
+    audio_degradation: Option<String>,
 }
 
 impl SessionStore {
@@ -73,7 +204,11 @@ impl SessionStore {
             cloud,
             ui_commands: None,
             sessions: BTreeMap::new(),
-            next_session_id: 0.into(),
+            next_session_id: Some(0.into()),
+            #[cfg(feature = "web-audio-cpal")]
+            audio: None,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_degradation: None,
         }
     }
 
@@ -85,6 +220,21 @@ impl SessionStore {
         store
     }
 
+    /// Production audio-host constructor. Feature-disabled builds and local UI
+    /// tests may retain [`Self::new`] / [`Self::with_ui_commands`]; every
+    /// `web-audio-cpal` production launch supplies this controller, including
+    /// when its physical delegate is unavailable and contexts run emulated.
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn with_ui_commands_and_audio(
+        cloud: CloudHandles,
+        ui_commands: UiCommandBus,
+        audio: ApplicationAudioController,
+    ) -> Self {
+        let mut store = Self::with_ui_commands(cloud, ui_commands);
+        store.audio = Some(audio);
+        store
+    }
+
     /// Allocates an id and creates the session state. Giving the session a
     /// pane in some window's grid is the caller's job.
     pub fn open_session(
@@ -92,11 +242,13 @@ impl SessionStore {
         server_name: String,
         profile_name: String,
         auto_connect: bool,
-    ) -> SessionId {
-        let session_id = self.next_session_id;
-        self.next_session_id = self.next_session_id + 1.into();
+    ) -> Result<SessionId, SessionOpenError> {
+        let session_id = self.next_session_id.ok_or(SessionOpenError::IdExhausted)?;
+        // Spend the id before every fallible operation. A failed open can
+        // never alias a stale scope, subscription identity, or runtime.
+        self.next_session_id = u32::from(session_id).checked_add(1).map(SessionId::from);
 
-        let session = ManagedSession::new(
+        let session = match ManagedSession::new(
             session_id,
             server_name,
             profile_name,
@@ -104,13 +256,39 @@ impl SessionStore {
             self.cloud.base_url.as_str(),
             auto_connect,
             self.ui_commands.clone(),
-        );
+            #[cfg(feature = "web-audio-cpal")]
+            self.audio.as_ref(),
+        ) {
+            Ok(session) => session,
+            Err(error) => return Err(error),
+        };
+        #[cfg(feature = "web-audio-cpal")]
+        if let Some(cause) = session
+            .audio_unavailable_cause
+            .as_ref()
+            .and_then(crate::application_audio::SessionAudioUnavailable::system)
+        {
+            self.audio_degradation
+                .get_or_insert_with(|| cause.to_string());
+        }
         self.sessions.insert(session_id, session);
-        session_id
+        Ok(session_id)
     }
 
     pub fn get(&self, session_id: SessionId) -> Option<&ManagedSession> {
         self.sessions.get(&session_id)
+    }
+
+    #[cfg(all(test, feature = "web-audio-cpal"))]
+    pub(crate) fn next_session_id_for_test(&self) -> Option<SessionId> {
+        self.next_session_id
+    }
+
+    #[cfg(all(test, feature = "web-audio-cpal"))]
+    pub(crate) fn uses_physical_audio_for_test(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|session| session.session_events.is_some() && !session.audio_is_emulated())
     }
 
     pub fn get_mut(&mut self, session_id: SessionId) -> Option<&mut ManagedSession> {
@@ -119,6 +297,35 @@ impl SessionStore {
 
     pub fn iter(&self) -> impl Iterator<Item = (SessionId, &ManagedSession)> {
         self.sessions.iter().map(|(id, session)| (*id, session))
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn take_audio_degradation(&mut self) -> Option<String> {
+        self.audio_degradation.take()
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn set_master_linear(
+        &self,
+        linear: f32,
+    ) -> Result<smudgy_audio::MixerGainState, crate::application_audio::ApplicationAudioControlError>
+    {
+        self.audio
+            .as_ref()
+            .ok_or(crate::application_audio::ApplicationAudioControlError::CoordinatorStopped)?
+            .set_master_linear(linear)
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn set_master_muted(
+        &self,
+        muted: bool,
+    ) -> Result<smudgy_audio::MixerGainState, crate::application_audio::ApplicationAudioControlError>
+    {
+        self.audio
+            .as_ref()
+            .ok_or(crate::application_audio::ApplicationAudioControlError::CoordinatorStopped)?
+            .set_master_muted(muted)
     }
 
     /// Reconcile the application-wide input-focus invariant. A successful
@@ -174,6 +381,16 @@ impl SessionStore {
     pub fn shutdown_and_remove(&mut self, session_id: SessionId) -> bool {
         match self.sessions.remove(&session_id) {
             Some(mut session) => {
+                #[cfg(feature = "web-audio-cpal")]
+                if let Some(audio) = &self.audio {
+                    match audio.close_session(session_id) {
+                        SessionAudioCloseDisposition::Requested
+                        | SessionAudioCloseDisposition::AlreadyClosing => {}
+                        disposition => log::error!(
+                            "audio close for session {session_id} was not accepted: {disposition:?}"
+                        ),
+                    }
+                }
                 session.shutdown();
                 true
             }
@@ -210,8 +427,28 @@ pub struct ManagedSession {
     pub input: session_input::SessionInput,
 
     pub session_params: Arc<SessionParams>,
+    /// Eagerly-created exact runtime stream. Eager construction reserves and
+    /// publishes the core runtime before the session can enter the UI store;
+    /// iced only takes and polls this already-created stream.
+    #[cfg(feature = "web-audio-cpal")]
+    session_events: Option<SessionEventSource>,
+    /// Exact application-side audio-control generation retained for future
+    /// visible controls. It carries no raw mixer or script authority.
+    #[cfg(feature = "web-audio-cpal")]
+    audio_control: Option<ApplicationAudioSessionController>,
+    #[cfg(feature = "web-audio-cpal")]
+    audio_unavailable_cause: Option<crate::application_audio::SessionAudioUnavailable>,
+    /// Saved-preference display for intentional emulation versus retained
+    /// last-acknowledgement display after a live physical output dies.
+    #[cfg(feature = "web-audio-cpal")]
+    audio_preference_only: bool,
+    #[cfg(feature = "web-audio-cpal")]
+    audio_gain: AudioGainSettings,
+    /// Enabled installed roots shown by the visible audio panel. Trusted
+    /// roots are informational because Main stops at session gain.
+    #[cfg(feature = "web-audio-cpal")]
+    audio_packages: Vec<AudioPackageRow>,
     ui_commands: Option<UiCommandBus>,
-
     pub mapper: Option<Mapper>,
 
     terminal_buffer: Rc<RefCell<TerminalBuffer>>,
@@ -301,6 +538,116 @@ pub struct ManagedSession {
     tls_offer: Option<u16>,
 }
 
+#[cfg(feature = "web-audio-cpal")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioPackageRow {
+    /// Process-unique stable view identity. Reload reconciliation retains the
+    /// key for the same folded owner/name pair, so keyed iced tree state can
+    /// never migrate to a different package row.
+    pub ui_key: u64,
+    /// Exact action generation. Unlike `ui_key`, this rotates whenever reload
+    /// replaces the package isolate so queued controls cannot target the new
+    /// live generation through its stable logical row identity.
+    pub action_key: u64,
+    pub owner: Arc<str>,
+    pub name: Arc<str>,
+    pub trusted: bool,
+    /// Persisted evidence that this versionless package root has successfully
+    /// prepared Web Audio at least once. Rows without this evidence stay out
+    /// of the Settings window's Audio pane.
+    pub audio_used: bool,
+    pub gain: AudioGainSettings,
+    /// True only after an exact live package controller acknowledged a UI
+    /// mutation. Startup/reload staging alone does not prove an active root.
+    pub applied: bool,
+}
+
+#[cfg(feature = "web-audio-cpal")]
+static NEXT_AUDIO_ROW_KEY: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "web-audio-cpal")]
+fn next_audio_row_key() -> Option<u64> {
+    NEXT_AUDIO_ROW_KEY
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |key| {
+            key.checked_add(1)
+        })
+        .ok()
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn load_audio_package_rows(server: &str) -> Result<Vec<AudioPackageRow>, String> {
+    let lock = shared_packages::load_lock(server).map_err(|error| error.to_string())?;
+    let mut rows: Vec<_> = lock
+        .packages
+        .into_iter()
+        .filter(|package| package.enabled)
+        .filter_map(|package| {
+            let rest = package.specifier.strip_prefix("smudgy://")?;
+            let (owner, name) = rest.rsplit_once('/')?;
+            let ui_key = next_audio_row_key()?;
+            let action_key = next_audio_row_key()?;
+            (!owner.is_empty() && !name.is_empty()).then(|| AudioPackageRow {
+                ui_key,
+                action_key,
+                owner: Arc::from(owner.to_ascii_lowercase()),
+                name: Arc::from(name.to_ascii_lowercase()),
+                trusted: package.trusted,
+                audio_used: package.audio_used,
+                gain: AudioGainSettings::default(),
+                applied: false,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    rows.dedup_by(|left, right| left.owner == right.owner && left.name == right.name);
+    Ok(rows)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn mark_package_audio_used(rows: &mut [AudioPackageRow], owner: &str, name: &str) -> Option<bool> {
+    let Some(row) = rows
+        .iter_mut()
+        .find(|row| row.owner.eq_ignore_ascii_case(owner) && row.name.eq_ignore_ascii_case(name))
+    else {
+        return None;
+    };
+    let changed = !row.audio_used;
+    row.audio_used = true;
+    Some(changed)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn retain_audio_row_keys(previous: &[AudioPackageRow], next: &mut [AudioPackageRow]) {
+    for row in next {
+        if let Some(prior) = previous
+            .iter()
+            .find(|prior| prior.owner == row.owner && prior.name == row.name)
+        {
+            row.ui_key = prior.ui_key;
+            // Reload replaces the isolate generation. The stable UI identity
+            // survives, but an acknowledgement for the retired generation
+            // cannot prove the replacement root is active.
+            row.applied = false;
+        }
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn retain_acknowledged_audio_after_output_failure(
+    previous_gain: AudioGainSettings,
+    previous_packages: &[AudioPackageRow],
+    next_packages: &mut [AudioPackageRow],
+) -> AudioGainSettings {
+    for row in next_packages {
+        row.gain = previous_packages
+            .iter()
+            .find(|previous| previous.owner == row.owner && previous.name == row.name)
+            .map_or_else(AudioGainSettings::default, |previous| previous.gain);
+        row.applied = false;
+    }
+    previous_gain
+}
+
 /// One server-sent link (OSC 8) held at the trust gate, with the dialog's
 /// checkbox state.
 #[derive(Debug, Clone)]
@@ -347,6 +694,11 @@ pub enum Message {
     Reload,
     Reconnect,
     Disconnect,
+    /// Reserved keyboard request bubbled to the hosting main window.
+    #[cfg(feature = "web-audio-cpal")]
+    OpenAudioPanel,
+    #[cfg(feature = "web-audio-cpal")]
+    AudioOutputFailed(String),
     /// A click released over the main pane's terminal (bubbled — the terminal
     /// deliberately leaves presses uncaptured). Focuses the session input
     /// when the click didn't create a selection.
@@ -753,6 +1105,263 @@ fn fan_visibility_event<'a>(
 }
 
 impl ManagedSession {
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn audio_packages(&self) -> &[AudioPackageRow] {
+        &self.audio_packages
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn audio_gain(&self) -> AudioGainSettings {
+        self.audio_gain
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn audio_is_emulated(&self) -> bool {
+        self.audio_unavailable_cause.is_some()
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn set_audio_preference_only(&mut self, gain: AudioGainSettings) {
+        self.audio_gain = gain;
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn set_package_audio_preference_only(
+        &mut self,
+        owner: &str,
+        name: &str,
+        gain: AudioGainSettings,
+    ) -> bool {
+        let Some(row) = self.audio_packages.iter_mut().find(|row| {
+            !row.trusted
+                && row.owner.eq_ignore_ascii_case(owner)
+                && row.name.eq_ignore_ascii_case(name)
+        }) else {
+            return false;
+        };
+        row.gain = gain;
+        true
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn set_audio_state(
+        &mut self,
+        gain: AudioGainSettings,
+    ) -> Result<smudgy_audio::MixerGainState, crate::application_audio::ApplicationAudioControlError>
+    {
+        let state = self
+            .audio_control
+            .as_ref()
+            .ok_or(crate::application_audio::ApplicationAudioControlError::UnknownSession)?
+            .set_state(gain.linear(), gain.muted)?;
+        self.audio_gain = AudioGainSettings {
+            volume: (state.linear() * 100.0).round().clamp(0.0, 100.0) as u8,
+            muted: state.is_muted(),
+        };
+        Ok(state)
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    pub fn set_package_audio_state(
+        &mut self,
+        owner: &str,
+        name: &str,
+        gain: AudioGainSettings,
+    ) -> Result<
+        smudgy_audio_web::PackageAudioGainState,
+        crate::application_audio::ApplicationAudioControlError,
+    > {
+        let state = self
+            .audio_control
+            .as_ref()
+            .ok_or(crate::application_audio::ApplicationAudioControlError::UnknownSession)?
+            .package(owner, name)?
+            .set_state(gain.linear(), gain.muted)?;
+        if let Some(row) = self.audio_packages.iter_mut().find(|row| {
+            !row.trusted
+                && row.owner.eq_ignore_ascii_case(owner)
+                && row.name.eq_ignore_ascii_case(name)
+        }) {
+            row.gain = AudioGainSettings {
+                volume: (state.linear() * 100.0).round().clamp(0.0, 100.0) as u8,
+                muted: state.is_muted(),
+            };
+            row.applied = true;
+        }
+        Ok(state)
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    fn prepare_audio_reload(&mut self) -> Result<Option<String>, AudioReloadPreparationError> {
+        // Resolve the exact package snapshot before touching any live state.
+        // A malformed/unreadable lock must leave the old runtime, rows, and
+        // hotkeys intact instead of silently staging an empty package set.
+        let mut next_packages = load_audio_package_rows(&self.server_name)
+            .map_err(AudioReloadPreparationError::PackageConfiguration)?;
+        let settings = load_settings();
+        let policy = settings
+            .audio
+            .session(&self.server_name, &self.profile_name);
+        let session_gain = policy.map_or_else(AudioGainSettings::default, |row| row.gain);
+        for row in &mut next_packages {
+            row.gain = policy
+                .and_then(|policy| policy.package(&row.owner, &row.name))
+                .map_or_else(AudioGainSettings::default, |package| package.gain);
+        }
+        retain_audio_row_keys(&self.audio_packages, &mut next_packages);
+        let Some(controller) = self.audio_control.as_ref() else {
+            // This can only occur in a feature-disabled/test construction;
+            // persisted policy remains explicitly not applied.
+            self.audio_gain = session_gain;
+            for row in &mut next_packages {
+                row.applied = false;
+            }
+            self.audio_packages = next_packages;
+            return Ok(None);
+        };
+        if self.audio_unavailable_cause.is_some() {
+            if self.audio_preference_only {
+                self.audio_gain = session_gain;
+                for row in &mut next_packages {
+                    row.applied = false;
+                }
+            } else {
+                self.audio_gain = retain_acknowledged_audio_after_output_failure(
+                    self.audio_gain,
+                    &self.audio_packages,
+                    &mut next_packages,
+                );
+            }
+            self.audio_packages = next_packages;
+            return Ok(None);
+        }
+        let packages = next_packages.iter().filter(|row| !row.trusted).map(|row| {
+            (
+                Arc::clone(&row.owner),
+                Arc::clone(&row.name),
+                row.gain.linear(),
+                row.gain.muted,
+            )
+        });
+        let staged = controller.stage_policy(
+            session_gain.linear(),
+            session_gain.muted,
+            self.audio_gain.linear(),
+            self.audio_gain.muted,
+            packages,
+        );
+        match staged {
+            Ok(()) => {
+                self.audio_gain = session_gain;
+                self.audio_packages = next_packages;
+                Ok(None)
+            }
+            Err(crate::application_audio::ApplicationAudioControlError::NotApplicable(cause)) => {
+                // Mixer-free registrations expose the saved desired policy as
+                // a preference, never as a live mixer acknowledgement.
+                self.audio_unavailable_cause = Some(cause);
+                self.audio_preference_only = true;
+                self.audio_gain = session_gain;
+                for row in &mut next_packages {
+                    row.applied = false;
+                }
+                self.audio_packages = next_packages;
+                Ok(None)
+            }
+            Err(error) => {
+                use crate::application_audio::{
+                    ApplicationAudioControlError, SessionAudioUnavailable,
+                };
+                if matches!(
+                    error,
+                    ApplicationAudioControlError::ApplicationSealed
+                        | ApplicationAudioControlError::UnknownSession
+                        | ApplicationAudioControlError::SessionClosing
+                        | ApplicationAudioControlError::StaleSession
+                        | ApplicationAudioControlError::CoordinatorSaturated
+                        | ApplicationAudioControlError::MixerQueueSaturated
+                ) {
+                    return Err(error.into());
+                }
+                let output_failed = matches!(&error, ApplicationAudioControlError::OutputFailed(_));
+                let cause = match &error {
+                    ApplicationAudioControlError::OutputFailed(failure) => {
+                        SessionAudioUnavailable::System(smudgy_audio::SystemMixerUnavailable::from(
+                            smudgy_audio::SystemMixerStartError::DriverFailed(failure.clone()),
+                        ))
+                    }
+                    _ => SessionAudioUnavailable::Policy(error.to_string().into()),
+                };
+                controller
+                    .force_emulated(cause.clone())
+                    .map_err(AudioReloadPreparationError::Control)?;
+                self.audio_unavailable_cause = Some(cause);
+                self.audio_preference_only = !output_failed;
+                if output_failed {
+                    // A dead physical output cannot acknowledge the freshly
+                    // loaded policy. Preserve the prior exact live snapshot;
+                    // new roots have no acknowledged generation and remain at
+                    // the default while the saved preference stays separate.
+                    self.audio_gain = retain_acknowledged_audio_after_output_failure(
+                        self.audio_gain,
+                        &self.audio_packages,
+                        &mut next_packages,
+                    );
+                } else {
+                    self.audio_gain = session_gain;
+                    for row in &mut next_packages {
+                        row.applied = false;
+                    }
+                }
+                self.audio_packages = next_packages;
+                Ok(output_failed.then(|| error.to_string()))
+            }
+        }
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    fn restore_audio_after_failed_reload_send(
+        &mut self,
+        previous_gain: AudioGainSettings,
+        previous_packages: Vec<AudioPackageRow>,
+        previous_unavailable_cause: Option<crate::application_audio::SessionAudioUnavailable>,
+        previous_preference_only: bool,
+    ) {
+        if previous_unavailable_cause.is_none()
+            && self.audio_unavailable_cause.is_none()
+            && let Some(controller) = self.audio_control.as_ref()
+        {
+            let packages = previous_packages
+                .iter()
+                .filter(|row| !row.trusted)
+                .map(|row| {
+                    (
+                        Arc::clone(&row.owner),
+                        Arc::clone(&row.name),
+                        row.gain.linear(),
+                        row.gain.muted,
+                    )
+                });
+            if let Err(error) = controller.stage_policy(
+                previous_gain.linear(),
+                previous_gain.muted,
+                self.audio_gain.linear(),
+                self.audio_gain.muted,
+                packages,
+            ) {
+                log::error!(
+                    "runtime reload channel closed after audio staging, and the prior live policy could not be restored for session {}: {error}",
+                    self.id
+                );
+                return;
+            }
+        }
+        self.audio_gain = previous_gain;
+        self.audio_packages = previous_packages;
+        self.audio_unavailable_cause = previous_unavailable_cause;
+        self.audio_preference_only = previous_preference_only;
+    }
+
     fn note_visibility_input(&self) {
         fan_visibility_event(
             &self.terminal_buffer,
@@ -778,6 +1387,7 @@ impl ManagedSession {
     ///
     /// `credentials` is the app-wide hot-swappable credential slot: logging
     /// in or out upgrades this session's mapper without a reconnect.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: SessionId,
         server_name: String,
@@ -786,7 +1396,8 @@ impl ManagedSession {
         base_url: &str,
         auto_connect: bool,
         ui_commands: Option<UiCommandBus>,
-    ) -> Self {
+        #[cfg(feature = "web-audio-cpal")] audio: Option<&ApplicationAudioController>,
+    ) -> Result<Self, SessionOpenError> {
         let settings = load_settings();
 
         info!("Settings: {settings:?}");
@@ -900,19 +1511,215 @@ impl ManagedSession {
             Some(Arc::new(move || widget_root.clear()) as Arc<dyn Fn() + Send + Sync>)
         };
 
-        Self {
+        let session_params = Arc::new(SessionParams {
+            session_id: id,
+            server_name: Arc::new(server_name.clone()),
+            profile_name: Arc::new(profile_name.clone()),
+            profile_subtext,
+            mapper: mapper.clone(),
+            package_client: Some(package_client),
+            extra_script_extensions,
+            on_engine_rebuild,
+        });
+        #[cfg(feature = "web-audio-cpal")]
+        let audio_policy = settings.audio.session(&server_name, &profile_name);
+        #[cfg(feature = "web-audio-cpal")]
+        let desired_audio_gain =
+            audio_policy.map_or_else(AudioGainSettings::default, |row| row.gain);
+        #[cfg(feature = "web-audio-cpal")]
+        let mut audio_packages = load_audio_package_rows(&server_name).unwrap_or_else(|error| {
+            // Package loading itself follows the same optional baseline: the
+            // engine warns and starts without packages on a malformed lock,
+            // so auxiliary audio metadata must never make the terminal
+            // stricter than the runtime it accompanies.
+            log::warn!(
+                "could not load package audio policy snapshot for {server_name}; starting without package rows: {error}"
+            );
+            Vec::new()
+        });
+        #[cfg(feature = "web-audio-cpal")]
+        let mut audio_gain = AudioGainSettings::default();
+        #[cfg(feature = "web-audio-cpal")]
+        let mut audio_unavailable_cause = None;
+        #[cfg(feature = "web-audio-cpal")]
+        let mut audio_preference_only = false;
+        #[cfg(feature = "web-audio-cpal")]
+        let mut pending_audio = match audio {
+            Some(audio) => match audio.begin_session(id) {
+                Ok(pending) => {
+                    audio_unavailable_cause = pending.unavailable_cause().cloned();
+                    audio_preference_only = audio_unavailable_cause.is_some();
+                    Some(pending)
+                }
+                // A live application controller recovers ordinary
+                // coordinator/mixer admission failures through its same-owner
+                // emulated registrar. These remaining errors are exact
+                // shutdown/identity violations, not permission to publish a
+                // runtime without Web Audio globals.
+                Err(error) => return Err(SessionOpenError::Audio(error)),
+            },
+            None => None,
+        };
+        #[cfg(feature = "web-audio-cpal")]
+        if let Some(pending) = pending_audio.as_ref() {
+            let package_gains =
+                audio_packages
+                    .iter()
+                    .filter(|row| !row.trusted)
+                    .filter_map(|row| {
+                        let gain = audio_policy
+                            .and_then(|policy| policy.package(&row.owner, &row.name))?
+                            .gain;
+                        (!gain.is_default()).then(|| {
+                            (
+                                Arc::clone(&row.owner),
+                                Arc::clone(&row.name),
+                                gain.linear(),
+                                gain.muted,
+                            )
+                        })
+                    });
+            if let Err(error) = pending.stage_policy(
+                desired_audio_gain.linear(),
+                desired_audio_gain.muted,
+                package_gains,
+            ) {
+                if is_transient_audio_policy_error(&error) {
+                    // Queue pressure says nothing about whether this physical
+                    // registration remains viable. Leave its acknowledged
+                    // defaults live so a later control or reload can retry.
+                    log::warn!(
+                        "saved Web Audio policy for session {id} was not staged because control capacity was temporarily saturated: {error}"
+                    );
+                    for row in &mut audio_packages {
+                        row.applied = false;
+                    }
+                } else {
+                    let (cause, show_saved_preference) = match &error {
+                        crate::application_audio::ApplicationAudioControlError::NotApplicable(
+                            cause,
+                        ) => (cause.clone(), true),
+                        crate::application_audio::ApplicationAudioControlError::OutputFailed(
+                            failure,
+                        ) => (
+                            crate::application_audio::SessionAudioUnavailable::System(
+                                smudgy_audio::SystemMixerUnavailable::from(
+                                    smudgy_audio::SystemMixerStartError::DriverFailed(*failure),
+                                ),
+                            ),
+                            false,
+                        ),
+                        _ => (
+                            crate::application_audio::SessionAudioUnavailable::Policy(
+                                error.to_string().into(),
+                            ),
+                            true,
+                        ),
+                    };
+                    if !matches!(
+                        &error,
+                        crate::application_audio::ApplicationAudioControlError::NotApplicable(_)
+                    ) {
+                        let transition = pending_audio
+                            .as_mut()
+                            .expect("the staged registration remains owned")
+                            .force_emulated(cause.clone());
+                        if let Err(transition) = transition {
+                            log::error!(
+                                "exact Web Audio scope was forced emulated after policy failure, but coordinator metadata also failed: {error}; {transition}"
+                            );
+                        }
+                    }
+                    audio_unavailable_cause = Some(cause);
+                    audio_preference_only = show_saved_preference;
+                    if show_saved_preference {
+                        audio_gain = desired_audio_gain;
+                    }
+                    for row in &mut audio_packages {
+                        if show_saved_preference {
+                            row.gain = audio_policy
+                                .and_then(|policy| policy.package(&row.owner, &row.name))
+                                .map_or_else(AudioGainSettings::default, |package| package.gain);
+                        }
+                        row.applied = false;
+                    }
+                }
+            } else {
+                audio_gain = desired_audio_gain;
+                for row in &mut audio_packages {
+                    row.gain = audio_policy
+                        .and_then(|policy| policy.package(&row.owner, &row.name))
+                        .map_or_else(AudioGainSettings::default, |package| package.gain);
+                }
+            }
+        }
+        #[cfg(feature = "web-audio-cpal")]
+        let audio_scope = pending_audio.as_ref().map(|pending| pending.scope());
+        #[cfg(feature = "web-audio-cpal")]
+        let session_stream: Option<BoxSessionEventStream> =
+            if let (Some(commands), Some(scope)) = (&ui_commands, audio_scope) {
+                let spawned = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    session::try_spawn_with_ui_commands_and_audio(
+                        &session_params,
+                        commands.clone(),
+                        scope,
+                    )
+                }));
+                match spawned {
+                    Ok(Ok(stream)) => Some(Box::pin(stream)),
+                    Ok(Err(error)) => {
+                        let open_error = match pending_audio.take() {
+                            Some(pending) => match pending.abort_spawn_error(error) {
+                                AbortedSessionSpawnError::Runtime(error) => {
+                                    SessionOpenError::Runtime(error)
+                                }
+                                AbortedSessionSpawnError::Publication {
+                                    session_id,
+                                    failure,
+                                } => SessionOpenError::RuntimePublication {
+                                    session_id,
+                                    failure,
+                                },
+                            },
+                            None => SessionOpenError::Runtime(error),
+                        };
+                        return Err(open_error);
+                    }
+                    Err(payload) => {
+                        // Panic payload destructors are arbitrary. The typed
+                        // UI error is safe; exact audio cleanup is still
+                        // requested before the failed shell can escape.
+                        std::mem::forget(payload);
+                        if let Some(pending) = pending_audio.take() {
+                            let _ = pending.abort();
+                        }
+                        return Err(SessionOpenError::RuntimeConstructionPanicked);
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(feature = "web-audio-cpal")]
+        let session_events = session_stream.map(|stream| SessionEventSource {
+            session_id: id,
+            stream: Arc::new(Mutex::new(Some(stream))),
+        });
+        let session = Self {
             id,
-            session_params: Arc::new(SessionParams {
-                session_id: id,
-                server_name: Arc::new(server_name.clone()),
-                profile_name: Arc::new(profile_name.clone()),
-                profile_subtext,
-                mapper: mapper.clone(),
-                package_client: Some(package_client),
-                extra_script_extensions,
-                on_engine_rebuild,
-            }),
+            session_params,
             ui_commands,
+            #[cfg(feature = "web-audio-cpal")]
+            session_events,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_control: None,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_unavailable_cause,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_preference_only,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_gain,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_packages,
             server_config: Rc::new(RefCell::new(load_server(&server_name).map_or_else(
                 |e| {
                     // Sessions can outlive an on-disk rename; a fallback
@@ -949,7 +1756,17 @@ impl ManagedSession {
             widget_root,
             map_store,
             text_store,
-        }
+        };
+        #[cfg(feature = "web-audio-cpal")]
+        let session = {
+            // This is the final publication boundary. Keep the rollback guard
+            // armed through every field initializer above so an unwind cannot
+            // strand a runtime/audio registration outside the store.
+            let mut session = session;
+            session.audio_control = pending_audio.take().map(|pending| pending.commit());
+            session
+        };
+        Ok(session)
     }
 
     /// Returns whether this session is currently connected
@@ -1422,6 +2239,8 @@ impl ManagedSession {
             session_input::Event::FocusGained => {
                 self.note_command_input_focus(MAIN_PANE_KEY);
             }
+            #[cfg(feature = "web-audio-cpal")]
+            session_input::Event::OpenAudioPanel => {}
             // The main input never opts into Escape-to-main.
             session_input::Event::FocusMain => {}
         }
@@ -1452,6 +2271,8 @@ impl ManagedSession {
                 self.note_command_input_focus(key);
                 Task::none()
             }
+            #[cfg(feature = "web-audio-cpal")]
+            session_input::Event::OpenAudioPanel => Task::done(Message::OpenAudioPanel),
             session_input::Event::FocusMain => {
                 self.note_command_input_focus(MAIN_PANE_KEY);
                 session_input::focus_target(self.input.input_id()).map(|found| {
@@ -1475,6 +2296,14 @@ impl ManagedSession {
     ) -> Task<Message> {
         self.sync_input_history(MAIN_PANE_KEY);
         if let Some(event) = update.event {
+            #[cfg(feature = "web-audio-cpal")]
+            if matches!(event, session_input::Event::OpenAudioPanel) {
+                self.sync_input_mirror(MAIN_PANE_KEY);
+                return Task::batch([
+                    update.task.map(Message::Input),
+                    Task::done(Message::OpenAudioPanel),
+                ]);
+            }
             self.handle_input_event(event);
         }
         self.sync_input_mirror(MAIN_PANE_KEY);
@@ -1676,6 +2505,10 @@ impl ManagedSession {
     }
 
     pub fn session_subscription(&self) -> Subscription<TaggedSessionEvent> {
+        #[cfg(feature = "web-audio-cpal")]
+        if let Some(events) = &self.session_events {
+            return Subscription::run_with(events.clone(), take_session_event_stream);
+        }
         if let Some(ui_commands) = &self.ui_commands {
             Subscription::run_with(
                 (self.session_params.clone(), ui_commands.clone()),
@@ -1713,6 +2546,10 @@ impl ManagedSession {
                 let update = self.input.update(input_msg);
                 self.finish_main_input_update(update)
             }
+            #[cfg(feature = "web-audio-cpal")]
+            Message::OpenAudioPanel => Task::none(),
+            #[cfg(feature = "web-audio-cpal")]
+            Message::AudioOutputFailed(_) => Task::none(),
             Message::LinkActivated(event) => {
                 self.handle_link_activation(event);
                 Task::none()
@@ -2000,6 +2837,28 @@ impl ManagedSession {
                         // update here — processing the message redraws the view.
                         Task::none()
                     }
+                    SessionEvent::PackageAudioUsed { owner, name } => {
+                        #[cfg(feature = "web-audio-cpal")]
+                        {
+                            let needs_persistence =
+                                mark_package_audio_used(&mut self.audio_packages, &owner, &name)
+                                    .unwrap_or(true);
+                            if needs_persistence
+                                && let Err(error) = shared_packages::record_audio_use(
+                                    &self.server_name,
+                                    &owner,
+                                    &name,
+                                )
+                            {
+                                log::warn!(
+                                    "could not persist Web Audio use for {owner}/{name}: {error:#}"
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "web-audio-cpal"))]
+                        let _ = (owner, name);
+                        Task::none()
+                    }
                     SessionEvent::LinkTooltipChanged => Task::none(),
                     SessionEvent::InputOp { key, op } => {
                         // The op layer refuses targets without an input, so a
@@ -2106,11 +2965,60 @@ impl ManagedSession {
                 Task::none()
             }
             Message::Reload => {
-                self.input.clear_hotkeys();
-                if let Some(tx) = self.runtime_tx.as_ref() {
-                    tx.send(RuntimeAction::Reload).ok();
+                if self.runtime_tx.as_ref().is_none_or(|tx| tx.is_closed()) {
+                    log::error!(
+                        "refusing script reload for session {} because its runtime channel is closed",
+                        self.id
+                    );
+                    return Task::none();
                 }
-                Task::none()
+                #[cfg(feature = "web-audio-cpal")]
+                let previous_audio = (
+                    self.audio_gain,
+                    self.audio_packages.clone(),
+                    self.audio_unavailable_cause.clone(),
+                    self.audio_preference_only,
+                );
+                #[cfg(feature = "web-audio-cpal")]
+                let audio_output_failure = match self.prepare_audio_reload() {
+                    Ok(failure) => failure,
+                    Err(error) => {
+                        log::error!(
+                            "refusing script reload for session {} because its saved audio policy could not be staged safely: {error}",
+                            self.id
+                        );
+                        return Task::none();
+                    }
+                };
+                let sent = self
+                    .runtime_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(RuntimeAction::Reload).is_ok());
+                if !sent {
+                    #[cfg(feature = "web-audio-cpal")]
+                    self.restore_audio_after_failed_reload_send(
+                        previous_audio.0,
+                        previous_audio.1,
+                        previous_audio.2,
+                        previous_audio.3,
+                    );
+                    log::error!(
+                        "refusing script reload for session {} because its runtime channel closed during preparation",
+                        self.id
+                    );
+                    return Task::none();
+                }
+                self.input.clear_hotkeys();
+                #[cfg(feature = "web-audio-cpal")]
+                {
+                    audio_output_failure.map_or_else(Task::none, |cause| {
+                        Task::done(Message::AudioOutputFailed(cause))
+                    })
+                }
+                #[cfg(not(feature = "web-audio-cpal"))]
+                {
+                    Task::none()
+                }
             }
             Message::Reconnect => {
                 info!("Connecting to server");
@@ -2664,6 +3572,133 @@ fn migrate_global_local_maps(legacy: &Path, server_local_dirs: &[PathBuf]) {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn reload_preserves_logical_package_key_but_resets_generation_acknowledgement() {
+        let row = |ui_key, action_key, owner: &str, name: &str, applied| AudioPackageRow {
+            ui_key,
+            action_key,
+            owner: Arc::from(owner),
+            name: Arc::from(name),
+            trusted: false,
+            audio_used: true,
+            gain: AudioGainSettings {
+                volume: 35,
+                muted: true,
+            },
+            applied,
+        };
+        let previous = vec![
+            row(7, 70, "one", "bell", true),
+            row(8, 80, "two", "bell", true),
+        ];
+        let mut replacement = vec![
+            row(101, 801, "two", "bell", false),
+            row(102, 701, "one", "bell", false),
+        ];
+
+        retain_audio_row_keys(&previous, &mut replacement);
+
+        assert_eq!(replacement[0].ui_key, 8);
+        assert_eq!(replacement[1].ui_key, 7);
+        assert_eq!(replacement[0].action_key, 801);
+        assert_eq!(replacement[1].action_key, 701);
+        assert!(replacement.iter().all(|row| !row.applied));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn observed_package_audio_use_reveals_only_the_matching_versionless_row() {
+        let row = |owner: &str, name: &str| AudioPackageRow {
+            ui_key: 1,
+            action_key: 1,
+            owner: Arc::from(owner),
+            name: Arc::from(name),
+            trusted: false,
+            audio_used: false,
+            gain: AudioGainSettings::default(),
+            applied: false,
+        };
+        let mut rows = vec![row("wbk", "earcon"), row("wbk", "mapper")];
+
+        assert_eq!(
+            mark_package_audio_used(&mut rows, "WBK", "EARCON"),
+            Some(true)
+        );
+        assert!(rows[0].audio_used);
+        assert!(!rows[1].audio_used);
+        assert_eq!(
+            mark_package_audio_used(&mut rows, "wbk", "earcon"),
+            Some(false)
+        );
+        assert_eq!(
+            mark_package_audio_used(&mut rows, "unknown", "package"),
+            None
+        );
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn transient_audio_policy_pressure_does_not_require_emulation() {
+        use crate::application_audio::ApplicationAudioControlError;
+
+        assert!(is_transient_audio_policy_error(
+            &ApplicationAudioControlError::CoordinatorSaturated
+        ));
+        assert!(is_transient_audio_policy_error(
+            &ApplicationAudioControlError::MixerQueueSaturated
+        ));
+        assert!(!is_transient_audio_policy_error(
+            &ApplicationAudioControlError::MixerWorkerStopped
+        ));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn output_failed_reload_retains_last_acknowledged_session_and_package_values() {
+        let row = |ui_key, action_key, owner: &str, volume| AudioPackageRow {
+            ui_key,
+            action_key,
+            owner: Arc::from(owner),
+            name: Arc::from("bell"),
+            trusted: false,
+            audio_used: true,
+            gain: AudioGainSettings {
+                volume,
+                muted: false,
+            },
+            applied: true,
+        };
+        let previous_gain = AudioGainSettings {
+            volume: 37,
+            muted: true,
+        };
+        let previous = vec![row(7, 70, "retained", 35)];
+        let mut replacement = vec![row(7, 71, "retained", 80), row(8, 81, "new", 65)];
+
+        let visible_gain = retain_acknowledged_audio_after_output_failure(
+            previous_gain,
+            &previous,
+            &mut replacement,
+        );
+        assert_eq!(visible_gain, previous_gain);
+        assert_eq!(replacement[0].gain.volume, 35);
+        assert_eq!(replacement[1].gain, AudioGainSettings::default());
+        assert!(replacement.iter().all(|row| !row.applied));
+
+        let mut second_reload = vec![row(7, 72, "retained", 99), row(8, 82, "new", 99)];
+        assert_eq!(
+            retain_acknowledged_audio_after_output_failure(
+                visible_gain,
+                &replacement,
+                &mut second_reload,
+            ),
+            previous_gain
+        );
+        assert_eq!(second_reload[0].gain.volume, 35);
+        assert_eq!(second_reload[1].gain, AudioGainSettings::default());
+    }
 
     #[test]
     fn input_focus_edges_are_visible_to_window_and_daemon_routers() {

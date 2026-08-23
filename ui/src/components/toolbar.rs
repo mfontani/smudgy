@@ -21,6 +21,8 @@ pub enum Message {
     AutomationsPressed,
     MapEditorPressed,
     LayoutsPressed,
+    #[cfg(feature = "web-audio-cpal")]
+    AudioPressed,
     ToggleExpand,
     // Window controls: the toolbar doubles as the titlebar of the borderless
     // main window. On Windows moves go through the `WM_NCHITTEST` chrome
@@ -210,6 +212,11 @@ pub fn view(
         buttons.push(toolbar_button(
             crate::i18n::t!("toolbar-settings"),
             Message::SettingsPressed,
+        ));
+        #[cfg(feature = "web-audio-cpal")]
+        buttons.push(toolbar_button(
+            crate::i18n::t!("toolbar-audio"),
+            Message::AudioPressed,
         ));
 
         buttons.push(drag_area(window));

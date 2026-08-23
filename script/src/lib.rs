@@ -5,7 +5,9 @@ mod module_loader;
 mod npm_resolver;
 mod package_resolver;
 mod transpiler;
+mod web_workers;
 
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,6 +37,9 @@ use deno_runtime::deno_inspector_server::{
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
 pub use deno_web::InMemoryBroadcastChannel;
+// Re-exported so the host can read an isolate's live worker count out of `OpState`
+// (the worker-host ops keep their handles here) without depending on `deno_runtime`.
+pub use deno_runtime::ops::worker_host::WorkersTable;
 use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
 
@@ -49,24 +54,78 @@ pub use package_resolver::{
     native_ipc_grants, native_ipc_path, params_module_url, parse_canonical, parse_params_url,
     platform_event_catalog, platform_state_producer,
 };
+pub use web_workers::{WorkerMode, worker_host_denied_extension};
 
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
 pub mod dts;
 
-// The V8 startup snapshot build.rs bakes at compile time (the deno_runtime BASE
-// extension set — see build.rs). Booting from it means extension JS never loads
+// V8 startup snapshots built at compile time bake deno_runtime's base
+// extension set and, when selected, deno_audio's frozen schema (see build.rs).
+// Keeping both snapshots lets a feature-enabled app create explicit legacy
+// no-audio runtimes without violating deno_core's frozen extension prefix.
+// Booting from them means extension JS never loads
 // from disk at runtime (deno_core 0.410 records those sources as absolute
 // build-machine paths), and skips re-evaluating the base extensions per
-// isolate. smudgy's own extensions are appended per isolate on top of the
-// snapshot; deno_core matches the snapshotted prefix by name and initializes
+// isolate. Smudgy's own extensions are appended per isolate on top of the
+// selected snapshot; deno_core matches the snapshotted prefix by name and initializes
 // the rest fresh (`extensions_in_snapshot` in deno_core's extension_set).
 static STARTUP_SNAPSHOT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/SMUDGY_RUNTIME_SNAPSHOT.bin"));
+#[cfg(feature = "web-audio")]
+static WEB_AUDIO_STARTUP_SNAPSHOT: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/SMUDGY_RUNTIME_AUDIO_SNAPSHOT.bin"
+));
 
 // `RESIDUAL_LAZY_JS_SOURCES` / `RESIDUAL_LAZY_ESM_SOURCES`: lazy_loaded_*
 // sources the snapshot did not consume, embedded here (generated — see
 // build.rs) and registered via `WorkerOptions::residual_lazy_*_sources`.
 include!(concat!(env!("OUT_DIR"), "/residual_lazy_sources.rs"));
+#[cfg(feature = "web-audio")]
+include!(concat!(env!("OUT_DIR"), "/residual_lazy_audio_sources.rs"));
+
+fn preflight_web_audio_extension(extensions: &[deno_core::Extension]) -> Result<bool> {
+    let positions: Vec<_> = extensions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, extension)| (extension.name == "deno_audio").then_some(index))
+        .collect();
+    match positions.as_slice() {
+        [] => Ok(false),
+        [0] => {
+            #[cfg(feature = "web-audio")]
+            {
+                Ok(true)
+            }
+            #[cfg(not(feature = "web-audio"))]
+            {
+                Err(anyhow::anyhow!(
+                    "the deno_audio extension requires the smudgy_script web-audio feature"
+                ))
+            }
+        }
+        _ => Err(anyhow::anyhow!(
+            "invalid deno_audio extension layout: expected zero instances or exactly one at custom-extension index 0; found positions {positions:?}"
+        )),
+    }
+}
+
+/// Embeds deno_audio's exact extension modules and defers their entry point until deno_runtime
+/// has installed the URL and Event globals those modules use.
+///
+/// This is feature-internal embedder glue; it does not grant a script any native authority.
+#[cfg(feature = "web-audio")]
+#[doc(hidden)]
+pub fn prepare_deferred_web_audio_extension(extension: &mut deno_core::Extension) {
+    let deferred = std::mem::take(extension.esm_files.to_mut());
+
+    // A runtime Extension may not retain unevaluated eager ESM. Register the exact graph as
+    // lazy-loaded ESM so MainWorker can bootstrap Deno first, then import the entry point through
+    // the internal ext: module map. The matching startup snapshot supplies their embedded residual
+    // sources; static peer imports within deno_audio remain closed to that map.
+    extension.lazy_loaded_esm_files.to_mut().extend(deferred);
+    extension.esm_entry_point = None;
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ModulePolicy {
@@ -116,6 +175,14 @@ pub struct ScriptRuntimeOptions {
     /// Server-entry scoped BroadcastChannel backend. `None` creates an
     /// isolated backend (primarily for standalone runtime tests).
     pub broadcast_channel: Option<InMemoryBroadcastChannel>,
+    /// Web `Worker` policy for this isolate. The default [`WorkerMode::Disabled`]
+    /// disables the worker-host ops so `new Worker(...)` — including through the
+    /// `node:worker_threads` shim — throws a catchable error instead of reaching
+    /// deno_runtime's panicking default callback. [`WorkerMode::ComputeOnly`]
+    /// (the trusted main isolate) makes workers real: reduced-op, off-thread
+    /// compute realms with a none-permissions container whose only I/O is the
+    /// message bridge (see `web_workers.rs`).
+    pub workers: WorkerMode,
 }
 
 pub struct ScriptRuntime {
@@ -129,6 +196,10 @@ pub struct ScriptRuntime {
     /// A clone of the loader's package provider so [`Self::load_modules`] can build a
     /// [`LoadReport`] (resolved versions, declared parameters) after evaluation.
     package_provider: Option<Rc<dyn PackageProvider>>,
+    /// Owned package-source handoff captured by this isolate's off-thread worker callback.
+    /// The `!Send` provider fills it exactly once after graph loading and before evaluation;
+    /// worker realms see only this immutable map, never the provider.
+    worker_module_sources: web_workers::WorkerModuleSourceChannel,
 }
 
 /// The set of modules to load into the shared isolate on session start: local
@@ -211,6 +282,23 @@ pub fn permission_descriptor_parser() -> Arc<dyn PermissionDescriptorParser> {
     Arc::new(RuntimePermissionDescriptorParser::new(RealSys))
 }
 
+/// deno's default `FeatureChecker` callback is `std::process::exit(70)`, and
+/// unstable-gated ops consult the checker BEFORE any permission check — the vsock net
+/// ops (compiled on Linux/Android/macOS) reach it straight from
+/// `Deno.connect({ transport: "vsock" })`. Script code must never be able to
+/// terminate the host process via a feature gate, so this checker enables no unstable
+/// features and swaps the exit callback for a log: the op falls through to the
+/// deny-by-default permission check (or its own unsupported-platform error) and
+/// surfaces as a catchable JS error instead of killing the app. Shared by the main
+/// runtime and every worker realm (each worker builds its own on its own thread).
+pub(crate) fn quiet_feature_checker() -> Arc<deno_runtime::FeatureChecker> {
+    let mut checker = deno_runtime::FeatureChecker::default();
+    checker.set_exit_cb(Box::new(|feature, api_name| {
+        log::warn!("smudgy: denied unstable Deno feature '{feature}' requested by '{api_name}'");
+    }));
+    Arc::new(checker)
+}
+
 /// Install the process-global rustls `CryptoProvider` exactly once. deno_tls is
 /// built against aws-lc-rs, so we install that provider; calling more than once
 /// (multiple sessions) is a no-op via `Once`. Errors from a competing install are
@@ -230,6 +318,13 @@ impl ScriptRuntime {
         // CryptoProvider available". Install once across all sessions.
         install_default_crypto_provider();
 
+        let initialize_web_audio = preflight_web_audio_extension(&options.extensions)?;
+        let mut extensions = options.extensions;
+        // Appending after the preflight keeps any deno_audio extension at
+        // custom index 0, where the frozen snapshot prefix expects it.
+        if options.workers == WorkerMode::Disabled {
+            extensions.push(web_workers::worker_host_denied_extension());
+        }
         let data_dir = options.data_dir;
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("failed to create script data dir {}", data_dir.display()))?;
@@ -254,6 +349,7 @@ impl ScriptRuntime {
             .context("failed to parse smudgy main module specifier")?;
         let (npm_services, node_services) = SmudgyNpmServices::new(data_dir.clone())?;
         let package_provider = options.package_provider.clone();
+        let worker_module_sources = Arc::new(std::sync::OnceLock::new());
         let loader = Rc::new(ScriptModuleLoader::with_npm_and_packages(
             std::env::current_dir().context("failed to get current directory")?,
             options.module_policy,
@@ -273,23 +369,7 @@ impl ScriptRuntime {
             )))
         });
 
-        // deno's default `FeatureChecker` callback is `std::process::exit(70)`, and
-        // unstable-gated ops consult the checker BEFORE any permission check — the vsock net
-        // ops (compiled on Linux/Android/macOS) reach it straight from
-        // `Deno.connect({ transport: "vsock" })`. Sandboxed script code must never be able to
-        // terminate the host process via a feature gate, so this checker enables no unstable
-        // features and swaps the exit callback for a log: the op falls through to the
-        // deny-by-default permission check (or its own unsupported-platform error) and
-        // surfaces as a catchable JS error instead of killing the app.
-        let feature_checker = {
-            let mut checker = deno_runtime::FeatureChecker::default();
-            checker.set_exit_cb(Box::new(|feature, api_name| {
-                log::warn!(
-                    "smudgy: denied unstable Deno feature '{feature}' requested by '{api_name}'"
-                );
-            }));
-            Arc::new(checker)
-        };
+        let feature_checker = quiet_feature_checker();
 
         let services =
             WorkerServiceOptions::<DenoInNpmPackageChecker, NpmResolver<RealSys>, RealSys> {
@@ -331,14 +411,36 @@ impl ScriptRuntime {
             (None, None)
         };
 
+        #[cfg(feature = "web-audio")]
+        let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) =
+            if initialize_web_audio {
+                (
+                    WEB_AUDIO_STARTUP_SNAPSHOT,
+                    RESIDUAL_LAZY_AUDIO_JS_SOURCES,
+                    RESIDUAL_LAZY_AUDIO_ESM_SOURCES,
+                )
+            } else {
+                (
+                    STARTUP_SNAPSHOT,
+                    RESIDUAL_LAZY_JS_SOURCES,
+                    RESIDUAL_LAZY_ESM_SOURCES,
+                )
+            };
+        #[cfg(not(feature = "web-audio"))]
+        let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = (
+            STARTUP_SNAPSHOT,
+            RESIDUAL_LAZY_JS_SOURCES,
+            RESIDUAL_LAZY_ESM_SOURCES,
+        );
+
         let mut worker_options = WorkerOptions {
-            extensions: options.extensions,
-            // Boot from the baked base-runtime snapshot (see STARTUP_SNAPSHOT
-            // above). `deno_bootstrap` inserts `SnapshotOptions` itself when a
-            // snapshot is present, so no shim is needed for the bootstrap op.
-            startup_snapshot: Some(STARTUP_SNAPSHOT),
-            residual_lazy_js_sources: RESIDUAL_LAZY_JS_SOURCES,
-            residual_lazy_esm_sources: RESIDUAL_LAZY_ESM_SOURCES,
+            extensions,
+            // Select the exact frozen extension prefix. A feature-enabled
+            // application may still construct a legacy runtime with no Web
+            // Audio extension, so the base and audio snapshots coexist.
+            startup_snapshot: Some(startup_snapshot),
+            residual_lazy_js_sources,
+            residual_lazy_esm_sources,
             origin_storage_dir: Some(origin_storage_dir),
             cache_storage_dir: Some(cache_storage_dir),
             ..Default::default()
@@ -353,6 +455,14 @@ impl ScriptRuntime {
         // empty `<data_dir>/node_modules` from earlier builds may exist on disk;
         // it is unused and must not be sniffed here.
         worker_options.bootstrap.has_node_modules_dir = false;
+        if options.workers == WorkerMode::ComputeOnly {
+            // Workers must boot the same snapshot blob as this (parent) runtime:
+            // V8's shared heap is process-global and blob-verified per isolate.
+            worker_options.create_web_worker_cb = web_workers::create_web_worker_callback(
+                initialize_web_audio,
+                Arc::clone(&worker_module_sources),
+            );
+        }
         worker_options.bootstrap.inspect = inspector_server.is_some();
         worker_options.should_break_on_first_statement = false;
         worker_options.should_wait_for_inspector_session = false;
@@ -370,10 +480,29 @@ impl ScriptRuntime {
         // drives them. This only bites when stdout is a TTY (e.g. `cargo run` from
         // a terminal) — under `cargo test` or a windowed build stdout is a pipe, so
         // the stdio handles aren't TTYs and `uv_tty_init` is never reached.
-        let worker = {
+        let mut worker = {
             let _tokio_guard = options.tokio.enter();
             MainWorker::bootstrap_from_options(&main_module, services, worker_options)
         };
+
+        // deno_audio's exact module graph is registered as lazy-loaded ESM. Import its entry point
+        // only after deno_runtime has installed the URL/Event globals it imports. Native state and
+        // ops were supplied by the matching runtime extension before bootstrap.
+        if initialize_web_audio {
+            let specifier = ModuleSpecifier::parse("file:///__smudgy_web_audio_bootstrap.js")
+                .context("failed to parse the Web Audio bootstrap module")?;
+            let module_id = options
+                .tokio
+                .block_on(worker.js_runtime.load_side_es_module_from_code(
+                    &specifier,
+                    "import 'ext:deno_audio/99_main.js';",
+                ))
+                .context("failed to load the Web Audio extension entry point")?;
+            options
+                .tokio
+                .block_on(worker.evaluate_module(module_id))
+                .context("failed to initialize the Web Audio extension")?;
+        }
 
         Ok(Self {
             worker: ManuallyDrop::new(worker),
@@ -381,6 +510,7 @@ impl ScriptRuntime {
             _inspector_server: inspector_server,
             _tokio: options.tokio,
             package_provider,
+            worker_module_sources,
         })
     }
 
@@ -432,6 +562,19 @@ impl ScriptRuntime {
             .load_main_es_module_from_code(&main, code)
             .await
             .context("failed to load smudgy module set")?;
+        // Graph loading has now resolved and fetched every statically imported package, but
+        // none of its top-level code has evaluated yet. Freeze the complete fetched archives
+        // here so a package may construct `new Worker('./worker.ts')` during evaluation: the
+        // callback runs on another OS thread and can read this owned map without capturing the
+        // per-isolate provider (`!Send`). Each ScriptRuntime loads one module set, so the
+        // single-assignment channel also makes the worker view immutable for the isolate's life.
+        let sources = self
+            .package_provider
+            .as_ref()
+            .map_or_else(HashMap::new, |provider| provider.snapshot_module_sources());
+        self.worker_module_sources
+            .set(sources)
+            .expect("worker module sources are published once per ScriptRuntime");
         let mut receiver = deno.mod_evaluate(module_id);
         let evaluation = tokio::select! {
             biased;

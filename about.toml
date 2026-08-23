@@ -1,14 +1,26 @@
 # Configuration for `cargo about`, which generates THIRD-PARTY-NOTICES.md.
+# Release packaging pins cargo-about 0.9.0 so this canonical output is reproducible.
 #
 # Regenerate after changing dependencies (from the workspace root):
-#   cargo about generate about.hbs -o THIRD-PARTY-NOTICES.md
+#   cargo about generate --workspace --features smudgy_ui/web-audio-cpal \
+#     --locked about.hbs -o THIRD-PARTY-NOTICES.md
+#   python bin/normalize-third-party-notices.py
 #
 # The hand-written font / icon / runtime notices live in the template
 # preamble (about.hbs); the Rust crate section below is gathered from the
 # dependency graph of the shipped binary.
 
-# Scope the dependency graph to what actually ships in the release build.
-targets = ["x86_64-pc-windows-msvc"]
+# Conservative union of every target shipped by the Windows installer,
+# universal macOS bundle, and two-architecture Flatpak release. Release scripts
+# select `smudgy_ui/web-audio-cpal`, so the generated notice covers every
+# platform-specific physical-output edge in one canonical file.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
 
 # Build- and dev-dependencies are not distributed in the binary.
 ignore-build-dependencies = true

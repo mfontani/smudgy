@@ -1050,6 +1050,9 @@ pub struct SmudgyCapabilities {
     /// mask, or submit it. One capability covers the whole surface — a package holding it
     /// can see and rewrite what the user types.
     pub input: bool,
+    /// `workers: ["spawn"]` — construct Web Workers: off-thread reduced-op compute
+    /// realms with a message-only bridge (no network, file, or smudgy ops inside them).
+    pub workers: bool,
 }
 
 impl SmudgyCapabilities {
@@ -1074,6 +1077,7 @@ impl SmudgyCapabilities {
             panes: true,
             gmcp_send: true,
             input: true,
+            workers: true,
         }
     }
 
@@ -1104,6 +1108,7 @@ impl SmudgyCapabilities {
         self.panes |= other.panes;
         self.gmcp_send |= other.gmcp_send;
         self.input |= other.input;
+        self.workers |= other.workers;
     }
 
     /// Whether `self` requests **nothing beyond** `ceiling` — every capability `self` wants is also
@@ -1131,6 +1136,7 @@ impl SmudgyCapabilities {
             && (!self.panes || ceiling.panes)
             && (!self.gmcp_send || ceiling.gmcp_send)
             && (!self.input || ceiling.input)
+            && (!self.workers || ceiling.workers)
     }
 
     /// The capabilities requested by `self` (a newly-resolved closure union) but **not** by
@@ -1156,6 +1162,7 @@ impl SmudgyCapabilities {
             panes: self.panes && !baseline.panes,
             gmcp_send: self.gmcp_send && !baseline.gmcp_send,
             input: self.input && !baseline.input,
+            workers: self.workers && !baseline.workers,
         }
     }
 }
@@ -1184,6 +1191,8 @@ struct SmudgyCapabilitiesWire {
     gmcp: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     input: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workers: Vec<String>,
 }
 
 /// Whether `tokens` contains `tok` (trimmed, case-insensitive — manifest authors shouldn't be
@@ -1213,6 +1222,7 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             panes: has_token(&wire.panes, "create"),
             gmcp_send: has_token(&wire.gmcp, "send"),
             input: has_token(&wire.input, "access"),
+            workers: has_token(&wire.workers, "spawn"),
         }
     }
 }
@@ -1276,6 +1286,10 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         if caps.input {
             input.push("access".to_string());
         }
+        let mut workers = Vec::new();
+        if caps.workers {
+            workers.push("spawn".to_string());
+        }
         Self {
             automations,
             session,
@@ -1286,6 +1300,7 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
             panes,
             gmcp,
             input,
+            workers,
         }
     }
 }
@@ -1625,6 +1640,20 @@ pub trait PackageProvider {
     /// host build a [`crate::LoadReport`] (version, declared options, integrity) after
     /// modules evaluate, without re-resolving.
     fn get_resolved(&self, key: &PackageKey) -> Option<Rc<ResolvedPackage>>;
+
+    /// Snapshot every module source fetched for code loading in this provider's isolate,
+    /// keyed by its version-pinned [`CANONICAL_SCHEME`] URL. The host calls this on the
+    /// isolate thread after the parent module graph has loaded, then publishes the owned,
+    /// `Send` map to that isolate's Web Worker callback. Worker threads must never capture
+    /// the provider itself: provider implementations are deliberately `!Send`.
+    ///
+    /// Each entry is the authored source text, not a V8 module or provider handle. The
+    /// worker loader transpiles it independently in the worker realm. The default exposes
+    /// no package sources, which keeps custom providers fail-closed unless they explicitly
+    /// implement this channel.
+    fn snapshot_module_sources(&self) -> HashMap<String, String> {
+        HashMap::new()
+    }
 
     /// The deno-native permission union across **this provider's isolate closure** — the
     /// `permissions` of the root package merged with every transitive `smudgy://`
@@ -2709,9 +2738,10 @@ fn subpath_candidates(sub: &str) -> Vec<String> {
 pub struct InMemoryPackageProvider {
     by_version: HashMap<(PackageKey, String), Rc<ResolvedPackage>>,
     latest: HashMap<PackageKey, String>,
-    /// Packages served through this provider (resolve or canonical-load hits), in first-served
-    /// order — the [`PackageProvider::loaded_packages`] view of the owning isolate's package set.
-    served: std::cell::RefCell<Vec<PackageKey>>,
+    /// Package instances served through this provider (resolve or canonical-load hits), in
+    /// first-served order. Version stays in the key so a worker-source snapshot preserves
+    /// coexisting versions; [`PackageProvider::loaded_packages`] folds it back to package keys.
+    served: std::cell::RefCell<Vec<(PackageKey, String)>>,
     /// The packages whose interop home is this provider's isolate (folded keys). `None`
     /// means homes were never configured: every load is home, nothing is scrubbed.
     homes: std::cell::RefCell<Option<std::collections::HashSet<PackageKey>>>,
@@ -2735,11 +2765,12 @@ impl InMemoryPackageProvider {
         self.by_version.insert((key, version), Rc::new(package));
     }
 
-    /// Record `key` as served through this provider (deduplicated, first-served order).
-    fn note_served(&self, key: &PackageKey) {
+    /// Record one concrete package instance as served (deduplicated, first-served order).
+    fn note_served(&self, key: &PackageKey, version: &str) {
+        let instance = (key.clone(), version.to_string());
         let mut served = self.served.borrow_mut();
-        if !served.contains(key) {
-            served.push(key.clone());
+        if !served.contains(&instance) {
+            served.push(instance);
         }
     }
 }
@@ -2760,7 +2791,7 @@ impl PackageProvider for InMemoryPackageProvider {
             .get(&(key.clone(), version.clone()))
             .cloned()
             .ok_or_else(|| PackageError::NotFound(key.to_user_specifier()))?;
-        self.note_served(key);
+        self.note_served(key, version);
         Ok(resolved)
     }
 
@@ -2769,7 +2800,7 @@ impl PackageProvider for InMemoryPackageProvider {
             .by_version
             .get(&(key.clone(), version.to_string()))
             .cloned()?;
-        self.note_served(key);
+        self.note_served(key, version);
         Some(cached)
     }
 
@@ -2778,6 +2809,22 @@ impl PackageProvider for InMemoryPackageProvider {
         self.by_version
             .get(&(key.clone(), version.clone()))
             .cloned()
+    }
+
+    fn snapshot_module_sources(&self) -> HashMap<String, String> {
+        let mut sources = HashMap::new();
+        for (key, version) in self.served.borrow().iter() {
+            let Some(package) = self.by_version.get(&(key.clone(), version.clone())) else {
+                continue;
+            };
+            for module in &package.modules {
+                sources.insert(
+                    canonical_url(key, version, &module.subpath).to_string(),
+                    module.text.clone(),
+                );
+            }
+        }
+        sources
     }
 
     /// Union the `permissions` of **every** package version this provider holds. The
@@ -2793,7 +2840,13 @@ impl PackageProvider for InMemoryPackageProvider {
     }
 
     fn loaded_packages(&self) -> Vec<PackageKey> {
-        self.served.borrow().clone()
+        let mut keys = Vec::new();
+        for (key, _) in self.served.borrow().iter() {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys
     }
 
     /// A stub fetch is a read of the producer's declarations, not a code load — serve it
@@ -4732,6 +4785,26 @@ mod tests {
         let none = SmudgyCapabilities::default();
         assert!(!caps.is_within(&none));
         assert!(caps.added_since(&none).input);
+        assert!(caps.is_within(&SmudgyCapabilities::all()));
+    }
+
+    #[test]
+    fn smudgy_workers_tokens_parse_and_round_trip() {
+        let caps = perms_with_smudgy(r#"{ "workers": ["spawn"] }"#).smudgy;
+        assert!(caps.workers);
+        assert!(
+            !caps.send && !caps.echo && !caps.interop_broadcast,
+            "workers rides with no other grant"
+        );
+        let json = serde_json::to_string(&caps).expect("serialize");
+        assert!(json.contains(r#""workers""#), "{json}");
+        assert!(json.contains(r#""spawn""#), "{json}");
+        let back: SmudgyCapabilities = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, caps, "workers tokens round-trip");
+        // Containment: a workers ask needs a workers grant.
+        let none = SmudgyCapabilities::default();
+        assert!(!caps.is_within(&none));
+        assert!(caps.added_since(&none).workers);
         assert!(caps.is_within(&SmudgyCapabilities::all()));
     }
 

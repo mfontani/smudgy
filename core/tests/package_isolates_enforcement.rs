@@ -22,12 +22,13 @@ use std::net::{Shutdown, TcpListener};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
-use smudgy_core::session::runtime::RuntimeAction;
+use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 use smudgy_core::session::{
     BufferUpdate, PackageProviderFactory, SessionEvent, SessionId, SessionParams,
     spawn_with_package_provider,
@@ -39,6 +40,15 @@ use smudgy_script::{
 
 /// Time the collector waits for the next buffer event before declaring the session idle.
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
+
+/// Session ids share one process-wide runtime registry while this test binary's
+/// cases execute in parallel. Allocate them instead of assigning literals so
+/// independently-running scenarios can never alias.
+static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(9_400);
+
+fn next_session_id() -> SessionId {
+    SessionId::from(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 // ---------------------------------------------------------------------------
 // Hermetic local HTTP server (the "allowed" net host)
@@ -227,7 +237,6 @@ fn prepare_server(server: &str) -> PathBuf {
 /// installs a single top-level package, so the provider's `closure_permissions()` is precisely
 /// that install's closure union. Call `prepare_server` first so the data dir exists before spawn.
 async fn collect_session_lines(
-    session_id: u32,
     server: &str,
     install_specifiers: &[&str],
     factory: PackageProviderFactory,
@@ -241,7 +250,7 @@ async fn collect_session_lines(
         consent.smudgy = SmudgyCapabilities::all();
         shared_packages::record_consent(server, spec, &consent).unwrap();
     }
-    spawn_and_drain(session_id, server, factory).await
+    spawn_and_drain(server, factory).await
 }
 
 /// Like [`collect_session_lines`] but records an **explicit** consent union per install (`Some`),
@@ -249,7 +258,6 @@ async fn collect_session_lines(
 /// that prove enforcement sources CONSENT: a partial consent withholds the manifest's other asks,
 /// and a `None` record (a lock entry with no consent) denies everything.
 async fn collect_session_lines_with_consent(
-    session_id: u32,
     server: &str,
     installs: &[(&str, Option<PackagePermissions>)],
     factory: PackageProviderFactory,
@@ -267,19 +275,16 @@ async fn collect_session_lines_with_consent(
             shared_packages::record_consent(server, spec, &union).unwrap();
         }
     }
-    spawn_and_drain(session_id, server, factory).await
+    spawn_and_drain(server, factory).await
 }
 
 /// Spawn a headless session resolving `smudgy://` from `factory` and collect every appended line
 /// until the session goes quiet. No input is sent — the permission probes run at package load —
 /// so this just drains the buffer. Callers install + record consent first.
-async fn spawn_and_drain(
-    session_id: u32,
-    server: &str,
-    factory: PackageProviderFactory,
-) -> Vec<String> {
+async fn spawn_and_drain(server: &str, factory: PackageProviderFactory) -> Vec<String> {
+    let session_id = next_session_id();
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(session_id),
+        session_id,
         server_name: Arc::new(server.to_string()),
         profile_name: Arc::new("test".to_string()),
         profile_subtext: Arc::new(String::new()),
@@ -321,8 +326,35 @@ async fn spawn_and_drain(
             }
         }
     }
-    tx.send(RuntimeAction::Shutdown).ok();
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
+    drop(tx);
+    drop(events);
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
     lines
+}
+
+#[test]
+fn session_ids_are_unique_across_parallel_harness_callers() {
+    const CALLERS: usize = 32;
+    let gate = Arc::new(std::sync::Barrier::new(CALLERS));
+    let callers = (0..CALLERS)
+        .map(|_| {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.wait();
+                next_session_id()
+            })
+        })
+        .collect::<Vec<_>>();
+    let ids = callers
+        .into_iter()
+        .map(|caller| caller.join().expect("allocator caller does not panic"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), CALLERS);
 }
 
 fn has_line(lines: &[String], needle: &str) -> bool {
@@ -368,7 +400,6 @@ async fn sandboxed_package_net_grant_is_enforced() {
         &src,
     );
     let lines = collect_session_lines(
-        9401,
         "pi_enf_net_allow",
         &["smudgy://wbk/fetcher"],
         factory_for(vec![pkg]),
@@ -430,7 +461,6 @@ async fn sandboxed_package_any_host_grant_respects_port_scope() {
         &src,
     );
     let lines = collect_session_lines(
-        9420,
         "pi_enf_net_any_host",
         &["smudgy://wbk/wildcard-fetcher"],
         factory_for(vec![pkg]),
@@ -470,7 +500,6 @@ async fn sandboxed_package_with_no_permissions_denies_net() {
     // No `permissions` block at all → empty union → deny-all.
     let pkg = make_package("wbk", "quiet", "1.0.0", "", &src);
     let lines = collect_session_lines(
-        9402,
         "pi_enf_net_deny",
         &["smudgy://wbk/quiet"],
         factory_for(vec![pkg]),
@@ -516,7 +545,6 @@ async fn import_none_blocks_npm_jsr_and_web() {
     // No `permissions` block ⇒ import defaults to None.
     let pkg = make_package("wbk", "iso", "1.0.0", "", &src);
     let lines = collect_session_lines(
-        9410,
         "pi_enf_import_none",
         &["smudgy://wbk/iso"],
         factory_for(vec![pkg]),
@@ -568,7 +596,6 @@ async fn import_registries_blocks_arbitrary_web() {
         &src,
     );
     let lines = collect_session_lines(
-        9411,
         "pi_enf_import_reg",
         &["smudgy://wbk/iso"],
         factory_for(vec![pkg]),
@@ -609,7 +636,6 @@ async fn import_any_allows_arbitrary_web() {
         &src,
     );
     let lines = collect_session_lines(
-        9412,
         "pi_enf_import_any",
         &["smudgy://wbk/iso"],
         factory_for(vec![pkg]),
@@ -659,7 +685,6 @@ async fn sandboxed_package_read_write_is_scoped_to_subtree() {
         src,
     );
     let lines = collect_session_lines(
-        9403,
         "pi_enf_fs",
         &["smudgy://wbk/fsuser"],
         factory_for(vec![pkg]),
@@ -736,7 +761,6 @@ async fn sandboxed_package_data_dir_fs_via_getdatadir() {
         src,
     );
     let lines = collect_session_lines(
-        9411,
         "pi_enf_getdatadir",
         &["smudgy://wbk/fsdata"],
         factory_for(vec![granted]),
@@ -763,7 +787,6 @@ async fn sandboxed_package_data_dir_fs_via_getdatadir() {
     // --- Denied: same code, NO read/write grant ---
     let denied = make_package("wbk", "fsdata_denied", "1.0.0", "", src);
     let denied_lines = collect_session_lines(
-        9412,
         "pi_enf_getdatadir",
         &["smudgy://wbk/fsdata_denied"],
         factory_for(vec![denied]),
@@ -826,7 +849,6 @@ async fn closure_union_grants_a_dependency_declared_permission() {
 
     // Only R is installed (top-level → sandbox); D is a transitive dep the provider holds.
     let lines = collect_session_lines(
-        9404,
         "pi_enf_union",
         &["smudgy://wbk/app"],
         factory_for(vec![root, dep]),
@@ -870,7 +892,7 @@ async fn main_isolate_keeps_full_authority() {
     std::fs::write(server_dir.join("modules").join("main_mod.ts"), &module_src).unwrap();
 
     // No packages, no installs — only the local module in main.
-    let lines = collect_session_lines(9405, "pi_enf_main", &[], factory_for(vec![])).await;
+    let lines = collect_session_lines("pi_enf_main", &[], factory_for(vec![])).await;
 
     assert!(
         has_line(&lines, "MAIN_NET:200:ok"),
@@ -914,7 +936,6 @@ async fn sandboxed_package_data_grant_cannot_escape_via_dotdot() {
         &src,
     );
     let lines = collect_session_lines(
-        9406,
         "pi_enf_escape",
         &["smudgy://wbk/escaper"],
         factory_for(vec![pkg]),
@@ -977,7 +998,6 @@ async fn consented_union_is_enforced_and_withholds_unconsented_asks() {
         ..Default::default()
     };
     let lines = collect_session_lines_with_consent(
-        9407,
         "pi_consent_withhold",
         &[("smudgy://wbk/withholder", Some(consent))],
         factory_for(vec![pkg]),
@@ -1033,7 +1053,6 @@ async fn unconsented_package_is_denied_everything() {
         &src,
     );
     let lines = collect_session_lines_with_consent(
-        9408,
         "pi_consent_none",
         &[(
             "smudgy://wbk/unconsented",
@@ -1075,7 +1094,6 @@ async fn sandboxed_package_without_interop_capability_is_denied_emit_and_subscri
     "#;
     let pkg = make_package("wbk", "noevents", "1.0.0", "", src);
     let lines = collect_session_lines_with_consent(
-        9421,
         "pi_events_denied",
         &[("smudgy://wbk/noevents", Some(PackagePermissions::default()))],
         factory_for(vec![pkg]),
@@ -1133,7 +1151,6 @@ async fn events_deliver_across_sandboxed_isolates() {
            evt.on((p) => echo("CROSS_GOT:" + p.n));"#,
     );
     let lines = collect_session_lines(
-        9422,
         "pi_events_cross",
         &["smudgy://o/emitter", "smudgy://o/listener"],
         factory_for(vec![emitter, listener]),
@@ -1195,7 +1212,6 @@ async fn sandboxed_package_run_and_sys_grants_are_enforced() {
         &src,
     );
     let lines = collect_session_lines(
-        9431,
         "pi_enf_run_sys",
         &["smudgy://wbk/native"],
         factory_for(vec![pkg]),
@@ -1253,7 +1269,6 @@ async fn sandboxed_package_with_no_permissions_denies_run_ffi_sys() {
 
     let pkg = make_package("wbk", "grounded", "1.0.0", "", &src);
     let lines = collect_session_lines(
-        9432,
         "pi_enf_native_deny",
         &["smudgy://wbk/grounded"],
         factory_for(vec![pkg]),
@@ -1323,7 +1338,6 @@ async fn worker_threads_broadcast_channel_cannot_bypass_interop_capability() {
         "#,
     );
     let lines = collect_session_lines_with_consent(
-        9433,
         server,
         &[(
             "smudgy://wbk/broadcast-denied",
@@ -1408,7 +1422,6 @@ async fn sandboxed_package_ipc_grant_materializes_the_native_realization() {
         &src,
     );
     let lines = collect_session_lines(
-        9440,
         "pi_enf_ipc",
         &["smudgy://wbk/ipc-probe"],
         factory_for(vec![pkg]),
@@ -1470,7 +1483,6 @@ async fn sandboxed_package_vsock_connect_is_a_catchable_error_not_process_death(
 
     let pkg = make_package("wbk", "vsock-probe", "1.0.0", "", src);
     let lines = collect_session_lines(
-        9441,
         "pi_enf_vsock",
         &["smudgy://wbk/vsock-probe"],
         factory_for(vec![pkg]),

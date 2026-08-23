@@ -41,13 +41,14 @@ jobs:
         run: cargo fmt --all -- --check
 
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.mode }})
     needs: fmt
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        mode: [default, silent, physical]
 
     steps:
       - name: Check out repository
@@ -73,7 +74,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libwebkit2gtk-4.1-dev
+          sudo apt-get install --yes --no-install-recommends \
+            libasound2-dev \
+            libwebkit2gtk-4.1-dev
 
       # rust-cache prunes workspace-member artifacts (the statically-linked
       # test binaries that dominate target/) before saving; caching target/
@@ -97,10 +100,51 @@ jobs:
             cargo install --locked patch-crate
           cargo patch-crate --force
 
+      - name: Audit Web Audio dependency and feature wiring
+        run: python bin/check-web-audio-wiring.py
+
+      - name: Test iced accessibility dependency patches
+        if: matrix.mode == 'default'
+        run: python bin/test-iced-accessibility-patches.py
+
+      - name: Check hardware-free opt-out build
+        if: matrix.mode == 'default'
+        run: >-
+          cargo check -p smudgy_ui --all-targets
+          --no-default-features --locked
+
+      - name: Check hosted silent Web Audio
+        if: matrix.mode == 'silent'
+        run: >-
+          cargo check -p smudgy_ui --all-targets --no-default-features
+          --features web-audio --locked
+
+      - name: Check platform physical Web Audio
+        if: matrix.mode == 'physical'
+        # Compile only: hosted runners are not required to have a default device.
+        # This selects WASAPI on Windows, ALSA on Linux, and CoreAudio on macOS.
+        run: >-
+          cargo check -p smudgy_ui --all-targets --no-default-features
+          --features web-audio-cpal --locked
+
+      - name: Test hardware-independent audio contracts
+        if: matrix.mode == 'physical'
+        run: |
+          cargo test -p smudgy_audio --features physical-output --lib --locked
+          cargo test -p smudgy_audio_web --lib --locked
+
+      - name: Test hosted silent Web Audio integration
+        if: matrix.mode != 'default'
+        run: >-
+          cargo test -p smudgy_core --no-default-features --features web-audio
+          --test web_audio_integration --test package_isolates_sandbox --locked
+
       - name: Check workspace
+        if: matrix.mode == 'default'
         run: cargo check --workspace --all-targets --all-features --locked
 
       - name: Test workspace
+        if: matrix.mode == 'default'
         # This test reaches the real OS credential service, which is not a
         # deterministic dependency on headless hosted runners.
         run: >-

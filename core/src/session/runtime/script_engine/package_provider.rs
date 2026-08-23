@@ -24,7 +24,7 @@ use std::sync::Arc;
 use smudgy_cloud::{CloudError, PackageApiClient, ResolvedDependency, ResolvedModuleWire};
 use smudgy_script::{
     PackageError, PackageKey, PackageManifest, PackageModuleSource, PackageParameter,
-    PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage,
+    PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage, canonical_url,
 };
 
 use super::package_cache::{CachedModule, CachedResolution, PackageCache, is_code_module};
@@ -381,6 +381,7 @@ impl SmudgyPackageProvider {
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         };
         let known_install = {
             let mut lock = self.lock.borrow_mut();
@@ -405,20 +406,20 @@ impl SmudgyPackageProvider {
                 false
             }
         };
-        let persisted = shared_packages::load_lock(&self.server_name).and_then(|mut disk| {
+        let persisted = shared_packages::mutate_lock(&self.server_name, |disk| {
             if let Some(entry) = disk.packages.iter_mut().find(|p| p.specifier == specifier) {
                 entry.last_resolved_version = Some(version.to_string());
                 entry.integrity = Some(integrity.to_string());
-                shared_packages::save_lock(&self.server_name, &disk)
+                Ok(((), true))
             } else if known_install {
                 // Uninstalled since this session loaded — don't resurrect it just to stamp
                 // resolution metadata on it.
-                Ok(())
+                Ok(((), false))
             } else {
                 // Not an install at all (a top-level resolve outside the lockfile): record it
                 // on disk the same way it was recorded in memory.
                 disk.upsert(fresh_entry());
-                shared_packages::save_lock(&self.server_name, &disk)
+                Ok(((), true))
             }
         });
         if let Err(err) = persisted {
@@ -1114,6 +1115,22 @@ impl PackageProvider for SmudgyPackageProvider {
     fn get_resolved(&self, key: &PackageKey) -> Option<Rc<ResolvedPackage>> {
         let version = self.resolved_versions.borrow().get(key).cloned()?;
         self.cache.borrow().get(&(key.clone(), version)).cloned()
+    }
+
+    /// Copy the package archives fetched for this isolate into an owned, `Send` source map.
+    /// `cache` contains code-load resolutions only (not solve-prepass or interop-stub fetches),
+    /// and its versioned keys preserve intra-isolate coexistence.
+    fn snapshot_module_sources(&self) -> HashMap<String, String> {
+        let mut sources = HashMap::new();
+        for ((key, version), package) in self.cache.borrow().iter() {
+            for module in &package.modules {
+                sources.insert(
+                    canonical_url(key, version, &module.subpath).to_string(),
+                    module.text.clone(),
+                );
+            }
+        }
+        sources
     }
 
     /// The closure permission union folded by the last `solve_closure` over this isolate's

@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use smudgy_core::session::connection::{TlsMode, shutdown_io_runtime};
 use smudgy_core::session::registry;
-use smudgy_core::session::runtime::{RuntimeAction, join_runtime_threads};
+use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 use smudgy_core::session::{SessionEvent, SessionId, SessionParams, spawn};
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -14,6 +14,7 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[tokio::test]
 async fn connected_session_runtime_joins_on_shutdown() {
     let _guard = TEST_LOCK.lock().unwrap();
+    let session_id = SessionId::from(9201_u32);
     let server_name = "test_session_shutdown".to_string();
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -31,7 +32,7 @@ async fn connected_session_runtime_joins_on_shutdown() {
     });
 
     let params = Arc::new(SessionParams {
-        session_id: SessionId::from(9201u32),
+        session_id,
         server_name: Arc::new(server_name),
         profile_name: Arc::new("test".to_string()),
         profile_subtext: Arc::new(String::new()),
@@ -74,8 +75,17 @@ async fn connected_session_runtime_joins_on_shutdown() {
     }
 
     tx.send(RuntimeAction::Shutdown).unwrap();
+    drop(tx);
+    drop(events);
     shutdown_io_runtime();
-    join_runtime_threads();
+    let joined = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || join_runtime_thread(session_id)),
+    )
+    .await
+    .expect("connected runtime did not join")
+    .expect("join task panicked");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
     server.join().unwrap();
 }
 
@@ -110,13 +120,16 @@ async fn dropping_event_stream_before_ready_unregisters_runtime() {
     // runtime-action sender.
     drop(events);
 
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while registry::get_runtime(session_id).is_some() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    let joined = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || join_runtime_thread(session_id)),
+    )
     .await
-    .expect("orphaned pre-ready runtime did not unregister");
-
-    join_runtime_threads();
+    .expect("immediately stopped runtime did not join")
+    .expect("join task panicked");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
+    assert!(
+        registry::get_runtime(session_id).is_none(),
+        "joined runtime remains published in the session registry"
+    );
 }

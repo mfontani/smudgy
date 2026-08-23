@@ -1,0 +1,94 @@
+diff --git a/src/window.rs b/src/window.rs
+index 2eb0509..39e5689 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -14,6 +14,15 @@ pub use raw_window_handle;
+ 
+ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+ 
++/// The interruption priority requested for a window announcement.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AnnouncementPriority {
++    /// Wait for the assistive technology's current output to finish.
++    Polite,
++    /// Interrupt the assistive technology's current output when supported.
++    Assertive,
++}
++
+ /// An operation to be performed on some window.
+ pub enum Action {
+     /// Open a new window with some [`Settings`].
+@@ -22,6 +31,9 @@ pub enum Action {
+     /// Close the window and exits the application.
+     Close(Id),
+ 
++    /// Request a best-effort assistive-technology announcement.
++    Announce(Id, String, AnnouncementPriority),
++
+     /// Gets the [`Id`] of the oldest window.
+     GetOldest(oneshot::Sender<Option<Id>>),
+ 
+@@ -285,6 +297,23 @@ pub fn close<T>(id: Id) -> Task<T> {
+     task::effect(crate::Action::Window(Action::Close(id)))
+ }
+ 
++/// Requests a best-effort assistive-technology announcement for a window.
++///
++/// Completing this effect only means that the request reached the windowing
++/// runtime. It does not report whether assistive technology was active or
++/// whether the text was spoken.
++pub fn announce<T>(
++    id: Id,
++    text: impl Into<String>,
++    priority: AnnouncementPriority,
++) -> Task<T> {
++    task::effect(crate::Action::Window(Action::Announce(
++        id,
++        text.into(),
++        priority,
++    )))
++}
++
+ /// Gets the window [`Id`] of the oldest window.
+ pub fn oldest() -> Task<Option<Id>> {
+     task::oneshot(|channel| crate::Action::Window(Action::GetOldest(channel)))
+@@ -515,3 +544,39 @@ pub fn allow_automatic_tabbing<T>(enabled: bool) -> Task<T> {
+         enabled,
+     )))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{Action, AnnouncementPriority, announce};
++    use crate::core::window::Id;
++    use crate::futures::futures::{FutureExt, StreamExt};
++
++    #[test]
++    fn announce_routes_the_exact_window_text_and_priority() {
++        let id = Id::unique();
++        let task = announce::<()>(
++            id,
++            "same localized text",
++            AnnouncementPriority::Assertive,
++        );
++        let mut stream = crate::task::into_stream(task)
++            .expect("announcement effect stream");
++        let action = stream
++            .next()
++            .now_or_never()
++            .flatten()
++            .expect("announcement action");
++
++        let crate::Action::Window(Action::Announce(
++            actual_id,
++            text,
++            AnnouncementPriority::Assertive,
++        )) = action
++        else {
++            panic!("expected assertive window announcement action");
++        };
++
++        assert_eq!(actual_id, id);
++        assert_eq!(text, "same localized text");
++    }
++}

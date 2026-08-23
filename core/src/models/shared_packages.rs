@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::{fs, io};
 
 use anyhow::{Context, Result};
@@ -42,6 +43,12 @@ const LOCK_FILE: &str = "smudgy.lock.json";
 const PARAMS_FILE: &str = "smudgy.params.json";
 /// Obfuscated secret-option fallback file (used only when no OS keyring is available).
 const SECRETS_FILE: &str = ".package-secrets.json";
+
+// Every in-process lockfile read/modify/write transaction passes through this
+// gate. `write_atomic` protects readers from partial JSON, but without this
+// serialization two writers can both load the same snapshot and silently
+// replace one another's unrelated fields.
+static LOCK_MUTATIONS: Mutex<()> = Mutex::new(());
 
 /// How an installed package resolves on each session load.
 ///
@@ -107,12 +114,23 @@ pub struct LockedPackage {
     /// user-installed entries are never treated as orphans. See `script/REQUIRED-PACKAGES.md`.
     #[serde(default)]
     pub installed_as_requirement: bool,
+    /// Whether this package has successfully prepared at least one Web Audio
+    /// context while sandboxed. This is observed behavior, not a declared
+    /// permission: it only controls whether package-specific gain controls
+    /// are worth showing. The versionless bit survives package updates and
+    /// defaults to `false` for pre-audio lockfiles.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub audio_used: bool,
 }
 
 /// The serde default for [`LockedPackage::enabled`] — `true`, so a lock entry written before this
 /// field existed (or by any path that doesn't set it) is treated as enabled and keeps running.
 fn default_enabled() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl LockedPackage {
@@ -129,6 +147,7 @@ impl LockedPackage {
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         }
     }
 
@@ -333,6 +352,27 @@ pub fn save_lock(server_name: &str, lock: &SharedPackageLock) -> Result<()> {
     save_lock_in(&server_dir(server_name)?, lock)
 }
 
+/// Performs one serialized package-lock read/modify/write transaction.
+///
+/// The boolean returned by `mutation` says whether the resulting snapshot
+/// needs to be written. This is crate-visible so the runtime resolver can
+/// preserve its "do not resurrect an uninstalled package" rule inside the
+/// same transaction as UI-originated metadata updates.
+pub(crate) fn mutate_lock<R>(
+    server_name: &str,
+    mutation: impl FnOnce(&mut SharedPackageLock) -> Result<(R, bool)>,
+) -> Result<R> {
+    let _guard = LOCK_MUTATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut lock = load_lock(server_name)?;
+    let (result, changed) = mutation(&mut lock)?;
+    if changed {
+        save_lock(server_name, &lock)?;
+    }
+    Ok(result)
+}
+
 /// Installs a package for a server (auto-update unless `mode` says otherwise), replacing
 /// any existing entry for the same specifier. `enabled` is written as part of the same lock
 /// write so an "install, don't enable" never transiently persists as `enabled: true`
@@ -346,19 +386,20 @@ pub fn install_package(
     mode: UpdateMode,
     enabled: bool,
 ) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    // Preserve any prior resolution metadata when re-installing.
-    let mut package = lock
-        .find(specifier)
-        .cloned()
-        .unwrap_or_else(|| LockedPackage::new(specifier, mode.clone()));
-    package.mode = mode;
-    package.enabled = enabled;
-    // An explicit install means the user owns this package: clear the auto-installed mark so a
-    // later orphan sweep never offers to remove it.
-    package.installed_as_requirement = false;
-    lock.upsert(package);
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        // Preserve any prior resolution metadata when re-installing.
+        let mut package = lock
+            .find(specifier)
+            .cloned()
+            .unwrap_or_else(|| LockedPackage::new(specifier, mode.clone()));
+        package.mode = mode;
+        package.enabled = enabled;
+        // An explicit install means the user owns this package: clear the auto-installed mark so a
+        // later orphan sweep never offers to remove it.
+        package.installed_as_requirement = false;
+        lock.upsert(package);
+        Ok(((), true))
+    })
 }
 
 /// Installs a package that was pulled in **automatically because another package `requires` it**
@@ -375,18 +416,19 @@ pub fn install_required_package(
     mode: UpdateMode,
     enabled: bool,
 ) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    let (mut package, is_new) = match lock.find(specifier) {
-        Some(existing) => (existing.clone(), false),
-        None => (LockedPackage::new(specifier, mode.clone()), true),
-    };
-    package.mode = mode;
-    package.enabled = enabled;
-    if is_new {
-        package.installed_as_requirement = true;
-    }
-    lock.upsert(package);
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        let (mut package, is_new) = match lock.find(specifier) {
+            Some(existing) => (existing.clone(), false),
+            None => (LockedPackage::new(specifier, mode.clone()), true),
+        };
+        package.mode = mode;
+        package.enabled = enabled;
+        if is_new {
+            package.installed_as_requirement = true;
+        }
+        lock.upsert(package);
+        Ok(((), true))
+    })
 }
 
 /// Removes a package from a server.
@@ -394,11 +436,7 @@ pub fn install_required_package(
 /// # Errors
 /// Returns an error if the lockfile can't be loaded or saved.
 pub fn uninstall_package(server_name: &str, specifier: &str) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    if lock.remove(specifier) {
-        save_lock(server_name, &lock)?;
-    }
-    Ok(())
+    mutate_lock(server_name, |lock| Ok(((), lock.remove(specifier))))
 }
 
 /// Reconciles installs under the reserved
@@ -424,42 +462,41 @@ pub fn uninstall_package(server_name: &str, specifier: &str) -> Result<()> {
 /// Returns an error if the lockfile can't be loaded or saved, or the packages directory can't
 /// be determined.
 pub fn reconcile_local_installs(server_name: &str, nickname: Option<&str>) -> Result<Vec<String>> {
-    let mut lock = load_lock(server_name)?;
     let packages_dir = crate::models::local_packages::packages_dir(server_name)?;
     let prefix = format!("smudgy://{}/", crate::models::local_packages::LOCAL_OWNER);
-    let mut changed: Vec<String> = Vec::new();
-    let mut migrated: Vec<LockedPackage> = Vec::new();
-    lock.packages.retain(|package| {
-        let Some(name) = package
-            .specifier
-            .strip_prefix(&prefix)
-            .filter(|name| !name.is_empty())
-        else {
-            return true;
-        };
-        if !packages_dir.join(name).exists() {
-            changed.push(package.specifier.clone());
-            return false;
+    mutate_lock(server_name, |lock| {
+        let mut changed: Vec<String> = Vec::new();
+        let mut migrated: Vec<LockedPackage> = Vec::new();
+        lock.packages.retain(|package| {
+            let Some(name) = package
+                .specifier
+                .strip_prefix(&prefix)
+                .filter(|name| !name.is_empty())
+            else {
+                return true;
+            };
+            if !packages_dir.join(name).exists() {
+                changed.push(package.specifier.clone());
+                return false;
+            }
+            if let Some(nick) = nickname {
+                changed.push(package.specifier.clone());
+                let mut entry = package.clone();
+                entry.specifier = format!("smudgy://{nick}/{name}");
+                migrated.push(entry);
+                return false;
+            }
+            true
+        });
+        for entry in migrated {
+            // The nickname form, when already installed, wins over the placeholder duplicate.
+            if lock.find(&entry.specifier).is_none() {
+                lock.packages.push(entry);
+            }
         }
-        if let Some(nick) = nickname {
-            changed.push(package.specifier.clone());
-            let mut entry = package.clone();
-            entry.specifier = format!("smudgy://{nick}/{name}");
-            migrated.push(entry);
-            return false;
-        }
-        true
-    });
-    for entry in migrated {
-        // The nickname form, when already installed, wins over the placeholder duplicate.
-        if lock.find(&entry.specifier).is_none() {
-            lock.packages.push(entry);
-        }
-    }
-    if !changed.is_empty() {
-        save_lock(server_name, &lock)?;
-    }
-    Ok(changed)
+        let needs_save = !changed.is_empty();
+        Ok((changed, needs_save))
+    })
 }
 
 /// Sets the update mode (auto vs pinned) for an already-installed package.
@@ -467,14 +504,15 @@ pub fn reconcile_local_installs(server_name: &str, nickname: Option<&str>) -> Re
 /// # Errors
 /// Returns an error if the package isn't installed, or the lockfile can't be saved.
 pub fn set_update_mode(server_name: &str, specifier: &str, mode: UpdateMode) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    let package = lock
-        .packages
-        .iter_mut()
-        .find(|p| p.specifier == specifier)
-        .with_context(|| format!("package {specifier} is not installed"))?;
-    package.mode = mode;
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|p| p.specifier == specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        package.mode = mode;
+        Ok(((), true))
+    })
 }
 
 /// Sets whether an already-installed package is **trusted** (promoted onto the allow-all main
@@ -488,14 +526,15 @@ pub fn set_update_mode(server_name: &str, specifier: &str, mode: UpdateMode) -> 
 /// # Errors
 /// Returns an error if the package isn't installed, or the lockfile can't be saved.
 pub fn set_trusted(server_name: &str, specifier: &str, trusted: bool) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    let package = lock
-        .packages
-        .iter_mut()
-        .find(|p| p.specifier == specifier)
-        .with_context(|| format!("package {specifier} is not installed"))?;
-    package.trusted = trusted;
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|p| p.specifier == specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        package.trusted = trusted;
+        Ok(((), true))
+    })
 }
 
 /// Sets whether an already-installed package is **enabled** (loaded + run by the engine). A
@@ -507,14 +546,40 @@ pub fn set_trusted(server_name: &str, specifier: &str, trusted: bool) -> Result<
 /// # Errors
 /// Returns an error if the package isn't installed, or the lockfile can't be saved.
 pub fn set_enabled(server_name: &str, specifier: &str, enabled: bool) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    let package = lock
-        .packages
-        .iter_mut()
-        .find(|p| p.specifier == specifier)
-        .with_context(|| format!("package {specifier} is not installed"))?;
-    package.enabled = enabled;
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|p| p.specifier == specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        package.enabled = enabled;
+        Ok(((), true))
+    })
+}
+
+/// Records that one installed package successfully prepared a sandboxed Web
+/// Audio context. Returns `true` only when the durable bit changed.
+///
+/// Matching is ASCII case-insensitive because package-audio policy is keyed
+/// by the same versionless folded `(owner, name)` identity. Repeated reports
+/// are no-ops and avoid rewriting the lockfile.
+///
+/// # Errors
+/// Returns an error if the package is absent or the lockfile cannot be saved.
+pub fn record_audio_use(server_name: &str, owner: &str, name: &str) -> Result<bool> {
+    let specifier = format!("smudgy://{owner}/{name}");
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        if package.audio_used {
+            return Ok((false, false));
+        }
+        package.audio_used = true;
+        Ok((true, true))
+    })
 }
 
 /// Records the deno-native permission union the user consented to for an already-installed
@@ -531,14 +596,15 @@ pub fn record_consent(
     specifier: &str,
     permissions: &PackagePermissions,
 ) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    let package = lock
-        .packages
-        .iter_mut()
-        .find(|p| p.specifier == specifier)
-        .with_context(|| format!("package {specifier} is not installed"))?;
-    package.consented_permissions = Some(permissions.clone());
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|p| p.specifier == specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        package.consented_permissions = Some(permissions.clone());
+        Ok(((), true))
+    })
 }
 
 /// Records the version + integrity a package most recently resolved to (called after a
@@ -552,23 +618,25 @@ pub fn record_resolution(
     version: &str,
     integrity: &str,
 ) -> Result<()> {
-    let mut lock = load_lock(server_name)?;
-    if let Some(entry) = lock.packages.iter_mut().find(|p| p.specifier == specifier) {
-        entry.last_resolved_version = Some(version.to_string());
-        entry.integrity = Some(integrity.to_string());
-    } else {
-        lock.packages.push(LockedPackage {
-            specifier: specifier.to_string(),
-            mode: UpdateMode::Auto,
-            last_resolved_version: Some(version.to_string()),
-            integrity: Some(integrity.to_string()),
-            trusted: false,
-            consented_permissions: None,
-            enabled: true,
-            installed_as_requirement: false,
-        });
-    }
-    save_lock(server_name, &lock)
+    mutate_lock(server_name, |lock| {
+        if let Some(entry) = lock.packages.iter_mut().find(|p| p.specifier == specifier) {
+            entry.last_resolved_version = Some(version.to_string());
+            entry.integrity = Some(integrity.to_string());
+        } else {
+            lock.packages.push(LockedPackage {
+                specifier: specifier.to_string(),
+                mode: UpdateMode::Auto,
+                last_resolved_version: Some(version.to_string()),
+                integrity: Some(integrity.to_string()),
+                trusted: false,
+                consented_permissions: None,
+                enabled: true,
+                installed_as_requirement: false,
+                audio_used: false,
+            });
+        }
+        Ok(((), true))
+    })
 }
 
 fn load_lock_in(dir: &Path) -> Result<SharedPackageLock> {
@@ -949,6 +1017,7 @@ mod tests {
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
+            audio_used: false,
         });
 
         save_lock_in(&dir, &lock).expect("save");
@@ -961,6 +1030,60 @@ mod tests {
         let dir = temp_dir("lock-missing");
         assert_eq!(load_lock_in(&dir).unwrap(), SharedPackageLock::default());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn package_audio_use_is_versionless_case_folded_and_idempotent() {
+        use_temp_smudgy_home();
+        let server = "package-audio-use";
+        let mut lock = SharedPackageLock::default();
+        lock.upsert(LockedPackage::new(
+            "smudgy://wbk/earcon",
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        ));
+        lock.upsert(LockedPackage::new(
+            "smudgy://wbk/unrelated",
+            UpdateMode::Auto,
+        ));
+        save_lock(server, &lock).unwrap();
+
+        assert!(record_audio_use(server, "WBK", "EARCON").unwrap());
+        assert!(!record_audio_use(server, "wbk", "earcon").unwrap());
+
+        let saved = load_lock(server).unwrap();
+        assert!(saved.find("smudgy://wbk/earcon").unwrap().audio_used);
+        assert!(!saved.find("smudgy://wbk/unrelated").unwrap().audio_used);
+    }
+
+    #[test]
+    fn concurrent_audio_use_and_resolution_updates_preserve_both_fields() {
+        use_temp_smudgy_home();
+        let server = "package-audio-resolution-race";
+        let specifier = "smudgy://wbk/earcon";
+        install_package(server, specifier, UpdateMode::Auto, true).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        std::thread::scope(|scope| {
+            let audio_start = std::sync::Arc::clone(&start);
+            scope.spawn(move || {
+                audio_start.wait();
+                assert!(record_audio_use(server, "wbk", "earcon").unwrap());
+            });
+            let resolution_start = std::sync::Arc::clone(&start);
+            scope.spawn(move || {
+                resolution_start.wait();
+                record_resolution(server, specifier, "2.0.0", "sha256-new").unwrap();
+            });
+            start.wait();
+        });
+
+        let saved = load_lock(server).unwrap();
+        let package = saved.find(specifier).unwrap();
+        assert!(package.audio_used);
+        assert_eq!(package.last_resolved_version.as_deref(), Some("2.0.0"));
+        assert_eq!(package.integrity.as_deref(), Some("sha256-new"));
     }
 
     #[test]
