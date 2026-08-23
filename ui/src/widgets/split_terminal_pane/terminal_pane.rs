@@ -2348,6 +2348,11 @@ where
                             from: position.clone(),
                             to: position,
                         };
+                        // The press hands the shared selection to the user:
+                        // search no longer owns it, so the search styling
+                        // must not apply and dismissing search must not
+                        // revert it (see `SessionInput::exit_search`).
+                        self.search_selection.set(false);
                         shell.invalidate_layout();
                     }
                     state.is_focused = true;

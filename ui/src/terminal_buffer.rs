@@ -1893,21 +1893,52 @@ impl TerminalBuffer {
     /// Find every visible whole-line text match, newest first. Matches on the
     /// same line are returned right-to-left so the initial result is the
     /// terminal's most recent occurrence in both dimensions.
+    ///
+    /// This runs on the UI thread against the whole scrollback on every search
+    /// keystroke, so the scan reuses its working buffers across lines and
+    /// takes an allocation-free lowercase path for all-ASCII lines.
     pub(crate) fn find_text_matches(&self, query: &str) -> Vec<TerminalTextMatch> {
         if query.is_empty() {
             return Vec::new();
         }
 
-        let (folded_query, _, _) = folded_grapheme_boundaries(query);
+        let mut folded = String::new();
+        let mut folded_boundaries = Vec::new();
+        let mut source_boundaries = Vec::new();
+        fold_grapheme_boundaries_into(
+            query,
+            &mut folded,
+            &mut folded_boundaries,
+            &mut source_boundaries,
+        );
+        let folded_query = std::mem::take(&mut folded);
         if folded_query.is_empty() {
             return Vec::new();
         }
+        // A folded query containing a non-ASCII byte can never be a substring
+        // of an all-ASCII line, and an all-ASCII pair needs no grapheme
+        // machinery: folding is per-byte lowercasing, so folded match offsets
+        // ARE source columns.
+        let ascii_query = folded_query.is_ascii();
 
         let link_state = self.link_state.borrow();
-        self.iter_rev_with_line_number(None)
-            .filter(|(line_number, _)| !link_state.line_concealed(*line_number))
-            .flat_map(|(line_number, line)| {
-                let concealed = link_state
+        let mut concealed: Vec<(usize, usize)> = Vec::new();
+        let mut line_matches: Vec<TerminalTextMatch> = Vec::new();
+        let mut results = Vec::new();
+
+        for (line_number, line) in self.iter_rev_with_line_number(None) {
+            if link_state.line_concealed(line_number) {
+                continue;
+            }
+            let text = line.styled_line.text.as_str();
+            let ascii_line = text.is_ascii();
+            if ascii_line && !ascii_query {
+                continue;
+            }
+
+            concealed.clear();
+            concealed.extend(
+                link_state
                     .by_line
                     .get(&line_number)
                     .into_iter()
@@ -1919,13 +1950,36 @@ impl TerminalBuffer {
                         }
                         let live = link_state.live.get(key)?;
                         Some((live.address.begin, live.address.end))
-                    })
-                    .collect::<Vec<_>>();
-                let (folded_line, folded_boundaries, source_boundaries) =
-                    folded_grapheme_boundaries(&line.styled_line.text);
-                let mut matches = folded_line
-                    .match_indices(&folded_query)
-                    .filter_map(|(start, matched)| {
+                    }),
+            );
+
+            line_matches.clear();
+            if ascii_line {
+                folded.clear();
+                folded.push_str(text);
+                folded.make_ascii_lowercase();
+                line_matches.extend(folded.match_indices(folded_query.as_str()).filter_map(
+                    |(start, matched)| {
+                        let end = start + matched.len();
+                        (!concealed.iter().any(|(hidden_begin, hidden_end)| {
+                            start < *hidden_end && end > *hidden_begin
+                        }))
+                        .then_some(TerminalTextMatch {
+                            line: line_number,
+                            start,
+                            end,
+                        })
+                    },
+                ));
+            } else {
+                fold_grapheme_boundaries_into(
+                    text,
+                    &mut folded,
+                    &mut folded_boundaries,
+                    &mut source_boundaries,
+                );
+                line_matches.extend(folded.match_indices(folded_query.as_str()).filter_map(
+                    |(start, matched)| {
                         let end = start + matched.len();
                         let start_boundary = folded_boundaries
                             .partition_point(|boundary| *boundary <= start)
@@ -1942,13 +1996,13 @@ impl TerminalBuffer {
                             start: start_column,
                             end: end_column,
                         })
-                    })
-                    .collect::<Vec<_>>();
-                matches.dedup();
-                matches.reverse();
-                matches
-            })
-            .collect()
+                    },
+                ));
+            }
+            line_matches.dedup();
+            results.extend(line_matches.drain(..).rev());
+        }
+        results
     }
 
     pub fn selected_text(&self, selection: &Selection) -> String {
@@ -2264,22 +2318,37 @@ impl TerminalBuffer {
     }
 }
 
-/// Lowercase a string a grapheme at a time and retain each source grapheme's
-/// byte boundary in the folded string. Lowercasing can expand a character, so
-/// direct byte offsets from the folded text cannot safely index the source.
-fn folded_grapheme_boundaries(value: &str) -> (String, Vec<usize>, Vec<usize>) {
-    let mut folded = String::new();
-    let boundary_capacity = value.graphemes(true).count() + 1;
-    let mut folded_boundaries = Vec::with_capacity(boundary_capacity);
-    let mut source_boundaries = Vec::with_capacity(boundary_capacity);
+/// Lowercase a string a grapheme at a time into `folded`, retaining each
+/// source grapheme's byte boundary in the folded string. Lowercasing can
+/// expand a character, so direct byte offsets from the folded text cannot
+/// safely index the source. The output buffers are cleared and refilled so a
+/// caller scanning many lines can reuse their allocations; characters fold via
+/// `char::to_lowercase` into the existing buffer rather than through the
+/// per-grapheme `String` that `str::to_lowercase` would allocate.
+fn fold_grapheme_boundaries_into(
+    value: &str,
+    folded: &mut String,
+    folded_boundaries: &mut Vec<usize>,
+    source_boundaries: &mut Vec<usize>,
+) {
+    folded.clear();
+    folded_boundaries.clear();
+    source_boundaries.clear();
+    // Byte length bounds the grapheme count, sparing a counting pre-pass.
+    folded.reserve(value.len());
+    folded_boundaries.reserve(value.len() + 1);
+    source_boundaries.reserve(value.len() + 1);
     folded_boundaries.push(0);
     source_boundaries.push(0);
     for (source_start, grapheme) in value.grapheme_indices(true) {
-        folded.push_str(&grapheme.to_lowercase());
+        for ch in grapheme.chars() {
+            for lower in ch.to_lowercase() {
+                folded.push(lower);
+            }
+        }
         folded_boundaries.push(folded.len());
         source_boundaries.push(source_start + grapheme.len());
     }
-    (folded, folded_boundaries, source_boundaries)
 }
 
 impl Drop for TerminalBuffer {

@@ -39,13 +39,33 @@ fn is_clipboard_write_shortcut(
     modifiers.command() && matches!(key.to_latin(physical_key), Some('c' | 'x'))
 }
 
-fn fallback_key_matches(expected: &keyboard::Key, pressed: &keyboard::Key) -> bool {
-    expected == pressed
-        || matches!(
-            (expected, pressed),
-            (keyboard::Key::Character(expected), keyboard::Key::Character(pressed))
-                if expected.eq_ignore_ascii_case(pressed)
-        )
+fn fallback_key_matches(
+    expected: &keyboard::Key,
+    pressed: &keyboard::Key,
+    physical_key: key::Physical,
+) -> bool {
+    if expected == pressed {
+        return true;
+    }
+    let (keyboard::Key::Character(expected_str), keyboard::Key::Character(pressed_str)) =
+        (expected, pressed)
+    else {
+        return false;
+    };
+    if expected_str.eq_ignore_ascii_case(pressed_str) {
+        return true;
+    }
+    // A non-Latin layout reports a chord like ctrl+F with a non-Latin logical
+    // key. Single-letter bindings dispatch through the same latin-key mapping
+    // the wrapped input uses for its clipboard shortcuts, so the chord stays
+    // reachable from any layout.
+    let mut expected_chars = expected_str.chars();
+    match (expected_chars.next(), expected_chars.next()) {
+        (Some(expected_char), None) => pressed
+            .to_latin(physical_key)
+            .is_some_and(|latin| latin.eq_ignore_ascii_case(&expected_char)),
+        _ => false,
+    }
 }
 
 enum ShortcutMatch<'a, Message> {
@@ -265,7 +285,8 @@ where
         self.shortcut_fallbacks
             .iter()
             .find(|(fallback_key, fallback_modifiers, _)| {
-                fallback_key_matches(fallback_key, key) && fallback_modifiers == modifiers
+                fallback_key_matches(fallback_key, key, *physical_key)
+                    && fallback_modifiers == modifiers
             })
             .map(|(_, _, message)| ShortcutMatch::Fallback(message))
     }
@@ -609,11 +630,31 @@ mod tests {
     fn fallback_character_hooks_ignore_ascii_case() {
         assert!(fallback_key_matches(
             &keyboard::Key::Character("f".into()),
-            &keyboard::Key::Character("F".into())
+            &keyboard::Key::Character("F".into()),
+            Physical::Code(Code::KeyF)
         ));
         assert!(!fallback_key_matches(
             &keyboard::Key::Character("f".into()),
-            &keyboard::Key::Character("g".into())
+            &keyboard::Key::Character("g".into()),
+            Physical::Code(Code::KeyG)
+        ));
+    }
+
+    /// A non-Latin layout reports a chord's logical key in its own script;
+    /// single-letter fallbacks dispatch by the physical latin key instead, so
+    /// e.g. ctrl+F opens search from a Cyrillic layout.
+    #[test]
+    fn fallback_character_hooks_dispatch_by_latin_key_on_non_latin_layouts() {
+        // The Ukrainian layout's F key produces Cyrillic 'а'.
+        assert!(fallback_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("\u{0430}".into()),
+            Physical::Code(Code::KeyF)
+        ));
+        assert!(!fallback_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("\u{0430}".into()),
+            Physical::Code(Code::KeyG)
         ));
     }
 

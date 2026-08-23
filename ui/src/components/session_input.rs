@@ -911,8 +911,14 @@ impl SessionInput {
             return Task::none();
         };
         if let Some(view) = self.terminal_view.as_ref() {
+            // The flag doubles as ownership of the shared selection: a mouse
+            // press in the terminal cleared it, and a selection the user
+            // dragged while searching survives dismissal instead of
+            // reverting to the pre-search snapshot.
+            if view.search_selection.get() {
+                *view.selection.borrow_mut() = search.previous_selection;
+            }
             view.search_selection.set(false);
-            *view.selection.borrow_mut() = search.previous_selection;
         }
         // As above, cross a message boundary so the disappearing search row
         // has settled before focus returns to the persistent game editor.
@@ -951,13 +957,16 @@ impl SessionInput {
 
         let active = current.and_then(|index| matches.get(index)).cloned();
         if let Some(search) = self.search.as_mut() {
-            search.matches.clone_from(&matches);
+            search.matches = matches;
             search.current = current;
         }
 
         let Some(view) = self.terminal_view.as_ref() else {
             return;
         };
+        // Writing the selection re-claims it for search after any manual
+        // drag released it (the terminal press cleared the flag).
+        view.search_selection.set(true);
         if let Some(found) = active {
             *view.selection.borrow_mut() = Selection::Selected {
                 from: BufferPosition {
@@ -1420,9 +1429,11 @@ impl SessionInput {
 
         // Terminal navigation belongs to the viewport even while the text
         // editor owns focus. User-created hotkeys take precedence; these
-        // bindings handle otherwise-unclaimed key presses.
+        // bindings handle otherwise-unclaimed key presses. Plain Home/End are
+        // claimed by the wrapped editor for caret movement whenever there is
+        // text to edit, so only an empty input cedes them to the viewport.
         let game_input = if self.terminal_view.is_some() {
-            game_input
+            let game_input = game_input
                 .on_fallback_key_pressed(
                     keyboard::Key::Character("f".into()),
                     keyboard::Modifiers::CTRL,
@@ -1437,17 +1448,22 @@ impl SessionInput {
                     keyboard::Key::Named(keyboard::key::Named::PageDown),
                     keyboard::Modifiers::empty(),
                     Message::ScrollPageDown,
-                )
-                .on_fallback_key_pressed(
-                    keyboard::Key::Named(keyboard::key::Named::Home),
-                    keyboard::Modifiers::empty(),
-                    Message::ScrollHome,
-                )
-                .on_fallback_key_pressed(
-                    keyboard::Key::Named(keyboard::key::Named::End),
-                    keyboard::Modifiers::empty(),
-                    Message::ScrollEnd,
-                )
+                );
+            if self.value.is_empty() {
+                game_input
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::Home),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollHome,
+                    )
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::End),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollEnd,
+                    )
+            } else {
+                game_input
+            }
         } else {
             game_input
         };
@@ -1531,17 +1547,24 @@ impl SessionInput {
                     keyboard::Key::Named(keyboard::key::Named::PageDown),
                     keyboard::Modifiers::empty(),
                     Message::ScrollPageDown,
-                )
-                .on_fallback_key_pressed(
-                    keyboard::Key::Named(keyboard::key::Named::Home),
-                    keyboard::Modifiers::empty(),
-                    Message::ScrollHome,
-                )
-                .on_fallback_key_pressed(
-                    keyboard::Key::Named(keyboard::key::Named::End),
-                    keyboard::Modifiers::empty(),
-                    Message::ScrollEnd,
                 );
+            // As with the game input, plain Home/End edit the query when one
+            // exists and scroll the viewport only from an empty search box.
+            let search_input = if search.query.is_empty() {
+                search_input
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::Home),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollHome,
+                    )
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::End),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollEnd,
+                    )
+            } else {
+                search_input
+            };
             #[cfg(feature = "web-audio-cpal")]
             let search_input = search_input.on_audio_panel_shortcut(Message::OpenAudioPanel);
 

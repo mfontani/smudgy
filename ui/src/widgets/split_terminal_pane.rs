@@ -67,7 +67,10 @@ impl ScrollHandle {
 
 /// The selection and viewport control shared by one terminal widget and its
 /// associated command editor. `search_selection` distinguishes the temporary
-/// search result without carrying every match into the renderer.
+/// search result without carrying every match into the renderer; it also
+/// tracks who owns the shared selection — a mouse press in the terminal
+/// clears it, handing the selection (and its normal styling) back to the
+/// user until the next search navigation re-claims it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TerminalViewHandle {
     pub(crate) selection: Rc<RefCell<Selection>>,
@@ -404,6 +407,13 @@ impl State {
     }
 }
 
+/// `visible_lines` is the full terminal region's height in lines;
+/// `split_visible_lines` is the height of the historical pane once the view is
+/// split (the same value for `ScrolledLayout::FullPane`, smaller by the live
+/// tail for `SplitWithLiveTail`). Paging steps by the window that is actually
+/// on screen: the full region for the first page away from the pinned bottom,
+/// the split pane afterwards — a full-height step from a split view would skip
+/// the lines the live tail displaced.
 #[allow(clippy::cast_precision_loss)]
 fn apply_scroll_request(
     state: &mut State,
@@ -411,6 +421,7 @@ fn apply_scroll_request(
     min_line: f32,
     max_line: f32,
     visible_lines: f32,
+    split_visible_lines: f32,
 ) {
     if max_line <= min_line {
         state.scroll_bar_value = max_line;
@@ -419,15 +430,22 @@ fn apply_scroll_request(
     }
 
     let page = visible_lines.floor().max(1.0);
+    let split_page = split_visible_lines.floor().max(1.0).min(page);
     let current = if state.is_split {
         state.scroll_bar_value.clamp(min_line, max_line)
     } else {
         max_line
     };
-    let oldest_full_page = (min_line + page).min(max_line);
+    // Every request other than `End` leaves the view split, so the oldest
+    // reachable window is one *split* page above the buffer floor; anchoring
+    // its bottom there puts the oldest retained line at the pane's top row.
+    let oldest_full_page = (min_line + split_page).min(max_line);
     let value = match request {
-        ScrollRequest::PageUp => (current - page).max(oldest_full_page),
-        ScrollRequest::PageDown => (current + page).min(max_line),
+        ScrollRequest::PageUp => {
+            let step = if state.is_split { split_page } else { page };
+            (current - step).max(oldest_full_page)
+        }
+        ScrollRequest::PageDown => (current + split_page).min(max_line),
         ScrollRequest::Home => oldest_full_page,
         ScrollRequest::End => max_line,
         ScrollRequest::RevealLine(line) => {
@@ -499,14 +517,24 @@ where
         let terminal_pane_limits = limits.shrink(Size::new(scroll_bar::SCROLLBAR_WIDTH, 0.0));
         let scrollbar_limits = limits.shrink(Size::new(terminal_pane_limits.max().width, 0.0));
         let line_height = self.line_height();
-        let visible_lines = terminal_pane_limits.max().height / line_height;
+        let full_height = terminal_pane_limits.max().height;
+        let visible_lines = full_height / line_height;
+        let live_tail_height = self.scrolled_layout.live_tail_max_height().min(full_height);
+        let split_visible_lines = (full_height - live_tail_height) / line_height;
 
         {
             let max_line = self.buffer.last_line_number() as f32;
             let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
             let mut state = state.borrow_mut();
             for request in self.view.scroll.take_requests() {
-                apply_scroll_request(&mut state, request, min_line, max_line, visible_lines);
+                apply_scroll_request(
+                    &mut state,
+                    request,
+                    min_line,
+                    max_line,
+                    visible_lines,
+                    split_visible_lines,
+                );
             }
             state.visible_lines = visible_lines;
         }
@@ -808,17 +836,51 @@ mod tests {
     fn keyboard_scroll_requests_use_full_pages_and_pin_end() {
         let mut state = State::default();
 
-        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0);
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 20.0);
         assert_eq!(state.scroll_bar_value, 80.0);
         assert!(state.is_split);
 
-        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0);
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 20.0);
         assert_eq!(state.scroll_bar_value, 60.0);
 
-        apply_scroll_request(&mut state, ScrollRequest::Home, 0.0, 100.0, 20.0);
+        apply_scroll_request(&mut state, ScrollRequest::Home, 0.0, 100.0, 20.0, 20.0);
         assert_eq!(state.scroll_bar_value, 20.0);
 
-        apply_scroll_request(&mut state, ScrollRequest::End, 0.0, 100.0, 20.0);
+        apply_scroll_request(&mut state, ScrollRequest::End, 0.0, 100.0, 20.0, 20.0);
+        assert_eq!(state.scroll_bar_value, 100.0);
+        assert!(!state.is_split);
+    }
+
+    #[test]
+    fn split_paging_steps_by_the_historical_pane_and_reaches_the_oldest_line() {
+        let mut state = State::default();
+
+        // Full region 20 lines, historical pane 12 once the live tail splits
+        // off. The first page away from the pinned bottom steps by the full
+        // region (the whole 20 lines were on screen), leaving the pane bottom
+        // adjacent to the previously visible top.
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 80.0);
+        assert!(state.is_split);
+
+        // Subsequent pages step by the historical pane's height: the pane
+        // showed lines 69..=80, so the next window is 57..=68 — contiguous.
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 68.0);
+
+        apply_scroll_request(&mut state, ScrollRequest::PageDown, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 80.0);
+
+        // Home anchors one split page above the floor, so the oldest retained
+        // line (1) lands on the pane's top row instead of staying unreachable.
+        apply_scroll_request(&mut state, ScrollRequest::Home, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 12.0);
+
+        // PageUp from Home has nowhere older to go.
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 12.0);
+
+        apply_scroll_request(&mut state, ScrollRequest::End, 0.0, 100.0, 20.0, 12.0);
         assert_eq!(state.scroll_bar_value, 100.0);
         assert!(!state.is_split);
     }
@@ -827,11 +889,25 @@ mod tests {
     fn reveal_only_leaves_the_live_tail_when_the_result_is_offscreen() {
         let mut state = State::default();
 
-        apply_scroll_request(&mut state, ScrollRequest::RevealLine(95), 0.0, 100.0, 20.0);
+        apply_scroll_request(
+            &mut state,
+            ScrollRequest::RevealLine(95),
+            0.0,
+            100.0,
+            20.0,
+            12.0,
+        );
         assert_eq!(state.scroll_bar_value, 100.0);
         assert!(!state.is_split);
 
-        apply_scroll_request(&mut state, ScrollRequest::RevealLine(70), 0.0, 100.0, 20.0);
+        apply_scroll_request(
+            &mut state,
+            ScrollRequest::RevealLine(70),
+            0.0,
+            100.0,
+            20.0,
+            12.0,
+        );
         assert_eq!(state.scroll_bar_value, 70.0);
         assert!(state.is_split);
     }
