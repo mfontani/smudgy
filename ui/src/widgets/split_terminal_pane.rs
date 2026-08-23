@@ -1,13 +1,11 @@
 use std::{
-    cell::{Ref, RefCell},
+    cell::{Cell, Ref, RefCell},
     collections::VecDeque,
     rc::{self, Rc},
     time::Instant,
 };
 
-use crate::terminal_buffer::{
-    LinkClickEvent, TerminalBuffer, TerminalTextMatch, selection::Selection,
-};
+use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer, selection::Selection};
 use iced::{
     Element, Event, Point, Rectangle, Size,
     advanced::{
@@ -67,20 +65,13 @@ impl ScrollHandle {
     }
 }
 
-/// Search decorations shared by one terminal widget and its associated search
-/// editor. `current` indexes `matches`, whose order is newest to oldest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct TerminalSearchHighlights {
-    pub(crate) matches: Vec<TerminalTextMatch>,
-    pub(crate) current: Option<usize>,
-}
-
-/// The selection, search decorations, and viewport control shared by one
-/// terminal widget and its associated command editor.
+/// The selection and viewport control shared by one terminal widget and its
+/// associated command editor. `search_selection` distinguishes the temporary
+/// search result without carrying every match into the renderer.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TerminalViewHandle {
     pub(crate) selection: Rc<RefCell<Selection>>,
-    pub(crate) search: Rc<RefCell<TerminalSearchHighlights>>,
+    pub(crate) search_selection: Rc<Cell<bool>>,
     pub(crate) scroll: ScrollHandle,
 }
 
@@ -134,7 +125,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
 
     fn terminal_pane(&self) -> TerminalPane<'a, Message> {
         terminal_pane(Ref::clone(&self.buffer), self.view.selection.clone())
-            .search_highlights(self.view.search.clone())
+            .search_selection(self.view.search_selection.clone())
             .on_link(self.on_link.clone())
             .on_link_tooltip(self.on_link_tooltip.clone())
             .font_size(self.font_size)

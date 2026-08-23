@@ -2,8 +2,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::keymap::{HotkeyKeys, MaybePhysicalKey};
+use crate::terminal_buffer::selection::{BufferPosition, Selection};
 use crate::terminal_buffer::{TerminalBuffer, TerminalTextMatch};
 use crate::theme::{Element, builtins};
 use crate::update::Update;
@@ -124,6 +126,15 @@ pub fn focus_target(target: Id) -> Task<bool> {
     })
 }
 
+/// Schedule a follow-up after the widget tree has reflected a model change
+/// that mounts or unmounts a focus target.
+fn after_widget_tree_update(message: Message) -> Task<Message> {
+    Task::perform(
+        async { tokio::time::sleep(Duration::from_millis(1)).await },
+        move |()| message.clone(),
+    )
+}
+
 fn effective_font_size(pane_font_size: Option<f32>, global_font_size: f32) -> f32 {
     pane_font_size.unwrap_or(global_font_size)
 }
@@ -150,9 +161,8 @@ pub struct SessionInput {
     completion_state: Option<CompletionState>,
     /// Reference to terminal buffer for tab completion
     terminal_buffer: Option<Rc<RefCell<TerminalBuffer>>>,
-    /// The terminal selection, search decoration, and viewport controllers
-    /// paired with this input. A widgets-only pane has no target and therefore
-    /// no search/scroll mode.
+    /// The terminal selection and viewport controllers paired with this input.
+    /// A widgets-only pane has no target and therefore no search/scroll mode.
     terminal_view: Option<TerminalViewHandle>,
     /// Active terminal-search state shown in its own row above the command.
     /// The game editor remains mounted and independently editable.
@@ -267,6 +277,7 @@ struct SearchState {
     query: String,
     matches: Vec<TerminalTextMatch>,
     current: Option<usize>,
+    previous_selection: Selection,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,8 +306,12 @@ pub enum Message {
     HandleTabCompletion,
     /// Enter terminal search without disturbing the pending command.
     EnterSearch,
+    /// Focus the search editor after its row has been mounted.
+    FocusSearch,
     /// Leave terminal search and clear its terminal decorations.
     ExitSearch,
+    /// Focus the game editor after the search row has been dismissed.
+    FocusGameInput,
     /// Move to the next older terminal match.
     SearchPrevious,
     /// Move back to the next newer terminal match.
@@ -404,8 +419,7 @@ impl SessionInput {
         self
     }
 
-    /// Associate the terminal's rendered selection, search, and viewport
-    /// controllers.
+    /// Associate the terminal's rendered selection and viewport controllers.
     /// The buffer itself is supplied separately by [`Self::with_terminal_buffer`]
     /// because completion-only tests and callers do not mount a terminal.
     pub fn with_terminal_view(mut self, view: TerminalViewHandle) -> Self {
@@ -867,38 +881,46 @@ impl SessionInput {
     /// Open an independent terminal-search editor above the pending command.
     fn enter_search(&mut self) -> Task<Message> {
         if self.search.is_some() {
-            return operation::select_all(self.search_input_id.clone());
+            return after_widget_tree_update(Message::FocusSearch);
         }
         if self.terminal_buffer.is_none() {
             return Task::none();
         }
-        if self.terminal_view.is_none() {
+        let Some(view) = self.terminal_view.as_ref() else {
             return Task::none();
-        }
+        };
 
+        let previous_selection = view.selection.borrow().clone();
+        view.search_selection.set(true);
+        *view.selection.borrow_mut() = Selection::None;
         self.search = Some(SearchState {
             query: String::new(),
             matches: Vec::new(),
             current: None,
+            previous_selection,
         });
-        operation::select_all(self.search_input_id.clone())
+        // The new text input does not exist in the widget tree until the next
+        // view pass. A message boundary lets it mount before focus traversal.
+        after_widget_tree_update(Message::FocusSearch)
     }
 
     /// Leave search mode, clear terminal decorations, and return focus to the
     /// pending game command without altering it.
     fn exit_search(&mut self) -> Task<Message> {
-        if self.search.take().is_none() {
+        let Some(search) = self.search.take() else {
             return Task::none();
-        }
+        };
         if let Some(view) = self.terminal_view.as_ref() {
-            *view.search.borrow_mut() = Default::default();
+            view.search_selection.set(false);
+            *view.selection.borrow_mut() = search.previous_selection;
         }
-        self.pending_caret_echo = Some(InputSource::Other);
-        operation::select_all(self.input_id.clone())
+        // As above, cross a message boundary so the disappearing search row
+        // has settled before focus returns to the persistent game editor.
+        after_widget_tree_update(Message::FocusGameInput)
     }
 
-    /// Re-scan the live buffer, decorate every match, and scroll to the active
-    /// result. A re-scan on every navigation keeps newly-arrived output in the
+    /// Re-scan the live buffer, select the active match, and scroll it into
+    /// view. A re-scan on every navigation keeps newly-arrived output in the
     /// cycle.
     fn refresh_search(&mut self, direction: Option<SearchDirection>) {
         let Some(search) = self.search.as_ref() else {
@@ -936,10 +958,20 @@ impl SessionInput {
         let Some(view) = self.terminal_view.as_ref() else {
             return;
         };
-        *view.search.borrow_mut() =
-            crate::widgets::split_terminal_pane::TerminalSearchHighlights { matches, current };
         if let Some(found) = active {
+            *view.selection.borrow_mut() = Selection::Selected {
+                from: BufferPosition {
+                    line: found.line,
+                    column: found.start,
+                },
+                to: BufferPosition {
+                    line: found.line,
+                    column: found.end,
+                },
+            };
             view.scroll.request(ScrollRequest::RevealLine(found.line));
+        } else {
+            *view.selection.borrow_mut() = Selection::None;
         }
     }
 
@@ -1266,7 +1298,21 @@ impl SessionInput {
                 Update::with_task(self.handle_tab_completion())
             }
             Message::EnterSearch => Update::with_task(self.enter_search()),
+            Message::FocusSearch if self.search.is_some() => Update::with_task(
+                focus_target(self.search_input_id.clone()).map(Message::SearchFocusSettled),
+            ),
+            Message::FocusSearch => Update::none(),
             Message::ExitSearch => Update::with_task(self.exit_search()),
+            Message::FocusGameInput if self.search.is_none() => {
+                self.pending_caret_echo = Some(InputSource::Other);
+                Update::with_task(focus_target(self.input_id.clone()).map(|found| {
+                    Message::FocusSettled {
+                        focused: true,
+                        found,
+                    }
+                }))
+            }
+            Message::FocusGameInput => Update::none(),
             Message::SearchPrevious => {
                 self.refresh_search(Some(SearchDirection::Previous));
                 Update::with_task(self.refocus_search())
@@ -2112,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_search_preserves_command_and_selection_while_cycling() {
+    fn terminal_search_keeps_command_editable_and_restores_selection_on_exit() {
         let (mut input, selection, view) = searchable_input(&["dragon old", "quiet", "DRAGON new"]);
         let previous_selection = Selection::Selected {
             from: BufferPosition { line: 2, column: 0 },
@@ -2122,6 +2168,7 @@ mod tests {
         let _ = input.update(Message::InputChanged("say hello".to_string()));
 
         let _ = input.update(Message::EnterSearch);
+        assert!(view.search_selection.get());
         let _ = input.update(Message::SearchChanged("dragon".to_string()));
         assert_eq!(input.value(), "say hello");
         assert_eq!(
@@ -2137,21 +2184,45 @@ mod tests {
         );
         assert_eq!(
             *selection.borrow(),
-            previous_selection,
-            "search decorations must not borrow the user's selection"
+            Selection::Selected {
+                from: BufferPosition { line: 3, column: 0 },
+                to: BufferPosition { line: 3, column: 6 },
+            }
         );
-        assert_eq!(view.search.borrow().current, Some(0));
-        assert_eq!(view.search.borrow().matches.len(), 2);
-        assert_eq!(view.search.borrow().matches[0].line, 3);
+        assert_eq!(
+            input.search.as_ref().and_then(|search| search.current),
+            Some(0)
+        );
+        assert_eq!(
+            input.search.as_ref().map(|search| search.matches.len()),
+            Some(2)
+        );
 
         let _ = input.update(Message::SearchPrevious);
-        assert_eq!(view.search.borrow().current, Some(1));
-        assert_eq!(view.search.borrow().matches[1].line, 1);
-        assert_eq!(*selection.borrow(), previous_selection);
+        assert_eq!(
+            input.search.as_ref().and_then(|search| search.current),
+            Some(1)
+        );
+        assert_eq!(
+            *selection.borrow(),
+            Selection::Selected {
+                from: BufferPosition { line: 1, column: 0 },
+                to: BufferPosition { line: 1, column: 6 },
+            }
+        );
 
         let _ = input.update(Message::SearchNext);
-        assert_eq!(view.search.borrow().current, Some(0));
-        assert_eq!(*selection.borrow(), previous_selection);
+        assert_eq!(
+            input.search.as_ref().and_then(|search| search.current),
+            Some(0)
+        );
+        assert_eq!(
+            *selection.borrow(),
+            Selection::Selected {
+                from: BufferPosition { line: 3, column: 0 },
+                to: BufferPosition { line: 3, column: 6 },
+            }
+        );
         assert_eq!(
             view.scroll.take_requests().into_iter().collect::<Vec<_>>(),
             vec![
@@ -2163,9 +2234,9 @@ mod tests {
 
         let _ = input.update(Message::ExitSearch);
         assert!(input.search.is_none());
+        assert!(!view.search_selection.get());
         assert_eq!(input.value(), "say goodbye");
         assert_eq!(*selection.borrow(), previous_selection);
-        assert_eq!(*view.search.borrow(), Default::default());
     }
 
     #[test]

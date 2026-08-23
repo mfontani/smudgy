@@ -1,5 +1,5 @@
 use std::{
-    cell::{Ref, RefCell},
+    cell::{Cell, Ref, RefCell},
     collections::HashSet,
     rc::Rc,
     sync::Arc,
@@ -32,150 +32,15 @@ use smudgy_core::session::styled_line::{
 
 mod spans;
 
-use super::TerminalSearchHighlights;
 use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection};
-use spans::{SearchRange, Spans};
+use spans::Spans;
 
 type Link = SpanMetadata;
 
 /// 100 '0's shaped once per prefs generation to measure the monospace cell
 /// advance for the column-based line-length clamp.
 const ADVANCE_PROBE: &str = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LineSearchMatch {
-    start: usize,
-    end: usize,
-    active: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SearchMatchRegion {
-    bounds: Rectangle,
-    active: bool,
-}
-
-fn merge_horizontal_regions(mut regions: Vec<Rectangle>) -> Vec<Rectangle> {
-    regions.sort_by(|left, right| {
-        left.y
-            .total_cmp(&right.y)
-            .then_with(|| left.x.total_cmp(&right.x))
-    });
-    let mut merged: Vec<Rectangle> = Vec::with_capacity(regions.len());
-    for region in regions {
-        if let Some(previous) = merged.last_mut()
-            && (previous.y - region.y).abs() < 0.5
-            && (previous.height - region.height).abs() < 0.5
-            && region.x <= previous.x + previous.width + 0.75
-        {
-            let right = (previous.x + previous.width).max(region.x + region.width);
-            previous.x = previous.x.min(region.x);
-            previous.width = right - previous.x;
-        } else {
-            merged.push(region);
-        }
-    }
-    merged
-}
-
-fn search_match_regions<P: text::Paragraph>(cache: &ParagraphCache<P>) -> Vec<SearchMatchRegion> {
-    let mut grouped = vec![Vec::new(); cache.search_matches.len()];
-    let mut active = vec![false; cache.search_matches.len()];
-    for matched in cache.spans.search_spans() {
-        grouped[matched.match_index].extend(cache.paragraph.span_bounds(matched.span_index));
-        active[matched.match_index] = matched.active;
-    }
-
-    grouped
-        .into_iter()
-        .zip(active)
-        .flat_map(|(regions, active)| {
-            merge_horizontal_regions(regions)
-                .into_iter()
-                .map(move |bounds| SearchMatchRegion { bounds, active })
-        })
-        .collect()
-}
-
-fn inset_rectangle(bounds: Rectangle, inset: f32) -> Option<Rectangle> {
-    let width = bounds.width - inset * 2.0;
-    let height = bounds.height - inset * 2.0;
-    (width > 0.0 && height > 0.0).then_some(Rectangle {
-        x: bounds.x + inset,
-        y: bounds.y + inset,
-        width,
-        height,
-    })
-}
-
-/// Draw a renderer-portable approximation of a radial glow. iced 0.14 only
-/// exposes linear gradient fills, so concentric translucent rounded quads keep
-/// the black-edge-to-Smudgy-purple-center treatment identical in the GPU and
-/// software renderers.
-fn draw_search_match<Renderer: advanced::Renderer>(
-    renderer: &mut Renderer,
-    bounds: Rectangle,
-    active: bool,
-    viewport: Rectangle,
-) {
-    let bounds = Rectangle {
-        x: bounds.x - 1.5,
-        y: bounds.y - 0.5,
-        width: bounds.width + 3.0,
-        height: bounds.height + 1.0,
-    };
-    let strength = if active { 1.35 } else { 1.0 };
-    let purple = iced::Color::from_rgb8(55, 23, 130);
-    for (inset, purple_mix, alpha) in [
-        (0.0, 0.0, 0.012),
-        (1.0, 0.28, 0.015),
-        (2.0, 0.58, 0.020),
-        (3.0, 1.0, 0.026),
-    ] {
-        let Some(layer) = inset_rectangle(bounds, inset) else {
-            continue;
-        };
-        let Some(layer) = layer.intersection(&viewport) else {
-            continue;
-        };
-        renderer.fill_quad(
-            Quad {
-                bounds: layer,
-                border: Border {
-                    radius: (4.0 - inset * 0.5).max(1.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            Background::Color(iced::Color {
-                r: purple.r * purple_mix,
-                g: purple.g * purple_mix,
-                b: purple.b * purple_mix,
-                a: alpha * strength,
-            }),
-        );
-    }
-
-    if let Some(bounds) = bounds.intersection(&viewport) {
-        renderer.fill_quad(
-            Quad {
-                bounds,
-                border: Border {
-                    color: iced::Color::from_rgba8(78, 55, 131, if active { 0.82 } else { 0.46 }),
-                    width: if active { 1.25 } else { 1.0 },
-                    radius: 4.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: iced::Color::from_rgba8(55, 23, 130, if active { 0.18 } else { 0.08 }),
-                    blur_radius: if active { 5.0 } else { 3.0 },
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            Background::Color(iced::Color::TRANSPARENT),
-        );
-    }
-}
+const TERMINAL_SELECTION_BACKGROUND: iced::Color = iced::Color::from_rgb8(55, 23, 130);
 
 fn draw_text_decoration<Renderer: advanced::Renderer>(
     renderer: &mut Renderer,
@@ -250,7 +115,7 @@ struct ParagraphCache<P: text::Paragraph> {
     blink_modes: u8,
     max_valid_width: f32,
     selection: LineSelection,
-    search_matches: Vec<LineSearchMatch>,
+    search_selection: bool,
     /// The prefs generation this paragraph was shaped with; a mismatch is a
     /// cache miss (font/size/palette changes rebuild paragraphs).
     generation: u64,
@@ -1574,7 +1439,7 @@ pub struct TerminalPane<'a, Message> {
     link_protocol_state: Rc<RefCell<LinkProtocolState>>,
     buffer_link_state: Rc<RefCell<BufferLinkState>>,
     selection: Rc<RefCell<Selection>>,
-    search_highlights: Rc<RefCell<TerminalSearchHighlights>>,
+    search_selection: Rc<Cell<bool>>,
     last_line_number: Option<usize>,
     /// Maps a clicked link span into the hosting session's message. Publishing
     /// through the widget shell defers session mutation until the terminal's
@@ -1597,7 +1462,7 @@ impl<'a, Message> TerminalPane<'a, Message> {
             link_protocol_state,
             buffer_link_state,
             selection,
-            search_highlights: Rc::new(RefCell::new(TerminalSearchHighlights::default())),
+            search_selection: Rc::new(Cell::new(false)),
             last_line_number: None,
             on_link: None,
             on_link_tooltip: None,
@@ -1610,11 +1475,8 @@ impl<'a, Message> TerminalPane<'a, Message> {
         self
     }
 
-    pub fn search_highlights(
-        mut self,
-        search_highlights: Rc<RefCell<TerminalSearchHighlights>>,
-    ) -> Self {
-        self.search_highlights = search_highlights;
+    pub fn search_selection(mut self, search_selection: Rc<Cell<bool>>) -> Self {
+        self.search_selection = search_selection;
         self
     }
 
@@ -1742,7 +1604,7 @@ where
         }
         state.process_link_navigation_reset(self.terminal_buffer.link_navigation_reset_epoch());
         let selection = self.selection.borrow();
-        let search_highlights = self.search_highlights.borrow();
+        let search_selection = self.search_selection.get();
         let protocol_state = self.link_protocol_state.borrow();
         let buffer_link_state = self.buffer_link_state.borrow();
         let prefs = crate::prefs::current();
@@ -1811,18 +1673,8 @@ where
                 continue;
             }
 
-            let line_search_matches = search_highlights
-                .matches
-                .iter()
-                .enumerate()
-                .filter(|(_, matched)| matched.line == line_number)
-                .map(|(index, matched)| LineSearchMatch {
-                    start: matched.start,
-                    end: matched.end,
-                    active: search_highlights.current == Some(index),
-                })
-                .collect::<Vec<_>>();
             let line_selection = selection.for_line(line_number);
+            let line_search_selection = search_selection && line_selection.is_some();
 
             let dynamic_links = line.styled_line.links.iter().any(|link| {
                 link.style.as_ref().is_some_and(|style| style.has_states())
@@ -1848,7 +1700,7 @@ where
                 && cache.visual_generation == visual_generation
                 && Arc::ptr_eq(&cache.source, &line.styled_line)
                 && cache.selection == line_selection
-                && cache.search_matches == line_search_matches
+                && cache.search_selection == line_search_selection
             {
                 i += 1;
 
@@ -1903,21 +1755,11 @@ where
                 line.rendered_spans()
             };
             let rendered_selection = rendered.offsets.map_selection(line_selection);
-            let rendered_search_ranges = line_search_matches
-                .iter()
-                .filter_map(|matched| {
-                    rendered
-                        .offsets
-                        .map_selection(Some((matched.start, matched.end)))
-                        .map(|(start, end)| SearchRange {
-                            start,
-                            end,
-                            active: matched.active,
-                        })
-                })
-                .collect::<Vec<_>>();
-            let spans =
-                Spans::with_search(rendered.spans, rendered_selection, &rendered_search_ranges);
+            let spans = Spans::with_selection_color(
+                rendered.spans,
+                rendered_selection,
+                line_search_selection.then_some(iced::Color::WHITE),
+            );
 
             let spans_vec = spans.spans();
             let blink_modes = span_blink_modes(&spans_vec);
@@ -1945,7 +1787,7 @@ where
                 blink_modes,
                 max_valid_width: text_bounds.width,
                 selection: line_selection,
-                search_matches: line_search_matches,
+                search_selection: line_search_selection,
                 generation: prefs.generation,
                 font_size,
                 visual_generation,
@@ -2075,19 +1917,6 @@ where
                     }
                 }
 
-                for matched in search_match_regions(cache) {
-                    draw_search_match(
-                        renderer,
-                        Rectangle {
-                            x: layout.bounds().x + matched.bounds.x,
-                            y: y + matched.bounds.y,
-                            ..matched.bounds
-                        },
-                        matched.active,
-                        clipped_viewport,
-                    );
-                }
-
                 for selected_span_idx in cache.spans.selected().iter() {
                     let span_bounds_list = cache.paragraph.span_bounds(*selected_span_idx);
 
@@ -2104,7 +1933,11 @@ where
                                     bounds,
                                     ..Default::default()
                                 },
-                                Background::Color(prefs.palette.selection),
+                                Background::Color(if cache.search_selection {
+                                    TERMINAL_SELECTION_BACKGROUND
+                                } else {
+                                    prefs.palette.selection
+                                }),
                             );
                         }
                     }
@@ -2804,23 +2637,6 @@ mod tests {
                 blink,
                 ..SpanMetadata::default()
             })
-    }
-
-    #[test]
-    fn adjacent_styled_fragments_form_one_search_rectangle() {
-        let merged = merge_horizontal_regions(vec![
-            Rectangle::new(Point::new(13.0, 4.0), Size::new(7.0, 16.0)),
-            Rectangle::new(Point::new(5.0, 4.0), Size::new(8.0, 16.0)),
-            Rectangle::new(Point::new(5.0, 20.0), Size::new(9.0, 16.0)),
-        ]);
-
-        assert_eq!(
-            merged,
-            vec![
-                Rectangle::new(Point::new(5.0, 4.0), Size::new(15.0, 16.0)),
-                Rectangle::new(Point::new(5.0, 20.0), Size::new(9.0, 16.0)),
-            ]
-        );
     }
 
     #[test]
