@@ -1374,22 +1374,22 @@ impl SessionInput {
         let input = input.on_audio_panel_shortcut(Message::OpenAudioPanel);
         let input = if searching {
             input
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::Escape),
                     keyboard::Modifiers::empty(),
                     Message::ExitSearch,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::ArrowUp),
                     keyboard::Modifiers::empty(),
                     Message::SearchPrevious,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::ArrowDown),
                     keyboard::Modifiers::empty(),
                     Message::SearchNext,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::Enter),
                     keyboard::Modifiers::SHIFT,
                     Message::SearchNext,
@@ -1421,31 +1421,31 @@ impl SessionInput {
         };
 
         // Terminal navigation belongs to the viewport even while the text
-        // editor owns focus. These are reserved ahead of script hotkeys so
-        // their terminal behavior is dependable.
+        // editor owns focus. User-created hotkeys take precedence; these
+        // bindings handle otherwise-unclaimed key presses.
         let input = if self.terminal_view.is_some() {
             input
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Character("f".into()),
                     keyboard::Modifiers::CTRL,
                     Message::EnterSearch,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::PageUp),
                     keyboard::Modifiers::empty(),
                     Message::ScrollPageUp,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::PageDown),
                     keyboard::Modifiers::empty(),
                     Message::ScrollPageDown,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::Home),
                     keyboard::Modifiers::empty(),
                     Message::ScrollHome,
                 )
-                .on_reserved_key_pressed(
+                .on_fallback_key_pressed(
                     keyboard::Key::Named(keyboard::key::Named::End),
                     keyboard::Modifiers::empty(),
                     Message::ScrollEnd,

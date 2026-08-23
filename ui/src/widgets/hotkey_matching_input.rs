@@ -39,13 +39,18 @@ fn is_clipboard_write_shortcut(
     modifiers.command() && matches!(key.to_latin(physical_key), Some('c' | 'x'))
 }
 
-fn hook_key_matches(expected: &keyboard::Key, pressed: &keyboard::Key) -> bool {
+fn fallback_key_matches(expected: &keyboard::Key, pressed: &keyboard::Key) -> bool {
     expected == pressed
         || matches!(
             (expected, pressed),
             (keyboard::Key::Character(expected), keyboard::Key::Character(pressed))
                 if expected.eq_ignore_ascii_case(pressed)
         )
+}
+
+enum ShortcutMatch<'a, Message> {
+    Hotkey(HotkeyId),
+    Fallback(&'a Message),
 }
 
 /// Reserved application chord that opens and focuses the audio panel. It is
@@ -65,7 +70,7 @@ where
 {
     hotkeys: &'a HashMap<MaybePhysicalKey, Vec<(keyboard::Modifiers, HotkeyId)>>,
     hooks: HashMap<keyboard::Key, Message>,
-    reserved_hooks: Vec<(keyboard::Key, keyboard::Modifiers, Message)>,
+    shortcut_fallbacks: Vec<(keyboard::Key, keyboard::Modifiers, Message)>,
     text_input: TextInput<'a, Message, Theme, Renderer>,
     on_match: Option<Box<dyn Fn(HotkeyId) -> Message>>,
     on_focus: Option<Message>,
@@ -92,7 +97,7 @@ where
         Self {
             hotkeys,
             hooks: HashMap::new(),
-            reserved_hooks: Vec::new(),
+            shortcut_fallbacks: Vec::new(),
             text_input: TextInput::<'a, Message, Theme, Renderer>::new(placeholder, value),
             on_match: None,
             on_focus: None,
@@ -182,16 +187,16 @@ where
         self
     }
 
-    /// Capture an exact key/modifier chord before user-defined hotkeys. Used
-    /// for editor-owned commands whose behavior must remain available while
+    /// Handle an exact key/modifier chord when no user-defined hotkey matches.
+    /// Used for editor-owned commands that remain available as fallbacks while
     /// the command input is focused.
-    pub fn on_reserved_key_pressed(
+    pub fn on_fallback_key_pressed(
         mut self,
         key: keyboard::Key,
         modifiers: keyboard::Modifiers,
         message: Message,
     ) -> Self {
-        self.reserved_hooks.push((key, modifiers, message));
+        self.shortcut_fallbacks.push((key, modifiers, message));
         self
     }
 
@@ -245,6 +250,24 @@ where
             }
         }
         None
+    }
+
+    fn check_shortcut(
+        &self,
+        key: &keyboard::Key,
+        physical_key: &key::Physical,
+        modifiers: &keyboard::Modifiers,
+    ) -> Option<ShortcutMatch<'_, Message>> {
+        if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers) {
+            return Some(ShortcutMatch::Hotkey(hotkey_id));
+        }
+
+        self.shortcut_fallbacks
+            .iter()
+            .find(|(fallback_key, fallback_modifiers, _)| {
+                fallback_key_matches(fallback_key, key) && fallback_modifiers == modifiers
+            })
+            .map(|(_, _, message)| ShortcutMatch::Fallback(message))
     }
 }
 
@@ -398,21 +421,14 @@ where
                 ..
             }) = event
         {
-            if let Some((_, _, message)) =
-                self.reserved_hooks
-                    .iter()
-                    .find(|(hook_key, hook_modifiers, _)| {
-                        hook_key_matches(hook_key, key) && hook_modifiers == modifiers
-                    })
-            {
-                shell.publish(message.clone());
-                shell.capture_event();
-                return;
-            }
-
-            if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers).as_ref() {
-                if let Some(on_match) = self.on_match.as_ref() {
-                    shell.publish(on_match(*hotkey_id));
+            if let Some(shortcut_match) = self.check_shortcut(key, physical_key, modifiers) {
+                match shortcut_match {
+                    ShortcutMatch::Hotkey(hotkey_id) => {
+                        if let Some(on_match) = self.on_match.as_ref() {
+                            shell.publish(on_match(hotkey_id));
+                        }
+                    }
+                    ShortcutMatch::Fallback(message) => shell.publish(message.clone()),
                 }
                 shell.capture_event();
                 return;
@@ -590,14 +606,34 @@ mod tests {
     }
 
     #[test]
-    fn reserved_character_hooks_ignore_ascii_case() {
-        assert!(hook_key_matches(
+    fn fallback_character_hooks_ignore_ascii_case() {
+        assert!(fallback_key_matches(
             &keyboard::Key::Character("f".into()),
             &keyboard::Key::Character("F".into())
         ));
-        assert!(!hook_key_matches(
+        assert!(!fallback_key_matches(
             &keyboard::Key::Character("f".into()),
             &keyboard::Key::Character("g".into())
+        ));
+    }
+
+    #[test]
+    fn user_hotkeys_precede_shortcut_fallbacks() {
+        let key = keyboard::Key::Character("f".into());
+        let physical_key = Physical::Code(Code::KeyF);
+        let modifiers = keyboard::Modifiers::CTRL;
+        let hotkey_id = HotkeyId::default();
+        let hotkeys = HashMap::from([(
+            MaybePhysicalKey::Key(key.clone()),
+            vec![(modifiers, hotkey_id)],
+        )]);
+        let input =
+            HotkeyMatchingInput::<u8, crate::theme::Theme, iced::Renderer>::new(&hotkeys, "", "")
+                .on_fallback_key_pressed(key.clone(), modifiers, 1);
+
+        assert!(matches!(
+            input.check_shortcut(&key, &physical_key, &modifiers),
+            Some(ShortcutMatch::Hotkey(matched)) if matched == hotkey_id
         ));
     }
 }
