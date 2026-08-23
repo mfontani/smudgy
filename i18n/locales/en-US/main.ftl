@@ -938,6 +938,7 @@ time-hours-ago = { $count }h ago
 # Automations sidebar
 automations-new = New
 automations-search-placeholder = Search automations…
+terminal-search-placeholder = Search terminal…
 automations-all = All
 automations-aliases = Aliases
 automations-triggers = Triggers

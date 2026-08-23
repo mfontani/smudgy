@@ -1000,6 +1000,7 @@ time-hours-ago = { $count } год тому
 # Automations sidebar
 automations-new = Новий
 automations-search-placeholder = Пошук автоматизацій…
+terminal-search-placeholder = Пошук у терміналі…
 automations-all = Усі
 automations-aliases = Аліаси
 automations-triggers = Тригери

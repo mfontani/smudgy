@@ -6,7 +6,7 @@ pub struct BufferPosition {
 
 pub type LineSelection = Option<(usize, usize)>;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     #[default]
     None,

@@ -931,6 +931,7 @@ time-hours-ago = { $count } 小時前
 # 自動化側邊欄
 automations-new = 新增
 automations-search-placeholder = 搜尋自動化…
+terminal-search-placeholder = 搜尋終端機…
 automations-all = 全部
 automations-aliases = 別名
 automations-triggers = 觸發器

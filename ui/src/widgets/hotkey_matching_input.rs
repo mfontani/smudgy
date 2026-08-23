@@ -39,6 +39,15 @@ fn is_clipboard_write_shortcut(
     modifiers.command() && matches!(key.to_latin(physical_key), Some('c' | 'x'))
 }
 
+fn hook_key_matches(expected: &keyboard::Key, pressed: &keyboard::Key) -> bool {
+    expected == pressed
+        || matches!(
+            (expected, pressed),
+            (keyboard::Key::Character(expected), keyboard::Key::Character(pressed))
+                if expected.eq_ignore_ascii_case(pressed)
+        )
+}
+
 /// Reserved application chord that opens and focuses the audio panel. It is
 /// excluded from user hotkey dispatch so a focused command input cannot
 /// double-fire a script automation and the application action.
@@ -56,6 +65,7 @@ where
 {
     hotkeys: &'a HashMap<MaybePhysicalKey, Vec<(keyboard::Modifiers, HotkeyId)>>,
     hooks: HashMap<keyboard::Key, Message>,
+    reserved_hooks: Vec<(keyboard::Key, keyboard::Modifiers, Message)>,
     text_input: TextInput<'a, Message, Theme, Renderer>,
     on_match: Option<Box<dyn Fn(HotkeyId) -> Message>>,
     on_focus: Option<Message>,
@@ -82,6 +92,7 @@ where
         Self {
             hotkeys,
             hooks: HashMap::new(),
+            reserved_hooks: Vec::new(),
             text_input: TextInput::<'a, Message, Theme, Renderer>::new(placeholder, value),
             on_match: None,
             on_focus: None,
@@ -168,6 +179,19 @@ where
 
     pub fn on_key_pressed(mut self, key: keyboard::Key, f: Message) -> Self {
         self.hooks.insert(key, f);
+        self
+    }
+
+    /// Capture an exact key/modifier chord before user-defined hotkeys. Used
+    /// for editor-owned commands whose behavior must remain available while
+    /// the command input is focused.
+    pub fn on_reserved_key_pressed(
+        mut self,
+        key: keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        message: Message,
+    ) -> Self {
+        self.reserved_hooks.push((key, modifiers, message));
         self
     }
 
@@ -374,6 +398,18 @@ where
                 ..
             }) = event
         {
+            if let Some((_, _, message)) =
+                self.reserved_hooks
+                    .iter()
+                    .find(|(hook_key, hook_modifiers, _)| {
+                        hook_key_matches(hook_key, key) && hook_modifiers == modifiers
+                    })
+            {
+                shell.publish(message.clone());
+                shell.capture_event();
+                return;
+            }
+
             if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers).as_ref() {
                 if let Some(on_match) = self.on_match.as_ref() {
                     shell.publish(on_match(*hotkey_id));
@@ -550,6 +586,18 @@ mod tests {
             &c,
             Physical::Code(Code::KeyC),
             keyboard::Modifiers::empty()
+        ));
+    }
+
+    #[test]
+    fn reserved_character_hooks_ignore_ascii_case() {
+        assert!(hook_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("F".into())
+        ));
+        assert!(!hook_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("g".into())
         ));
     }
 }

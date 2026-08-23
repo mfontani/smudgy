@@ -11,7 +11,6 @@
 use crate::cloud_account::CloudHandles;
 use crate::components::session_input;
 use crate::images::image_store;
-use crate::terminal_buffer::selection::Selection;
 use crate::terminal_buffer::{LinkClickEvent, LinkProtocolState, TerminalBuffer};
 use crate::theme::Element;
 use crate::widgets::split_terminal_pane;
@@ -410,7 +409,7 @@ impl SessionStore {
 pub struct PaneDisplay {
     pub def: PaneDef,
     buffer: Option<Rc<RefCell<TerminalBuffer>>>,
-    selection: Rc<RefCell<Selection>>,
+    terminal_view: split_terminal_pane::TerminalViewHandle,
     input: Option<session_input::SessionInput>,
 }
 
@@ -453,7 +452,7 @@ pub struct ManagedSession {
 
     terminal_buffer: Rc<RefCell<TerminalBuffer>>,
     link_protocol_state: Rc<RefCell<LinkProtocolState>>,
-    terminal_pane_selection: Rc<RefCell<Selection>>,
+    terminal_view: split_terminal_pane::TerminalViewHandle,
 
     /// Display state for this session's non-main panes, keyed by the
     /// never-reused `PaneKey`. Existence is core's call (`PaneOpened`/
@@ -1407,6 +1406,7 @@ impl ManagedSession {
             scrollback_limit(&settings),
             link_protocol_state.clone(),
         )));
+        let terminal_view = split_terminal_pane::TerminalViewHandle::default();
 
         // Load profile to get the subtext (caption) once
         let profile_subtext = match load_profile(&server_name, &profile_name) {
@@ -1479,6 +1479,7 @@ impl ManagedSession {
         };
         let input = session_input::SessionInput::new()
             .with_terminal_buffer(terminal_buffer.clone())
+            .with_terminal_view(terminal_view.clone())
             .with_history(input_history);
 
         // The image store is process-global (entries are keyed by content source, shared
@@ -1739,7 +1740,7 @@ impl ManagedSession {
             input,
             terminal_buffer: terminal_buffer.clone(),
             link_protocol_state,
-            terminal_pane_selection: Rc::new(RefCell::new(Selection::default())),
+            terminal_view,
             panes: HashMap::new(),
             main_title_bar: TitleBarPolicy::Normal,
             main_font_size: None,
@@ -1809,6 +1810,7 @@ impl ManagedSession {
                 // pane's whole body).
                 PaneKind::Widgets => None,
             };
+            let terminal_view = split_terminal_pane::TerminalViewHandle::default();
             // A pane input is the same component as the main input, with its
             // own state: completion scans the pane's own scrollback (none on
             // a widgets-only pane — suggestion sets still complete), Escape
@@ -1821,7 +1823,9 @@ impl ManagedSession {
                     input = input.with_placeholder(placeholder);
                 }
                 if let Some(buffer) = buffer.clone() {
-                    input = input.with_terminal_buffer(buffer);
+                    input = input
+                        .with_terminal_buffer(buffer)
+                        .with_terminal_view(terminal_view.clone());
                 }
                 input.copy_hotkeys_from(main_input);
                 if mirror_interest {
@@ -1832,7 +1836,7 @@ impl ManagedSession {
             PaneDisplay {
                 def,
                 buffer,
-                selection: Rc::new(RefCell::new(Selection::default())),
+                terminal_view,
                 input,
             }
         });
@@ -1934,7 +1938,7 @@ impl ManagedSession {
                     Some(buffer) => {
                         let terminal = split_terminal_pane::split_terminal_pane(
                             buffer.borrow(),
-                            pane.selection.clone(),
+                            pane.terminal_view.clone(),
                             self.link_handler(),
                             self.link_tooltip_handler(),
                             // NAWS describes the main terminal; script panes don't report.
@@ -2582,7 +2586,7 @@ impl ManagedSession {
                 else {
                     return Task::none();
                 };
-                if pane.selection.borrow().blocks_focus() {
+                if pane.terminal_view.selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
                     self.note_command_input_focus(key);
@@ -3037,7 +3041,7 @@ impl ManagedSession {
             Message::TerminalClicked => {
                 // Only the selection-less click focuses the input — the
                 // pre-pane behavior (see `Selection::blocks_focus`).
-                if self.terminal_pane_selection.borrow().blocks_focus() {
+                if self.terminal_view.selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
                     self.note_command_input_focus(MAIN_PANE_KEY);
@@ -3205,7 +3209,7 @@ impl ManagedSession {
         // under the cursor captures or levitates them away before this layer.
         let terminal = mouse_area(split_terminal_pane::split_terminal_pane(
             self.terminal_buffer.borrow(),
-            self.terminal_pane_selection.clone(),
+            self.terminal_view.clone(),
             self.link_handler(),
             self.link_tooltip_handler(),
             self.grid_change_handler(),
