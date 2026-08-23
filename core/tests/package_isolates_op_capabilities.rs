@@ -995,3 +995,93 @@ async fn worker_constructions_pass_the_cap_guard() {
         "no failure in the guard path; transcript:\n{lines:#?}"
     );
 }
+
+/// A relative Worker specifier resolves against the CALLING module, not the synthetic
+/// `file:///smudgy-main.js` location deno_runtime would otherwise use: a local module's
+/// `new Worker("./workers/worker.ts")` names its on-disk sibling. This is the trusted
+/// main isolate (local modules), with no packages installed.
+#[tokio::test]
+async fn worker_relative_specifier_resolves_against_the_calling_module() {
+    let session_id = SessionId::from(9649);
+    let server = "pi_caps_workers_relative";
+    prepare_server(server);
+    let modules_dir = smudgy_core::get_smudgy_home()
+        .expect("smudgy home")
+        .join(server)
+        .join("modules");
+    std::fs::create_dir_all(modules_dir.join("workers")).expect("create workers dir");
+    std::fs::write(
+        modules_dir.join("workertest.ts"),
+        r#"
+            import { echo } from "smudgy:core";
+            const worker = new Worker("./workers/worker.ts", { type: "module" });
+            const keepalive = setInterval(() => echo("WAITING"), 200);
+            const done = () => clearInterval(keepalive);
+            setTimeout(done, 15000);
+            worker.onmessage = (e) => {
+                done();
+                echo("WORKER_REL_REPLY:" + e.data);
+                worker.terminate();
+            };
+            worker.onerror = (e) => {
+                e.preventDefault();
+                done();
+                echo("WORKER_REL_ERROR:" + e.message);
+            };
+            worker.postMessage("ping");
+        "#,
+    )
+    .expect("write workertest module");
+    std::fs::write(
+        modules_dir.join("workers").join("worker.ts"),
+        "onmessage = (e: MessageEvent) => { postMessage('pong:' + e.data); };\n",
+    )
+    .expect("write worker module");
+
+    let params = Arc::new(SessionParams {
+        session_id,
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn_with_package_provider(params, factory_for(Vec::new())));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    tx.send(RuntimeAction::Shutdown)
+        .expect("runtime accepts shutdown");
+    drop(tx);
+    drop(events);
+    let joined = tokio::task::spawn_blocking(move || join_runtime_thread(session_id))
+        .await
+        .expect("runtime join task does not panic");
+    assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
+
+    assert!(
+        has_line(&lines, "WORKER_REL_REPLY:pong:ping"),
+        "a caller-relative worker module loads and echoes; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "WORKER_REL_ERROR:"),
+        "no worker error on the relative path; transcript:\n{lines:#?}"
+    );
+}
