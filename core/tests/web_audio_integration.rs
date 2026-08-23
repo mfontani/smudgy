@@ -165,7 +165,7 @@ async fn trusted_smudgy_script_can_render_and_close_web_audio() {
 }
 
 #[tokio::test]
-async fn unavailable_session_keeps_none_joinable_and_rejects_default_without_mixer() {
+async fn unavailable_session_keeps_default_and_none_joinable_without_mixer() {
     let _guard = AUDIO_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -182,12 +182,12 @@ async fn unavailable_session_keeps_none_joinable_and_rejects_default_without_mix
         modules_dir.join("unavailable.ts"),
         r#"
         import { echo } from "smudgy:core";
-        try {
-          new AudioContext({ sampleRate: 48_000 });
-          echo("UNAVAILABLE_DEFAULT_MISSED");
-        } catch (error) {
-          echo(`UNAVAILABLE_DEFAULT:${String(error)}`);
+        const fallback = new AudioContext({ sampleRate: 48_000 });
+        if (fallback.sinkId !== "") {
+          throw new Error(`unexpected fallback sink: ${fallback.sinkId}`);
         }
+        await fallback.close();
+        echo("UNAVAILABLE_DEFAULT_OK");
         const silent = new AudioContext({ sampleRate: 48_000, sinkId: "none" });
         await silent.close();
         echo("UNAVAILABLE_NONE_OK");
@@ -236,9 +236,7 @@ async fn unavailable_session_keeps_none_joinable_and_rejects_default_without_mix
                     for update in updates.iter() {
                         if let BufferUpdate::Append(line) = update {
                             transcript.push(line.text.clone());
-                            assert_ne!(line.text, "UNAVAILABLE_DEFAULT_MISSED");
-                            saw_default |= line.text.starts_with("UNAVAILABLE_DEFAULT:")
-                                && line.text.contains("deterministic no-default-device cause");
+                            saw_default |= line.text == "UNAVAILABLE_DEFAULT_OK";
                             saw_none |= line.text == "UNAVAILABLE_NONE_OK";
                         }
                     }
