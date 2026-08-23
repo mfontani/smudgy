@@ -240,7 +240,7 @@ fn worker_terminate_settles() -> Result<()> {
 
 /// `WorkerMode::Disabled`: construction is a catchable error (the worker-host
 /// ops are disabled at registration) — no panic, no thread spawn. This is the
-/// sandboxed-package posture until the W2 `workers` capability.
+/// posture of a sandboxed package without the consented `workers` capability.
 #[test]
 fn disabled_mode_makes_worker_a_catchable_error() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -255,6 +255,116 @@ fn disabled_mode_makes_worker_a_catchable_error() -> Result<()> {
     })()"#;
     let ok = eval_async_bool(&tokio, &mut rt, source)?;
     assert!(ok, "a disabled isolate's Worker construction should throw");
+    Ok(())
+}
+
+/// A worker whose module throws at top level surfaces through the parent's
+/// `onerror` — contained, catchable, and the parent event loop settles.
+#[test]
+fn worker_top_level_error_reaches_onerror() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let source = r#"(async () => {
+        const worker = new Worker(
+            "data:text/javascript," +
+                encodeURIComponent("throw new Error('worker boot failure');"),
+            { type: "module" },
+        );
+        try {
+            return await new Promise((resolve, reject) => {
+                worker.onerror = (e) => {
+                    e.preventDefault();
+                    resolve(String(e.message).includes("worker boot failure"));
+                };
+                worker.onmessage = () => reject(new Error("unexpected message"));
+                setTimeout(() => reject(new Error("worker timed out")), 15000);
+            });
+        } finally {
+            worker.terminate();
+        }
+    })()"#;
+    let ok = eval_async_bool(&tokio, &mut rt, source)?;
+    assert!(ok, "a top-level worker throw should surface via onerror");
+    Ok(())
+}
+
+/// Dropping the parent runtime while a worker is alive terminates the worker
+/// through the worker-host teardown path — no abort, no hang. This is the
+/// shape of an engine reload or session shutdown with workers in flight.
+#[test]
+fn dropping_runtime_with_live_worker_is_clean() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    // The worker keeps itself busy indefinitely; the parent confirms it is
+    // alive, then the whole runtime is dropped out from under it.
+    let source = first_message_source(
+        "setInterval(() => {}, 50); onmessage = () => { postMessage('alive'); };",
+        "worker.postMessage(null);",
+    );
+    let ok = eval_async_bool(
+        &tokio,
+        &mut rt,
+        // Deliberately NO terminate() before returning: `finally` in the
+        // helper terminates this handle, so probe liveness with a fresh one.
+        &format!("{source}.then((v) => v === 'alive')"),
+    )?;
+    assert!(ok, "worker should be alive before the runtime drops");
+    let raw = {
+        let _entered = EnteredIsolate::enter(&mut rt);
+        rt.deno_runtime().execute_script(
+            "<spawn-unterminated>",
+            FastString::from(
+                r#"globalThis.__lingering = new Worker(
+                    "data:text/javascript," +
+                        encodeURIComponent("setInterval(() => {}, 50);"),
+                    { type: "module" },
+                ); true"#
+                    .to_string(),
+            ),
+        )?
+    };
+    drop(raw);
+    // Drop with the worker alive. ScriptRuntime::drop runs inside the tokio
+    // context; the worker-host table drop terminates the worker thread.
+    drop(rt);
+    drop(tokio);
+    Ok(())
+}
+
+/// Repeated spawn/echo/terminate cycles: no cross-worker state bleed and no
+/// resource pileup that would wedge a later cycle.
+#[test]
+fn repeated_worker_cycles_stay_isolated() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let source = r#"(async () => {
+        for (let i = 0; i < 4; i++) {
+            const worker = new Worker(
+                "data:text/javascript," + encodeURIComponent(
+                    "let seen = 0; onmessage = (e) => { seen++; postMessage([e.data, seen]); };",
+                ),
+                { type: "module" },
+            );
+            try {
+                const [echoed, seen] = await new Promise((resolve, reject) => {
+                    worker.onmessage = (e) => resolve(e.data);
+                    worker.onerror = (e) => {
+                        e.preventDefault();
+                        reject(new Error("worker error: " + e.message));
+                    };
+                    worker.postMessage(i);
+                    setTimeout(() => reject(new Error("worker timed out")), 15000);
+                });
+                // A fresh realm each cycle: its private counter is always 1.
+                if (echoed !== i || seen !== 1) return false;
+            } finally {
+                worker.terminate();
+            }
+        }
+        return true;
+    })()"#;
+    let ok = eval_async_bool(&tokio, &mut rt, source)?;
+    assert!(ok, "each cycle should get a fresh, isolated worker realm");
     Ok(())
 }
 
