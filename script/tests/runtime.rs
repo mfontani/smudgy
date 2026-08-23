@@ -164,19 +164,11 @@ fn compiled_web_audio_feature_keeps_base_runtime_audio_free() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "web-audio")]
-#[test]
-fn exact_audio_extension_selects_audio_snapshot_and_installs_globals() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let (tokio, mut runtime) =
-        runtime_with_extensions(temp.path(), vec![deferred_audio_extension()])?;
-    assert!(eval_bool_in_tokio(
-        &tokio,
-        &mut runtime,
-        "typeof globalThis.AudioContext === 'function' && typeof globalThis.OfflineAudioContext === 'function'",
-    )?);
-    Ok(())
-}
+// The positive audio-snapshot selection test lives in `runtime_web_audio.rs`,
+// its own test binary and therefore its own PROCESS: V8's shared heap is
+// process-global and blob-verified per isolate, so an audio-blob isolate must
+// never be live beside this binary's base-blob isolates. The preflight
+// rejection tests below never construct an isolate and are safe here.
 
 #[cfg(feature = "web-audio")]
 #[test]
