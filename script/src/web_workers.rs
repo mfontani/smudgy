@@ -44,8 +44,8 @@ use crate::transpiler::transpile;
 /// Whether an isolate may construct Web `Worker`s, and in what shape.
 ///
 /// This is per-isolate policy chosen by the isolate factory: the trusted main
-/// isolate gets `ComputeOnly`; sandboxed package isolates get `Disabled`
-/// until the `workers` capability exists (tracker slice W2).
+/// isolate gets `ComputeOnly`; a sandboxed package isolate gets `ComputeOnly`
+/// only with the consented `workers` capability, `Disabled` otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkerMode {
     /// Worker-host ops are disabled: `new Worker(...)` (and the
@@ -127,7 +127,22 @@ const DENIED_WORKER_REALM_OP_PREFIXES: &[&str] = &[
     "op_host_",
 ];
 
+/// Authority-free ops exempted from the realm deny prefixes. Web-platform
+/// paths lazily load deno_node internals inside a worker — `setInterval`
+/// pulls in async_hooks → errors → uv → os, whose module scope calls
+/// `op_node_build_os` — so the inert constants those module scopes need stay
+/// enabled. Every entry here must be a pure constant/compute op; anything
+/// that touches the system belongs in the deny list.
+const WORKER_REALM_OP_EXCEPTIONS: &[&str] = &[
+    "op_node_build_os",
+    "op_node_fs_constants",
+    "op_node_new_async_id",
+];
+
 fn is_denied(name: &str, exact: &[&str], prefixes: &[&str]) -> bool {
+    if WORKER_REALM_OP_EXCEPTIONS.contains(&name) {
+        return false;
+    }
     exact.contains(&name) || prefixes.iter().any(|prefix| name.starts_with(prefix))
 }
 

@@ -33,7 +33,7 @@ use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
 use smudgy_cloud::{AreaId, Uuid, WidgetIsolate, WidgetsEnabled};
-use smudgy_script::SmudgyCapabilities;
+use smudgy_script::{SmudgyCapabilities, WorkersTable};
 
 deno_core::extension!(
   smudgy_ops,
@@ -169,6 +169,8 @@ deno_core::extension!(
     op_smudgy_data_dir,
     op_smudgy_broadcast_allowed,
     op_smudgy_workers_allowed,
+    op_smudgy_worker_count,
+    op_smudgy_worker_cap,
     ],
   esm_entry_point = "ext:smudgy_ops/smudgy.ts",
   esm = [ dir "src/session/runtime/js", "smudgy.ts" ],
@@ -536,6 +538,9 @@ pub struct SmudgyGrants {
     /// tab-completion word sets. One capability covers the whole surface — a package
     /// that wants any of it can see and rewrite what the user types.
     pub input: bool,
+    /// `workers: ["spawn"]` — construct Web Workers: off-thread reduced-op compute
+    /// realms with a message-only bridge (no network, file, or smudgy ops inside them).
+    pub workers: bool,
 }
 
 impl SmudgyGrants {
@@ -559,6 +564,7 @@ impl SmudgyGrants {
             panes: true,
             gmcp_send: true,
             input: true,
+            workers: true,
         }
     }
 
@@ -583,6 +589,7 @@ impl SmudgyGrants {
             panes: caps.panes,
             gmcp_send: caps.gmcp_send,
             input: caps.input,
+            workers: caps.workers,
         }
     }
 }
@@ -1072,14 +1079,31 @@ fn op_smudgy_broadcast_allowed(state: &OpState) -> bool {
     grants(state).interop_broadcast
 }
 
-/// Whether this isolate may construct Web `Worker`s (`WorkerMode::ComputeOnly`).
-/// Not a `SmudgyGrants` capability yet: v1 enables workers for the trusted main
-/// isolate only; the sandbox `workers` capability is tracker slice W2.
+/// Whether this isolate may construct Web `Worker`s (`WorkerMode::ComputeOnly`):
+/// the trusted main isolate, or a sandboxed package holding the consented
+/// `workers` capability. Mirrors the isolate's `WorkerMode` — both derive from
+/// the same grant, so `smudgy.ts` can shadow `Worker` with a clear TypeError
+/// exactly where the worker-host ops are disabled.
 pub(crate) struct WorkersEnabled(pub bool);
 
 #[op2(fast)]
 fn op_smudgy_workers_allowed(state: &OpState) -> bool {
     state.borrow::<WorkersEnabled>().0
+}
+
+/// Per-isolate live-worker ceiling, enforced by the `smudgy.ts` constructor wrap
+/// (the `Worker` shadow refuses to construct a ninth). The `node:worker_threads`
+/// path in the trusted main isolate is not cap-checked.
+pub(crate) const WORKER_CAP: u32 = 8;
+
+#[op2(fast)]
+fn op_smudgy_worker_count(state: &OpState) -> u32 {
+    state.borrow::<WorkersTable>().len() as u32
+}
+
+#[op2(fast)]
+fn op_smudgy_worker_cap() -> u32 {
+    WORKER_CAP
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

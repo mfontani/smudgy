@@ -54,6 +54,33 @@ fn make_package(owner: &str, name: &str, version: &str, src: &str) -> ResolvedPa
     }
 }
 
+/// Like [`make_package`], but the manifest also DECLARES a `permissions.smudgy` block — for tests
+/// whose interest includes the manifest wire shape (the recorded consent still drives enforcement).
+fn make_package_declaring(
+    owner: &str,
+    name: &str,
+    version: &str,
+    smudgy_json: &str,
+    src: &str,
+) -> ResolvedPackage {
+    let manifest_json = format!(
+        r#"{{ "name": "{name}", "version": "{version}", "permissions": {{ "smudgy": {smudgy_json} }} }}"#
+    );
+    ResolvedPackage {
+        key: PackageKey {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        },
+        resolved_version: version.to_string(),
+        manifest: PackageManifest::parse(&manifest_json).expect("valid manifest"),
+        integrity: format!("test-{name}-{version}"),
+        modules: vec![PackageModuleSource {
+            subpath: "index.js".to_string(),
+            text: src.to_string(),
+        }],
+    }
+}
+
 fn factory_for(packages: Vec<ResolvedPackage>) -> PackageProviderFactory {
     Arc::new(move || {
         let mut provider = InMemoryPackageProvider::new();
@@ -839,5 +866,156 @@ async fn gmcp_send_is_its_own_capability() {
     assert!(
         !has_line(&granted, "BADNAME_NO_THROW") && has_line(&granted, "BADNAME_DENIED:"),
         "an invalid GMCP name is rejected loudly at the op; transcript:\n{granted:#?}"
+    );
+}
+
+/// The `workers` capability (`workers: ["spawn"]`, declared in the manifest's wire shape and
+/// consented) gates Web Worker construction. Granted: a data:-URL module worker constructs,
+/// round-trips one postMessage, and terminates — data: because the worker loader serves
+/// file:/data: only and package sources are not files. Ungated: `new Worker` is the facade's
+/// catchable TypeError, naming the capability.
+#[tokio::test]
+async fn workers_capability_gates_worker_construction() {
+    // A worker boot spawns a thread and initializes a fresh realm, which can outlast the
+    // harness's quiet window — the keepalive echo holds the collection loop open until the
+    // reply (or the 15s cap) lands.
+    let granted_src = r#"
+        import { echo } from "smudgy:core";
+        const body = "onmessage = (e) => { postMessage('pong:' + e.data); };";
+        try {
+            const worker = new Worker(
+                "data:text/javascript," + encodeURIComponent(body),
+                { type: "module" },
+            );
+            const keepalive = setInterval(() => echo("WAITING"), 200);
+            const done = () => clearInterval(keepalive);
+            setTimeout(done, 15000);
+            worker.onmessage = (e) => {
+                done();
+                echo("WORKER_REPLY:" + e.data);
+                worker.terminate();
+            };
+            worker.onerror = (e) => {
+                e.preventDefault();
+                done();
+                echo("WORKER_ONERROR:" + e.message);
+            };
+            worker.postMessage("ping");
+            echo("WORKER_SPAWNED");
+        } catch (e) { echo("WORKER_THROW:" + (e?.message ?? String(e))); }
+    "#;
+    let granted = run_capability_case(
+        9646,
+        "pi_caps_workers_granted",
+        "smudgy://wbk/workerful",
+        Some(consent_with(|s| s.workers = true)),
+        make_package_declaring(
+            "wbk",
+            "workerful",
+            "1.0.0",
+            r#"{ "workers": ["spawn"], "session": ["echo"] }"#,
+            granted_src,
+        ),
+    )
+    .await;
+    assert!(
+        has_line(&granted, "WORKER_SPAWNED") && !has_line(&granted, "WORKER_THROW:"),
+        "with workers:spawn the constructor must not throw; transcript:\n{granted:#?}"
+    );
+    assert!(
+        has_line(&granted, "WORKER_REPLY:pong:ping"),
+        "the worker must echo the sentinel back through postMessage; transcript:\n{granted:#?}"
+    );
+
+    // Ungated: the facade shadows the constructor with a TypeError naming the capability.
+    let denied_src = r#"
+        import { echo } from "smudgy:core";
+        try {
+            new Worker("data:text/javascript,", { type: "module" });
+            echo("WORKER_NO_THROW");
+        } catch (e) {
+            echo("WORKER_DENIED:" + (e instanceof TypeError) + ":" + (e?.message ?? String(e)));
+        }
+    "#;
+    let denied = run_capability_case(
+        9647,
+        "pi_caps_workers_denied",
+        "smudgy://wbk/workless",
+        Some(consent_with(|_| {})), // echo only
+        make_package("wbk", "workless", "1.0.0", denied_src),
+    )
+    .await;
+    assert!(
+        !has_line(&denied, "WORKER_NO_THROW") && has_line(&denied, "WORKER_DENIED:true:"),
+        "without workers:spawn the constructor throws a TypeError; transcript:\n{denied:#?}"
+    );
+    assert!(
+        has_line(&denied, "workers:spawn"),
+        "the denial names the missing 'workers:spawn' capability; transcript:\n{denied:#?}"
+    );
+}
+
+/// The per-isolate live-worker ceiling: eight workers construct, the ninth throws the
+/// facade's limit error, and terminating one eventually frees its slot for a new
+/// construction. The freed-slot half polls — `terminate()` only requests termination,
+/// and the worker-host table drops the entry when the worker's close lands.
+#[tokio::test]
+async fn worker_cap_limits_live_workers() {
+    let src = r#"
+        import { echo } from "smudgy:core";
+        const spec = ["data:text/javascript,", { type: "module" }];
+        const workers = [];
+        try {
+            for (let i = 0; i < 9; i++) {
+                try {
+                    workers.push(new Worker(spec[0], spec[1]));
+                } catch (e) {
+                    echo("CAP_HIT:" + i + ":" + (e?.message ?? String(e)));
+                }
+            }
+            echo("CAP_LIVE:" + workers.length);
+            workers[0].terminate();
+            const deadline = Date.now() + 10000;
+            const retry = () => {
+                try {
+                    workers.push(new Worker(spec[0], spec[1]));
+                    echo("CAP_FREED_SLOT_REUSED");
+                } catch (e) {
+                    if (Date.now() > deadline) {
+                        echo("CAP_SLOT_NEVER_FREED:" + (e?.message ?? String(e)));
+                    } else {
+                        echo("CAP_WAITING");
+                        setTimeout(retry, 100);
+                    }
+                }
+            };
+            setTimeout(retry, 100);
+        } catch (e) {
+            echo("CAP_UNEXPECTED:" + (e?.message ?? String(e)));
+        }
+    "#;
+    let lines = run_capability_case(
+        9648,
+        "pi_caps_workers_cap",
+        "smudgy://wbk/workcap",
+        Some(consent_with(|s| s.workers = true)),
+        make_package("wbk", "workcap", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        has_line(&lines, "CAP_LIVE:8") && has_line(&lines, "CAP_HIT:8:"),
+        "exactly eight workers construct and the ninth throws; transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "live-worker limit"),
+        "the ninth construction's error names the limit; transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "CAP_FREED_SLOT_REUSED") && !has_line(&lines, "CAP_SLOT_NEVER_FREED:"),
+        "a terminated worker's slot frees for a later construction; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "CAP_UNEXPECTED:"),
+        "no failure outside the cap path; transcript:\n{lines:#?}"
     );
 }

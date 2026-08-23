@@ -1126,8 +1126,10 @@ impl<'a> ScriptEngine<'a> {
                 let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
                     Rc::new(RefCell::new(Vec::new()));
                 // Must agree with the `WorkerMode` this isolate's runtime is built with
-                // below: main = ComputeOnly, sandboxes = Disabled (W2 adds the capability).
-                let workers_enabled = matches!(isolate_id, IsolateId::Main);
+                // below: main = ComputeOnly, sandboxes = ComputeOnly only with the
+                // consented `workers` capability (mirrored into `smudgy_grants`).
+                let workers_enabled =
+                    matches!(isolate_id, IsolateId::Main) || smudgy_grants.workers;
                 let mut extensions = Vec::new();
                 #[cfg(feature = "web-audio")]
                 let mut package_audio_binding = None;
@@ -1772,11 +1774,16 @@ impl<'a> ScriptEngine<'a> {
                     effective.import,
                     params.tokio_runtime.clone(),
                     isolate_broadcast_channel,
-                    // Sandboxed packages cannot spawn workers until the `workers`
-                    // capability exists (smudgy-worker tracker, slice W2). Disabled
+                    // A sandboxed package spawns workers only with the consented `workers`
+                    // capability (the same grant `make_extensions` mirrored into
+                    // `workers_enabled` above, so the facade and the ops agree). Disabled
                     // means the worker-host ops are inert: a catchable error with
                     // no thread spawn, including via `node:worker_threads`.
-                    WorkerMode::Disabled,
+                    if smudgy_grants.workers {
+                        WorkerMode::ComputeOnly
+                    } else {
+                        WorkerMode::Disabled
+                    },
                 ) {
                     Ok(runtime) => runtime,
                     Err(e) => {

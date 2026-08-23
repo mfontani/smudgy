@@ -1326,6 +1326,15 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
             "permission-can-interop-broadcast"
         )));
     }
+    if caps.workers {
+        // Compute-only, but a worker is a real OS thread that keeps running between
+        // the isolate's turns — elevated exposure (sustained CPU), not a scoped grant.
+        out.push(PermissionLine {
+            head: crate::i18n::t!("permission-can-workers"),
+            detail: None,
+            risk: PermissionRisk::Caution,
+        });
+    }
     if caps.panes {
         out.push(cap_line(crate::i18n::ts!("permission-can-panes")));
     }
@@ -1405,6 +1414,9 @@ fn smudgy_cannot_lines(caps: &SmudgyCapabilities) -> Vec<String> {
     }
     if !caps.interop_broadcast {
         out.push(crate::i18n::t!("permission-cannot-interop-broadcast"));
+    }
+    if !caps.workers {
+        out.push(crate::i18n::t!("permission-cannot-workers"));
     }
     if !caps.gmcp_send {
         out.push(crate::i18n::t!("permission-cannot-gmcp"));

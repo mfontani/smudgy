@@ -1050,6 +1050,9 @@ pub struct SmudgyCapabilities {
     /// mask, or submit it. One capability covers the whole surface — a package holding it
     /// can see and rewrite what the user types.
     pub input: bool,
+    /// `workers: ["spawn"]` — construct Web Workers: off-thread reduced-op compute
+    /// realms with a message-only bridge (no network, file, or smudgy ops inside them).
+    pub workers: bool,
 }
 
 impl SmudgyCapabilities {
@@ -1074,6 +1077,7 @@ impl SmudgyCapabilities {
             panes: true,
             gmcp_send: true,
             input: true,
+            workers: true,
         }
     }
 
@@ -1104,6 +1108,7 @@ impl SmudgyCapabilities {
         self.panes |= other.panes;
         self.gmcp_send |= other.gmcp_send;
         self.input |= other.input;
+        self.workers |= other.workers;
     }
 
     /// Whether `self` requests **nothing beyond** `ceiling` — every capability `self` wants is also
@@ -1131,6 +1136,7 @@ impl SmudgyCapabilities {
             && (!self.panes || ceiling.panes)
             && (!self.gmcp_send || ceiling.gmcp_send)
             && (!self.input || ceiling.input)
+            && (!self.workers || ceiling.workers)
     }
 
     /// The capabilities requested by `self` (a newly-resolved closure union) but **not** by
@@ -1156,6 +1162,7 @@ impl SmudgyCapabilities {
             panes: self.panes && !baseline.panes,
             gmcp_send: self.gmcp_send && !baseline.gmcp_send,
             input: self.input && !baseline.input,
+            workers: self.workers && !baseline.workers,
         }
     }
 }
@@ -1184,6 +1191,8 @@ struct SmudgyCapabilitiesWire {
     gmcp: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     input: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workers: Vec<String>,
 }
 
 /// Whether `tokens` contains `tok` (trimmed, case-insensitive — manifest authors shouldn't be
@@ -1213,6 +1222,7 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             panes: has_token(&wire.panes, "create"),
             gmcp_send: has_token(&wire.gmcp, "send"),
             input: has_token(&wire.input, "access"),
+            workers: has_token(&wire.workers, "spawn"),
         }
     }
 }
@@ -1276,6 +1286,10 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         if caps.input {
             input.push("access".to_string());
         }
+        let mut workers = Vec::new();
+        if caps.workers {
+            workers.push("spawn".to_string());
+        }
         Self {
             automations,
             session,
@@ -1286,6 +1300,7 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
             panes,
             gmcp,
             input,
+            workers,
         }
     }
 }
@@ -4732,6 +4747,26 @@ mod tests {
         let none = SmudgyCapabilities::default();
         assert!(!caps.is_within(&none));
         assert!(caps.added_since(&none).input);
+        assert!(caps.is_within(&SmudgyCapabilities::all()));
+    }
+
+    #[test]
+    fn smudgy_workers_tokens_parse_and_round_trip() {
+        let caps = perms_with_smudgy(r#"{ "workers": ["spawn"] }"#).smudgy;
+        assert!(caps.workers);
+        assert!(
+            !caps.send && !caps.echo && !caps.interop_broadcast,
+            "workers rides with no other grant"
+        );
+        let json = serde_json::to_string(&caps).expect("serialize");
+        assert!(json.contains(r#""workers""#), "{json}");
+        assert!(json.contains(r#""spawn""#), "{json}");
+        let back: SmudgyCapabilities = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, caps, "workers tokens round-trip");
+        // Containment: a workers ask needs a workers grant.
+        let none = SmudgyCapabilities::default();
+        assert!(!caps.is_within(&none));
+        assert!(caps.added_since(&none).workers);
         assert!(caps.is_within(&SmudgyCapabilities::all()));
     }
 

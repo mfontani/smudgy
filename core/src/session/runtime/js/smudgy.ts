@@ -165,6 +165,8 @@ const {
     op_smudgy_interop_declare,
     op_smudgy_broadcast_allowed,
     op_smudgy_workers_allowed,
+    op_smudgy_worker_count,
+    op_smudgy_worker_cap,
 } = __smudgy_ops as any;
 
 if (!op_smudgy_broadcast_allowed()) {
@@ -193,8 +195,29 @@ if (!op_smudgy_workers_allowed()) {
         value: class Worker {
             constructor(_specifier: string | URL, _options?: unknown) {
                 throw new TypeError(
-                    "smudgy: Worker is not available in this isolate (sandboxed packages cannot spawn workers yet)",
+                    "smudgy: this package did not request the 'workers:spawn' capability",
                 );
+            }
+        },
+    });
+} else {
+    // The per-isolate live-worker cap. The count is the worker-host ops' own
+    // table of live handles (terminate/exit removes an entry), so the ceiling
+    // tracks actual liveness, not construction history.
+    const RealWorker = (globalThis as any).Worker;
+    Object.defineProperty(globalThis, "Worker", {
+        configurable: true,
+        writable: true,
+        value: class Worker extends RealWorker {
+            constructor(...args: unknown[]) {
+                if (op_smudgy_worker_count() >= op_smudgy_worker_cap()) {
+                    throw new Error(
+                        "smudgy: live-worker limit reached (" +
+                            op_smudgy_worker_cap() +
+                            " per isolate); terminate one before spawning another",
+                    );
+                }
+                super(...args);
             }
         },
     });

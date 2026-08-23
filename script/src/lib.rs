@@ -36,6 +36,9 @@ use deno_runtime::deno_inspector_server::{
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
 pub use deno_web::InMemoryBroadcastChannel;
+// Re-exported so the host can read an isolate's live worker count out of `OpState`
+// (the worker-host ops keep their handles here) without depending on `deno_runtime`.
+pub use deno_runtime::ops::worker_host::WorkersTable;
 use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
 
