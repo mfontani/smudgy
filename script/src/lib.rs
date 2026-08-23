@@ -450,7 +450,10 @@ impl ScriptRuntime {
         // it is unused and must not be sniffed here.
         worker_options.bootstrap.has_node_modules_dir = false;
         if options.workers == WorkerMode::ComputeOnly {
-            worker_options.create_web_worker_cb = web_workers::create_web_worker_callback();
+            // Workers must boot the same snapshot blob as this (parent) runtime:
+            // V8's shared heap is process-global and blob-verified per isolate.
+            worker_options.create_web_worker_cb =
+                web_workers::create_web_worker_callback(initialize_web_audio);
         }
         worker_options.bootstrap.inspect = inspector_server.is_some();
         worker_options.should_break_on_first_statement = false;

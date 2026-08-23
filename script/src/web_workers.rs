@@ -99,10 +99,16 @@ const DENIED_WORKER_REALM_OPS: &[&str] = &[
     "op_set_raw",
     "op_console_size",
     "op_read_line_prompt",
+    // deno_audio (registered in audio-snapshot workers purely for blob
+    // compatibility — see create_compute_worker; workers get no audio).
+    "op_decode_audio_data",
+    "op_offline_start_rendering",
+    "op_online_wait_events",
     // Nested workers: a worker may not construct workers in v1.
     "op_create_worker",
 ];
 const DENIED_WORKER_REALM_OP_PREFIXES: &[&str] = &[
+    "op_phase0_",
     "op_net_",
     "op_tls_",
     "op_ws_",
@@ -296,12 +302,22 @@ impl ModuleLoader for WorkerModuleLoader {
 /// thread**, inside the current-thread tokio runtime deno_runtime creates for
 /// it, to construct the worker realm. Everything here is built fresh on that
 /// thread; nothing session-bound (and nothing `!Send`) is captured.
-pub(crate) fn create_web_worker_callback() -> Arc<CreateWebWorkerCb> {
-    Arc::new(|args: CreateWebWorkerArgs| create_compute_worker(args))
+///
+/// `web_audio` records which snapshot the PARENT runtime booted. V8's shared
+/// heap (string table included) is process-global: the first live isolate's
+/// blob initializes it and every later `Isolate::New` verifies against it, so
+/// a worker booting a different blob than its concurrently-live parent is a
+/// fatal `Check failed: index < size()` inside snapshot deserialization. The
+/// worker therefore always boots the parent's snapshot; on the audio blob it
+/// registers a matching state-free deno_audio extension (options-default,
+/// exactly like the snapshot build) whose ops the realm guard disables.
+pub(crate) fn create_web_worker_callback(web_audio: bool) -> Arc<CreateWebWorkerCb> {
+    Arc::new(move |args: CreateWebWorkerArgs| create_compute_worker(args, web_audio))
 }
 
 fn create_compute_worker(
     args: CreateWebWorkerArgs,
+    web_audio: bool,
 ) -> (WebWorker, deno_runtime::web_worker::SendableWebWorkerHandle) {
     let parser = Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
     // No authority, not inherited authority: the spawning isolate's forwarded
@@ -327,18 +343,54 @@ fn create_compute_worker(
         bundle_provider: None,
     };
 
+    #[cfg(feature = "web-audio")]
+    let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = if web_audio {
+        (
+            crate::WEB_AUDIO_STARTUP_SNAPSHOT,
+            crate::RESIDUAL_LAZY_AUDIO_JS_SOURCES,
+            crate::RESIDUAL_LAZY_AUDIO_ESM_SOURCES,
+        )
+    } else {
+        (
+            crate::STARTUP_SNAPSHOT,
+            crate::RESIDUAL_LAZY_JS_SOURCES,
+            crate::RESIDUAL_LAZY_ESM_SOURCES,
+        )
+    };
+    #[cfg(not(feature = "web-audio"))]
+    let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = {
+        debug_assert!(!web_audio, "audio-snapshot parents require the web-audio feature");
+        (
+            crate::STARTUP_SNAPSHOT,
+            crate::RESIDUAL_LAZY_JS_SOURCES,
+            crate::RESIDUAL_LAZY_ESM_SOURCES,
+        )
+    };
+
+    // On the audio blob the snapshot's frozen extension prefix ends with
+    // deno_audio, so the worker registers a matching instance first — deferred
+    // ESM never imported (no bootstrap side-module runs in workers), ops
+    // disabled by the realm guard, default (state-free) options exactly like
+    // the snapshot build's instance.
+    let mut extensions = Vec::new();
+    #[cfg(feature = "web-audio")]
+    if web_audio {
+        let mut audio =
+            deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
+        crate::prepare_deferred_web_audio_extension(&mut audio);
+        extensions.push(audio);
+    }
+    extensions.push(worker_realm_guard_extension());
+
     let mut options = WebWorkerOptions {
         name: args.name,
         main_module: args.main_module.clone(),
         worker_id: args.worker_id,
         bootstrap: Default::default(),
-        extensions: vec![worker_realm_guard_extension()],
-        // Workers always boot the base snapshot: they carry no smudgy or
-        // deno_audio extension, so the audio snapshot's frozen prefix would
-        // not match.
-        startup_snapshot: Some(crate::STARTUP_SNAPSHOT),
-        residual_lazy_js_sources: crate::RESIDUAL_LAZY_JS_SOURCES,
-        residual_lazy_esm_sources: crate::RESIDUAL_LAZY_ESM_SOURCES,
+        extensions,
+        startup_snapshot: Some(startup_snapshot),
+        residual_lazy_js_sources,
+        residual_lazy_esm_sources,
         unsafely_ignore_certificate_errors: None,
         create_params: None,
         seed: None,

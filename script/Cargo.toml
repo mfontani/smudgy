@@ -58,6 +58,14 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+# Runtime construction of the deferred deno_audio extension for WORKER realms
+# whose parent booted the audio snapshot: every concurrently-live isolate in a
+# process must boot the same snapshot blob (V8's shared heap — string table
+# included — is initialized by the first isolate and verified by every later
+# one; a mismatched blob is a fatal `index < size()` check). The worker's
+# instance uses `AudioExtensionOptions::default()` exactly like the snapshot
+# build; its ops are disabled by the worker realm guard.
+deno_audio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
