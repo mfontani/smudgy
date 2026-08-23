@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 use deno_core::error::ModuleLoaderError;
 use deno_core::{
     Extension, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ResolutionKind,
+    ModuleSource, ModuleSourceCode, ModuleSpecifier, OpMiddlewareContext, ResolutionKind,
 };
 use deno_error::JsErrorBox;
 use deno_fs::RealFs;
@@ -44,9 +44,9 @@ use crate::transpiler::transpile;
 
 /// Whether an isolate may construct Web `Worker`s, and in what shape.
 ///
-/// This is per-isolate policy chosen by the isolate factory: the trusted main
-/// isolate gets `ComputeOnly`; a sandboxed package isolate gets `ComputeOnly`
-/// only with the consented `workers` capability, `Disabled` otherwise.
+/// This is per-isolate policy chosen by the isolate factory. Trusted and
+/// sandboxed parents deliberately remain distinct because loading a worker's
+/// source is embedder-owned authority, separate from the child's denied ops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkerMode {
     /// Worker-host ops are disabled: `new Worker(...)` (and the
@@ -54,9 +54,38 @@ pub enum WorkerMode {
     /// spawn and no panic.
     #[default]
     Disabled,
-    /// Workers are reduced-op compute realms with a message-only bridge.
-    ComputeOnly,
+    /// Trusted user/local code may load local worker modules as well as inline
+    /// and snapshotted package sources.
+    TrustedComputeOnly,
+    /// A consented sandbox package may load only inline and immutable
+    /// `smudgy-pkg:` closure sources, never ambient host files.
+    SandboxedComputeOnly,
 }
+
+impl WorkerMode {
+    #[must_use]
+    pub(crate) fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    #[must_use]
+    fn allows_file_modules(self) -> bool {
+        matches!(self, Self::TrustedComputeOnly)
+    }
+
+    #[must_use]
+    pub(crate) fn max_live_workers(self, requested: Option<usize>) -> usize {
+        if self.enabled() {
+            requested.unwrap_or(WORKER_CAP).min(WORKER_CAP)
+        } else {
+            0
+        }
+    }
+}
+
+/// Per-parent live-worker ceiling, enforced natively by deno_runtime before
+/// `op_create_worker` detaches transferables or spawns an OS thread.
+pub(crate) const WORKER_CAP: usize = 128;
 
 /// Worker-host ops disabled in isolates whose [`WorkerMode`] is `Disabled`.
 ///
@@ -67,90 +96,162 @@ pub enum WorkerMode {
 const DENIED_WORKER_HOST_OPS: &[&str] = &["op_create_worker"];
 const DENIED_WORKER_HOST_OP_PREFIXES: &[&str] = &["op_host_", "op_node_worker_thread_"];
 
-/// Op families absent from a worker realm (`ComputeOnly` reduction).
-///
-/// Deny-by-family over op names, applied at registration via extension
-/// middleware, so the authority is absent from the realm rather than gated
-/// behind a permission check. Kept: core, webidl, web (timers, streams,
-/// encoding, structured clone, MessagePort, events, abort, blobs), crypto,
-/// the worker's own bridge ops (`op_worker_*`, minus its classic-worker sync
-/// fetch), bootstrap/runtime plumbing, and permission-query ops (which report
-/// against the none-permissions container).
-const DENIED_WORKER_REALM_OPS: &[&str] = &[
-    // Classic-worker `importScripts` support performs network/file I/O.
-    "op_worker_sync_fetch",
-    // deno_os one-offs without a shared prefix.
-    "op_delete_env",
-    "op_env",
-    "op_exec_path",
-    "op_exit",
-    "op_get_env",
-    "op_get_env_no_permission_check",
-    "op_gid",
-    "op_hostname",
-    "op_loadavg",
-    "op_network_interfaces",
-    "op_runtime_cpu_usage",
-    "op_runtime_memory_usage",
-    "op_set_env",
-    "op_set_exit_code",
-    "op_system_memory_info",
-    "op_uid",
-    // deno_tty (registered by deno_runtime).
-    "op_set_raw",
-    "op_console_size",
-    "op_read_line_prompt",
-    // deno_audio (registered in audio-snapshot workers purely for blob
-    // compatibility — see create_compute_worker; workers get no audio).
-    "op_decode_audio_data",
-    "op_offline_start_rendering",
-    "op_online_wait_events",
-    // Nested workers: a worker may not construct workers in v1.
-    "op_create_worker",
-];
-const DENIED_WORKER_REALM_OP_PREFIXES: &[&str] = &[
-    "op_phase0_",
-    "op_net_",
-    "op_tls_",
-    "op_ws_",
-    "op_http_",
-    "op_fetch",
-    "op_fs_",
-    "op_ffi_",
-    "op_napi_",
-    "op_spawn_",
-    "op_kv_",
-    "op_cron_",
-    "op_webgpu_",
-    "op_image_",
-    "op_canvas_",
-    "op_cache_",
-    "op_webstorage_",
-    "op_node_",
-    "op_require_",
-    "op_bundle_",
-    "op_desktop_",
-    "op_os_",
-    "op_host_",
+/// Process-wide controls are never appropriate for an embedded script realm,
+/// including the trusted main realm: a script error must not terminate or
+/// install signal handlers on the Smudgy host process.
+const DENIED_EMBEDDED_PROCESS_OPS: &[&str] = &["op_exit", "op_kill", "op_set_exit_code"];
+const DENIED_EMBEDDED_PROCESS_OP_PREFIXES: &[&str] = &["op_signal_"];
+
+/// Core V8/runtime plumbing needed by the web/crypto compute surface. This is
+/// an allowlist, not a denylist: generic resource I/O (`op_read`, `op_write`,
+/// `op_close`), process stdout (`op_print`), resource enumeration, and the
+/// intentional Rust panic op are absent.
+const ALLOWED_WORKER_CORE_OPS: &[&str] = &[
+    "op_wasm_streaming_feed",
+    "op_wasm_streaming_set_url",
+    "op_str_byte_length",
+    "op_cancel_handle",
+    "op_encode_binary_string",
+    "op_import_sync",
+    "op_import_sync_with_source",
+    "op_is_any_array_buffer",
+    "op_is_arguments_object",
+    "op_is_array_buffer",
+    "op_is_array_buffer_view",
+    "op_is_async_function",
+    "op_is_big_int_object",
+    "op_is_boolean_object",
+    "op_is_boxed_primitive",
+    "op_is_data_view",
+    "op_is_date",
+    "op_is_generator_function",
+    "op_is_generator_object",
+    "op_is_map",
+    "op_is_map_iterator",
+    "op_is_module_namespace_object",
+    "op_is_native_error",
+    "op_is_number_object",
+    "op_is_promise",
+    "op_is_proxy",
+    "op_is_reg_exp",
+    "op_is_set",
+    "op_is_set_iterator",
+    "op_is_shared_array_buffer",
+    "op_is_string_object",
+    "op_is_symbol_object",
+    "op_is_typed_array",
+    "op_is_weak_map",
+    "op_is_weak_set",
+    "op_add_main_module_handler",
+    "op_set_handled_promise_rejection_handler",
+    "op_timer_schedule",
+    "op_timer_track",
+    "op_timer_untrack",
+    "op_timer_now",
+    "op_ref_op",
+    "op_unref_op",
+    "op_lazy_load_esm",
+    "op_load_ext_script",
+    "op_set_captured_bootstrap",
+    "op_run_microtasks",
+    "op_drain_pending_rejections",
+    "op_compile_function",
+    "op_eval_context",
+    "op_encode",
+    "op_decode",
+    "op_serialize",
+    "op_deserialize",
+    "op_structured_clone",
+    "op_set_promise_hooks",
+    "op_get_promise_details",
+    "op_get_proxy_details",
+    "op_get_non_index_property_names",
+    "op_get_constructor_name",
+    "op_get_extras_binding_object",
+    "op_memory_usage",
+    "op_set_wasm_streaming_callback",
+    "op_abort_wasm_streaming",
+    "op_destructure_error",
+    "op_dispatch_exception",
+    "op_op_names",
+    "op_current_user_call_site",
+    "op_set_format_exception_callback",
+    "op_event_loop_has_more_work",
+    "op_immediate_check",
+    "op_leak_tracing_enable",
+    "op_leak_tracing_submit",
+    "op_leak_tracing_get_all",
+    "op_leak_tracing_get",
+    "op_get_ext_import_meta_proto",
 ];
 
-/// Authority-free ops exempted from the realm deny prefixes. Web-platform
-/// paths lazily load deno_node internals inside a worker — `setInterval`
-/// pulls in async_hooks → errors → uv → os, whose module scope calls
-/// `op_node_build_os` — so the inert constants those module scopes need stay
-/// enabled. Every entry here must be a pure constant/compute op; anything
-/// that touches the system belongs in the deny list.
-const WORKER_REALM_OP_EXCEPTIONS: &[&str] = &[
+const ALLOWED_WORKER_RUNTIME_OPS: &[&str] = &["op_main_module"];
+const ALLOWED_WORKER_PERMISSION_OPS: &[&str] = &[
+    "op_query_permission",
+    "op_revoke_permission",
+    "op_request_permission",
+];
+const ALLOWED_WORKER_BOOTSTRAP_OPS: &[&str] = &[
+    "op_bootstrap_args",
+    "op_bootstrap_pid",
+    "op_bootstrap_numcpus",
+    "op_bootstrap_user_agent",
+    "op_bootstrap_language",
+    "op_bootstrap_log_level",
+    "op_bootstrap_color_depth",
+    "op_bootstrap_no_color",
+    "op_bootstrap_stdout_no_color",
+    "op_bootstrap_stderr_no_color",
+    "op_bootstrap_unstable_args",
+    "op_bootstrap_is_from_unconfigured_runtime",
+    "op_proto_set_attempted",
+    "op_proto_get_attempted",
+    "op_snapshot_options",
+];
+const ALLOWED_WORKER_BRIDGE_OPS: &[&str] = &[
+    "op_worker_post_message",
+    "op_worker_post_message_raw",
+    "op_worker_recv_message",
+    "op_worker_recv_message_sync",
+    "op_worker_maybe_wait_for_debugger",
+    "op_worker_close",
+    "op_worker_get_type",
+];
+
+/// Pure constants needed when web-platform modules lazily initialize a small
+/// part of deno_node. Native object methods from deno_node remain disabled.
+const ALLOWED_WORKER_NODE_OPS: &[&str] = &[
     "op_node_build_os",
     "op_node_fs_constants",
     "op_node_new_async_id",
 ];
 
 fn is_denied(name: &str, exact: &[&str], prefixes: &[&str]) -> bool {
-    if WORKER_REALM_OP_EXCEPTIONS.contains(&name) {
-        return false;
-    }
     exact.contains(&name) || prefixes.iter().any(|prefix| name.starts_with(prefix))
+}
+
+fn is_worker_realm_op_allowed(context: OpMiddlewareContext, name: &str) -> bool {
+    // Native object names are not globally unique (`open`, `close`, and
+    // `constructor` occur across safe and authority-bearing APIs). Provenance
+    // comes from deno_core's context-aware middleware hook.
+    if context.method_kind.is_some() {
+        return matches!(context.extension_name, "deno_web" | "deno_crypto");
+    }
+
+    match context.extension_name {
+        "deno_core" => ALLOWED_WORKER_CORE_OPS.contains(&name),
+        // These extensions are the intentionally retained Web Platform
+        // compute surface. Their backends are per-worker/in-memory.
+        "deno_web" | "deno_crypto" => true,
+        "deno_runtime" => ALLOWED_WORKER_RUNTIME_OPS.contains(&name),
+        "deno_permissions" => ALLOWED_WORKER_PERMISSION_OPS.contains(&name),
+        "deno_bootstrap" => ALLOWED_WORKER_BOOTSTRAP_OPS.contains(&name),
+        "deno_web_worker" => ALLOWED_WORKER_BRIDGE_OPS.contains(&name),
+        "deno_node" => ALLOWED_WORKER_NODE_OPS.contains(&name),
+        // Every unrecognized extension/op is disabled, including future Deno
+        // additions until they receive an explicit security review.
+        _ => false,
+    }
 }
 
 /// Middleware-only extension for isolates whose [`WorkerMode`] is `Disabled`:
@@ -174,20 +275,38 @@ pub fn worker_host_denied_extension() -> Extension {
     }
 }
 
-/// Middleware-only extension appended to every worker realm: the op-surface
-/// reduction described on [`DENIED_WORKER_REALM_OPS`].
-fn worker_realm_guard_extension() -> Extension {
+/// Baseline process-integrity guard for every embedded Smudgy runtime. This is
+/// separate from filesystem/network permissions because `op_kill` explicitly
+/// permits killing the current process without a run grant in upstream Deno.
+pub(crate) fn embedded_process_guard_extension() -> Extension {
     Extension {
-        name: "smudgy_worker_realm_guard",
+        name: "smudgy_embedded_process_guard",
         middleware_fn: Some(Box::new(|op| {
             if is_denied(
                 op.name,
-                DENIED_WORKER_REALM_OPS,
-                DENIED_WORKER_REALM_OP_PREFIXES,
+                DENIED_EMBEDDED_PROCESS_OPS,
+                DENIED_EMBEDDED_PROCESS_OP_PREFIXES,
             ) {
                 op.disable()
             } else {
                 op
+            }
+        })),
+        ..Default::default()
+    }
+}
+
+/// Middleware-only extension appended to every worker realm: a fail-closed,
+/// provenance-aware op allowlist covering regular ops and native object
+/// constructors/methods/static methods.
+fn worker_realm_guard_extension() -> Extension {
+    Extension {
+        name: "smudgy_worker_realm_guard",
+        context_middleware_fn: Some(Box::new(|context, op| {
+            if is_worker_realm_op_allowed(context, op.name) {
+                op
+            } else {
+                op.disable()
             }
         })),
         ..Default::default()
@@ -206,6 +325,7 @@ pub(crate) type WorkerModuleSourceChannel = Arc<OnceLock<HashMap<String, String>
 /// `blob:` workers are not supported in v1.
 struct WorkerModuleLoader {
     package_sources: WorkerModuleSourceChannel,
+    allow_file_modules: bool,
 }
 
 fn percent_decode(input: &str) -> String {
@@ -240,7 +360,27 @@ fn loader_error(message: String) -> ModuleLoaderError {
 }
 
 impl WorkerModuleLoader {
+    fn ensure_scheme_allowed(&self, specifier: &ModuleSpecifier) -> Result<(), ModuleLoaderError> {
+        if specifier.scheme() == "file" {
+            if !self.allow_file_modules {
+                return Err(loader_error(format!(
+                    "sandboxed worker modules may not load host files: {specifier}"
+                )));
+            }
+            if specifier
+                .host_str()
+                .is_some_and(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost"))
+            {
+                return Err(loader_error(format!(
+                    "non-local file worker modules are not supported: {specifier}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn load_source(&self, specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
+        self.ensure_scheme_allowed(specifier)?;
         let source = match specifier.scheme() {
             "file" => {
                 let path = specifier
@@ -302,7 +442,10 @@ impl ModuleLoader for WorkerModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        deno_core::resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
+        let resolved =
+            deno_core::resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)?;
+        self.ensure_scheme_allowed(&resolved)?;
+        Ok(resolved)
     }
 
     fn load(
@@ -331,9 +474,11 @@ impl ModuleLoader for WorkerModuleLoader {
 pub(crate) fn create_web_worker_callback(
     web_audio: bool,
     package_sources: WorkerModuleSourceChannel,
+    mode: WorkerMode,
 ) -> Arc<CreateWebWorkerCb> {
+    debug_assert!(mode.enabled());
     Arc::new(move |args: CreateWebWorkerArgs| {
-        create_compute_worker(args, web_audio, Arc::clone(&package_sources))
+        create_compute_worker(args, web_audio, Arc::clone(&package_sources), mode)
     })
 }
 
@@ -341,6 +486,7 @@ fn create_compute_worker(
     args: CreateWebWorkerArgs,
     web_audio: bool,
     package_sources: WorkerModuleSourceChannel,
+    mode: WorkerMode,
 ) -> (WebWorker, deno_runtime::web_worker::SendableWebWorkerHandle) {
     let parser = Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
     // No authority, not inherited authority: the spawning isolate's forwarded
@@ -358,7 +504,10 @@ fn create_compute_worker(
             feature_checker: crate::quiet_feature_checker(),
             fs: Arc::new(RealFs),
             main_inspector_session_tx: MainInspectorSessionChannel::new(),
-            module_loader: Rc::new(WorkerModuleLoader { package_sources }),
+            module_loader: Rc::new(WorkerModuleLoader {
+                package_sources,
+                allow_file_modules: mode.allows_file_modules(),
+            }),
             node_services: None,
             npm_process_state_provider: None,
             permissions,
@@ -429,6 +578,7 @@ fn create_compute_worker(
             unreachable!("op_create_worker is disabled inside smudgy worker realms")
         }),
         format_js_error_fn: None,
+        max_live_workers: Some(0),
         worker_type: args.worker_type,
         cache_storage_dir: None,
         stdio: Default::default(),
@@ -447,4 +597,26 @@ fn create_compute_worker(
     options.bootstrap.has_node_modules_dir = false;
 
     WebWorker::bootstrap_from_options(services, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_and_unc_file_urls_are_rejected_before_path_conversion() {
+        let sandboxed = WorkerModuleLoader {
+            package_sources: Arc::new(OnceLock::new()),
+            allow_file_modules: false,
+        };
+        let local = ModuleSpecifier::parse("file:///host/secret.json").unwrap();
+        assert!(sandboxed.ensure_scheme_allowed(&local).is_err());
+
+        let trusted = WorkerModuleLoader {
+            package_sources: Arc::new(OnceLock::new()),
+            allow_file_modules: true,
+        };
+        let unc = ModuleSpecifier::parse("file://unreachable.invalid/share/worker.js").unwrap();
+        assert!(trusted.ensure_scheme_allowed(&unc).is_err());
+    }
 }

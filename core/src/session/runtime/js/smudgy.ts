@@ -165,8 +165,6 @@ const {
     op_smudgy_interop_declare,
     op_smudgy_broadcast_allowed,
     op_smudgy_workers_allowed,
-    op_smudgy_worker_count,
-    op_smudgy_worker_cap,
 } = __smudgy_ops as any;
 
 if (!op_smudgy_broadcast_allowed()) {
@@ -231,22 +229,15 @@ if (!op_smudgy_workers_allowed()) {
         return specifier;
     };
 
-    // The per-isolate live-worker cap. The count is the worker-host ops' own
-    // table of live handles (terminate/exit removes an entry), so the ceiling
-    // tracks actual liveness, not construction history.
+    // This wrapper only resolves relative specifiers. The live-worker ceiling
+    // is enforced inside deno_runtime's native op_create_worker path, which
+    // also covers this class's exposed superclass and node:worker_threads.
     const RealWorker = (globalThis as any).Worker;
     Object.defineProperty(globalThis, "Worker", {
         configurable: true,
         writable: true,
         value: class Worker extends RealWorker {
             constructor(...args: unknown[]) {
-                if (op_smudgy_worker_count() >= op_smudgy_worker_cap()) {
-                    throw new Error(
-                        "smudgy: live-worker limit reached (" +
-                            op_smudgy_worker_cap() +
-                            " per isolate); terminate one before spawning another",
-                    );
-                }
                 if (args.length > 0) {
                     args[0] = resolveWorkerSpecifier(args[0]);
                 }

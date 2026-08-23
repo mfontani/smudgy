@@ -2,7 +2,7 @@
 //!
 //! Workers run on their own OS threads inside deno_runtime's worker host, so
 //! these tests exercise real cross-thread construction, messaging, reduction,
-//! and termination against `WorkerMode::ComputeOnly`, plus the `Disabled`
+//! and termination against `WorkerMode::TrustedComputeOnly`, plus the `Disabled`
 //! denial path (which must be a catchable error, never a panic or thread
 //! spawn — deno_runtime's default callback panics a fresh thread per call).
 
@@ -11,7 +11,10 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use deno_core::{FastString, PollEventLoopOptions, serde_v8};
-use smudgy_script::{ImportPolicy, ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode};
+use smudgy_script::{
+    ImportPolicy, ModulePolicy, Permissions, PermissionsContainer, ScriptRuntime,
+    ScriptRuntimeOptions, WorkerMode, permission_descriptor_parser,
+};
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
     Rc::new(
@@ -46,6 +49,15 @@ fn script_runtime(
     data_dir: &Path,
     workers: WorkerMode,
 ) -> Result<(Rc<tokio::runtime::Runtime>, ScriptRuntime)> {
+    script_runtime_with(data_dir, workers, None, None)
+}
+
+fn script_runtime_with(
+    data_dir: &Path,
+    workers: WorkerMode,
+    permissions: Option<PermissionsContainer>,
+    max_live_workers_override: Option<usize>,
+) -> Result<(Rc<tokio::runtime::Runtime>, ScriptRuntime)> {
     let tokio = tokio_runtime();
     let runtime = ScriptRuntime::new(ScriptRuntimeOptions {
         extensions: Vec::new(),
@@ -58,9 +70,10 @@ fn script_runtime(
         inspector: None,
         tokio: tokio.clone(),
         package_provider: None,
-        permissions: None,
+        permissions,
         broadcast_channel: None,
         workers,
+        max_live_workers_override,
     })?;
     Ok((tokio, runtime))
 }
@@ -121,7 +134,7 @@ fn first_message_source(worker_body: &str, post: &str) -> String {
 #[test]
 fn worker_echo_round_trip() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let source = first_message_source(
         "onmessage = (e) => { postMessage(e.data * 2); };",
         "worker.postMessage(21);",
@@ -143,7 +156,7 @@ fn worker_file_module_transpiles_typescript() -> Result<()> {
     )?;
     let module_url = deno_core::url::Url::from_file_path(&module_path)
         .expect("temp path converts to a file URL");
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let source = format!(
         r#"(async () => {{
             const worker = new Worker({:?}, {{ type: "module" }});
@@ -168,6 +181,58 @@ fn worker_file_module_transpiles_typescript() -> Result<()> {
     Ok(())
 }
 
+/// Sandboxed package workers may execute inline or snapshotted package code,
+/// but a `file:` import is embedder I/O and must be rejected before touching
+/// the filesystem, even for JSON modules that can be posted to the parent.
+#[test]
+fn sandboxed_worker_cannot_import_host_json() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let secret_path = temp.path().join("secret.json");
+    std::fs::write(&secret_path, r#"{"token":"TOP-SECRET"}"#)?;
+    let secret_url = deno_core::url::Url::from_file_path(&secret_path)
+        .expect("temp path converts to a file URL");
+    let permissions = PermissionsContainer::new(
+        permission_descriptor_parser(),
+        Permissions::none_without_prompt(),
+    );
+    let (tokio, mut rt) = script_runtime_with(
+        temp.path(),
+        WorkerMode::SandboxedComputeOnly,
+        Some(permissions),
+        None,
+    )?;
+    let worker_body = format!(
+        r#"import secret from {:?} with {{ type: "json" }};
+            postMessage(secret.token);"#,
+        secret_url.as_str(),
+    );
+    let source = format!(
+        r#"(async () => {{
+            const worker = new Worker(
+                "data:text/javascript," + encodeURIComponent({worker_body:?}),
+                {{ type: "module" }},
+            );
+            try {{
+                return await new Promise((resolve) => {{
+                    worker.onmessage = () => resolve(false);
+                    worker.onerror = (e) => {{
+                        e.preventDefault();
+                        resolve(String(e.message).includes("may not load host files"));
+                    }};
+                    setTimeout(() => resolve(false), 15000);
+                }});
+            }} finally {{
+                worker.terminate();
+            }}
+        }})()"#,
+    );
+    assert!(
+        eval_async_bool(&tokio, &mut rt, &source)?,
+        "a sandbox worker must not read an ambient file module"
+    );
+    Ok(())
+}
+
 /// The reduced realm: fetch, fs, env/os, and nested worker construction are
 /// absent (disabled at op registration), while pure-compute web platform
 /// pieces — structuredClone and crypto — work. The worker probes its own
@@ -175,7 +240,7 @@ fn worker_file_module_transpiles_typescript() -> Result<()> {
 #[test]
 fn worker_realm_is_reduced_to_compute() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let worker_body = r#"
         onmessage = async () => {
             const denied = async (fn) => {
@@ -185,6 +250,17 @@ fn worker_realm_is_reduced_to_compute() -> Result<()> {
                 fetchDenied: await denied(() => fetch("https://example.invalid/")),
                 fsDenied: await denied(() => Deno.readTextFile("does-not-matter.txt")),
                 envDenied: await denied(() => Deno.env.get("PATH")),
+                killDenied: await denied(() => Deno.kill(Deno.pid, 0)),
+                signalDenied: await denied(() => {
+                    Deno.addSignalListener("SIGINT", () => {});
+                }),
+                sqliteDenied: await denied(async () => {
+                    const { DatabaseSync } = await import("node:sqlite");
+                    new DatabaseSync(":memory:");
+                }),
+                coreReadDenied: await denied(() => {
+                    Deno.core.ops.op_read(0, new Uint8Array(1));
+                }),
                 nestedWorkerDenied: await denied(() => {
                     new Worker("data:text/javascript,", { type: "module" });
                 }),
@@ -200,6 +276,7 @@ fn worker_realm_is_reduced_to_compute() -> Result<()> {
         &mut rt,
         &format!(
             "{source}.then((p) => p.fetchDenied && p.fsDenied && p.envDenied \
+             && p.killDenied && p.signalDenied && p.sqliteDenied && p.coreReadDenied \
              && p.nestedWorkerDenied && p.structuredCloneWorks && p.cryptoWorks)"
         ),
     )?;
@@ -212,7 +289,7 @@ fn worker_realm_is_reduced_to_compute() -> Result<()> {
 #[test]
 fn worker_terminate_settles() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let source = r#"(async () => {
         const worker = new Worker(
             "data:text/javascript," +
@@ -256,12 +333,60 @@ fn disabled_mode_makes_worker_a_catchable_error() -> Result<()> {
     Ok(())
 }
 
+/// The quota is checked inside native `op_create_worker`, before transferables
+/// or an OS thread are created. Both Web Worker and node:worker_threads reach
+/// that same choke point; this uses a zero test ceiling rather than allocating
+/// hundreds of V8 isolates.
+#[test]
+fn native_worker_quota_covers_web_and_node_workers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut rt) =
+        script_runtime_with(temp.path(), WorkerMode::TrustedComputeOnly, None, Some(0))?;
+    let source = r#"(async () => {
+        const quotaError = (fn) => {
+            try { fn(); return false; }
+            catch (e) { return e instanceof DOMException && e.name === "QuotaExceededError"; }
+        };
+        const webDenied = quotaError(() => {
+            new Worker("data:text/javascript,", { type: "module" });
+        });
+        const { Worker: NodeWorker } = await import("node:worker_threads");
+        const nodeDenied = quotaError(() => {
+            new NodeWorker("", { eval: true });
+        });
+        return webDenied && nodeDenied;
+    })()"#;
+    assert!(
+        eval_async_bool(&tokio, &mut rt, source)?,
+        "the native quota must cover both worker constructors"
+    );
+    Ok(())
+}
+
+/// Process controls are disabled in every embedded parent realm, not only in
+/// child workers. Signal zero is a harmless existence probe if the guard ever
+/// regresses, so this test cannot terminate its own harness.
+#[test]
+fn embedded_parent_cannot_reach_process_kill() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::Disabled)?;
+    let source = r#"(async () => {
+        try { Deno.kill(Deno.pid, 0); return false; }
+        catch (e) { return String(e).includes("disabled"); }
+    })()"#;
+    assert!(
+        eval_async_bool(&tokio, &mut rt, source)?,
+        "the embedded parent must not control the Smudgy process"
+    );
+    Ok(())
+}
+
 /// A worker whose module throws at top level surfaces through the parent's
 /// `onerror` — contained, catchable, and the parent event loop settles.
 #[test]
 fn worker_top_level_error_reaches_onerror() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let source = r#"(async () => {
         const worker = new Worker(
             "data:text/javascript," +
@@ -292,7 +417,7 @@ fn worker_top_level_error_reaches_onerror() -> Result<()> {
 #[test]
 fn dropping_runtime_with_live_worker_is_clean() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     // The worker keeps itself busy indefinitely; the parent confirms it is
     // alive, then the whole runtime is dropped out from under it.
     let source = first_message_source(
@@ -334,7 +459,7 @@ fn dropping_runtime_with_live_worker_is_clean() -> Result<()> {
 #[test]
 fn repeated_worker_cycles_stay_isolated() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let source = r#"(async () => {
         for (let i = 0; i < 4; i++) {
             const worker = new Worker(
@@ -370,7 +495,7 @@ fn repeated_worker_cycles_stay_isolated() -> Result<()> {
 #[test]
 fn classic_workers_stay_rejected() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::ComputeOnly)?;
+    let (tokio, mut rt) = script_runtime(temp.path(), WorkerMode::TrustedComputeOnly)?;
     let source = r#"(async () => {
         try {
             new Worker("data:text/javascript,");

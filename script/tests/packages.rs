@@ -71,6 +71,7 @@ fn runtime_with_packages(
         permissions: None,
         broadcast_channel: None,
         workers: smudgy_script::WorkerMode::Disabled,
+        max_live_workers_override: None,
     })?;
     Ok((tokio, runtime))
 }

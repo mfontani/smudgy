@@ -33,7 +33,7 @@ use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
 use smudgy_cloud::{AreaId, Uuid, WidgetIsolate, WidgetsEnabled};
-use smudgy_script::{SmudgyCapabilities, WorkersTable};
+use smudgy_script::SmudgyCapabilities;
 
 deno_core::extension!(
   smudgy_ops,
@@ -169,8 +169,6 @@ deno_core::extension!(
     op_smudgy_data_dir,
     op_smudgy_broadcast_allowed,
     op_smudgy_workers_allowed,
-    op_smudgy_worker_count,
-    op_smudgy_worker_cap,
     ],
   esm_entry_point = "ext:smudgy_ops/smudgy.ts",
   esm = [ dir "src/session/runtime/js", "smudgy.ts" ],
@@ -285,7 +283,7 @@ deno_core::extension!(
     // same crate-DAG bridge as `WidgetsEnabled`. `trusted` for main; the consented grants +
     // own-package membership for a sandbox.
     image_policy: smudgy_cloud::image_source::ImageSourcePolicy,
-    // Whether this isolate's `ScriptRuntime` was built with `WorkerMode::ComputeOnly`.
+    // Whether this isolate's `ScriptRuntime` was built with an enabled worker mode.
     // Mirrored so `smudgy.ts` can shadow `Worker` with a clear TypeError in isolates
     // whose worker-host ops are disabled; the op middleware remains the enforcement.
     workers_enabled: bool,
@@ -1079,7 +1077,7 @@ fn op_smudgy_broadcast_allowed(state: &OpState) -> bool {
     grants(state).interop_broadcast
 }
 
-/// Whether this isolate may construct Web `Worker`s (`WorkerMode::ComputeOnly`):
+/// Whether this isolate may construct Web `Worker`s (an enabled `WorkerMode`):
 /// the trusted main isolate, or a sandboxed package holding the consented
 /// `workers` capability. Mirrors the isolate's `WorkerMode` — both derive from
 /// the same grant, so `smudgy.ts` can shadow `Worker` with a clear TypeError
@@ -1089,23 +1087,6 @@ pub(crate) struct WorkersEnabled(pub bool);
 #[op2(fast)]
 fn op_smudgy_workers_allowed(state: &OpState) -> bool {
     state.borrow::<WorkersEnabled>().0
-}
-
-/// Per-isolate live-worker ceiling, enforced by the `smudgy.ts` constructor wrap
-/// (the `Worker` shadow refuses to construct past it). Sized as a runaway
-/// backstop — each worker is an OS thread plus a V8 isolate — not as a working
-/// budget. The `node:worker_threads` path in the trusted main isolate is not
-/// cap-checked.
-pub(crate) const WORKER_CAP: u32 = 128;
-
-#[op2(fast)]
-fn op_smudgy_worker_count(state: &OpState) -> u32 {
-    state.borrow::<WorkersTable>().len() as u32
-}
-
-#[op2(fast)]
-fn op_smudgy_worker_cap() -> u32 {
-    WORKER_CAP
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

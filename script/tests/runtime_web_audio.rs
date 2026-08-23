@@ -49,6 +49,7 @@ fn audio_runtime(data_dir: &Path) -> Result<(Rc<tokio::runtime::Runtime>, Script
         permissions: None,
         broadcast_channel: None,
         workers: WorkerMode::Disabled,
+        max_live_workers_override: None,
     })?;
     Ok((tokio, runtime))
 }
