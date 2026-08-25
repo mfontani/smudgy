@@ -1126,7 +1126,7 @@ impl<'a> ScriptEngine<'a> {
                 let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
                     Rc::new(RefCell::new(Vec::new()));
                 // Must agree with the `WorkerMode` this isolate's runtime is built with
-                // below: main = ComputeOnly, sandboxes = ComputeOnly only with the
+                // below: main = TrustedComputeOnly, sandboxes = SandboxedComputeOnly only with the
                 // consented `workers` capability (mirrored into `smudgy_grants`).
                 let workers_enabled =
                     matches!(isolate_id, IsolateId::Main) || smudgy_grants.workers;
@@ -1251,7 +1251,7 @@ impl<'a> ScriptEngine<'a> {
                         // <Image> build ops to resolve + gate `src` strings (a bridge type in
                         // `smudgy_cloud`, like `WidgetsEnabled`).
                         image_policy,
-                        // Mirrors this isolate's `WorkerMode` (main = ComputeOnly, sandboxes =
+                        // Mirrors this isolate's `WorkerMode` (main = trusted compute, sandboxes =
                         // Disabled until the W2 `workers` capability) so `smudgy.ts` can shadow
                         // `Worker` with a clear TypeError where the worker-host ops are disabled.
                         workers_enabled,
@@ -1421,7 +1421,7 @@ impl<'a> ScriptEngine<'a> {
             broadcast_channel.clone(),
             // Trusted user code may spawn workers: off-thread reduced-op compute
             // realms with a message-only bridge (no smudgy API inside them).
-            WorkerMode::ComputeOnly,
+            WorkerMode::TrustedComputeOnly,
         )
         .expect("Failed to create JS runtime");
         // Surface the v8 inspector endpoint (main only) so it can be debugged via the bundled
@@ -1780,7 +1780,7 @@ impl<'a> ScriptEngine<'a> {
                     // means the worker-host ops are inert: a catchable error with
                     // no thread spawn, including via `node:worker_threads`.
                     if smudgy_grants.workers {
-                        WorkerMode::ComputeOnly
+                        WorkerMode::SandboxedComputeOnly
                     } else {
                         WorkerMode::Disabled
                     },
@@ -3117,6 +3117,7 @@ fn build_script_runtime(
         webstorage_dir,
         broadcast_channel: Some(broadcast_channel),
         workers,
+        max_live_workers_override: None,
     })?;
     // rusty_v8 enters the isolate when its `OwnedIsolate` is constructed and leaves it current.
     // With an isolate *set* on one thread that would make every isolate but the last "current"

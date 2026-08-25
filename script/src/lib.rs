@@ -37,9 +37,6 @@ use deno_runtime::deno_inspector_server::{
 };
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
 pub use deno_web::InMemoryBroadcastChannel;
-// Re-exported so the host can read an isolate's live worker count out of `OpState`
-// (the worker-host ops keep their handles here) without depending on `deno_runtime`.
-pub use deno_runtime::ops::worker_host::WorkersTable;
 use npm_resolver::SmudgyNpmServices;
 use sys_traits::impls::RealSys;
 
@@ -178,11 +175,16 @@ pub struct ScriptRuntimeOptions {
     /// Web `Worker` policy for this isolate. The default [`WorkerMode::Disabled`]
     /// disables the worker-host ops so `new Worker(...)` — including through the
     /// `node:worker_threads` shim — throws a catchable error instead of reaching
-    /// deno_runtime's panicking default callback. [`WorkerMode::ComputeOnly`]
-    /// (the trusted main isolate) makes workers real: reduced-op, off-thread
-    /// compute realms with a none-permissions container whose only I/O is the
-    /// message bridge (see `web_workers.rs`).
+    /// deno_runtime's panicking default callback. The enabled modes make
+    /// workers real: reduced-op, off-thread compute realms with a
+    /// none-permissions container whose only I/O is the message bridge. They
+    /// distinguish trusted local worker modules from sandboxed package
+    /// snapshots because module loading is embedder authority (see
+    /// `web_workers.rs`).
     pub workers: WorkerMode,
+    /// Optional lower ceiling for tests or memory-constrained embedders. This
+    /// can reduce, but never raise, Smudgy's native 128-worker policy.
+    pub max_live_workers_override: Option<usize>,
 }
 
 pub struct ScriptRuntime {
@@ -319,10 +321,12 @@ impl ScriptRuntime {
         install_default_crypto_provider();
 
         let initialize_web_audio = preflight_web_audio_extension(&options.extensions)?;
+        let worker_mode = options.workers;
         let mut extensions = options.extensions;
         // Appending after the preflight keeps any deno_audio extension at
         // custom index 0, where the frozen snapshot prefix expects it.
-        if options.workers == WorkerMode::Disabled {
+        extensions.push(web_workers::embedded_process_guard_extension());
+        if worker_mode == WorkerMode::Disabled {
             extensions.push(web_workers::worker_host_denied_extension());
         }
         let data_dir = options.data_dir;
@@ -350,13 +354,6 @@ impl ScriptRuntime {
         let (npm_services, node_services) = SmudgyNpmServices::new(data_dir.clone())?;
         let package_provider = options.package_provider.clone();
         let worker_module_sources = Arc::new(std::sync::OnceLock::new());
-        let loader = Rc::new(ScriptModuleLoader::with_npm_and_packages(
-            std::env::current_dir().context("failed to get current directory")?,
-            options.module_policy,
-            npm_services.clone(),
-            package_provider.clone(),
-        ));
-        let fs = Arc::new(RealFs);
         // Allow-all is the default for trusted code (user scripts, local modules, trusted
         // packages). A caller may instead pass a *restricted* container to sandbox this
         // isolate — that is how a package's manifest permissions are enforced: the isolate
@@ -368,6 +365,14 @@ impl ScriptRuntime {
                 RealSys,
             )))
         });
+        let loader = Rc::new(ScriptModuleLoader::with_npm_and_packages(
+            std::env::current_dir().context("failed to get current directory")?,
+            options.module_policy,
+            npm_services.clone(),
+            package_provider.clone(),
+            permissions.clone(),
+        ));
+        let fs = Arc::new(RealFs);
 
         let feature_checker = quiet_feature_checker();
 
@@ -445,6 +450,8 @@ impl ScriptRuntime {
             cache_storage_dir: Some(cache_storage_dir),
             ..Default::default()
         };
+        worker_options.max_live_workers =
+            Some(worker_mode.max_live_workers(options.max_live_workers_override));
         worker_options.bootstrap.location = Some(main_module.clone());
         // MUST stay false: the npm stack resolves from the global cache
         // (`<data_dir>/npm`, `maybe_node_modules_path: None` in npm_resolver.rs).
@@ -455,12 +462,13 @@ impl ScriptRuntime {
         // empty `<data_dir>/node_modules` from earlier builds may exist on disk;
         // it is unused and must not be sniffed here.
         worker_options.bootstrap.has_node_modules_dir = false;
-        if options.workers == WorkerMode::ComputeOnly {
+        if worker_mode.enabled() {
             // Workers must boot the same snapshot blob as this (parent) runtime:
             // V8's shared heap is process-global and blob-verified per isolate.
             worker_options.create_web_worker_cb = web_workers::create_web_worker_callback(
                 initialize_web_audio,
                 Arc::clone(&worker_module_sources),
+                worker_mode,
             );
         }
         worker_options.bootstrap.inspect = inspector_server.is_some();

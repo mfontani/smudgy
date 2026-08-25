@@ -1,0 +1,211 @@
+diff --git a/ops/worker_host.rs b/ops/worker_host.rs
+index 049aecb..38a47dd 100644
+--- a/ops/worker_host.rs
++++ b/ops/worker_host.rs
+@@ -9,6 +9,7 @@ use std::sync::LazyLock;
+ use std::sync::Mutex;
+ use std::sync::atomic::AtomicU32;
+ use std::sync::atomic::AtomicU64;
++use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ 
+ use deno_core::CancelFuture;
+@@ -246,10 +247,15 @@ deno_core::extension!(
+   options = {
+     create_web_worker_cb: Arc<CreateWebWorkerCb>,
+     format_js_error_fn: Option<Arc<FormatJsErrorFn>>,
++    max_live_workers: Option<usize>,
+   },
+   state = |state, options| {
+     state.put::<WorkersTable>(WorkersTable::default());
+ 
++    if let Some(max) = options.max_live_workers {
++      state.put(WorkerQuota::new(max));
++    }
++
+     let create_web_worker_cb_holder =
+       CreateWebWorkerCbHolder(options.create_web_worker_cb);
+     state.put::<CreateWebWorkerCbHolder>(create_web_worker_cb_holder);
+@@ -290,6 +296,50 @@ pub enum CreateWorkerError {
+   #[class(inherit)]
+   #[error("{0}")]
+   Io(#[from] std::io::Error),
++  #[class("DOMExceptionQuotaExceededError")]
++  #[error("live-worker limit reached ({max} per isolate)")]
++  Limit { max: usize },
++}
++
++/// Per-parent worker quota. A permit is held by the worker thread itself, not
++/// by the host-side handle table: Node workers leave that table as soon as
++/// termination is requested, and Web Worker channels can close before their
++/// V8 isolate has finished unwinding.
++struct WorkerQuota {
++  max: usize,
++  live: Arc<AtomicUsize>,
++}
++
++impl WorkerQuota {
++  fn new(max: usize) -> Self {
++    Self {
++      max,
++      live: Arc::new(AtomicUsize::new(0)),
++    }
++  }
++
++  fn try_acquire(&self) -> Result<WorkerPermit, CreateWorkerError> {
++    self
++      .live
++      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
++        (live < self.max).then_some(live + 1)
++      })
++      .map_err(|_| CreateWorkerError::Limit { max: self.max })?;
++    Ok(WorkerPermit {
++      live: Arc::clone(&self.live),
++    })
++  }
++}
++
++struct WorkerPermit {
++  live: Arc<AtomicUsize>,
++}
++
++impl Drop for WorkerPermit {
++  fn drop(&mut self) {
++    let previous = self.live.fetch_sub(1, Ordering::AcqRel);
++    debug_assert!(previous > 0, "worker quota permit underflow");
++  }
+ }
+ 
+ /// Create worker as the host
+@@ -313,6 +363,14 @@ fn op_create_worker(
+     return Err(CreateWorkerError::ClassicWorkers);
+   }
+ 
++  // Reserve capacity before deriving permissions, detaching transferables, or
++  // spawning an OS thread. Every JS constructor path, including
++  // `node:worker_threads`, funnels through this op.
++  let worker_permit = state
++    .try_borrow::<WorkerQuota>()
++    .map(WorkerQuota::try_acquire)
++    .transpose()?;
++
+   if args.permissions.is_some() {
+     super::check_unstable(
+       state,
+@@ -387,6 +445,9 @@ fn op_create_worker(
+ 
+   // Spawn it
+   thread_builder.spawn(move || {
++    // Declared first so it drops last, after the worker's V8 isolate, Tokio
++    // runtime, and allocator trim have all completed.
++    let _worker_permit = worker_permit;
+     // Capture the OS thread handle for CPU usage queries from the host.
+     cpu_thread_handle_writer
+       .store(capture_current_thread_handle(), Ordering::Release);
+@@ -986,3 +1047,46 @@ fn capture_current_thread_handle() -> u64 {
+ fn get_thread_cpu_usage_by_handle(_handle: u64) -> (f64, f64) {
+   (0.0, 0.0)
+ }
++
++#[cfg(test)]
++mod quota_tests {
++  use super::*;
++  use std::sync::Barrier;
++
++  #[test]
++  fn worker_quota_releases_only_when_permit_drops() {
++    let quota = WorkerQuota::new(1);
++    let permit = quota.try_acquire().expect("first worker gets the slot");
++    assert!(matches!(
++      quota.try_acquire(),
++      Err(CreateWorkerError::Limit { max: 1 })
++    ));
++    drop(permit);
++    assert!(quota.try_acquire().is_ok());
++  }
++
++  #[test]
++  fn worker_quota_tracks_thread_lifetime_and_unwind() {
++    let quota = WorkerQuota::new(1);
++    let permit = quota.try_acquire().expect("first worker gets the slot");
++    let barrier = Arc::new(Barrier::new(2));
++    let thread_barrier = Arc::clone(&barrier);
++    let handle = std::thread::spawn(move || {
++      let _permit = permit;
++      thread_barrier.wait();
++      thread_barrier.wait();
++    });
++    barrier.wait();
++    assert!(quota.try_acquire().is_err());
++    barrier.wait();
++    handle.join().expect("quota holder thread exits cleanly");
++    assert!(quota.try_acquire().is_ok());
++
++    let quota = WorkerQuota::new(1);
++    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++      let _permit = quota.try_acquire().expect("panic path gets a slot");
++      panic!("intentional quota unwind probe");
++    }));
++    assert!(quota.try_acquire().is_ok());
++  }
++}
+diff --git a/snapshot_info.rs b/snapshot_info.rs
+index 2d13936..de98d90 100644
+--- a/snapshot_info.rs
++++ b/snapshot_info.rs
+@@ -58,6 +58,7 @@ pub fn get_extensions_in_snapshot() -> Vec<Extension> {
+     ops::worker_host::deno_worker_host::init(
+       Arc::new(|_| unreachable!("not used in snapshot.")),
+       None,
++      None,
+     ),
+     ops::fs_events::deno_fs_events::init(),
+     ops::permissions::deno_permissions::init(),
+diff --git a/web_worker.rs b/web_worker.rs
+index ae51358..66b00f1 100644
+--- a/web_worker.rs
++++ b/web_worker.rs
+@@ -410,6 +410,7 @@ pub struct WebWorkerOptions {
+   pub seed: Option<u64>,
+   pub create_web_worker_cb: Arc<ops::worker_host::CreateWebWorkerCb>,
+   pub format_js_error_fn: Option<Arc<FormatJsErrorFn>>,
++  pub max_live_workers: Option<usize>,
+   pub worker_type: WorkerThreadType,
+   pub cache_storage_dir: Option<std::path::PathBuf>,
+   pub stdio: Stdio,
+@@ -611,6 +612,7 @@ impl WebWorker {
+       ops::worker_host::deno_worker_host::init(
+         options.create_web_worker_cb,
+         options.format_js_error_fn,
++        options.max_live_workers,
+       ),
+       ops::fs_events::deno_fs_events::init(),
+       ops::permissions::deno_permissions::init(),
+diff --git a/worker.rs b/worker.rs
+index e8209fc..e7ceb91 100644
+--- a/worker.rs
++++ b/worker.rs
+@@ -295,6 +295,7 @@ pub struct WorkerOptions {
+   // Callbacks invoked when creating new instance of WebWorker
+   pub create_web_worker_cb: Arc<ops::worker_host::CreateWebWorkerCb>,
+   pub format_js_error_fn: Option<Arc<FormatJsErrorFn>>,
++  pub max_live_workers: Option<usize>,
+ 
+   // If true, the worker will wait for inspector session and break on first
+   // statement of user code. Takes higher precedence than
+@@ -328,6 +329,7 @@ impl Default for WorkerOptions {
+       should_wait_for_inspector_session: Default::default(),
+       trace_ops: Default::default(),
+       format_js_error_fn: Default::default(),
++      max_live_workers: None,
+       origin_storage_dir: Default::default(),
+       cache_storage_dir: Default::default(),
+       extensions: Default::default(),
+@@ -677,6 +679,7 @@ impl MainWorker {
+         ops::worker_host::deno_worker_host::args(
+           options.create_web_worker_cb.clone(),
+           options.format_js_error_fn.clone(),
++          options.max_live_workers,
+         ),
+         deno_bundle_runtime::deno_bundle_runtime::args(
+           services.bundle_provider.clone(),

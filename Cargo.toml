@@ -147,6 +147,13 @@ unic-langid = "0.9.6"
 #   scoped read+write grants can reach them; paired invariant: smudgy rejects
 #   pipe-namespace paths in manifest path axes, so a pipe fs-grant only ever
 #   originates from a consented Critical-tier `ipc` row.
+# - `deno_runtime` (patches/deno_runtime+0.265.0.patch): enforces the embedded
+#   worker ceiling inside `op_create_worker`, before transferables are detached
+#   or an OS thread is spawned, and holds the quota permit until the worker
+#   runtime has fully unwound.
+# - `deno_core` (patches/deno_core+0.410.0.patch): applies extension op
+#   middleware to native-object constructor/method/static-method ops as well as
+#   regular ops, so Smudgy's worker-realm allowlist is a complete boundary.
 # - `iced_runtime` (patches/iced_runtime+0.14.0.patch): adds the narrow
 #   per-window announcement action used by the audio control panel.
 # - `iced_winit` (patches/iced_winit+0.14.0.patch): owns the matching bounded
@@ -159,6 +166,8 @@ crates = [
     "cosmic-text",
     "vtparse",
     "deno_permissions",
+    "deno_runtime",
+    "deno_core",
 ]
 
 [patch.crates-io]
@@ -168,6 +177,8 @@ iced_winit = { path = "./target/patch/iced_winit-0.14.0" }
 cosmic-text = { path = "./target/patch/cosmic-text-0.15.0" }
 vtparse = { path = "./target/patch/vtparse-0.7.0" }
 deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }
+deno_runtime = { path = "./target/patch/deno_runtime-0.265.0" }
+deno_core = { path = "./target/patch/deno_core-0.410.0" }
 
 # Define workspace-wide lints
 [workspace.lints.clippy]

@@ -10,6 +10,7 @@ use deno_core::{
     ModuleSourceCode, ModuleSpecifier, ModuleType, ResolutionKind,
 };
 use deno_error::JsErrorBox;
+use deno_permissions::{OpenAccessKind, PermissionsContainer};
 use deno_semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde_json::Value;
@@ -72,6 +73,9 @@ pub struct ScriptModuleLoader {
     /// (network fetch on the session runtime), so it lives here rather than as an
     /// ImportProvider. `None` disables `smudgy://` imports.
     package_provider: Option<std::rc::Rc<dyn crate::package_resolver::PackageProvider>>,
+    /// The same container installed into this isolate's OpState. Module loading
+    /// is embedder-owned I/O, so it must consult the container explicitly.
+    permissions: PermissionsContainer,
 }
 
 /// Which manifest declaration authorizes a `smudgy://` reference made FROM a package module.
@@ -109,6 +113,7 @@ impl ScriptModuleLoader {
             jsr: Rc::new(tokio::sync::Mutex::new(JsrResolver::default())),
             http: reqwest::Client::new(),
             package_provider: None,
+            permissions: PermissionsContainer::allow_all(crate::permission_descriptor_parser()),
         }
     }
 
@@ -131,12 +136,69 @@ impl ScriptModuleLoader {
         policy: ModulePolicy,
         npm: std::rc::Rc<crate::npm_resolver::SmudgyNpmServices>,
         package_provider: Option<std::rc::Rc<dyn crate::package_resolver::PackageProvider>>,
+        permissions: PermissionsContainer,
     ) -> Self {
         Self {
             npm: Some(npm),
             package_provider,
+            permissions,
             ..Self::with_import_provider(cwd, policy, Box::new(NoopImportProvider))
         }
+    }
+
+    fn checked_file_path(&self, specifier: &ModuleSpecifier) -> Result<PathBuf, ModuleLoaderError> {
+        if specifier
+            .host_str()
+            .is_some_and(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost"))
+        {
+            return Err(generic_loader_error(format!(
+                "non-local file module URLs are not supported: {specifier}"
+            )));
+        }
+
+        let path = specifier
+            .to_file_path()
+            .map_err(|_| generic_loader_error(format!("{specifier} is not a file URL")))?;
+
+        // npm import permission authorizes code under the managed cache without
+        // granting arbitrary filesystem reads. Re-check the canonical path so
+        // a symlink/junction inside the cache cannot turn that exemption into
+        // an out-of-root read.
+        if self.policy.import_policy.allows_import("npm", "")
+            && self
+                .npm
+                .as_ref()
+                .is_some_and(|npm| npm.is_npm_package_specifier(specifier))
+        {
+            let canonical = std::fs::canonicalize(&path).map_err(|e| {
+                generic_loader_error(format!(
+                    "failed to resolve npm module {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let canonical_url = ModuleSpecifier::from_file_path(&canonical).map_err(|()| {
+                generic_loader_error(format!(
+                    "resolved npm module is not a local file path: {}",
+                    canonical.display()
+                ))
+            })?;
+            if self
+                .npm
+                .as_ref()
+                .is_some_and(|npm| npm.is_npm_package_specifier(&canonical_url))
+            {
+                return Ok(canonical);
+            }
+        }
+
+        self.permissions
+            .check_open(
+                Cow::Owned(path),
+                OpenAccessKind::Read,
+                Some("module import"),
+            )
+            .map(|checked| checked.into_owned_path())
+            .map_err(JsErrorBox::from_err)
     }
 
     /// Enforce that a `smudgy://` reference made FROM a package module is declared in that
@@ -261,9 +323,7 @@ impl ScriptModuleLoader {
     fn load_sync(&self, specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
         let source = match specifier.scheme() {
             "file" => {
-                let path = specifier
-                    .to_file_path()
-                    .map_err(|_| generic_loader_error(format!("{specifier} is not a file URL")))?;
+                let path = self.checked_file_path(specifier)?;
                 // Name the path on failure — a bare `os error 2` (file not found), e.g. from
                 // a relative import to a missing/renamed file, is otherwise undiagnosable.
                 std::fs::read_to_string(&path).map_err(|e| {
@@ -448,9 +508,10 @@ impl ModuleLoader for ScriptModuleLoader {
                 })?;
             // Dep-gating: a PACKAGE's module may only import `smudgy://` packages it
             // declared in its manifest `dependencies`. User modules (`<server>/modules/`,
-            // `file://`) are unrestricted, and only `smudgy://` is gated (jsr:/npm:/url
-            // imports are not). This keeps the manifest's smudgy:// dep list authoritative
-            // for the backend's permission closure.
+            // `file://`) are unrestricted by this dependency gate (their file reads are
+            // separately checked against the isolate's permission container); jsr:/npm:/url
+            // imports are not dependency-gated. This keeps the manifest's smudgy:// dep list
+            // authoritative for the backend's permission closure.
             self.enforce_declared_smudgy_dep(&spec, referrer, DepGate::CodeImport)?;
             // A user-level (file://) code import of a package: recorded so the host can warn
             // when the target declares interop handles — on main, a trusted package's home
@@ -524,6 +585,14 @@ impl ModuleLoader for ScriptModuleLoader {
         maybe_referrer: Option<&ModuleLoadReferrer>,
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
+        // Gate file: before any custom provider can serve it. The disk-backed
+        // branch below checks again and consumes the canonical CheckedPath;
+        // this first check ensures a provider cannot bypass read authority.
+        if module_specifier.scheme() == "file" {
+            if let Err(error) = self.checked_file_path(module_specifier) {
+                return ModuleLoadResponse::Sync(Err(error));
+            }
+        }
         // npm: load async so deno_core drives it on the session runtime (its npm
         // stack is async + !Send; a nested block_on deadlocks the current-thread rt).
         if module_specifier.scheme() == "npm" {
@@ -1050,6 +1119,7 @@ mod dep_gating_tests {
             jsr: Rc::new(tokio::sync::Mutex::new(JsrResolver::default())),
             http: reqwest::Client::new(),
             package_provider: Some(Rc::new(provider)),
+            permissions: PermissionsContainer::allow_all(crate::permission_descriptor_parser()),
         }
     }
 
@@ -1279,6 +1349,7 @@ mod import_gate_tests {
             jsr: Rc::new(tokio::sync::Mutex::new(JsrResolver::default())),
             http: reqwest::Client::new(),
             package_provider: None,
+            permissions: PermissionsContainer::allow_all(crate::permission_descriptor_parser()),
         }
     }
 

@@ -70,7 +70,8 @@ fn audio_script_runtime(data_dir: &Path) -> Result<(Rc<tokio::runtime::Runtime>,
         package_provider: None,
         permissions: None,
         broadcast_channel: None,
-        workers: WorkerMode::ComputeOnly,
+        workers: WorkerMode::TrustedComputeOnly,
+        max_live_workers_override: None,
     })?;
     Ok((tokio, runtime))
 }

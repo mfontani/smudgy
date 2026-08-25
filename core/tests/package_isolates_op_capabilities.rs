@@ -954,25 +954,24 @@ async fn workers_capability_gates_worker_construction() {
     );
 }
 
-/// A batch of constructions passes the live-worker cap guard. The facade's `Worker`
-/// shadow consults the count and cap ops on every construction, so nine successful
-/// spawns prove the accounting returns sane values well under the 128 ceiling. The
-/// throw-at-cap branch itself is not driven: constructing 129 OS threads/V8 isolates
-/// is disproportionate for CI, and the guard is a two-line comparison over exactly
-/// the ops each of these constructions already exercised. (`Deno.core` is hidden
-/// from script realms, so the ops are not directly probeable — by design.)
+/// Every constructor alias reaches deno_runtime's native quota gate: the public
+/// relative-specifier facade, its recoverable native superclass, and
+/// node:worker_threads. The small-limit rejection itself is covered in
+/// smudgy_script without allocating 129 OS threads/V8 isolates.
 #[tokio::test]
-async fn worker_constructions_pass_the_cap_guard() {
+async fn worker_constructor_aliases_share_the_native_host_path() {
     let src = r#"
         import { echo } from "smudgy:core";
+        import { Worker as NodeWorker } from "node:worker_threads";
         const workers = [];
         try {
-            for (let i = 0; i < 9; i++) {
-                workers.push(new Worker("data:text/javascript,", { type: "module" }));
-            }
-            echo("CAP_BATCH_OK:" + workers.length);
+            workers.push(new Worker("data:text/javascript,", { type: "module" }));
+            const NativeWorker = Object.getPrototypeOf(globalThis.Worker);
+            workers.push(new NativeWorker("data:text/javascript,", { type: "module" }));
+            workers.push(new NodeWorker("", { eval: true }));
+            echo("WORKER_ALIASES_OK:" + workers.length);
         } catch (e) {
-            echo("CAP_UNEXPECTED:" + (e?.message ?? String(e)));
+            echo("WORKER_ALIAS_UNEXPECTED:" + (e?.message ?? String(e)));
         } finally {
             for (const w of workers) w.terminate();
         }
@@ -986,12 +985,12 @@ async fn worker_constructions_pass_the_cap_guard() {
     )
     .await;
     assert!(
-        has_line(&lines, "CAP_BATCH_OK:9"),
-        "nine constructions pass the cap guard; transcript:\n{lines:#?}"
+        has_line(&lines, "WORKER_ALIASES_OK:3"),
+        "all worker aliases should reach the native host path; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "CAP_UNEXPECTED:"),
-        "no failure in the guard path; transcript:\n{lines:#?}"
+        !has_line(&lines, "WORKER_ALIAS_UNEXPECTED:"),
+        "no constructor alias should bypass host initialization; transcript:\n{lines:#?}"
     );
 }
 

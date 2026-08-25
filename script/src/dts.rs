@@ -128,6 +128,7 @@ pub fn generate_declarations(
         permissions: None,
         broadcast_channel: None,
         workers: crate::WorkerMode::Disabled,
+        max_live_workers_override: None,
     })
     .context("construct dts generator runtime")?;
 

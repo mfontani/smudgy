@@ -20,7 +20,7 @@ use deno_npm_cache::{
     TarballCache,
 };
 use deno_npmrc::{NpmRc, NpmRegistryUrl};
-use deno_permissions::PermissionsContainer;
+use deno_permissions::{OpenAccessKind, PermissionsContainer};
 use deno_resolver::cjs::analyzer::{
     DenoCjsCodeAnalyzer, MemberReExport, ModuleExportAnalyzer, ModuleExportsAndReExports,
     ModuleForExportAnalysis, NullNodeAnalysisCache,
@@ -177,7 +177,10 @@ impl SmudgyNpmServices {
             node_code_translator,
             sys.clone(),
         );
-        let node_require_loader = Rc::new(SmudgyNodeRequireLoader { cjs_tracker });
+        let node_require_loader = Rc::new(SmudgyNodeRequireLoader {
+            cjs_tracker,
+            in_npm_package_checker: in_npm_package_checker.clone(),
+        });
         let req_resolver = NpmReqResolver::new(NpmReqResolverOptions {
             in_npm_pkg_checker: in_npm_package_checker.clone(),
             node_resolver: node_resolver.clone(),
@@ -695,15 +698,41 @@ fn call_expr_require_spec(call: &deno_ast::swc::ast::CallExpr) -> Option<String>
 
 struct SmudgyNodeRequireLoader {
     cjs_tracker: deno_resolver::cjs::CjsTrackerRc<DenoInNpmPackageChecker, RealSys>,
+    in_npm_package_checker: DenoInNpmPackageChecker,
 }
 
 impl NodeRequireLoader for SmudgyNodeRequireLoader {
     fn ensure_read_permission<'a>(
         &self,
-        _permissions: &mut PermissionsContainer,
+        permissions: &mut PermissionsContainer,
         path: Cow<'a, Path>,
     ) -> Result<Cow<'a, Path>, JsErrorBox> {
-        Ok(path)
+        let original_url = ModuleSpecifier::from_file_path(&path).ok();
+        if original_url.as_ref().is_some_and(|specifier| {
+            node_resolver::InNpmPackageChecker::in_npm_package(
+                &self.in_npm_package_checker,
+                specifier,
+            )
+        }) {
+            let canonical = std::fs::canonicalize(&path).map_err(JsErrorBox::from_err)?;
+            let canonical_url = ModuleSpecifier::from_file_path(&canonical).map_err(|()| {
+                JsErrorBox::generic(format!(
+                    "resolved npm require target is not a local file path: {}",
+                    canonical.display()
+                ))
+            })?;
+            if node_resolver::InNpmPackageChecker::in_npm_package(
+                &self.in_npm_package_checker,
+                &canonical_url,
+            ) {
+                return Ok(Cow::Owned(canonical));
+            }
+        }
+
+        permissions
+            .check_open(path, OpenAccessKind::Read, Some("require"))
+            .map(deno_permissions::CheckedPath::into_path)
+            .map_err(JsErrorBox::from_err)
     }
 
     fn load_text_file_lossy(&self, path: &Path) -> Result<FastString, JsErrorBox> {

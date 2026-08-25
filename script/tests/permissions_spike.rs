@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -26,8 +26,9 @@ use anyhow::{Context, Result};
 use deno_core::{FastString, PollEventLoopOptions, serde_v8};
 use serde_json::Value;
 use smudgy_script::{
-    IpcEntry, ModulePolicy, OpenAccessKind, Permissions, PermissionsContainer, PermissionsOptions,
-    ScriptRuntime, ScriptRuntimeOptions, native_ipc_grants, permission_descriptor_parser,
+    IpcEntry, ModulePolicy, ModuleSet, OpenAccessKind, Permissions, PermissionsContainer,
+    PermissionsOptions, ScriptRuntime, ScriptRuntimeOptions, native_ipc_grants,
+    permission_descriptor_parser,
 };
 
 fn tokio_runtime() -> Rc<tokio::runtime::Runtime> {
@@ -69,6 +70,7 @@ fn restricted_runtime(
         permissions: Some(container),
         broadcast_channel: None,
         workers: smudgy_script::WorkerMode::Disabled,
+        max_live_workers_override: None,
     })?;
     Ok((tokio, runtime))
 }
@@ -281,6 +283,132 @@ fn restricted_container_enforces_deno_native_permissions() -> Result<()> {
         name(&out, "readMessage"),
     );
 
+    Ok(())
+}
+
+/// Canonicalize a tempdir path so every spelling derived from it survives the
+/// realpath step inside Node `require()` resolution: the resolved module file is
+/// canonicalized (symlinks followed, Windows 8.3 short names expanded) before the
+/// permission-checked read, and `deno_permissions` matches paths textually, so a
+/// grant built from the raw spelling would not cover the canonical one. Hosted CI
+/// exercises both divergences — macOS tempdirs live behind the `/var` →
+/// `/private/var` symlink, and Windows runners publish `TEMP` through an 8.3
+/// short path. The Windows `\\?\` verbatim prefix is stripped (as `require()`'s
+/// own realpath does) to keep the spelling conventional for the JS side.
+fn canonical_temp_path(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    let text = canonical.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => Ok(PathBuf::from(rest)),
+        _ => Ok(canonical),
+    }
+}
+
+/// Module loading and Node `require()` are embedder-side filesystem reads, so
+/// they must consult the same restricted container as Deno filesystem ops.
+/// JSON makes the confidentiality impact explicit and avoids executing code.
+#[test]
+fn file_modules_and_node_require_obey_read_permissions() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let temp_path = canonical_temp_path(temp.path())?;
+    let secret = temp_path.join("secret.json");
+    std::fs::write(&secret, r#"{"token":"TOP-SECRET"}"#)?;
+    let secret_url =
+        deno_core::url::Url::from_file_path(&secret).expect("temp path converts to a file URL");
+    let module_url = serde_json::to_string(secret_url.as_str())?;
+    let require_path = serde_json::to_string(&secret.to_string_lossy())?;
+    let source = format!(
+        r#"(async () => {{
+            const out = {{}};
+            try {{
+                const value = await import({module_url}, {{ with: {{ type: "json" }} }});
+                out.import = value.default.token;
+            }} catch (e) {{
+                out.import = e?.name ?? String(e);
+            }}
+            try {{
+                const {{ createRequire }} = await import("node:module");
+                const require = createRequire("file:///smudgy-permission-test.js");
+                out.require = require({require_path}).token;
+            }} catch (e) {{
+                out.require = e?.name ?? String(e);
+            }}
+            return out;
+        }})()"#,
+    );
+
+    let denied = PermissionsOptions {
+        prompt: false,
+        ..Default::default()
+    };
+    let (tokio, mut rt) = restricted_runtime(&temp_path, &denied)?;
+    let out = eval_async_json(&tokio, &mut rt, &source)?;
+    assert_ne!(
+        out.get("import").and_then(Value::as_str),
+        Some("TOP-SECRET")
+    );
+    assert_ne!(
+        out.get("require").and_then(Value::as_str),
+        Some("TOP-SECRET")
+    );
+    drop(rt);
+    drop(tokio);
+
+    let allowed = PermissionsOptions {
+        allow_read: Some(vec![secret.to_string_lossy().into_owned()]),
+        prompt: false,
+        ..Default::default()
+    };
+    let (tokio, mut rt) = restricted_runtime(&temp_path, &allowed)?;
+    let out = eval_async_json(&tokio, &mut rt, &source)?;
+    assert_eq!(
+        out.get("import").and_then(Value::as_str),
+        Some("TOP-SECRET")
+    );
+    assert_eq!(
+        out.get("require").and_then(Value::as_str),
+        Some("TOP-SECRET")
+    );
+    Ok(())
+}
+
+/// Static imports go through the same load-time read gate as dynamic imports;
+/// Deno's specifier-level permission helper intentionally exempts static files,
+/// so this regression exercises Smudgy's explicit `check_open` choke point.
+#[test]
+fn static_file_module_obeys_read_permissions() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let module = temp.path().join("static-secret.ts");
+    std::fs::write(&module, "globalThis.__staticSecret = 'TOP-SECRET';")?;
+    let module_url =
+        deno_core::url::Url::from_file_path(&module).expect("temp path converts to a file URL");
+    let set = ModuleSet {
+        local_modules: vec![module_url],
+        packages: Vec::new(),
+    };
+
+    let denied = PermissionsOptions {
+        prompt: false,
+        ..Default::default()
+    };
+    let (tokio, mut rt) = restricted_runtime(temp.path(), &denied)?;
+    let error = tokio
+        .block_on(rt.load_modules(&set))
+        .expect_err("static module outside read grants must be denied");
+    assert!(
+        format!("{error:#}").contains("Requires read access"),
+        "denial should identify the missing read permission: {error:#}"
+    );
+    drop(rt);
+    drop(tokio);
+
+    let allowed = PermissionsOptions {
+        allow_read: Some(vec![module.to_string_lossy().into_owned()]),
+        prompt: false,
+        ..Default::default()
+    };
+    let (tokio, mut rt) = restricted_runtime(temp.path(), &allowed)?;
+    tokio.block_on(rt.load_modules(&set))?;
     Ok(())
 }
 
