@@ -1576,13 +1576,22 @@ impl Trigger {
         TIterRawPattern: Iterator<Item = TRawPatternStr>,
         TIterAntiPattern: Iterator<Item = TAntiPatternStr>,
     {
+        // An empty pattern compiles to a regex that matches EVERY subject —
+        // never what a definition saved without a pattern means. Empty sources
+        // are dropped from all three lists, so an empty match/raw pattern
+        // matches nothing and an empty exception blocks nothing. A deliberate
+        // match-everything automation is still expressible as a non-empty
+        // regex (`.*`) or a `{...rest}` simple pattern.
         let patterns: Vec<_> = patterns
+            .filter(|pattern| !pattern.as_ref().is_empty())
             .map(|pattern| Regex::new(pattern.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         let raw_patterns: Vec<_> = raw_patterns
+            .filter(|pattern| !pattern.as_ref().is_empty())
             .map(|pattern| Regex::new(pattern.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let anti_patterns = RegexSet::new(anti_patterns)?;
+        let anti_patterns =
+            RegexSet::new(anti_patterns.filter(|pattern| !pattern.as_ref().is_empty()))?;
 
         Ok(Self {
             isolate,
@@ -1625,11 +1634,7 @@ impl Trigger {
             isolate,
             origin,
             name,
-            // An empty pattern compiles to a regex that matches EVERY command —
-            // never what an alias saved without a pattern means. Dropping it
-            // here makes such an alias match nothing, on every registration
-            // path. (A deliberate catch-all is still expressible as `.*`.)
-            patterns.filter(|pattern| !pattern.as_ref().is_empty()),
+            patterns,
             std::iter::empty::<&str>(),
             std::iter::empty::<&str>(),
             script,
@@ -2427,6 +2432,120 @@ mod tests {
             assert!(
                 err.to_string().contains("\"loop\""),
                 "the bail should name the alias: {err}"
+            );
+        }
+    }
+
+    mod empty_trigger_patterns {
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use super::super::{ActionQueue, Manager, PushTriggerParams, ScriptAction};
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+        use crate::session::styled_line::StyledLine;
+
+        fn manager() -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            (
+                Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default()),
+                queue,
+            )
+        }
+
+        fn push(
+            manager: &mut Manager,
+            patterns: Vec<String>,
+            raw_patterns: Vec<String>,
+            anti_patterns: Vec<String>,
+        ) {
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin: Origin::User,
+                    name: &Arc::new("guarded".to_string()),
+                    patterns: &Arc::new(patterns),
+                    raw_patterns: &Arc::new(raw_patterns),
+                    anti_patterns: &Arc::new(anti_patterns),
+                    action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
+                    prompt: false,
+                    enabled: true,
+                    priority: 0,
+                    fallthrough: true,
+                    fire_limit: None,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+        }
+
+        fn drain_runs(queue: &ActionQueue) -> usize {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+                .count()
+        }
+
+        fn line_with_raw(text: &str, raw: &str) -> Arc<StyledLine> {
+            Arc::new(StyledLine::new_with_raw(
+                text,
+                Vec::new(),
+                Some(raw.as_bytes()),
+            ))
+        }
+
+        #[test]
+        fn empty_trigger_pattern_never_fires() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, vec![String::new()], Vec::new(), Vec::new());
+
+            manager
+                .process_incoming_line(&line_with_raw("anything at all", "anything at all"))
+                .unwrap();
+
+            assert_eq!(
+                drain_runs(&queue),
+                0,
+                "an empty pattern must not match every line"
+            );
+        }
+
+        #[test]
+        fn empty_raw_pattern_neither_fires_nor_requests_raw_capture() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Vec::new(), vec![String::new()], Vec::new());
+
+            assert!(
+                !manager.raw_wanted_flag().load(Ordering::Relaxed),
+                "a dropped empty raw pattern must not enable raw capture"
+            );
+
+            manager
+                .process_incoming_line(&line_with_raw("42hp", "\x1b[31m42hp"))
+                .unwrap();
+            assert_eq!(drain_runs(&queue), 0);
+        }
+
+        #[test]
+        fn empty_exception_does_not_block() {
+            let (mut manager, queue) = manager();
+            push(
+                &mut manager,
+                vec!["42hp".to_string()],
+                Vec::new(),
+                vec![String::new()],
+            );
+
+            manager
+                .process_incoming_line(&line_with_raw("42hp", "42hp"))
+                .unwrap();
+
+            assert_eq!(
+                drain_runs(&queue),
+                1,
+                "an empty exception must not veto every line"
             );
         }
     }
