@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -286,13 +286,32 @@ fn restricted_container_enforces_deno_native_permissions() -> Result<()> {
     Ok(())
 }
 
+/// Canonicalize a tempdir path so every spelling derived from it survives the
+/// realpath step inside Node `require()` resolution: the resolved module file is
+/// canonicalized (symlinks followed, Windows 8.3 short names expanded) before the
+/// permission-checked read, and `deno_permissions` matches paths textually, so a
+/// grant built from the raw spelling would not cover the canonical one. Hosted CI
+/// exercises both divergences — macOS tempdirs live behind the `/var` →
+/// `/private/var` symlink, and Windows runners publish `TEMP` through an 8.3
+/// short path. The Windows `\\?\` verbatim prefix is stripped (as `require()`'s
+/// own realpath does) to keep the spelling conventional for the JS side.
+fn canonical_temp_path(path: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    let text = canonical.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => Ok(PathBuf::from(rest)),
+        _ => Ok(canonical),
+    }
+}
+
 /// Module loading and Node `require()` are embedder-side filesystem reads, so
 /// they must consult the same restricted container as Deno filesystem ops.
 /// JSON makes the confidentiality impact explicit and avoids executing code.
 #[test]
 fn file_modules_and_node_require_obey_read_permissions() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let secret = temp.path().join("secret.json");
+    let temp_path = canonical_temp_path(temp.path())?;
+    let secret = temp_path.join("secret.json");
     std::fs::write(&secret, r#"{"token":"TOP-SECRET"}"#)?;
     let secret_url =
         deno_core::url::Url::from_file_path(&secret).expect("temp path converts to a file URL");
@@ -322,7 +341,7 @@ fn file_modules_and_node_require_obey_read_permissions() -> Result<()> {
         prompt: false,
         ..Default::default()
     };
-    let (tokio, mut rt) = restricted_runtime(temp.path(), &denied)?;
+    let (tokio, mut rt) = restricted_runtime(&temp_path, &denied)?;
     let out = eval_async_json(&tokio, &mut rt, &source)?;
     assert_ne!(
         out.get("import").and_then(Value::as_str),
@@ -340,7 +359,7 @@ fn file_modules_and_node_require_obey_read_permissions() -> Result<()> {
         prompt: false,
         ..Default::default()
     };
-    let (tokio, mut rt) = restricted_runtime(temp.path(), &allowed)?;
+    let (tokio, mut rt) = restricted_runtime(&temp_path, &allowed)?;
     let out = eval_async_json(&tokio, &mut rt, &source)?;
     assert_eq!(
         out.get("import").and_then(Value::as_str),
