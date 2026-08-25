@@ -39,6 +39,40 @@ fn is_clipboard_write_shortcut(
     modifiers.command() && matches!(key.to_latin(physical_key), Some('c' | 'x'))
 }
 
+fn fallback_key_matches(
+    expected: &keyboard::Key,
+    pressed: &keyboard::Key,
+    physical_key: key::Physical,
+) -> bool {
+    if expected == pressed {
+        return true;
+    }
+    let (keyboard::Key::Character(expected_str), keyboard::Key::Character(pressed_str)) =
+        (expected, pressed)
+    else {
+        return false;
+    };
+    if expected_str.eq_ignore_ascii_case(pressed_str) {
+        return true;
+    }
+    // A non-Latin layout reports a chord like ctrl+F with a non-Latin logical
+    // key. Single-letter bindings dispatch through the same latin-key mapping
+    // the wrapped input uses for its clipboard shortcuts, so the chord stays
+    // reachable from any layout.
+    let mut expected_chars = expected_str.chars();
+    match (expected_chars.next(), expected_chars.next()) {
+        (Some(expected_char), None) => pressed
+            .to_latin(physical_key)
+            .is_some_and(|latin| latin.eq_ignore_ascii_case(&expected_char)),
+        _ => false,
+    }
+}
+
+enum ShortcutMatch<'a, Message> {
+    Hotkey(HotkeyId),
+    Fallback(&'a Message),
+}
+
 /// Reserved application chord that opens and focuses the audio panel. It is
 /// excluded from user hotkey dispatch so a focused command input cannot
 /// double-fire a script automation and the application action.
@@ -56,6 +90,7 @@ where
 {
     hotkeys: &'a HashMap<MaybePhysicalKey, Vec<(keyboard::Modifiers, HotkeyId)>>,
     hooks: HashMap<keyboard::Key, Message>,
+    shortcut_fallbacks: Vec<(keyboard::Key, keyboard::Modifiers, Message)>,
     text_input: TextInput<'a, Message, Theme, Renderer>,
     on_match: Option<Box<dyn Fn(HotkeyId) -> Message>>,
     on_focus: Option<Message>,
@@ -82,6 +117,7 @@ where
         Self {
             hotkeys,
             hooks: HashMap::new(),
+            shortcut_fallbacks: Vec::new(),
             text_input: TextInput::<'a, Message, Theme, Renderer>::new(placeholder, value),
             on_match: None,
             on_focus: None,
@@ -171,6 +207,19 @@ where
         self
     }
 
+    /// Handle an exact key/modifier chord when no user-defined hotkey matches.
+    /// Used for editor-owned commands that remain available as fallbacks while
+    /// the command input is focused.
+    pub fn on_fallback_key_pressed(
+        mut self,
+        key: keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        message: Message,
+    ) -> Self {
+        self.shortcut_fallbacks.push((key, modifiers, message));
+        self
+    }
+
     pub fn on_submit(mut self, f: Message) -> Self {
         self.text_input = self.text_input.on_submit(f);
         self
@@ -221,6 +270,25 @@ where
             }
         }
         None
+    }
+
+    fn check_shortcut(
+        &self,
+        key: &keyboard::Key,
+        physical_key: &key::Physical,
+        modifiers: &keyboard::Modifiers,
+    ) -> Option<ShortcutMatch<'_, Message>> {
+        if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers) {
+            return Some(ShortcutMatch::Hotkey(hotkey_id));
+        }
+
+        self.shortcut_fallbacks
+            .iter()
+            .find(|(fallback_key, fallback_modifiers, _)| {
+                fallback_key_matches(fallback_key, key, *physical_key)
+                    && fallback_modifiers == modifiers
+            })
+            .map(|(_, _, message)| ShortcutMatch::Fallback(message))
     }
 }
 
@@ -374,9 +442,14 @@ where
                 ..
             }) = event
         {
-            if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers).as_ref() {
-                if let Some(on_match) = self.on_match.as_ref() {
-                    shell.publish(on_match(*hotkey_id));
+            if let Some(shortcut_match) = self.check_shortcut(key, physical_key, modifiers) {
+                match shortcut_match {
+                    ShortcutMatch::Hotkey(hotkey_id) => {
+                        if let Some(on_match) = self.on_match.as_ref() {
+                            shell.publish(on_match(hotkey_id));
+                        }
+                    }
+                    ShortcutMatch::Fallback(message) => shell.publish(message.clone()),
                 }
                 shell.capture_event();
                 return;
@@ -550,6 +623,58 @@ mod tests {
             &c,
             Physical::Code(Code::KeyC),
             keyboard::Modifiers::empty()
+        ));
+    }
+
+    #[test]
+    fn fallback_character_hooks_ignore_ascii_case() {
+        assert!(fallback_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("F".into()),
+            Physical::Code(Code::KeyF)
+        ));
+        assert!(!fallback_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("g".into()),
+            Physical::Code(Code::KeyG)
+        ));
+    }
+
+    /// A non-Latin layout reports a chord's logical key in its own script;
+    /// single-letter fallbacks dispatch by the physical latin key instead, so
+    /// e.g. ctrl+F opens search from a Cyrillic layout.
+    #[test]
+    fn fallback_character_hooks_dispatch_by_latin_key_on_non_latin_layouts() {
+        // The Ukrainian layout's F key produces Cyrillic 'а'.
+        assert!(fallback_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("\u{0430}".into()),
+            Physical::Code(Code::KeyF)
+        ));
+        assert!(!fallback_key_matches(
+            &keyboard::Key::Character("f".into()),
+            &keyboard::Key::Character("\u{0430}".into()),
+            Physical::Code(Code::KeyG)
+        ));
+    }
+
+    #[test]
+    fn user_hotkeys_precede_shortcut_fallbacks() {
+        let key = keyboard::Key::Character("f".into());
+        let physical_key = Physical::Code(Code::KeyF);
+        let modifiers = keyboard::Modifiers::CTRL;
+        let hotkey_id = HotkeyId::default();
+        let hotkeys = HashMap::from([(
+            MaybePhysicalKey::Key(key.clone()),
+            vec![(modifiers, hotkey_id)],
+        )]);
+        let input =
+            HotkeyMatchingInput::<u8, crate::theme::Theme, iced::Renderer>::new(&hotkeys, "", "")
+                .on_fallback_key_pressed(key.clone(), modifiers, 1);
+
+        assert!(matches!(
+            input.check_shortcut(&key, &physical_key, &modifiers),
+            Some(ShortcutMatch::Hotkey(matched)) if matched == hotkey_id
         ));
     }
 }

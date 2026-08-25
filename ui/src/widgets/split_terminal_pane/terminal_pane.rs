@@ -1,5 +1,5 @@
 use std::{
-    cell::{Ref, RefCell},
+    cell::{Cell, Ref, RefCell},
     collections::HashSet,
     rc::Rc,
     sync::Arc,
@@ -40,6 +40,7 @@ type Link = SpanMetadata;
 /// 100 '0's shaped once per prefs generation to measure the monospace cell
 /// advance for the column-based line-length clamp.
 const ADVANCE_PROBE: &str = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+const TERMINAL_SELECTION_BACKGROUND: iced::Color = iced::Color::from_rgb8(55, 23, 130);
 
 fn draw_text_decoration<Renderer: advanced::Renderer>(
     renderer: &mut Renderer,
@@ -114,6 +115,7 @@ struct ParagraphCache<P: text::Paragraph> {
     blink_modes: u8,
     max_valid_width: f32,
     selection: LineSelection,
+    search_selection: bool,
     /// The prefs generation this paragraph was shaped with; a mismatch is a
     /// cache miss (font/size/palette changes rebuild paragraphs).
     generation: u64,
@@ -1437,6 +1439,7 @@ pub struct TerminalPane<'a, Message> {
     link_protocol_state: Rc<RefCell<LinkProtocolState>>,
     buffer_link_state: Rc<RefCell<BufferLinkState>>,
     selection: Rc<RefCell<Selection>>,
+    search_selection: Rc<Cell<bool>>,
     last_line_number: Option<usize>,
     /// Maps a clicked link span into the hosting session's message. Publishing
     /// through the widget shell defers session mutation until the terminal's
@@ -1459,6 +1462,7 @@ impl<'a, Message> TerminalPane<'a, Message> {
             link_protocol_state,
             buffer_link_state,
             selection,
+            search_selection: Rc::new(Cell::new(false)),
             last_line_number: None,
             on_link: None,
             on_link_tooltip: None,
@@ -1468,6 +1472,11 @@ impl<'a, Message> TerminalPane<'a, Message> {
 
     pub fn last_line_number(mut self, last_line_number: usize) -> Self {
         self.last_line_number = Some(last_line_number);
+        self
+    }
+
+    pub fn search_selection(mut self, search_selection: Rc<Cell<bool>>) -> Self {
+        self.search_selection = search_selection;
         self
     }
 
@@ -1595,6 +1604,7 @@ where
         }
         state.process_link_navigation_reset(self.terminal_buffer.link_navigation_reset_epoch());
         let selection = self.selection.borrow();
+        let search_selection = self.search_selection.get();
         let protocol_state = self.link_protocol_state.borrow();
         let buffer_link_state = self.buffer_link_state.borrow();
         let prefs = crate::prefs::current();
@@ -1663,6 +1673,9 @@ where
                 continue;
             }
 
+            let line_selection = selection.for_line(line_number);
+            let line_search_selection = search_selection && line_selection.is_some();
+
             let dynamic_links = line.styled_line.links.iter().any(|link| {
                 link.style.as_ref().is_some_and(|style| style.has_states())
                     || link.action.protocol().is_some()
@@ -1686,44 +1699,25 @@ where
                 && cache.font_size == font_size
                 && cache.visual_generation == visual_generation
                 && Arc::ptr_eq(&cache.source, &line.styled_line)
+                && cache.selection == line_selection
+                && cache.search_selection == line_search_selection
             {
-                let line_selection = selection.for_line(line_number);
+                i += 1;
 
-                if cache.selection != line_selection {
-                    match line_selection {
-                        None => {
-                            cache.spans.select_none();
-                        }
-                        Some((0, usize::MAX)) => {
-                            cache.spans.select_all();
-                        }
-                        Some((from, to)) => {
-                            cache.spans.select_range(
-                                cache.offsets.source_to_rendered(from),
-                                cache.offsets.source_to_rendered(to),
-                            );
-                        }
-                    }
-                } else {
-                    i += 1;
-
-                    if text_bounds.width > cache.max_valid_width
-                        || text_bounds.width < cache.paragraph.min_bounds().width
-                    {
-                        cache.paragraph.resize(text_bounds);
-                        *cache.hidden_blink_paragraphs.borrow_mut() =
-                            HiddenBlinkParagraphs::default();
-                        cache.max_valid_width = text_bounds.width;
-                    }
-
-                    new_cache.push(cache.clone());
-
-                    available_y -= cache.paragraph.min_height();
-                    continue;
+                if text_bounds.width > cache.max_valid_width
+                    || text_bounds.width < cache.paragraph.min_bounds().width
+                {
+                    cache.paragraph.resize(text_bounds);
+                    *cache.hidden_blink_paragraphs.borrow_mut() = HiddenBlinkParagraphs::default();
+                    cache.max_valid_width = text_bounds.width;
                 }
+
+                new_cache.push(cache.clone());
+
+                available_y -= cache.paragraph.min_height();
+                continue;
             }
 
-            let line_selection = selection.for_line(line_number);
             let rendered = if dynamic_links {
                 line.spans_with_link_state(&prefs, false, |link| {
                     let key = buffer_link_state
@@ -1761,7 +1755,11 @@ where
                 line.rendered_spans()
             };
             let rendered_selection = rendered.offsets.map_selection(line_selection);
-            let spans = Spans::with_selection(rendered.spans, rendered_selection);
+            let spans = Spans::with_selection_color(
+                rendered.spans,
+                rendered_selection,
+                line_search_selection.then_some(iced::Color::WHITE),
+            );
 
             let spans_vec = spans.spans();
             let blink_modes = span_blink_modes(&spans_vec);
@@ -1789,6 +1787,7 @@ where
                 blink_modes,
                 max_valid_width: text_bounds.width,
                 selection: line_selection,
+                search_selection: line_search_selection,
                 generation: prefs.generation,
                 font_size,
                 visual_generation,
@@ -1934,7 +1933,11 @@ where
                                     bounds,
                                     ..Default::default()
                                 },
-                                Background::Color(prefs.palette.selection),
+                                Background::Color(if cache.search_selection {
+                                    TERMINAL_SELECTION_BACKGROUND
+                                } else {
+                                    prefs.palette.selection
+                                }),
                             );
                         }
                     }
@@ -2345,6 +2348,11 @@ where
                             from: position.clone(),
                             to: position,
                         };
+                        // The press hands the shared selection to the user:
+                        // search no longer owns it, so the search styling
+                        // must not apply and dismissing search must not
+                        // revert it (see `SessionInput::exit_search`).
+                        self.search_selection.set(false);
                         shell.invalidate_layout();
                     }
                     state.is_focused = true;

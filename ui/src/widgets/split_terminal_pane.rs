@@ -1,5 +1,6 @@
 use std::{
-    cell::{Ref, RefCell},
+    cell::{Cell, Ref, RefCell},
+    collections::VecDeque,
     rc::{self, Rc},
     time::Instant,
 };
@@ -35,6 +36,48 @@ pub enum ScrolledLayout {
     FullPane,
 }
 
+/// A keyboard/search request issued by the command editor for its associated
+/// terminal viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollRequest {
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    RevealLine(usize),
+}
+
+/// Shared bridge between one terminal's command editor and the custom
+/// terminal widget state. Requests are queued because repeated page keys can
+/// arrive before the next layout pass.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScrollHandle {
+    requests: Rc<RefCell<VecDeque<ScrollRequest>>>,
+}
+
+impl ScrollHandle {
+    pub(crate) fn request(&self, request: ScrollRequest) {
+        self.requests.borrow_mut().push_back(request);
+    }
+
+    pub(crate) fn take_requests(&self) -> VecDeque<ScrollRequest> {
+        std::mem::take(&mut *self.requests.borrow_mut())
+    }
+}
+
+/// The selection and viewport control shared by one terminal widget and its
+/// associated command editor. `search_selection` distinguishes the temporary
+/// search result without carrying every match into the renderer; it also
+/// tracks who owns the shared selection — a mouse press in the terminal
+/// clears it, handing the selection (and its normal styling) back to the
+/// user until the next search navigation re-claims it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TerminalViewHandle {
+    pub(crate) selection: Rc<RefCell<Selection>>,
+    pub(crate) search_selection: Rc<Cell<bool>>,
+    pub(crate) scroll: ScrollHandle,
+}
+
 impl ScrolledLayout {
     const fn live_tail_max_height(self) -> f32 {
         match self {
@@ -49,7 +92,7 @@ impl ScrolledLayout {
 }
 
 struct SplitTerminalPane<'a, Message> {
-    pub selection: Rc<RefCell<Selection>>,
+    pub view: TerminalViewHandle,
     pub buffer: Ref<'a, TerminalBuffer>,
     pub on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     pub on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
@@ -69,11 +112,11 @@ struct SplitTerminalPane<'a, Message> {
 impl<'a, Message> SplitTerminalPane<'a, Message> {
     pub fn new(
         buffer: Ref<'a, TerminalBuffer>,
-        selection: Rc<RefCell<Selection>>,
+        view: TerminalViewHandle,
         scrolled_layout: ScrolledLayout,
     ) -> Self {
         Self {
-            selection,
+            view,
             buffer,
             on_link: None,
             on_link_tooltip: None,
@@ -84,7 +127,8 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
     }
 
     fn terminal_pane(&self) -> TerminalPane<'a, Message> {
-        terminal_pane(Ref::clone(&self.buffer), self.selection.clone())
+        terminal_pane(Ref::clone(&self.buffer), self.view.selection.clone())
+            .search_selection(self.view.search_selection.clone())
             .on_link(self.on_link.clone())
             .on_link_tooltip(self.on_link_tooltip.clone())
             .font_size(self.font_size)
@@ -168,7 +212,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
     ) where
         P: text::Paragraph + 'static,
     {
-        if !matches!(*self.selection.borrow(), Selection::Selecting { .. }) {
+        if !matches!(*self.view.selection.borrow(), Selection::Selecting { .. }) {
             return;
         }
 
@@ -290,7 +334,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
             return false;
         };
 
-        let mut selection = self.selection.borrow_mut();
+        let mut selection = self.view.selection.borrow_mut();
         if let Selection::Selecting { origin, from, to } = &*selection {
             let (new_from, new_to) = if hit.line < origin.line
                 || (hit.line == origin.line && hit.column < origin.column)
@@ -363,6 +407,62 @@ impl State {
     }
 }
 
+/// `visible_lines` is the full terminal region's height in lines;
+/// `split_visible_lines` is the height of the historical pane once the view is
+/// split (the same value for `ScrolledLayout::FullPane`, smaller by the live
+/// tail for `SplitWithLiveTail`). Paging steps by the window that is actually
+/// on screen: the full region for the first page away from the pinned bottom,
+/// the split pane afterwards — a full-height step from a split view would skip
+/// the lines the live tail displaced.
+#[allow(clippy::cast_precision_loss)]
+fn apply_scroll_request(
+    state: &mut State,
+    request: ScrollRequest,
+    min_line: f32,
+    max_line: f32,
+    visible_lines: f32,
+    split_visible_lines: f32,
+) {
+    if max_line <= min_line {
+        state.scroll_bar_value = max_line;
+        state.is_split = false;
+        return;
+    }
+
+    let page = visible_lines.floor().max(1.0);
+    let split_page = split_visible_lines.floor().max(1.0).min(page);
+    let current = if state.is_split {
+        state.scroll_bar_value.clamp(min_line, max_line)
+    } else {
+        max_line
+    };
+    // Every request other than `End` leaves the view split, so the oldest
+    // reachable window is one *split* page above the buffer floor; anchoring
+    // its bottom there puts the oldest retained line at the pane's top row.
+    let oldest_full_page = (min_line + split_page).min(max_line);
+    let value = match request {
+        ScrollRequest::PageUp => {
+            let step = if state.is_split { split_page } else { page };
+            (current - step).max(oldest_full_page)
+        }
+        ScrollRequest::PageDown => (current + split_page).min(max_line),
+        ScrollRequest::Home => oldest_full_page,
+        ScrollRequest::End => max_line,
+        ScrollRequest::RevealLine(line) => {
+            let line = (line as f32).clamp(min_line + 1.0, max_line);
+            let visible_top = current - page + 1.0;
+            if !state.is_split && line >= visible_top {
+                current
+            } else {
+                line
+            }
+        }
+    };
+
+    state.scroll_bar_value = value;
+    state.is_split = value < max_line;
+}
+
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for SplitTerminalPane<'a, Message>
 where
@@ -416,6 +516,28 @@ where
 
         let terminal_pane_limits = limits.shrink(Size::new(scroll_bar::SCROLLBAR_WIDTH, 0.0));
         let scrollbar_limits = limits.shrink(Size::new(terminal_pane_limits.max().width, 0.0));
+        let line_height = self.line_height();
+        let full_height = terminal_pane_limits.max().height;
+        let visible_lines = full_height / line_height;
+        let live_tail_height = self.scrolled_layout.live_tail_max_height().min(full_height);
+        let split_visible_lines = (full_height - live_tail_height) / line_height;
+
+        {
+            let max_line = self.buffer.last_line_number() as f32;
+            let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
+            let mut state = state.borrow_mut();
+            for request in self.view.scroll.take_requests() {
+                apply_scroll_request(
+                    &mut state,
+                    request,
+                    min_line,
+                    max_line,
+                    visible_lines,
+                    split_visible_lines,
+                );
+            }
+            state.visible_lines = visible_lines;
+        }
 
         let (main_pane_node, scrollback_pane_node) = if state.borrow().is_split() {
             let main_pane_limits = terminal_pane_limits
@@ -460,12 +582,6 @@ where
         };
 
         let prefs = crate::prefs::current();
-        let line_height = self.line_height();
-
-        // Use the same line height the panes lay text out with, so the
-        // scrollbar's visible-lines math matches what is on screen.
-        let visible_lines = terminal_pane_limits.max().height / line_height;
-
         let scrollbar_node = self
             .scroll_bar_element::<Theme, Renderer>(visible_lines, Some(Rc::downgrade(state)))
             .as_widget_mut()
@@ -474,8 +590,6 @@ where
         let main_pane_width = main_pane_node.size().width;
 
         let mut state = state.borrow_mut();
-        state.visible_lines = visible_lines;
-
         // Report the character grid of the FULL terminal region — not the
         // split-shrunk main pane; the scrollback split is a UI affordance, not
         // a terminal resize — whenever it actually changes. Cell-boundary
@@ -675,7 +789,7 @@ where
 
 pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     buffer: Ref<'a, TerminalBuffer>,
-    selection: Rc<RefCell<Selection>>,
+    view: TerminalViewHandle,
     on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
     on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
@@ -689,7 +803,7 @@ where
     Theme: iced::widget::text::Catalog + 'a,
     Message: 'a,
 {
-    let mut pane = SplitTerminalPane::new(buffer, selection, scrolled_layout);
+    let mut pane = SplitTerminalPane::new(buffer, view, scrolled_layout);
     pane.on_link = on_link;
     pane.on_link_tooltip = on_link_tooltip;
     pane.on_grid_change = on_grid_change;
@@ -699,7 +813,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{SPLIT_LIVE_TAIL_MAX_HEIGHT, ScrolledLayout};
+    use super::{
+        SPLIT_LIVE_TAIL_MAX_HEIGHT, ScrollRequest, ScrolledLayout, State, apply_scroll_request,
+    };
 
     #[test]
     fn full_pane_scrollback_reserves_no_live_tail() {
@@ -714,5 +830,85 @@ mod tests {
             SPLIT_LIVE_TAIL_MAX_HEIGHT
         );
         assert!(ScrolledLayout::SplitWithLiveTail.keeps_live_tail());
+    }
+
+    #[test]
+    fn keyboard_scroll_requests_use_full_pages_and_pin_end() {
+        let mut state = State::default();
+
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 20.0);
+        assert_eq!(state.scroll_bar_value, 80.0);
+        assert!(state.is_split);
+
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 20.0);
+        assert_eq!(state.scroll_bar_value, 60.0);
+
+        apply_scroll_request(&mut state, ScrollRequest::Home, 0.0, 100.0, 20.0, 20.0);
+        assert_eq!(state.scroll_bar_value, 20.0);
+
+        apply_scroll_request(&mut state, ScrollRequest::End, 0.0, 100.0, 20.0, 20.0);
+        assert_eq!(state.scroll_bar_value, 100.0);
+        assert!(!state.is_split);
+    }
+
+    #[test]
+    fn split_paging_steps_by_the_historical_pane_and_reaches_the_oldest_line() {
+        let mut state = State::default();
+
+        // Full region 20 lines, historical pane 12 once the live tail splits
+        // off. The first page away from the pinned bottom steps by the full
+        // region (the whole 20 lines were on screen), leaving the pane bottom
+        // adjacent to the previously visible top.
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 80.0);
+        assert!(state.is_split);
+
+        // Subsequent pages step by the historical pane's height: the pane
+        // showed lines 69..=80, so the next window is 57..=68 — contiguous.
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 68.0);
+
+        apply_scroll_request(&mut state, ScrollRequest::PageDown, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 80.0);
+
+        // Home anchors one split page above the floor, so the oldest retained
+        // line (1) lands on the pane's top row instead of staying unreachable.
+        apply_scroll_request(&mut state, ScrollRequest::Home, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 12.0);
+
+        // PageUp from Home has nowhere older to go.
+        apply_scroll_request(&mut state, ScrollRequest::PageUp, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 12.0);
+
+        apply_scroll_request(&mut state, ScrollRequest::End, 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 100.0);
+        assert!(!state.is_split);
+    }
+
+    #[test]
+    fn reveal_only_leaves_the_live_tail_when_the_result_is_offscreen() {
+        let mut state = State::default();
+
+        apply_scroll_request(
+            &mut state,
+            ScrollRequest::RevealLine(95),
+            0.0,
+            100.0,
+            20.0,
+            12.0,
+        );
+        assert_eq!(state.scroll_bar_value, 100.0);
+        assert!(!state.is_split);
+
+        apply_scroll_request(
+            &mut state,
+            ScrollRequest::RevealLine(70),
+            0.0,
+            100.0,
+            20.0,
+            12.0,
+        );
+        assert_eq!(state.scroll_bar_value, 70.0);
+        assert!(state.is_split);
     }
 }

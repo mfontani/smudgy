@@ -2,14 +2,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::keymap::{HotkeyKeys, MaybePhysicalKey};
-use crate::terminal_buffer::TerminalBuffer;
+use crate::terminal_buffer::selection::{BufferPosition, Selection};
+use crate::terminal_buffer::{TerminalBuffer, TerminalTextMatch};
 use crate::theme::{Element, builtins};
 use crate::update::Update;
 use crate::widgets::hotkey_matching_input::{CaretState, HotkeyMatchingInput};
+use crate::widgets::split_terminal_pane::{ScrollRequest, TerminalViewHandle};
 use iced::advanced::widget::operation::{Focusable, Operation, Outcome};
-use iced::widget::{Id, Space, operation, row, text_input};
+use iced::widget::{Id, Space, button, column, operation, row, text, text_input};
 use iced::{Alignment, Length, Task, keyboard};
 use smudgy_core::models::hotkeys::HotkeyDefinition;
 use smudgy_core::models::settings::CommandInputBehavior;
@@ -123,6 +126,15 @@ pub fn focus_target(target: Id) -> Task<bool> {
     })
 }
 
+/// Schedule a follow-up after the widget tree has reflected a model change
+/// that mounts or unmounts a focus target.
+fn after_widget_tree_update(message: Message) -> Task<Message> {
+    Task::perform(
+        async { tokio::time::sleep(Duration::from_millis(1)).await },
+        move |()| message.clone(),
+    )
+}
+
 fn effective_font_size(pane_font_size: Option<f32>, global_font_size: f32) -> f32 {
     pane_font_size.unwrap_or(global_font_size)
 }
@@ -149,12 +161,20 @@ pub struct SessionInput {
     completion_state: Option<CompletionState>,
     /// Reference to terminal buffer for tab completion
     terminal_buffer: Option<Rc<RefCell<TerminalBuffer>>>,
+    /// The terminal selection and viewport controllers paired with this input.
+    /// A widgets-only pane has no target and therefore no search/scroll mode.
+    terminal_view: Option<TerminalViewHandle>,
+    /// Active terminal-search state shown in its own row above the command.
+    /// The game editor remains mounted and independently editable.
+    search: Option<SearchState>,
     /// Active hotkey definitions (pre-processed for efficiency)
     hotkeys: HashMap<HotkeyId, HotkeyKeys>,
     /// Fast lookup table: key -> vec of (modifiers, hotkey_id) pairs
     hotkey_lookup: HashMap<MaybePhysicalKey, Vec<(keyboard::Modifiers, HotkeyId)>>,
     /// Unique ID for the input component
     input_id: Id,
+    /// Independent widget ID for the temporary terminal-search editor.
+    search_input_id: Id,
     /// The caret (focus + raw cursor) as last observed on the widget, feeding
     /// the session-thread input mirror. Raw: positions are clamped against
     /// the current value only when a snapshot is built.
@@ -253,9 +273,27 @@ struct CompletionState {
 }
 
 #[derive(Debug, Clone)]
+struct SearchState {
+    query: String,
+    matches: Vec<TerminalTextMatch>,
+    current: Option<usize>,
+    previous_selection: Selection,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SearchDirection {
+    /// Move toward older terminal output.
+    Previous,
+    /// Move back toward newer terminal output.
+    Next,
+}
+
+#[derive(Debug, Clone)]
 pub enum Message {
     /// Input value changed
     InputChanged(String),
+    /// Terminal-search query changed.
+    SearchChanged(String),
     /// Submit the current input
     Submit,
     /// Hotkey triggered
@@ -266,6 +304,26 @@ pub enum Message {
     NavigateHistoryDown,
     /// Handle tab completion
     HandleTabCompletion,
+    /// Enter terminal search without disturbing the pending command.
+    EnterSearch,
+    /// Focus the search editor after its row has been mounted.
+    FocusSearch,
+    /// Leave terminal search and clear its terminal decorations.
+    ExitSearch,
+    /// Focus the game editor after the search row has been dismissed.
+    FocusGameInput,
+    /// Move to the next older terminal match.
+    SearchPrevious,
+    /// Move back to the next newer terminal match.
+    SearchNext,
+    /// Completion of a chrome-driven focus return to the search editor.
+    SearchFocusSettled(bool),
+    /// Scroll the associated terminal by one viewport.
+    ScrollPageUp,
+    ScrollPageDown,
+    /// Scroll the associated terminal to its oldest/newest page.
+    ScrollHome,
+    ScrollEnd,
     /// The input lost focus (used by the clear-on-blur behavior).
     FocusLost,
     /// The input gained focus; the parent clears stale terminal link focus.
@@ -273,7 +331,10 @@ pub enum Message {
     /// A targeted widget operation completed. `found` distinguishes a real
     /// focus mutation (or an already-satisfied target) from an unlaid/stale
     /// target that the operation could not reach.
-    FocusSettled { focused: bool, found: bool },
+    FocusSettled {
+        focused: bool,
+        found: bool,
+    },
     /// Escape pressed in a pane input: hand focus back to the main input.
     EscapePressed,
     /// The widget's caret (focus/cursor) changed.
@@ -326,9 +387,12 @@ impl SessionInput {
             history_revision: 0,
             completion_state: None,
             terminal_buffer: None,
+            terminal_view: None,
+            search: None,
             hotkeys: HashMap::new(),
             hotkey_lookup: HashMap::new(),
             input_id: Id::unique(),
+            search_input_id: Id::unique(),
             caret: CaretState::default(),
             mirror_interest: false,
             last_source: InputSource::Other,
@@ -352,6 +416,14 @@ impl SessionInput {
     /// Set the terminal buffer for tab completion
     pub fn with_terminal_buffer(mut self, buffer: Rc<RefCell<TerminalBuffer>>) -> Self {
         self.terminal_buffer = Some(buffer);
+        self
+    }
+
+    /// Associate the terminal's rendered selection and viewport controllers.
+    /// The buffer itself is supplied separately by [`Self::with_terminal_buffer`]
+    /// because completion-only tests and callers do not mount a terminal.
+    pub fn with_terminal_view(mut self, view: TerminalViewHandle) -> Self {
+        self.terminal_view = Some(view);
         self
     }
 
@@ -806,6 +878,122 @@ impl SessionInput {
         Task::none()
     }
 
+    /// Open an independent terminal-search editor above the pending command.
+    fn enter_search(&mut self) -> Task<Message> {
+        if self.search.is_some() {
+            return after_widget_tree_update(Message::FocusSearch);
+        }
+        if self.terminal_buffer.is_none() {
+            return Task::none();
+        }
+        let Some(view) = self.terminal_view.as_ref() else {
+            return Task::none();
+        };
+
+        let previous_selection = view.selection.borrow().clone();
+        view.search_selection.set(true);
+        *view.selection.borrow_mut() = Selection::None;
+        self.search = Some(SearchState {
+            query: String::new(),
+            matches: Vec::new(),
+            current: None,
+            previous_selection,
+        });
+        // The new text input does not exist in the widget tree until the next
+        // view pass. A message boundary lets it mount before focus traversal.
+        after_widget_tree_update(Message::FocusSearch)
+    }
+
+    /// Leave search mode, clear terminal decorations, and return focus to the
+    /// pending game command without altering it.
+    fn exit_search(&mut self) -> Task<Message> {
+        let Some(search) = self.search.take() else {
+            return Task::none();
+        };
+        if let Some(view) = self.terminal_view.as_ref() {
+            // The flag doubles as ownership of the shared selection: a mouse
+            // press in the terminal cleared it, and a selection the user
+            // dragged while searching survives dismissal instead of
+            // reverting to the pre-search snapshot.
+            if view.search_selection.get() {
+                *view.selection.borrow_mut() = search.previous_selection;
+            }
+            view.search_selection.set(false);
+        }
+        // As above, cross a message boundary so the disappearing search row
+        // has settled before focus returns to the persistent game editor.
+        after_widget_tree_update(Message::FocusGameInput)
+    }
+
+    /// Re-scan the live buffer, select the active match, and scroll it into
+    /// view. A re-scan on every navigation keeps newly-arrived output in the
+    /// cycle.
+    fn refresh_search(&mut self, direction: Option<SearchDirection>) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let Some(buffer) = self.terminal_buffer.as_ref() else {
+            return;
+        };
+
+        let anchor = search
+            .current
+            .and_then(|index| search.matches.get(index))
+            .cloned();
+        let matches = buffer.borrow().find_text_matches(&search.query);
+        let current = if matches.is_empty() {
+            None
+        } else if let (Some(direction), Some(anchor)) = (direction, anchor) {
+            let anchor_index = matches.iter().position(|candidate| candidate == &anchor);
+            Some(match (direction, anchor_index) {
+                (SearchDirection::Previous, Some(index)) => (index + 1) % matches.len(),
+                (SearchDirection::Next, Some(0)) => matches.len() - 1,
+                (SearchDirection::Next, Some(index)) => index - 1,
+                (_, None) => 0,
+            })
+        } else {
+            Some(0)
+        };
+
+        let active = current.and_then(|index| matches.get(index)).cloned();
+        if let Some(search) = self.search.as_mut() {
+            search.matches = matches;
+            search.current = current;
+        }
+
+        let Some(view) = self.terminal_view.as_ref() else {
+            return;
+        };
+        // Writing the selection re-claims it for search after any manual
+        // drag released it (the terminal press cleared the flag).
+        view.search_selection.set(true);
+        if let Some(found) = active {
+            *view.selection.borrow_mut() = Selection::Selected {
+                from: BufferPosition {
+                    line: found.line,
+                    column: found.start,
+                },
+                to: BufferPosition {
+                    line: found.line,
+                    column: found.end,
+                },
+            };
+            view.scroll.request(ScrollRequest::RevealLine(found.line));
+        } else {
+            *view.selection.borrow_mut() = Selection::None;
+        }
+    }
+
+    fn refocus_search(&self) -> Task<Message> {
+        focus_target(self.search_input_id.clone()).map(Message::SearchFocusSettled)
+    }
+
+    fn request_scroll(&self, request: ScrollRequest) {
+        if let Some(view) = self.terminal_view.as_ref() {
+            view.scroll.request(request);
+        }
+    }
+
     /// The full submit path — the user's Enter and a script's `submit()` take
     /// exactly this route. Masked submissions skip history; the configured
     /// post-submit behavior applies either way.
@@ -1048,6 +1236,13 @@ impl SessionInput {
     /// Update the component state based on messages
     pub fn update(&mut self, message: Message) -> Update<Message, Event> {
         match message {
+            Message::SearchChanged(value) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.query = value;
+                }
+                self.refresh_search(None);
+                Update::none()
+            }
             Message::InputChanged(value) => {
                 self.value = value;
                 self.note_value_edited();
@@ -1068,7 +1263,8 @@ impl SessionInput {
                 // it. Never while masked — clicking the reveal eye blurs the
                 // input for a moment, and that must not cost the user the
                 // secret (or the stash discipline its buffer).
-                if !obscured
+                if self.search.is_none()
+                    && !obscured
                     && !self.masked
                     && crate::prefs::current().command_input_behavior
                         == CommandInputBehavior::SelectAllClearOnBlur
@@ -1110,6 +1306,47 @@ impl SessionInput {
                 self.last_source = InputSource::Other;
                 Update::with_task(self.handle_tab_completion())
             }
+            Message::EnterSearch => Update::with_task(self.enter_search()),
+            Message::FocusSearch if self.search.is_some() => Update::with_task(
+                focus_target(self.search_input_id.clone()).map(Message::SearchFocusSettled),
+            ),
+            Message::FocusSearch => Update::none(),
+            Message::ExitSearch => Update::with_task(self.exit_search()),
+            Message::FocusGameInput if self.search.is_none() => {
+                self.pending_caret_echo = Some(InputSource::Other);
+                Update::with_task(focus_target(self.input_id.clone()).map(|found| {
+                    Message::FocusSettled {
+                        focused: true,
+                        found,
+                    }
+                }))
+            }
+            Message::FocusGameInput => Update::none(),
+            Message::SearchPrevious => {
+                self.refresh_search(Some(SearchDirection::Previous));
+                Update::with_task(self.refocus_search())
+            }
+            Message::SearchNext => {
+                self.refresh_search(Some(SearchDirection::Next));
+                Update::with_task(self.refocus_search())
+            }
+            Message::SearchFocusSettled(_found) => Update::none(),
+            Message::ScrollPageUp => {
+                self.request_scroll(ScrollRequest::PageUp);
+                Update::none()
+            }
+            Message::ScrollPageDown => {
+                self.request_scroll(ScrollRequest::PageDown);
+                Update::none()
+            }
+            Message::ScrollHome => {
+                self.request_scroll(ScrollRequest::Home);
+                Update::none()
+            }
+            Message::ScrollEnd => {
+                self.request_scroll(ScrollRequest::End);
+                Update::none()
+            }
             Message::CaretChanged(caret) => {
                 self.caret = caret;
                 self.last_source = self.pending_caret_echo.take().unwrap_or(InputSource::User);
@@ -1140,14 +1377,16 @@ impl SessionInput {
     /// widgets-only pane inputs, which have no terminal from which to inherit.
     pub fn view_with_font_size(&self, font_size: Option<f32>) -> Element<'_, Message> {
         let prefs = crate::prefs::current();
+        let searching = self.search.is_some();
+        let effective_size = effective_font_size(font_size, prefs.font_size);
 
-        let input = HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(
+        let game_input = HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(
             &self.hotkey_lookup,
             &self.placeholder,
             &self.value,
         )
         .font(prefs.font)
-        .size(effective_font_size(font_size, prefs.font_size))
+        .size(effective_size)
         .id(self.input_id.clone())
         .secure(self.masked && !self.masked_reveal)
         .suppress_clipboard_writes(self.masked)
@@ -1157,39 +1396,84 @@ impl SessionInput {
         .on_unfocus(Message::FocusLost)
         .style(builtins::text_input::borderless)
         .width(Length::Fill)
-        .on_match(Message::HotkeyTriggered);
+        .on_match(Message::HotkeyTriggered)
+        .on_key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+            Message::NavigateHistoryUp,
+        )
+        .on_key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+            Message::NavigateHistoryDown,
+        )
+        .on_key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::Tab),
+            Message::HandleTabCompletion,
+        );
         #[cfg(feature = "web-audio-cpal")]
-        let input = input.on_audio_panel_shortcut(Message::OpenAudioPanel);
-        let input = input
-            .on_key_pressed(
-                keyboard::Key::Named(keyboard::key::Named::ArrowUp),
-                Message::NavigateHistoryUp,
+        let game_input = game_input.on_audio_panel_shortcut(Message::OpenAudioPanel);
+        let game_input = if searching {
+            game_input.on_fallback_key_pressed(
+                keyboard::Key::Named(keyboard::key::Named::Escape),
+                keyboard::Modifiers::empty(),
+                Message::ExitSearch,
             )
-            .on_key_pressed(
-                keyboard::Key::Named(keyboard::key::Named::ArrowDown),
-                Message::NavigateHistoryDown,
-            )
-            .on_key_pressed(
-                keyboard::Key::Named(keyboard::key::Named::Tab),
-                Message::HandleTabCompletion,
-            );
-
-        // Pane inputs hand focus back to the main input on Escape.
-        let input = if self.escape_to_main {
-            input.on_key_pressed(
+        } else if self.escape_to_main {
+            // Pane inputs hand focus back to the main input on Escape.
+            game_input.on_key_pressed(
                 keyboard::Key::Named(keyboard::key::Named::Escape),
                 Message::EscapePressed,
             )
         } else {
-            input
+            game_input
+        };
+
+        // Terminal navigation belongs to the viewport even while the text
+        // editor owns focus. User-created hotkeys take precedence; these
+        // bindings handle otherwise-unclaimed key presses. Plain Home/End are
+        // claimed by the wrapped editor for caret movement whenever there is
+        // text to edit, so only an empty input cedes them to the viewport.
+        let game_input = if self.terminal_view.is_some() {
+            let game_input = game_input
+                .on_fallback_key_pressed(
+                    keyboard::Key::Character("f".into()),
+                    keyboard::Modifiers::CTRL,
+                    Message::EnterSearch,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::PageUp),
+                    keyboard::Modifiers::empty(),
+                    Message::ScrollPageUp,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::PageDown),
+                    keyboard::Modifiers::empty(),
+                    Message::ScrollPageDown,
+                );
+            if self.value.is_empty() {
+                game_input
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::Home),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollHome,
+                    )
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::End),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollEnd,
+                    )
+            } else {
+                game_input
+            }
+        } else {
+            game_input
         };
 
         // The caret observer costs a message per caret move, so it is
         // attached only while the session thread wants mirror state.
-        let input = if self.mirror_interest {
-            input.on_caret_change(Message::CaretChanged)
+        let game_input = if self.mirror_interest {
+            game_input.on_caret_change(Message::CaretChanged)
         } else {
-            input
+            game_input
         };
 
         // The eye slot: the built-in show/hide affordance while masked (a
@@ -1209,14 +1493,133 @@ impl SessionInput {
             Space::new().into()
         };
 
-        // One element shape in both modes: the same row, the input always at
-        // child index 0. iced pairs child state positionally and recreates a
-        // subtree when its tag changes, so swapping a bare input for a row
-        // across a mask toggle would destroy the text input's focus/cursor
-        // state at exactly the password-prompt moment.
-        row![Element::new(input), eye_slot]
+        let game_row = row![Element::new(game_input), eye_slot]
             .spacing(if self.masked { 4 } else { 0 })
             .align_y(Alignment::Center)
+            .width(Length::Fill);
+
+        let search_slot: Element<'_, Message> = if let Some(search) = self.search.as_ref() {
+            let search_input =
+                HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(
+                    &self.hotkey_lookup,
+                    crate::i18n::ts!("terminal-search-placeholder"),
+                    &search.query,
+                )
+                .font(prefs.font)
+                .size(effective_size)
+                .id(self.search_input_id.clone())
+                .on_input(Message::SearchChanged)
+                .on_submit(Message::SearchPrevious)
+                .style(builtins::text_input::borderless)
+                .width(Length::Fill)
+                .on_match(Message::HotkeyTriggered)
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::Escape),
+                    keyboard::Modifiers::empty(),
+                    Message::ExitSearch,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+                    keyboard::Modifiers::empty(),
+                    Message::SearchPrevious,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    keyboard::Modifiers::empty(),
+                    Message::SearchNext,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::Enter),
+                    keyboard::Modifiers::SHIFT,
+                    Message::SearchNext,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Character("f".into()),
+                    keyboard::Modifiers::CTRL,
+                    Message::EnterSearch,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::PageUp),
+                    keyboard::Modifiers::empty(),
+                    Message::ScrollPageUp,
+                )
+                .on_fallback_key_pressed(
+                    keyboard::Key::Named(keyboard::key::Named::PageDown),
+                    keyboard::Modifiers::empty(),
+                    Message::ScrollPageDown,
+                );
+            // As with the game input, plain Home/End edit the query when one
+            // exists and scroll the viewport only from an empty search box.
+            let search_input = if search.query.is_empty() {
+                search_input
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::Home),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollHome,
+                    )
+                    .on_fallback_key_pressed(
+                        keyboard::Key::Named(keyboard::key::Named::End),
+                        keyboard::Modifiers::empty(),
+                        Message::ScrollEnd,
+                    )
+            } else {
+                search_input
+            };
+            #[cfg(feature = "web-audio-cpal")]
+            let search_input = search_input.on_audio_panel_shortcut(Message::OpenAudioPanel);
+
+            let result = text(format!(
+                "{} / {}",
+                search.current.map_or(0, |index| index + 1),
+                search.matches.len()
+            ))
+            .size((effective_size * 0.75).max(10.0));
+            let previous = button(
+                text(crate::assets::bootstrap_icons::CHEVRON_UP)
+                    .font(crate::assets::fonts::BOOTSTRAP_ICONS)
+                    .size((effective_size * 0.8).max(11.0)),
+            )
+            .style(builtins::button::link)
+            .padding(3);
+            let next = button(
+                text(crate::assets::bootstrap_icons::CHEVRON_DOWN)
+                    .font(crate::assets::fonts::BOOTSTRAP_ICONS)
+                    .size((effective_size * 0.8).max(11.0)),
+            )
+            .style(builtins::button::link)
+            .padding(3);
+            let (previous, next) = if search.matches.is_empty() {
+                (previous, next)
+            } else {
+                (
+                    previous.on_press(Message::SearchPrevious),
+                    next.on_press(Message::SearchNext),
+                )
+            };
+
+            row![
+                text(crate::assets::bootstrap_icons::SEARCH)
+                    .font(crate::assets::fonts::BOOTSTRAP_ICONS)
+                    .size((effective_size * 0.8).max(11.0)),
+                Element::new(search_input),
+                result,
+                previous,
+                next,
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
+        // Keep the game row at child index 1 in both modes. iced pairs widget
+        // state positionally, so the zero-height search slot preserves the
+        // game's focus/cursor when the real search row appears above it.
+        column![search_slot, game_row]
+            .spacing(if searching { 4 } else { 0 })
+            .width(Length::Fill)
             .into()
     }
 }
@@ -1224,6 +1627,7 @@ impl SessionInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_buffer::selection::{BufferPosition, Selection};
     use smudgy_core::session::styled_line::StyledLine;
 
     #[test]
@@ -1762,6 +2166,120 @@ mod tests {
             }
         }
         buffer
+    }
+
+    fn searchable_input(
+        lines: &[&str],
+    ) -> (SessionInput, Rc<RefCell<Selection>>, TerminalViewHandle) {
+        let buffer = buffer_with_lines(lines);
+        let view = TerminalViewHandle::default();
+        let selection = view.selection.clone();
+        let input = SessionInput::new()
+            .with_terminal_buffer(buffer)
+            .with_terminal_view(view.clone());
+        (input, selection, view)
+    }
+
+    #[test]
+    fn terminal_search_keeps_command_editable_and_restores_selection_on_exit() {
+        let (mut input, selection, view) = searchable_input(&["dragon old", "quiet", "DRAGON new"]);
+        let previous_selection = Selection::Selected {
+            from: BufferPosition { line: 2, column: 0 },
+            to: BufferPosition { line: 2, column: 1 },
+        };
+        *selection.borrow_mut() = previous_selection.clone();
+        let _ = input.update(Message::InputChanged("say hello".to_string()));
+
+        let _ = input.update(Message::EnterSearch);
+        assert!(view.search_selection.get());
+        let _ = input.update(Message::SearchChanged("dragon".to_string()));
+        assert_eq!(input.value(), "say hello");
+        assert_eq!(
+            input.search.as_ref().map(|search| search.query.as_str()),
+            Some("dragon")
+        );
+        let _ = input.update(Message::InputChanged("say goodbye".to_string()));
+        assert_eq!(input.value(), "say goodbye");
+        assert_eq!(
+            input.search.as_ref().map(|search| search.query.as_str()),
+            Some("dragon"),
+            "editing the still-mounted game input must not replace the search query"
+        );
+        assert_eq!(
+            *selection.borrow(),
+            Selection::Selected {
+                from: BufferPosition { line: 3, column: 0 },
+                to: BufferPosition { line: 3, column: 6 },
+            }
+        );
+        assert_eq!(
+            input.search.as_ref().and_then(|search| search.current),
+            Some(0)
+        );
+        assert_eq!(
+            input.search.as_ref().map(|search| search.matches.len()),
+            Some(2)
+        );
+
+        let _ = input.update(Message::SearchPrevious);
+        assert_eq!(
+            input.search.as_ref().and_then(|search| search.current),
+            Some(1)
+        );
+        assert_eq!(
+            *selection.borrow(),
+            Selection::Selected {
+                from: BufferPosition { line: 1, column: 0 },
+                to: BufferPosition { line: 1, column: 6 },
+            }
+        );
+
+        let _ = input.update(Message::SearchNext);
+        assert_eq!(
+            input.search.as_ref().and_then(|search| search.current),
+            Some(0)
+        );
+        assert_eq!(
+            *selection.borrow(),
+            Selection::Selected {
+                from: BufferPosition { line: 3, column: 0 },
+                to: BufferPosition { line: 3, column: 6 },
+            }
+        );
+        assert_eq!(
+            view.scroll.take_requests().into_iter().collect::<Vec<_>>(),
+            vec![
+                ScrollRequest::RevealLine(3),
+                ScrollRequest::RevealLine(1),
+                ScrollRequest::RevealLine(3),
+            ]
+        );
+
+        let _ = input.update(Message::ExitSearch);
+        assert!(input.search.is_none());
+        assert!(!view.search_selection.get());
+        assert_eq!(input.value(), "say goodbye");
+        assert_eq!(*selection.borrow(), previous_selection);
+    }
+
+    #[test]
+    fn terminal_navigation_keys_queue_viewport_requests() {
+        let (mut input, _selection, view) = searchable_input(&["one"]);
+
+        let _ = input.update(Message::ScrollPageUp);
+        let _ = input.update(Message::ScrollPageDown);
+        let _ = input.update(Message::ScrollHome);
+        let _ = input.update(Message::ScrollEnd);
+
+        assert_eq!(
+            view.scroll.take_requests().into_iter().collect::<Vec<_>>(),
+            vec![
+                ScrollRequest::PageUp,
+                ScrollRequest::PageDown,
+                ScrollRequest::Home,
+                ScrollRequest::End,
+            ]
+        );
     }
 
     fn set_words(input: &mut SessionInput, suggestions: &[&str], blacklist: &[&str]) {

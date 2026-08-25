@@ -1490,6 +1490,15 @@ pub struct BufferLine {
     spans: std::cell::OnceCell<Rc<Vec<Span<'static, SpanMetadata>>>>,
 }
 
+/// One case-insensitive text match in the terminal's absolute line/column
+/// coordinate space. Columns are UTF-8 byte offsets, matching [`Selection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalTextMatch {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
 impl PartialEq for BufferLine {
     fn eq(&self, other: &Self) -> bool {
         self.styled_line == other.styled_line
@@ -1881,6 +1890,121 @@ impl TerminalBuffer {
         self.last_line_number
     }
 
+    /// Find every visible whole-line text match, newest first. Matches on the
+    /// same line are returned right-to-left so the initial result is the
+    /// terminal's most recent occurrence in both dimensions.
+    ///
+    /// This runs on the UI thread against the whole scrollback on every search
+    /// keystroke, so the scan reuses its working buffers across lines and
+    /// takes an allocation-free lowercase path for all-ASCII lines.
+    pub(crate) fn find_text_matches(&self, query: &str) -> Vec<TerminalTextMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut folded = String::new();
+        let mut folded_boundaries = Vec::new();
+        let mut source_boundaries = Vec::new();
+        fold_grapheme_boundaries_into(
+            query,
+            &mut folded,
+            &mut folded_boundaries,
+            &mut source_boundaries,
+        );
+        let folded_query = std::mem::take(&mut folded);
+        if folded_query.is_empty() {
+            return Vec::new();
+        }
+        // A folded query containing a non-ASCII byte can never be a substring
+        // of an all-ASCII line, and an all-ASCII pair needs no grapheme
+        // machinery: folding is per-byte lowercasing, so folded match offsets
+        // ARE source columns.
+        let ascii_query = folded_query.is_ascii();
+
+        let link_state = self.link_state.borrow();
+        let mut concealed: Vec<(usize, usize)> = Vec::new();
+        let mut line_matches: Vec<TerminalTextMatch> = Vec::new();
+        let mut results = Vec::new();
+
+        for (line_number, line) in self.iter_rev_with_line_number(None) {
+            if link_state.line_concealed(line_number) {
+                continue;
+            }
+            let text = line.styled_line.text.as_str();
+            let ascii_line = text.is_ascii();
+            if ascii_line && !ascii_query {
+                continue;
+            }
+
+            concealed.clear();
+            concealed.extend(
+                link_state
+                    .by_line
+                    .get(&line_number)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|key| {
+                        let visibility = link_state.visibility.get(key)?;
+                        if !visibility.concealed {
+                            return None;
+                        }
+                        let live = link_state.live.get(key)?;
+                        Some((live.address.begin, live.address.end))
+                    }),
+            );
+
+            line_matches.clear();
+            if ascii_line {
+                folded.clear();
+                folded.push_str(text);
+                folded.make_ascii_lowercase();
+                line_matches.extend(folded.match_indices(folded_query.as_str()).filter_map(
+                    |(start, matched)| {
+                        let end = start + matched.len();
+                        (!concealed.iter().any(|(hidden_begin, hidden_end)| {
+                            start < *hidden_end && end > *hidden_begin
+                        }))
+                        .then_some(TerminalTextMatch {
+                            line: line_number,
+                            start,
+                            end,
+                        })
+                    },
+                ));
+            } else {
+                fold_grapheme_boundaries_into(
+                    text,
+                    &mut folded,
+                    &mut folded_boundaries,
+                    &mut source_boundaries,
+                );
+                line_matches.extend(folded.match_indices(folded_query.as_str()).filter_map(
+                    |(start, matched)| {
+                        let end = start + matched.len();
+                        let start_boundary = folded_boundaries
+                            .partition_point(|boundary| *boundary <= start)
+                            .saturating_sub(1);
+                        let end_boundary =
+                            folded_boundaries.partition_point(|boundary| *boundary < end);
+                        let start_column = source_boundaries[start_boundary];
+                        let end_column = source_boundaries[end_boundary];
+                        (!concealed.iter().any(|(hidden_begin, hidden_end)| {
+                            start_column < *hidden_end && end_column > *hidden_begin
+                        }))
+                        .then_some(TerminalTextMatch {
+                            line: line_number,
+                            start: start_column,
+                            end: end_column,
+                        })
+                    },
+                ));
+            }
+            line_matches.dedup();
+            results.extend(line_matches.drain(..).rev());
+        }
+        results
+    }
+
     pub fn selected_text(&self, selection: &Selection) -> String {
         match selection {
             Selection::None => String::new(),
@@ -2191,6 +2315,39 @@ impl TerminalBuffer {
         self.lines.clear();
         self.lines_with_links = 0;
         self.line_terminated = true;
+    }
+}
+
+/// Lowercase a string a grapheme at a time into `folded`, retaining each
+/// source grapheme's byte boundary in the folded string. Lowercasing can
+/// expand a character, so direct byte offsets from the folded text cannot
+/// safely index the source. The output buffers are cleared and refilled so a
+/// caller scanning many lines can reuse their allocations; characters fold via
+/// `char::to_lowercase` into the existing buffer rather than through the
+/// per-grapheme `String` that `str::to_lowercase` would allocate.
+fn fold_grapheme_boundaries_into(
+    value: &str,
+    folded: &mut String,
+    folded_boundaries: &mut Vec<usize>,
+    source_boundaries: &mut Vec<usize>,
+) {
+    folded.clear();
+    folded_boundaries.clear();
+    source_boundaries.clear();
+    // Byte length bounds the grapheme count, sparing a counting pre-pass.
+    folded.reserve(value.len());
+    folded_boundaries.reserve(value.len() + 1);
+    source_boundaries.reserve(value.len() + 1);
+    folded_boundaries.push(0);
+    source_boundaries.push(0);
+    for (source_start, grapheme) in value.grapheme_indices(true) {
+        for ch in grapheme.chars() {
+            for lower in ch.to_lowercase() {
+                folded.push(lower);
+            }
+        }
+        folded_boundaries.push(folded.len());
+        source_boundaries.push(source_start + grapheme.len());
     }
 }
 
@@ -2861,6 +3018,49 @@ mod tests {
     }
 
     #[test]
+    fn terminal_text_search_is_case_insensitive_and_newest_first() {
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(sl("alpha older Alpha"));
+        buffer.push_line(sl("new ALPHA"));
+
+        assert_eq!(
+            buffer.find_text_matches("alpha"),
+            vec![
+                TerminalTextMatch {
+                    line: 2,
+                    start: 4,
+                    end: 9,
+                },
+                TerminalTextMatch {
+                    line: 1,
+                    start: 12,
+                    end: 17,
+                },
+                TerminalTextMatch {
+                    line: 1,
+                    start: 0,
+                    end: 5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_maps_expanding_lowercase_to_source_graphemes() {
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(sl("İstanbul"));
+
+        assert_eq!(
+            buffer.find_text_matches("i\u{307}"),
+            vec![TerminalTextMatch {
+                line: 1,
+                start: 0,
+                end: 2,
+            }]
+        );
+    }
+
+    #[test]
     fn find_recent_word_logic() {
         let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
         buffer.push_line(sl("hello world"));
@@ -3464,6 +3664,10 @@ mod tests {
             },
         };
         assert_eq!(buffer.selected_text(&selection), "    ");
+        assert!(
+            buffer.find_text_matches("link").is_empty(),
+            "terminal search must not expose concealed link text"
+        );
     }
 
     #[test]

@@ -7,21 +7,28 @@ use iced::widget::text::Span;
 pub struct Spans<Link: Clone> {
     spans: Rc<Vec<Span<'static, Link>>>,
     selected: Vec<usize>,
+    selection_color: Option<iced::Color>,
     spans_with_selection: Option<Rc<Vec<Span<'static, Link>>>>,
 }
 
 impl<Link: Clone> Spans<Link> {
-    pub fn with_selection(spans: Rc<Vec<Span<'static, Link>>>, selection: LineSelection) -> Self {
+    pub fn with_selection_color(
+        spans: Rc<Vec<Span<'static, Link>>>,
+        selection: LineSelection,
+        selection_color: Option<iced::Color>,
+    ) -> Self {
         match selection {
             None => Self {
                 spans,
                 selected: Vec::new(),
+                selection_color,
                 spans_with_selection: None,
             },
             Some((0, usize::MAX)) => {
                 let mut spans = Self {
                     spans,
                     selected: Vec::new(),
+                    selection_color,
                     spans_with_selection: None,
                 };
                 spans.select_all();
@@ -31,6 +38,7 @@ impl<Link: Clone> Spans<Link> {
                 let mut spans = Self {
                     spans,
                     selected: Vec::new(),
+                    selection_color,
                     spans_with_selection: None,
                 };
                 spans.select_range(from, to);
@@ -46,6 +54,7 @@ impl<Link: Clone> Spans<Link> {
             .unwrap_or_else(|| self.spans.clone())
     }
 
+    #[cfg(test)]
     pub fn select_none(&mut self) {
         self.selected.clear();
         self.spans_with_selection = None;
@@ -53,7 +62,19 @@ impl<Link: Clone> Spans<Link> {
 
     pub fn select_all(&mut self) {
         self.selected = (0..self.spans.len()).collect();
-        self.spans_with_selection = None;
+        self.spans_with_selection = self.selection_color.map(|color| {
+            Rc::new(
+                self.spans
+                    .iter()
+                    .map(|span| Span {
+                        text: Cow::Owned(span.text.to_string()),
+                        color: Some(color),
+                        link: span.link.clone(),
+                        ..*span
+                    })
+                    .collect(),
+            )
+        });
     }
 
     pub fn select_range(&mut self, sel_start: usize, sel_end: usize) {
@@ -106,6 +127,7 @@ impl<Link: Clone> Spans<Link> {
                                     text: Cow::Owned(
                                         span_text[selected_start..selected_end].to_string(),
                                     ),
+                                    color: self.selection_color.or(span.color),
                                     link: span.link.clone(),
                                     ..*span
                                 },
@@ -153,9 +175,10 @@ mod tests {
 
     #[test]
     fn selection_ranges_are_utf8_byte_offsets() {
-        let mut spans = Spans::with_selection(
+        let mut spans = Spans::with_selection_color(
             Rc::new(vec![Span::<'static, ()>::new(Cow::Borrowed("A🗝️B"))]),
             Some((1, 8)),
+            Some(iced::Color::WHITE),
         );
         let rendered = spans.spans();
 
@@ -163,9 +186,18 @@ mod tests {
         assert_eq!(rendered[0].text, "A");
         assert_eq!(rendered[1].text, "🗝️");
         assert_eq!(rendered[2].text, "B");
+        assert_eq!(rendered[1].color, Some(iced::Color::WHITE));
         assert_eq!(spans.selected(), &[1]);
 
         spans.select_none();
         assert!(spans.selected().is_empty());
+
+        spans.select_all();
+        assert!(
+            spans
+                .spans()
+                .iter()
+                .all(|span| span.color == Some(iced::Color::WHITE))
+        );
     }
 }
