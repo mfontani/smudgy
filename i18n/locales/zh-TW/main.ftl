@@ -319,7 +319,6 @@ toolbar-automations = 自動化
 toolbar-map-editor = 地圖編輯器
 toolbar-layouts = 版面配置
 toolbar-settings = 設定
-toolbar-audio = 音訊
 
 # Named layouts menu
 layouts-apply-hint = 點選版面配置即可套用。

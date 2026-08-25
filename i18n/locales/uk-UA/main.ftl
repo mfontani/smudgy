@@ -330,7 +330,6 @@ toolbar-automations = Автоматизації
 toolbar-map-editor = Редактор мап
 toolbar-layouts = Розкладки
 toolbar-settings = Налаштування
-toolbar-audio = Аудіо
 
 # Named layouts menu
 layouts-apply-hint = Натисніть на розкладку, щоб застосувати її.
