@@ -326,7 +326,6 @@ toolbar-automations = Automations
 toolbar-map-editor = Map Editor
 toolbar-layouts = Layouts
 toolbar-settings = Settings
-toolbar-audio = Audio
 
 # Named layouts menu
 layouts-apply-hint = Click a layout to apply it.

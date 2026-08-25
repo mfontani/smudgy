@@ -164,8 +164,8 @@ pub enum Event {
     /// runtime shutdown, grid cleanup across all windows, the empty-window
     /// rule — is the daemon's job.
     CloseSession(SessionId),
-    /// The toolbar or reserved keyboard shortcut requested the audio
-    /// controls (the Settings window's Audio pane).
+    /// The reserved keyboard shortcut requested the audio controls (the
+    /// Settings window's Audio pane).
     #[cfg(feature = "web-audio-cpal")]
     OpenAudioPanel,
     /// The user clicked a pane's title-bar eyeball. The window already
@@ -2820,8 +2820,6 @@ impl SmudgyWindow {
                     Update::none()
                 }
                 toolbar::Message::SettingsPressed => Update::with_event(Event::OpenSettingsWindow),
-                #[cfg(feature = "web-audio-cpal")]
-                toolbar::Message::AudioPressed => Update::with_event(Event::OpenAudioPanel),
                 toolbar::Message::DragWindow => Update::with_task(window::drag(self.window_id)),
                 toolbar::Message::MinimizePressed => {
                     Update::with_task(window::minimize(self.window_id, true))
@@ -4154,11 +4152,14 @@ mod tests {
 
     #[cfg(feature = "web-audio-cpal")]
     #[test]
-    fn toolbar_audio_action_requests_the_audio_settings_pane() {
+    fn session_audio_shortcut_requests_the_audio_settings_pane() {
         let mut window = test_window();
         let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
         let update = window.update(
-            Message::ToolbarAction(toolbar::Message::AudioPressed),
+            Message::SessionPaneUserAction {
+                session_id: SessionId::from(0),
+                msg: session_store::Message::OpenAudioPanel,
+            },
             &mut sessions,
         );
         assert!(matches!(update.event, Some(Event::OpenAudioPanel)));

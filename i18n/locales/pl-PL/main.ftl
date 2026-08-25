@@ -328,7 +328,6 @@ toolbar-automations = Automatyzacje
 toolbar-map-editor = Edytor map
 toolbar-layouts = Układy
 toolbar-settings = Ustawienia
-toolbar-audio = Dźwięk
 
 # Named layouts menu
 layouts-apply-hint = Kliknij układ, aby go zastosować.
