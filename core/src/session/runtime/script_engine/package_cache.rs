@@ -18,10 +18,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use smudgy_cloud::ResolvedDependency;
-use smudgy_script::{PackageKey, PackageManifest};
+use smudgy_cloud::{ResolvedDependency, package_api::ResolvedModuleWire};
+pub use smudgy_script::PackageKey;
+use smudgy_script::PackageManifest;
 
 use crate::get_smudgy_home;
+use crate::models::persistence::write_atomic;
 
 /// A cached resolution of a concrete package version (no presigned URLs — those are
 /// ephemeral; bodies live in the blob cache, keyed by `content_hash`).
@@ -123,6 +125,20 @@ fn has_binary_media_extension(subpath: &str) -> bool {
     )
 }
 
+/// A deterministic package-level integrity fingerprint over the per-module content
+/// hashes (each is already a SHA-256). Detects any module change for the lockfile.
+/// One recipe for every writer — the engine's provider and the background update
+/// checker stamp identical metas.
+#[must_use]
+pub fn package_integrity(modules: &[ResolvedModuleWire]) -> String {
+    let mut entries: Vec<String> = modules
+        .iter()
+        .map(|module| format!("{}={}", module.subpath, module.content_hash))
+        .collect();
+    entries.sort();
+    entries.join(";")
+}
+
 /// Disk cache rooted at `<smudgy_home>/cache/packages/`.
 #[derive(Debug, Clone)]
 pub struct PackageCache {
@@ -142,6 +158,13 @@ impl PackageCache {
         Ok(Self { root })
     }
 
+    /// A cache rooted at an explicit directory, for callers that must not touch the
+    /// process-global smudgy home (tests, tooling).
+    #[must_use]
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     fn blob_path(&self, content_hash: &str) -> PathBuf {
         let a = content_hash.get(0..2).unwrap_or("00");
         let b = content_hash.get(2..4).unwrap_or("00");
@@ -154,6 +177,14 @@ impl PackageCache {
             .join(&key.owner)
             .join(&key.name)
             .join(format!("{version}.json"))
+    }
+
+    /// Whether a module body is already cached — presence is truth (bodies are
+    /// verified before they are written), so writers use this to skip a fetch
+    /// without reading the file.
+    #[must_use]
+    pub fn has_blob(&self, content_hash: &str) -> bool {
+        self.blob_path(content_hash).exists()
     }
 
     /// A cached module body, if present (content-addressed; trusted without re-hashing).
@@ -179,6 +210,11 @@ impl PackageCache {
 
     /// Byte twin of [`write_blob`](Self::write_blob), for binary (asset) bodies.
     ///
+    /// The write is atomic (temp sibling + rename): presence-gating trusts a blob file
+    /// forever, so a crash or full disk mid-write must never leave a torn body at a
+    /// content-addressed path — and a completed write replaces any torn file a previous
+    /// interrupted attempt left behind.
+    ///
     /// # Errors
     /// Returns an error if the cache directory cannot be created or the file written.
     pub fn write_blob_bytes(&self, content_hash: &str, body: &[u8]) -> Result<()> {
@@ -187,7 +223,15 @@ impl PackageCache {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create blob cache dir {}", parent.display()))?;
         }
-        fs::write(&path, body).with_context(|| format!("write blob {}", path.display()))
+        write_atomic(&path, body).with_context(|| format!("write blob {}", path.display()))
+    }
+
+    /// Whether resolution metadata for a concrete version is already cached. Versions
+    /// are immutable, so presence means the write-once entry is final — writers use
+    /// this to skip a redundant serialize + write.
+    #[must_use]
+    pub fn has_meta(&self, key: &PackageKey, version: &str) -> bool {
+        self.meta_path(key, version).exists()
     }
 
     /// The cached resolution metadata for a concrete version, if present.
@@ -211,6 +255,9 @@ impl PackageCache {
 
     /// Persist resolution metadata for a concrete version (immutable, so write-once).
     ///
+    /// The write is atomic (temp sibling + rename), so readers never see partial JSON
+    /// and a completed write replaces any torn file an interrupted attempt left behind.
+    ///
     /// # Errors
     /// Returns an error if the cache directory cannot be created or the file written.
     pub fn write_meta(
@@ -225,7 +272,37 @@ impl PackageCache {
                 .with_context(|| format!("create meta cache dir {}", parent.display()))?;
         }
         let json = serde_json::to_string(resolution).context("serialize cached resolution")?;
-        fs::write(&path, json).with_context(|| format!("write meta {}", path.display()))
+        write_atomic(&path, json.as_bytes())
+            .with_context(|| format!("write meta {}", path.display()))
+    }
+
+    /// Persist resolution metadata unless an equally-complete copy is already cached —
+    /// the self-healing form of [`write_meta`](Self::write_meta). Versions are
+    /// immutable, so the common case skips a redundant serialize + write; but a cache
+    /// file written before `CachedResolution` grew a field deserializes with that field
+    /// defaulted (a pre-`dependencies` file folds to a root-only closure; a
+    /// pre-`media_type` file misclassifies modules), and freezing it forever would
+    /// silently under-report the version's true facts. So a fresh resolution that
+    /// carries dependency edges or modules the cached copy lacks — or finds the cached
+    /// file unreadable (torn, corrupt) — overwrites it instead of skipping.
+    ///
+    /// # Errors
+    /// Returns an error if the cache directory cannot be created or the file written.
+    pub fn refresh_meta(
+        &self,
+        key: &PackageKey,
+        version: &str,
+        resolution: &CachedResolution,
+    ) -> Result<()> {
+        if let Some(cached) = self.read_meta(key, version) {
+            let missing_deps =
+                cached.dependencies.is_empty() && !resolution.dependencies.is_empty();
+            let missing_modules = cached.modules.len() < resolution.modules.len();
+            if !missing_deps && !missing_modules {
+                return Ok(());
+            }
+        }
+        self.write_meta(key, version, resolution)
     }
 }
 
@@ -305,6 +382,92 @@ mod tests {
         assert!(!cache.has_all_code_blobs(&loaded));
         cache.write_blob("deadbeef", "export const x = 1;").unwrap();
         assert!(cache.has_all_code_blobs(&loaded));
+    }
+
+    #[test]
+    fn a_fresh_write_replaces_a_torn_file() {
+        // Presence-gating trusts cached files forever, so the atomic writers must be
+        // able to REPLACE a torn file left by an interrupted write — the old
+        // write-once early return would have trusted the garbage indefinitely.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let resolution = CachedResolution {
+            version: "1.4.0".into(),
+            integrity: "sum".into(),
+            manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.4.0" }"#)
+                .unwrap(),
+            modules: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        // Plant torn files at the final content-addressed paths.
+        let meta_path = cache.meta_path(&key(), "1.4.0");
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(&meta_path, r#"{"version":"1.4"#).unwrap();
+        assert!(
+            cache.read_meta(&key(), "1.4.0").is_none(),
+            "torn JSON is unreadable"
+        );
+        let blob_path = cache.blob_path("abc123");
+        fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        fs::write(&blob_path, "export const trunc").unwrap();
+
+        // A completed write (rename over the final path) heals both.
+        cache.refresh_meta(&key(), "1.4.0", &resolution).unwrap();
+        assert_eq!(
+            cache.read_meta(&key(), "1.4.0").map(|m| m.version),
+            Some("1.4.0".to_string())
+        );
+        cache.write_blob("abc123", "export const x = 1;").unwrap();
+        assert_eq!(
+            cache.read_blob("abc123").as_deref(),
+            Some("export const x = 1;")
+        );
+    }
+
+    #[test]
+    fn refresh_meta_heals_a_legacy_deps_less_file_but_never_regresses_one() {
+        // A cache file written before the `dependencies` field deserializes with an
+        // empty dep list; folding it yields a root-only closure union. A fresh
+        // resolution carrying the version's true edges must overwrite it.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let manifest =
+            PackageManifest::parse(r#"{ "name": "mapper", "version": "1.4.0" }"#).unwrap();
+        let legacy = CachedResolution {
+            version: "1.4.0".into(),
+            integrity: "sum".into(),
+            manifest: manifest.clone(),
+            modules: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        cache.write_meta(&key(), "1.4.0", &legacy).unwrap();
+        let full = CachedResolution {
+            dependencies: vec![ResolvedDependency {
+                owner_nickname: "wbk".into(),
+                name: "base".into(),
+                range: "^1".into(),
+                resolved_version: "1.0.0".into(),
+            }],
+            ..legacy.clone()
+        };
+        cache.refresh_meta(&key(), "1.4.0", &full).unwrap();
+        assert_eq!(
+            cache
+                .read_meta(&key(), "1.4.0")
+                .map(|m| m.dependencies.len()),
+            Some(1),
+            "the legacy file was healed with the wire's dependency edges"
+        );
+        // The reverse never regresses: a deps-less resolution (a degraded wire)
+        // must not clobber the healed copy.
+        cache.refresh_meta(&key(), "1.4.0", &legacy).unwrap();
+        assert_eq!(
+            cache
+                .read_meta(&key(), "1.4.0")
+                .map(|m| m.dependencies.len()),
+            Some(1),
+            "an equally-or-less-complete resolution leaves the cached copy alone"
+        );
     }
 
     #[test]

@@ -62,6 +62,11 @@ pub(crate) use remote_interop::SharedRemoteStateRegistry;
 
 pub use script_action::ScriptAction;
 pub use script_engine::layout_fold;
+// The persistent package cache is public API: published versions are immutable, so the
+// cache is a first-class local source of package content — session load serves from it
+// cache-first, and out-of-session consumers (the update checker, cache-sourced package
+// copies) read and warm the same store.
+pub use script_engine::package_cache;
 use script_engine::{ScriptEngine, ScriptEngineParams};
 #[cfg(not(feature = "bench-api"))]
 use store::SessionStore;

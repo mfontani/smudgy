@@ -2210,6 +2210,20 @@ impl ManagedSession {
         self.send_runtime_action(RuntimeAction::PaneUserHidden { key, hidden });
     }
 
+    /// Whether the session's runtime has reported ready at least once (its action
+    /// channel is adopted). `false` exactly until the first `RuntimeReady` — the
+    /// daemon's once-per-open discriminator (a reload re-emits readiness).
+    pub fn has_runtime(&self) -> bool {
+        self.runtime_tx.is_some()
+    }
+
+    /// Print one informational line into the session's terminal — the package
+    /// checker's staging/uninstall notices. Best-effort: a not-yet-ready runtime
+    /// drops the line with a log warning.
+    pub fn echo_notice(&self, line: String) {
+        self.send_runtime_action(RuntimeAction::Echo(Arc::new(line)));
+    }
+
     fn send_runtime_action(&self, action: RuntimeAction) {
         match &self.runtime_tx {
             Some(tx) => {

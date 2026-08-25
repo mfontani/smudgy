@@ -389,6 +389,33 @@ shell-visit-download = Перейдіть на сторінку завантаж
 shell-remind-later = Нагадати пізніше
 shell-skip-version = Пропустити цю версію
 
+# Сповіщення про оновлення пакетів (нижня пігулка головного вікна)
+toast-package-updates-ready = Оновлення пакетів готові ({ $count })
+toast-package-reload-scripts = Перезавантажити скрипти
+toast-package-ignore = Ігнорувати
+toast-package-needs-permissions = Оновлення { $name } потребує нових дозволів
+toast-package-review = Переглянути…
+toast-package-pin-current = Закріпити поточну версію
+toast-package-later = Пізніше
+toast-package-attention = Оновлень пакетів, що потребують уваги: { $count }
+toast-package-open-automations = Переглянути у вікні автоматизацій
+toast-package-update-failed = Сталася помилка під час завантаження оновлення для { $name }. Щоб повторити спробу, закрийте та знову відкрийте цю сесію.
+
+# Вікно перегляду оновлення пакета
+package-update-modal-title = Оновлення пакета
+package-update-versions = { $current } → { $latest }
+package-update-version-new = Нова версія { $latest }
+package-update-asks = Це оновлення потребує додаткових дозволів:
+package-update-needs-smudgy = Це оновлення потребує smudgy { $version } або новішої версії. Спершу оновіть smudgy.
+package-update-grant = Надати дозволи й оновити
+package-update-pin = Закріпити поточну версію
+package-update-not-now = Не зараз
+
+# Package-update terminal notices (echoed into the owning session)
+notice-package-deleted-uninstalled = [package] { $name } було видалено видавцем і деінстальовано
+notice-package-update-ready = [package] оновлення { $name } { $from } → { $to } готове
+notice-package-staged-ready = [package] { $name } { $to } готово
+
 # Cloud errors
 cloud-error-email-unverified = Підтвердьте свою електронну адресу, щоб користуватися цією функцією.
 cloud-error-not-found = Не знайдено.

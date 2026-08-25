@@ -39,12 +39,12 @@ use crate::keymap::MaybePhysicalKey;
 use crate::theme::Element as ThemedElement;
 use crate::update::Update;
 
-mod common;
+pub(crate) mod common;
 mod dashboard;
 mod editors;
 mod highlight;
 mod manifest;
-mod model;
+pub(crate) mod model;
 mod packages;
 mod palette;
 mod param_values;

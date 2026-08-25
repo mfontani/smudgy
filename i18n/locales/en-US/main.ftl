@@ -385,6 +385,33 @@ shell-visit-download = Visit download page
 shell-remind-later = Remind me later
 shell-skip-version = Skip this version
 
+# Package-update toasts (the main window's bottom pill)
+toast-package-updates-ready = Package updates ready ({ $count })
+toast-package-reload-scripts = Reload scripts
+toast-package-ignore = Ignore
+toast-package-needs-permissions = Update for { $name } needs new permissions
+toast-package-review = Review…
+toast-package-pin-current = Pin current
+toast-package-later = Later
+toast-package-attention = { $count } package updates need attention
+toast-package-open-automations = Review in Automations
+toast-package-update-failed = There was an error downloading an update for { $name }. To retry, close and reopen this session.
+
+# The package-update review modal
+package-update-modal-title = Package update
+package-update-versions = { $current } → { $latest }
+package-update-version-new = New version { $latest }
+package-update-asks = This update requires additional permissions:
+package-update-needs-smudgy = This update needs smudgy { $version } or newer. Update smudgy first.
+package-update-grant = Grant & update
+package-update-pin = Pin current version
+package-update-not-now = Not now
+
+# Package-update terminal notices (echoed into the owning session)
+notice-package-deleted-uninstalled = [package] { $name } was deleted by its publisher and has been uninstalled
+notice-package-update-ready = [package] { $name } update { $from } → { $to } ready
+notice-package-staged-ready = [package] { $name } { $to } ready
+
 # Cloud errors
 cloud-error-email-unverified = Verify your email to use this feature.
 cloud-error-not-found = Not found.

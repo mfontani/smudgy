@@ -21,7 +21,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     assets,
     cloud_account::CloudHandles,
-    components::{self, modal, resize_grips, tab_strip, toolbar},
+    components::{self, modal, resize_grips, tab_strip, toast, toolbar},
     pane_drag::{self, ClassifiedTarget, DropRegion, GridEdgeSide, TabDrag},
     pane_groups::{self, GroupId, GroupLayout, SplitSizing, Tab, TabId},
     session_store::{self, SessionStore},
@@ -143,6 +143,8 @@ pub enum Message {
     /// frame timestamp so the CRT-cat shader's clock advances. Only emitted
     /// while there is no pane grid (see `subscription`).
     EmptyStateTick(std::time::Instant),
+    /// A button press on the visible package-update toast.
+    Toast(toast::Message),
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +213,39 @@ pub enum Event {
     OpenDownloadPage,
     DismissUpgrade,
     DismissUpgradeForVersion,
+    /// The updates-ready toast's Reload scripts: reload every session on
+    /// `server_name` so they pick the staged package versions up from cache
+    /// (the same live-reload path the Automations window's `ScriptsChanged`
+    /// takes).
+    PackageReloadScripts {
+        server_name: String,
+    },
+    /// The needs-permissions toast's Later: persist the dismissal of the
+    /// offered `version` so the offer stays quiet until a strictly newer one
+    /// appears.
+    PackageUpdateDismissed {
+        server_name: String,
+        specifier: String,
+        version: String,
+    },
+    /// Pin the package at `version` (its currently staged version) — the
+    /// terminal answer that ends update offers and delta scans for it.
+    PackageUpdatePinned {
+        server_name: String,
+        specifier: String,
+        version: String,
+    },
+    /// The collapsed needs-attention toast's action: open the Automations
+    /// window for `server_name`, where the per-package update cards live.
+    OpenAutomationsForServer {
+        server_name: String,
+    },
+    /// The review modal's Grant & update: record the offer's union as the
+    /// consented grant, then stage the update (prefetch + lockfile advance)
+    /// and live-reload the server's sessions when it lands.
+    PackageUpdateGranted {
+        offer: Box<components::toast::UpdateOffer>,
+    },
     /// Capture `server`'s window footprint and save it as the named layout
     /// `name` (the daemon owns capture — it spans windows). The acting
     /// session is this window's active one; `server` is its server.
@@ -395,6 +430,11 @@ pub struct SmudgyWindow {
     /// the self-drawn frame the same way maximized does.
     fullscreen: bool,
     modal: Option<modal::Modal>,
+    /// Bottom-anchored package-update toasts: one visible slot plus a FIFO
+    /// queue. Non-modal — no backdrop, the window stays interactive behind the
+    /// pill. Fed by the daemon's background update checker via
+    /// [`Self::push_toast`].
+    toasts: toast::Toasts,
     /// A keep-or-close prompt that arrived while the modal surface was
     /// otherwise occupied (a Connect form mid-use, or the Layouts menu deep
     /// in a rename/save stage). Parked rather than clobbering: nothing
@@ -665,6 +705,7 @@ impl SmudgyWindow {
             maximized: false,
             fullscreen: false,
             modal: None,
+            toasts: toast::Toasts::default(),
             pending_layout_prompt: None,
             grid_area: std::cell::Cell::new(Size::ZERO),
             layout: GroupLayout::new(),
@@ -687,6 +728,13 @@ impl SmudgyWindow {
             vacancies: Vec::new(),
             cat_clock: widgets::crt_cat::Clock::default(),
         }
+    }
+
+    /// Queue a package-update toast into this window's slot. The daemon routes
+    /// each offer to the window hosting the owning session; the toast state
+    /// handles the single-slot queue and the needs-attention collapse.
+    pub fn push_toast(&mut self, toast: toast::Toast) {
+        self.toasts.push(toast);
     }
 
     /// Whether every group renders regardless of the hidden set. Toolbar
@@ -1402,7 +1450,7 @@ impl SmudgyWindow {
     }
 
     /// Whether this window's layout holds a pane of `session_id`.
-    fn hosts_session(&self, session_id: SessionId) -> bool {
+    pub fn hosts_session(&self, session_id: SessionId) -> bool {
         self.bindings
             .keys()
             .any(|slot| slot.session_id == session_id)
@@ -2926,6 +2974,27 @@ impl SmudgyWindow {
                         }
                     }
                 }
+                modal::Event::PackageUpdate(update_event) => {
+                    // Every decision closes the modal; the daemon performs the
+                    // consequences.
+                    self.modal = None;
+                    self.deliver_pending_layout_prompt();
+                    match update_event {
+                        modal::package_update::Event::Grant(offer) => {
+                            Update::with_event(Event::PackageUpdateGranted { offer })
+                        }
+                        modal::package_update::Event::Pin {
+                            server_name,
+                            specifier,
+                            version,
+                        } => Update::with_event(Event::PackageUpdatePinned {
+                            server_name,
+                            specifier,
+                            version,
+                        }),
+                        modal::package_update::Event::Close => Update::none(),
+                    }
+                }
             },
             Message::PromptLayoutAnswers {
                 server,
@@ -3336,6 +3405,56 @@ impl SmudgyWindow {
                 self.cat_clock.tick(now);
                 Update::none()
             }
+            Message::Toast(msg) => match msg {
+                toast::Message::ReloadScripts { server_name } => {
+                    self.toasts.advance();
+                    Update::with_event(Event::PackageReloadScripts { server_name })
+                }
+                toast::Message::Ignore => {
+                    // Staging is durable — the updates apply at the next session
+                    // load regardless, so dismissal persists nothing.
+                    self.toasts.advance();
+                    Update::none()
+                }
+                toast::Message::Review(offer) => {
+                    // The modal replaces the toast: it carries the same offer, and
+                    // its Not now is the same non-persisted deferral as losing the
+                    // toast (the persisted dismissal is the toast's Later).
+                    self.toasts.advance();
+                    self.modal = Some(modal::Modal::PackageUpdate(
+                        modal::package_update::State::new(*offer),
+                    ));
+                    Update::none()
+                }
+                toast::Message::PinCurrent {
+                    server_name,
+                    specifier,
+                    version,
+                } => {
+                    self.toasts.advance();
+                    Update::with_event(Event::PackageUpdatePinned {
+                        server_name,
+                        specifier,
+                        version,
+                    })
+                }
+                toast::Message::Later {
+                    server_name,
+                    specifier,
+                    version,
+                } => {
+                    self.toasts.advance();
+                    Update::with_event(Event::PackageUpdateDismissed {
+                        server_name,
+                        specifier,
+                        version,
+                    })
+                }
+                toast::Message::OpenAutomations { server_name } => {
+                    self.toasts.advance();
+                    Update::with_event(Event::OpenAutomationsForServer { server_name })
+                }
+            },
         }
     }
 
@@ -3757,6 +3876,16 @@ impl SmudgyWindow {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
+
+        // Package-update toasts: a non-modal bottom pill layer — no backdrop,
+        // the window stays fully interactive behind it. Stacked under any modal,
+        // so an open modal's scrim dims the toast along with the rest of the
+        // window.
+        let main_layout: ThemedElement<Message> = if let Some(toast_layer) = self.toasts.view() {
+            stack(vec![main_layout, toast_layer.map(Message::Toast)]).into()
+        } else {
+            main_layout
+        };
 
         let main_layout: ThemedElement<Message> = if let Some(modal) = &self.modal {
             let modal_view = modal.view().map(Message::ModalMessage);
