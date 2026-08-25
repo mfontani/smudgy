@@ -38,7 +38,7 @@ use crate::{
             ActionResult, IsolateId, SingletonRegistry,
             line_operation::LineOperation,
             script_engine::ops::{Capture, Fallthrough},
-            trigger::{Manager, MatchCapture, SharedAutomationRegistry},
+            trigger::{AliasSender, Manager, MatchCapture, SharedAutomationRegistry},
         },
         styled_line::StyledLine,
         ui_command::{PaneCommand, UiCommand, UiCommandProducer},
@@ -2518,6 +2518,7 @@ impl<'a> ScriptEngine<'a> {
         function_id: FunctionId,
         matches: &Arc<Vec<MatchCapture>>,
         depth: u32,
+        sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
         // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
         // hot path pays just a level check (compiled out when TRACE is statically off).
@@ -2563,6 +2564,14 @@ impl<'a> ScriptEngine<'a> {
             .try_borrow::<ops::EventDepth>()
             .map_or(0, |d| d.0);
         op_state.borrow_mut().put(ops::EventDepth(depth));
+        // The alias identity rides beside the depth (same save/restore bracket): a `send()`
+        // issued inside this handler stamps both onto its queued action, so the sent text is
+        // excluded from re-matching the sending alias.
+        let prior_sender = op_state
+            .borrow()
+            .try_borrow::<ops::AliasContext>()
+            .and_then(|context| context.0.clone());
+        op_state.borrow_mut().put(ops::AliasContext(sender.clone()));
         // Make the owning isolate current for this call (it usually isn't — Model B leaves the
         // enter-stack empty between ops); released after the scope on the way out.
         let _entered = EnteredIsolate::enter(deno);
@@ -2609,7 +2618,11 @@ impl<'a> ScriptEngine<'a> {
             } else if let Some(value) = result {
                 if value.is_string() {
                     let output = value.to_rust_string_lossy(try_catch);
-                    trigger_manager.process_nested_outgoing_line(output.as_str(), depth + 1)?;
+                    trigger_manager.process_nested_outgoing_line(
+                        output.as_str(),
+                        depth + 1,
+                        sender.as_ref(),
+                    )?;
                     Ok(ActionResult::None)
                 } else {
                     Ok(ActionResult::None)
@@ -2621,6 +2634,7 @@ impl<'a> ScriptEngine<'a> {
 
         // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
         op_state.borrow_mut().put(ops::EventDepth(prior_depth));
+        op_state.borrow_mut().put(ops::AliasContext(prior_sender));
 
         if let Some(started) = started {
             trace!(
@@ -2668,6 +2682,7 @@ impl<'a> ScriptEngine<'a> {
         // from an earlier handler on this isolate. No restore needed — 0 is the between-dispatch
         // baseline the save/restore in the other dispatch paths returns to.
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
+        deno.op_state().borrow_mut().put(ops::AliasContext(None));
         // Make the target isolate current for this callback (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -2749,6 +2764,7 @@ impl<'a> ScriptEngine<'a> {
         };
         // Top-level dispatch (depth 0), like a widget callback.
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
+        deno.op_state().borrow_mut().put(ops::AliasContext(None));
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -2820,6 +2836,7 @@ impl<'a> ScriptEngine<'a> {
         };
         let request_id = pending.borrow_mut().insert(state);
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
+        deno.op_state().borrow_mut().put(ops::AliasContext(None));
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -2893,6 +2910,7 @@ impl<'a> ScriptEngine<'a> {
         script_id: ScriptId,
         matches: &Arc<Vec<MatchCapture>>,
         depth: u32,
+        sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
         // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
         // hot path pays just a level check (compiled out when TRACE is statically off).
@@ -2923,6 +2941,13 @@ impl<'a> ScriptEngine<'a> {
             .try_borrow::<ops::EventDepth>()
             .map_or(0, |d| d.0);
         op_state.borrow_mut().put(ops::EventDepth(depth));
+        // Alias identity beside the depth, same save/restore bracket as
+        // `call_javascript_function` (see the comment there).
+        let prior_sender = op_state
+            .borrow()
+            .try_borrow::<ops::AliasContext>()
+            .and_then(|context| context.0.clone());
+        op_state.borrow_mut().put(ops::AliasContext(sender.clone()));
         // Make the owning isolate current for this eval (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -2966,7 +2991,11 @@ impl<'a> ScriptEngine<'a> {
             } else if let Some(value) = result {
                 if value.is_string() {
                     let output = value.to_rust_string_lossy(try_catch);
-                    trigger_manager.process_nested_outgoing_line(output.as_str(), depth + 1)?;
+                    trigger_manager.process_nested_outgoing_line(
+                        output.as_str(),
+                        depth + 1,
+                        sender.as_ref(),
+                    )?;
 
                     Ok(ActionResult::None)
                 } else {
@@ -2979,6 +3008,7 @@ impl<'a> ScriptEngine<'a> {
 
         // Restore the enclosing depth now the eval has returned (see the save above).
         op_state.borrow_mut().put(ops::EventDepth(prior_depth));
+        op_state.borrow_mut().put(ops::AliasContext(prior_sender));
 
         if let Some(started) = started {
             trace!(

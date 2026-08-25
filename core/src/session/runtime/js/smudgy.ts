@@ -1340,10 +1340,15 @@ interface SavedAlias {
     priority?: number;
     /** Continue checking later aliases after a match. Defaults to true. */
     fallthrough?: boolean;
+    /** Whether text this alias sends may match this same alias again. Defaults to false. */
+    allowSelfMatch?: boolean;
     /** Defaults to "plaintext". */
     language?: ScriptLang;
     /** Optional package-folder grouping in the automations window. */
     package?: string;
+    /** The editor's authoring sidecar, preserved verbatim across a get/save
+     *  round trip. The editor authors it; scripts should carry it, not build it. */
+    matcher?: unknown;
 }
 
 /** A persisted user-side trigger (the shape saved in `triggers.json`). */
@@ -2720,10 +2725,10 @@ function derivePatternName(patternList: string[]): string {
     return patternList.join(" | ");
 }
 
-/** Creates an alias that matches input patterns and executes a script. */
+/** Creates an alias that matches input patterns (or a command`...` value) and executes a script. */
 function createAlias(
     creatorId: number,
-    patterns: Pattern | Pattern[],
+    patterns: Pattern | Pattern[] | Command,
     script: AutomationScript,
     options: AliasOptions = {},
 ): Alias {
@@ -2750,8 +2755,25 @@ function createAlias(
     const priority = normalizePriority(options);
     const fallthrough = normalizeFallthrough(options);
 
-    const patternList = (Array.isArray(patterns) ? patterns : [patterns]).map(patternSource);
-    const name = resolveAutomationName(options.name, () => derivePatternName(patternList));
+    let patternList: string[];
+    let commandSpec = "";
+    let name: string;
+    if (isCommand(patterns)) {
+        // The host derives the match prefilter from the word (its single source
+        // of truth); the alias's identity defaults to the word itself, so the
+        // automations window lists the command the player actually types.
+        patternList = [];
+        commandSpec = JSON.stringify({ name: patterns.word, args: patterns.args, parse: "all" });
+        const word = patterns.word;
+        name = resolveAutomationName(options.name, () => word);
+    } else {
+        const list = Array.isArray(patterns) ? patterns : [patterns];
+        if (list.some(isCommand)) {
+            throw new TypeError("A command`...` value stands alone; it cannot be combined with other patterns");
+        }
+        patternList = list.map(patternSource);
+        name = resolveAutomationName(options.name, () => derivePatternName(patternList));
+    }
 
     const singleton = options.singleton ?? false;
     let created: boolean;
@@ -2768,6 +2790,7 @@ function createAlias(
             fallthrough,
             fireLimit,
             script.toString(),
+            commandSpec,
         );
     } else {
         created = op_smudgy_create_simple_alias(
@@ -2779,6 +2802,7 @@ function createAlias(
             priority,
             fallthrough,
             fireLimit,
+            commandSpec,
         );
     }
 
@@ -3224,12 +3248,190 @@ const pattern = Object.assign(makePatternTag("both"), {
     contains: makePatternTag("none"),
 });
 
+// ---- The `command` tagged template ------------------------------------------------
+
+/** One argument of a command`...` value, in declaration order. */
+interface CommandArg {
+    readonly name: string;
+    readonly kind: "required" | "optional" | "rest";
+}
+
+/**
+ * A parsed command`...` value: the command word plus its argument spec, handed
+ * to `createAlias` in the pattern position. Branded (the tag is the only
+ * constructor) so `createAlias` can tell it from a pattern.
+ */
+interface Command {
+    readonly word: string;
+    readonly args: readonly CommandArg[];
+    /** The canonical usage line (`greet <person> [words...]`) -- what a
+     *  missing required argument echoes. */
+    readonly usage: string;
+}
+
+const COMMAND_BRAND = Symbol("smudgy.command");
+
+function isCommand(value: unknown): value is Command {
+    return typeof value === "object" && value !== null && (value as any)[COMMAND_BRAND] === true;
+}
+
+/** Argument names become capture names (`m.person`, `$person`), so they are identifiers. */
+const COMMAND_ARG_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** One usage-line character: written in the tag body (`text`, may be syntax) or
+ *  interpolated (always literal word text). */
+type CommandChar = { ch: string; text: boolean };
+
+/**
+ * The `command` tagged template: the editor's Usage-line notation, evaluating
+ * to a value `createAlias` accepts in the pattern position.
+ *
+ *     createAlias(command`greet <person> [greeting] [words...]`, (m) => { ... });
+ *
+ * The first token is the command word; `<name>` is a required argument,
+ * `[name]` optional, and `[name...]` takes the rest of the line (last position
+ * only) -- exactly what the editor's Usage row prints, so a Usage line copies
+ * straight into a script. Arguments arrive as named entries on the matches
+ * object (an absent optional reads `""`); `m[0]` is the line as typed. A
+ * missing required argument echoes the usage line and captures the input
+ * without running the body; unclaimed trailing words fall through to the
+ * game. Tokens split on spaces, with quotes or braces grouping a multi-word
+ * argument, and the command word joins tab completion.
+ *
+ * Interpolated `${values}` are always literal word text, never syntax. A body
+ * that fails to parse throws (`TypeError`).
+ *
+ * Pure: no session or isolate state, so it is safe at module top level.
+ */
+function command(strings: TemplateStringsArray, ...values: unknown[]): Command {
+    const chars: CommandChar[] = [];
+    let written = "";
+    for (let i = 0; i < strings.raw.length; i++) {
+        for (const ch of strings.raw[i]) chars.push({ ch, text: true });
+        written += strings.raw[i];
+        if (i < values.length) {
+            const value = String(values[i]);
+            for (const ch of value) chars.push({ ch, text: false });
+            written += value;
+        }
+    }
+
+    const fail = (message: string): never => {
+        throw new TypeError("command`" + written + "`: " + message);
+    };
+
+    // A splice may not carry whitespace: the word and every argument name are
+    // single tokens, and a space from data must not quietly split one.
+    for (const c of chars) {
+        if (!c.text && /\s/.test(c.ch)) {
+            fail("interpolated values must be single words (no whitespace)");
+        }
+    }
+
+    const n = chars.length;
+    const isTextWs = (k: number): boolean => chars[k].text && /\s/.test(chars[k].ch);
+    const isTextStructural = (k: number): boolean =>
+        chars[k].text && (chars[k].ch === "<" || chars[k].ch === ">" || chars[k].ch === "[" || chars[k].ch === "]");
+
+    let word = "";
+    const args: { name: string; kind: CommandArg["kind"] }[] = [];
+    let sawRest = false;
+    let i = 0;
+    while (i < n) {
+        if (isTextWs(i)) {
+            i++;
+            continue;
+        }
+        const c = chars[i];
+        if (c.text && (c.ch === "<" || c.ch === "[")) {
+            // An argument token: `<name>`, `[name]`, or `[name...]`.
+            if (word === "") fail("write the command word before any arguments");
+            if (sawRest) fail("a rest argument ([name...]) must be last");
+            const closer = c.ch === "<" ? ">" : "]";
+            i++;
+            let name = "";
+            // Consecutive dots WRITTEN IN THE TAG BODY ending at the current
+            // position: only those may spell the `...` rest marker, so a dot
+            // arriving by interpolation can never turn [name] into a rest.
+            let textDots = 0;
+            let closed = false;
+            while (i < n) {
+                const a = chars[i];
+                if (a.text && a.ch === closer) {
+                    closed = true;
+                    i++;
+                    break;
+                }
+                if (isTextStructural(i)) fail('unexpected "' + a.ch + '" in an argument name');
+                if (isTextWs(i)) fail("argument names are single words");
+                textDots = a.text && a.ch === "." ? textDots + 1 : 0;
+                name += a.ch;
+                i++;
+            }
+            if (!closed) fail('missing "' + closer + '"');
+            let kind: CommandArg["kind"] = closer === ">" ? "required" : "optional";
+            if (closer === "]" && textDots >= 3 && name.endsWith("...")) {
+                name = name.slice(0, -3);
+                kind = "rest";
+                sawRest = true;
+            }
+            if (!COMMAND_ARG_NAME.test(name)) {
+                fail('argument names are letters, digits, and underscores: "' + name + '"');
+            }
+            if (args.some((arg) => arg.name === name)) fail('duplicate argument name "' + name + '"');
+            args.push({ name, kind });
+        } else if (isTextStructural(i)) {
+            fail('unexpected "' + c.ch + '"');
+        } else {
+            // A bare token: the command word, first position only.
+            if (word !== "") {
+                fail("arguments are written <name>, [name], or [name...]");
+            }
+            let token = "";
+            while (i < n && !isTextWs(i)) {
+                if (isTextStructural(i)) fail('unexpected "' + chars[i].ch + '" in the command word');
+                token += chars[i].ch;
+                i++;
+            }
+            word = token;
+        }
+    }
+    if (word === "") fail("write the command word first: command`word <required> [optional] [rest...]`");
+
+    // The canonical usage line -- `usage_line` in core/src/models/matchers.rs
+    // renders the same shapes, and the integration test holds the two in lockstep.
+    const usage = word +
+        args
+            .map((arg) =>
+                arg.kind === "required"
+                    ? " <" + arg.name + ">"
+                    : arg.kind === "optional"
+                    ? " [" + arg.name + "]"
+                    : " [" + arg.name + "...]"
+            )
+            .join("");
+
+    const value = {
+        word,
+        args: Object.freeze(args.map((arg) => Object.freeze(arg))),
+        usage,
+        toString(): string {
+            return usage;
+        },
+    };
+    Object.defineProperty(value, COMMAND_BRAND, { value: true });
+    return Object.freeze(value);
+}
+
 /** Normalizes the patterns for a trigger. */
 function normalizePatterns(patterns: Pattern | TriggerPatterns): {
     patterns: string[];
     rawPatterns: string[];
     antiPatterns: string[];
 } {
+    if (isCommand(patterns)) {
+        throw new TypeError("command`...` values are for createAlias; a trigger matches lines with patterns");
+    }
     const normalized = {
         patterns: [] as string[],
         rawPatterns: [] as string[],
@@ -3992,9 +4194,13 @@ const aliasToWire = (def: SavedAlias) => ({
     enabled: def.enabled ?? true,
     priority: def.priority ?? 0,
     fallthrough: def.fallthrough ?? true,
+    allow_self_match: def.allowSelfMatch ?? false,
     language: langToWire(def.language),
     ...(def.script !== undefined ? { script: String(def.script) } : {}),
     ...(def.package !== undefined ? { package: String(def.package) } : {}),
+    // The editor's authoring sidecar rides verbatim, so a get/save round trip
+    // cannot strip it (the save op validates the shape on deserialization).
+    ...(def.matcher !== undefined && def.matcher !== null ? { matcher: def.matcher } : {}),
 });
 const triggerToWire = (def: SavedTrigger) => ({
     enabled: def.enabled ?? true,
@@ -4024,8 +4230,10 @@ const aliasFromWire = (w: any): SavedAlias => ({
     enabled: w.enabled,
     priority: w.priority ?? 0,
     fallthrough: w.fallthrough ?? true,
+    allowSelfMatch: w.allow_self_match ?? false,
     language: langFromWire(w.language),
     package: w.package ?? undefined,
+    matcher: w.matcher ?? undefined,
 });
 const triggerFromWire = (w: any): SavedTrigger => ({
     patterns: patternArray(w.pattern, w.patterns),
@@ -5093,6 +5301,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         style,
         link,
         pattern,
+        command,
         reload,
         capture,
         fallthrough,
@@ -5114,7 +5323,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         userAutomations,
         // Creator-bound creation surface. Public arguments stay pattern/key/options-first;
         // the creator id is internal provenance and never exposed to scripts.
-        createAlias: (patterns: Pattern | Pattern[], script: AutomationScript, options?: AliasOptions) =>
+        createAlias: (patterns: Pattern | Pattern[] | Command, script: AutomationScript, options?: AliasOptions) =>
             createAlias(creatorId, patterns, script, options),
         createTrigger: (patterns: Pattern | TriggerPatterns, script: AutomationScript, options?: TriggerOptions) =>
             createTrigger(creatorId, patterns, script, options),

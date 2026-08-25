@@ -24,7 +24,7 @@ use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
-use super::trigger::MatchCapture;
+use super::trigger::{AliasSender, MatchCapture};
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
@@ -133,6 +133,16 @@ pub enum RuntimeAction {
         operation: LineOperation,
     },
     Send(Arc<String>),
+    /// A script-originated send (`session.send()` to the own session): the same pipeline
+    /// as [`Self::Send`], but carrying the expansion depth of the dispatch it was issued
+    /// from — so a handler that re-sends its own matching text counts toward the loop
+    /// bail instead of restarting at zero — and, when that dispatch was an alias, the
+    /// alias's identity, so its own sent text is excluded from re-matching it.
+    SendScripted {
+        text: Arc<String>,
+        depth: u32,
+        sender: Option<AliasSender>,
+    },
     /// The user's typed submission of the main input — the Enter key, or a scripted
     /// `input.submit()` (which replays the same UI submit path). Enters the identical
     /// pipeline as [`Self::Send`], but first fires the `sys:input` host event so
@@ -162,7 +172,14 @@ pub enum RuntimeAction {
         redactions: Arc<Vec<String>>,
     },
     SendRawUnless(Arc<AtomicBool>, Arc<String>),
-    ProcessOutgoingLine(Arc<String>),
+    /// One separator-split command entering alias matching. `depth` and `sender` carry
+    /// the expansion context of the send that produced it (zero/`None` for typed input);
+    /// see [`Self::SendScripted`].
+    ProcessOutgoingLine {
+        line: Arc<String>,
+        depth: u32,
+        sender: Option<AliasSender>,
+    },
     /// One matched alias/trigger, deferred so an earlier invocation in the same dispatch frame
     /// can prevent it from running. `stopped` is shared only by automations of the same kind and
     /// `(isolate, origin)`; nested sends create fresh frames.
@@ -306,6 +323,9 @@ pub enum RuntimeAction {
         /// The handler's `toString()`, passed in good faith from JS-land for the read-only
         /// detail pane. `None` when the caller supplied no source. Display-only.
         script_source: Option<Arc<str>>,
+        /// A `command` tag alias's argument parser. When set, `patterns` holds the derived
+        /// prefilter and the spec decides firing and captures (`Trigger::run_command`).
+        command: Option<crate::models::matchers::CommandSpec>,
     },
     AddTrigger {
         isolate: IsolateId,

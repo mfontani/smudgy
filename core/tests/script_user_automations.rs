@@ -29,14 +29,28 @@ createAlias("^makeauto$", () => {
     const langOk = a.def().language === "js";
     const upd = userAutomations.aliases.get("greet").update({ enabled: false });
     userAutomations.aliases.save("live", { pattern: "^ping$", script: "echo('PONG')", language: "js" });
+    // A get -> save round trip must not strip the editor's matcher sidecar or
+    // the self-match opt-in: both ride the def.
+    userAutomations.aliases.save("cmdlike", {
+        pattern: "^gt(?:\\s|$)",
+        script: "guildtell $words",
+        allowSelfMatch: true,
+        matcher: { kind: "command", name: "gt", args: [{ name: "words", kind: "rest" }] },
+    });
+    userAutomations.aliases.save("cmdlike", userAutomations.aliases.get("cmdlike").def());
+    const back = userAutomations.aliases.get("cmdlike").def();
+    const rt = back.allowSelfMatch === true
+        && (back.matcher as any)?.kind === "command"
+        && (back.matcher as any)?.name === "gt";
     const nowDisabled = userAutomations.aliases.get("greet").def().enabled === false;
     const listed = userAutomations.aliases.list().join(",");
     const trig = userAutomations.triggers.exists("onsay");
-    echo("MADE lang=" + langOk + " upd=" + upd + " disabled=" + nowDisabled + " list=" + listed + " trig=" + trig);
+    echo("MADE lang=" + langOk + " upd=" + upd + " disabled=" + nowDisabled + " rt=" + rt + " list=" + listed + " trig=" + trig);
 });
 createAlias("^delauto$", () => {
     const removed = userAutomations.aliases.delete("greet");
     userAutomations.aliases.delete("live");
+    userAutomations.aliases.delete("cmdlike");
     echo("DEL removed=" + removed);
 });
 "#;
@@ -127,8 +141,8 @@ async fn script_crud_persisted_user_automations() {
         .unwrap();
     let (made, own_reloads) = drain_until_quiet(&mut events).await;
     assert!(
-        made.iter()
-            .any(|l| l == "MADE lang=true upd=true disabled=true list=greet,live trig=true"),
+        made.iter().any(|l| l
+            == "MADE lang=true upd=true disabled=true rt=true list=cmdlike,greet,live trig=true"),
         "create/edit controller did not report success: {made:?}"
     );
     assert_eq!(
@@ -177,6 +191,23 @@ async fn script_crud_persisted_user_automations() {
         "handle.update({{enabled:false}}) persisted to disk"
     );
 
+    // The round-tripped alias kept its sidecar and self-match opt-in on disk.
+    let cmdlike = aliases
+        .get("cmdlike")
+        .expect("cmdlike alias persisted to aliases.json");
+    assert!(
+        cmdlike.allow_self_match,
+        "allowSelfMatch round-trips to disk"
+    );
+    match &cmdlike.matcher {
+        Some(smudgy_core::models::matchers::AliasMatcherSource::Command { name, args, .. }) => {
+            assert_eq!(name.as_deref(), Some("gt"));
+            assert_eq!(args.len(), 1);
+            assert_eq!(args[0].name, "words");
+        }
+        other => panic!("the matcher sidecar was stripped or reshaped: {other:?}"),
+    }
+
     let triggers = load_triggers(&server_name).unwrap();
     let onsay = triggers
         .get("onsay")
@@ -223,6 +254,10 @@ async fn script_crud_persisted_user_automations() {
     assert!(
         !aliases.contains_key("live"),
         "live should be deleted from aliases.json"
+    );
+    assert!(
+        !aliases.contains_key("cmdlike"),
+        "cmdlike should be deleted from aliases.json"
     );
     // The untouched trigger is still there.
     assert!(load_triggers(&server_name).unwrap().contains_key("onsay"));

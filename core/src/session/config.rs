@@ -264,6 +264,7 @@ mod tests {
             enabled,
             priority: 0,
             fallthrough: true,
+            allow_self_match: false,
             language: ScriptLang::Plaintext,
             matcher: None,
         }

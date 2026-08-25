@@ -463,6 +463,229 @@ async fn pattern_tag_end_to_end() {
     }
 }
 
+/// A module exercising the `command` tagged template end to end: a function
+/// body reading named arguments, a string body substituting them, an
+/// interpolated command word, the parsed value's display surface, usage
+/// probes for the Rust lockstep check, and the parse errors.
+const COMMAND_TAG_TS: &str = r#"
+import { aliases, command, createAlias, echo } from "smudgy:core";
+
+createAlias(command`greet <person> [greeting] [words...]`, (m) => {
+    echo("CMD_GREET person=" + m.person
+        + " greeting=" + (m.greeting === "" ? "(none)" : m.greeting)
+        + " words=" + (m.words === "" ? "(none)" : m.words)
+        + " line=" + m[0]);
+});
+
+// A string body substitutes arguments by name.
+createAlias(command`gt [words...]`, "guildtell $words");
+
+// The word may be interpolated -- literal text, never syntax. By fire time
+// registration has landed, so the handler can check the derived names: each
+// command alias is named after its word.
+const word = "hail";
+createAlias(command`${word} <target>`, (m) => {
+    const named = aliases.exists("hail") && aliases.exists("greet") && aliases.exists("gt");
+    echo("CMD_HAIL target=" + m.target + " named=" + named);
+});
+
+// The parsed value's display surface. `cast` is never registered as an alias,
+// so it must NOT tab-complete below.
+const c = command`cast <spell> [target]`;
+echo("CMD_PROPS word=" + c.word + " str=" + String(c) + " args=" + JSON.stringify(c.args));
+
+// Usage probes for the Rust lockstep check.
+[
+    command`greet <person> [greeting] [words...]`,
+    command`gt [words...]`,
+    command`cast <spell> [target]`,
+].forEach((probe, i) => echo("CMDUSAGE " + i + " " + probe.usage));
+
+// Parse errors throw.
+try { command`multi word <x>`; echo("CMD_ERR_BAREWORD missed"); }
+catch { echo("CMD_ERR_BAREWORD ok"); }
+try { command`foo [rest...] <after>`; echo("CMD_ERR_RESTLAST missed"); }
+catch { echo("CMD_ERR_RESTLAST ok"); }
+try { command`foo <${"sp ace"}>`; echo("CMD_ERR_SPLICEWS missed"); }
+catch { echo("CMD_ERR_SPLICEWS ok"); }
+// A splice ending in dots must not quietly become a rest argument.
+try { command`foo [${"x..."}]`; echo("CMD_ERR_SPLICEDOTS missed"); }
+catch { echo("CMD_ERR_SPLICEDOTS ok"); }
+"#;
+
+/// Drive `COMMAND_TAG_TS`: tag-built command aliases fire with the editor's
+/// Command semantics (named captures, quote grouping, the usage echo on a
+/// missing required argument), string bodies substitute by name, the words
+/// join tab completion, and the JS tag's usage lines match the Rust
+/// `usage_line` renderer shape for shape.
+#[tokio::test]
+async fn command_tag_end_to_end() {
+    use smudgy_core::models::matchers::{ArgKind, ArgSpec, usage_line};
+
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "CommandTag";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules_dir.join("cmd.ts"), COMMAND_TAG_TS).unwrap();
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(7018),
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+
+    // The completion push can land while the engine is still loading, ahead of
+    // `RuntimeReady` on the stream, so the wait loop collects it too.
+    let mut command_names: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::CommandNames { names } => {
+                command_names = names.iter().map(|n| n.as_str().to_string()).collect();
+            }
+            _ => {}
+        }
+    };
+
+    for input in [
+        "greet Mira",
+        "greet Mira warmly and well",
+        "greet \"big ugly troll\"",
+        "greet",
+        "gt hello there",
+        "hail Bob",
+    ] {
+        tx.send(RuntimeAction::Send(Arc::new(input.to_string())))
+            .unwrap();
+    }
+
+    let mut lines = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        match event.event {
+            SessionEvent::UpdateBuffer(updates) => {
+                for update in updates.iter() {
+                    if let BufferUpdate::Append(line) = update {
+                        lines.push(line.text.clone());
+                    }
+                }
+            }
+            SessionEvent::CommandNames { names } => {
+                command_names = names.iter().map(|n| n.as_str().to_string()).collect();
+            }
+            _ => {}
+        }
+    }
+
+    tx.send(RuntimeAction::Shutdown).ok();
+
+    let transcript = lines.join("\n");
+    let has = |needle: &str| lines.iter().any(|l| l == needle);
+    assert!(
+        has("CMD_GREET person=Mira greeting=(none) words=(none) line=greet Mira"),
+        "required-only input fires with empty optionals.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("CMD_GREET person=Mira greeting=warmly words=and well line=greet Mira warmly and well"),
+        "optional and rest arguments assign in order; rest keeps the raw remainder.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has(
+            "CMD_GREET person=big ugly troll greeting=(none) words=(none) line=greet \"big ugly troll\""
+        ),
+        "quotes group a multi-word argument.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("Usage: greet <person> [greeting] [words...]"),
+        "a missing required argument echoes the usage line.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("guildtell hello there"),
+        "a string body substitutes $words.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has("CMD_HAIL target=Bob named=true"),
+        "an interpolated word matches literally, and command aliases are named after their word.\nTranscript:\n{transcript}"
+    );
+    assert!(
+        has(concat!(
+            "CMD_PROPS word=cast str=cast <spell> [target] ",
+            "args=[{\"name\":\"spell\",\"kind\":\"required\"},{\"name\":\"target\",\"kind\":\"optional\"}]"
+        )),
+        "the parsed value exposes word/usage/args.\nTranscript:\n{transcript}"
+    );
+    for sentinel in [
+        "CMD_ERR_BAREWORD ok",
+        "CMD_ERR_RESTLAST ok",
+        "CMD_ERR_SPLICEWS ok",
+        "CMD_ERR_SPLICEDOTS ok",
+    ] {
+        assert!(
+            has(sentinel),
+            "a malformed tag body must throw ({sentinel}).\nTranscript:\n{transcript}"
+        );
+    }
+
+    // The registered words (and only those) tab-complete.
+    assert!(
+        command_names.iter().any(|n| n == "greet")
+            && command_names.iter().any(|n| n == "gt")
+            && command_names.iter().any(|n| n == "hail"),
+        "tag-created command words join completion; got {command_names:?}"
+    );
+    assert!(
+        !command_names.iter().any(|n| n == "cast"),
+        "an unregistered command value must not complete; got {command_names:?}"
+    );
+
+    // The JS tag's usage lines and the Rust renderer must agree shape for shape.
+    let spec = |name: &str, kind: ArgKind| ArgSpec {
+        name: name.to_string(),
+        kind,
+    };
+    let expected = [
+        usage_line(
+            "greet",
+            &[
+                spec("person", ArgKind::Required),
+                spec("greeting", ArgKind::Optional),
+                spec("words", ArgKind::Rest),
+            ],
+        ),
+        usage_line("gt", &[spec("words", ArgKind::Rest)]),
+        usage_line(
+            "cast",
+            &[
+                spec("spell", ArgKind::Required),
+                spec("target", ArgKind::Optional),
+            ],
+        ),
+    ];
+    for (i, usage) in expected.iter().enumerate() {
+        let needle = format!("CMDUSAGE {i} {usage}");
+        assert!(
+            has(&needle),
+            "JS and Rust disagree on usage probe {i}: wanted {needle:?}.\nTranscript:\n{transcript}"
+        );
+    }
+}
+
 /// One alias, two patterns. Sending `first x` fires pattern one, where `a`
 /// participates, `opt` (an optional group of the fired pattern) does not, and
 /// `b` belongs to the pattern that did not fire. The handler reports what each

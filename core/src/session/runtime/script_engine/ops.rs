@@ -1,12 +1,16 @@
 use crate::models::ScriptLang;
 use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
+use crate::models::matchers::{
+    AliasMatcherSource, ArgSpec, CmdMode, CommandSpec, ParseMode, command_prefilter,
+};
 use crate::models::triggers::TriggerDefinition;
 use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
 use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceRun};
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
+use crate::session::runtime::trigger::AliasSender;
 use crate::session::runtime::trigger::MatchCapture;
 use crate::session::runtime::trigger::SharedAutomationRegistry;
 use crate::session::runtime::{
@@ -1062,6 +1066,13 @@ fn op_smudgy_validate_name(#[string] name: &str) -> Option<String> {
 /// its subscribers one level deeper and the chain terminates at [`MAX_EVENT_DEPTH`].
 #[derive(Clone, Copy, Default)]
 pub struct EventDepth(pub u32);
+
+/// The alias whose dispatch is currently running in this isolate — `None` outside an alias
+/// handler. Stashed into `OpState` beside [`EventDepth`] (same save/restore bracket) by
+/// `call_javascript_function`/`run_script`, and stamped by `op_smudgy_session_send` onto its
+/// queued action so an alias's own sent text is excluded from re-matching it.
+#[derive(Clone, Default)]
+pub struct AliasContext(pub Option<AliasSender>);
 
 /// One event subscriber: which isolate registered the handler and its `FunctionId` in that
 /// isolate's `script_functions`. Cloned out before queueing so the registry borrow is released.
@@ -4304,11 +4315,26 @@ fn op_smudgy_session_send(
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send, "send")?;
     reserve_script_send(state, line)?;
-    route_session_action(
-        state,
-        target,
-        RuntimeAction::Send(Arc::new(line.to_string())),
-    );
+    let action = if target == *state.borrow::<SessionId>() {
+        // An own-session send carries its dispatch context: one deeper than the
+        // running handler (mirroring the returned-string path), plus the alias
+        // identity when that handler IS an alias — so a self-matching send loop
+        // is excluded (or, opted in, still bounded by the depth limit) instead
+        // of restarting at depth zero forever. A cross-session send lands on
+        // the other runtime like fresh input.
+        let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
+        let sender = state
+            .try_borrow::<AliasContext>()
+            .and_then(|context| context.0.clone());
+        RuntimeAction::SendScripted {
+            text: Arc::new(line.to_string()),
+            depth: depth + 1,
+            sender,
+        }
+    } else {
+        RuntimeAction::Send(Arc::new(line.to_string()))
+    };
+    route_session_action(state, target, action);
     Ok(())
 }
 
@@ -4368,6 +4394,29 @@ fn script_source_arc(source: String) -> Option<std::sync::Arc<str>> {
     (!source.is_empty()).then(|| std::sync::Arc::from(source))
 }
 
+/// The wire form of a `command` tag's spec, as `createAlias` JSON-encodes it (an empty
+/// string on the op means "not a command alias"). `args`/`parse` reuse the alias
+/// sidecar's serde shapes, so the tag and the editor cannot drift on names.
+#[derive(serde::Deserialize)]
+struct WireCommandSpec {
+    name: String,
+    #[serde(default)]
+    args: Vec<ArgSpec>,
+    #[serde(default)]
+    parse: ParseMode,
+}
+
+/// Parses an op's `command_spec` argument. `Ok(None)` for the empty (non-command) case;
+/// `Err(())` for malformed JSON — unreachable from the real `createAlias`, which built it.
+fn parse_command_spec(raw: &str) -> Result<Option<WireCommandSpec>, ()> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str::<WireCommandSpec>(raw)
+        .map(Some)
+        .map_err(|_| ())
+}
+
 /// Errors an automation op can throw: the capability denial, or an interop identity lookup
 /// failure (an unknown/forged creator id — the host-minted ids the facade carries are
 /// always valid, and a malformed creator descriptor already failed loudly at
@@ -4397,12 +4446,16 @@ fn op_smudgy_create_simple_alias(
     priority: i32,
     fallthrough: bool,
     fire_limit: u32,
+    #[string] command_spec: &str,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_aliases, "aliases")?;
     // Convert patterns array to Vec<String>
     let patterns_vec = match v8_array_to_vec_str(scope, patterns) {
         Ok(patterns) => patterns,
         Err(_) => return Ok(false), // Silently fail on error
+    };
+    let Ok(command) = parse_command_spec(command_spec) else {
+        return Ok(false); // Silently fail on error (parity with the pattern conversion above)
     };
 
     let origin = creator_origin(state, creator_id)?;
@@ -4412,16 +4465,33 @@ fn op_smudgy_create_simple_alias(
     }
 
     // Create AliasDefinition
-    let alias_def = AliasDefinition {
+    let mut alias_def = AliasDefinition {
         pattern: patterns_vec.into_iter().next().unwrap_or_default(),
         script: Some(script),
         package: None,
         enabled: true,
         priority,
         fallthrough,
+        // Script-created aliases keep the historical semantics — their own output
+        // may re-match them, bounded by the depth limit (see the
+        // `AddJavascriptFunctionAlias` dispatch arm).
+        allow_self_match: true,
         language: ScriptLang::Plaintext,
         matcher: None,
     };
+    if let Some(spec) = command {
+        // A `command` tag alias: the prefilter regex is derived host-side from the
+        // word (its single source of truth), and the parser spec rides the same
+        // sidecar an editor-saved Command carries — the `AddAlias` dispatch arm
+        // reads it back identically for both.
+        alias_def.pattern = command_prefilter(&spec.name);
+        alias_def.matcher = Some(AliasMatcherSource::Command {
+            name: Some(spec.name),
+            args: spec.args,
+            parse: spec.parse,
+            mode: CmdMode::Advanced,
+        });
+    }
 
     let isolate = current_isolate(state);
     queue_own_action(
@@ -4623,12 +4693,28 @@ fn op_smudgy_create_javascript_function_alias<'s>(
     fallthrough: bool,
     fire_limit: u32,
     #[string] script_source: String,
+    #[string] command_spec: &str,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_aliases, "aliases")?;
     // Convert patterns array to Vec<String>
-    let patterns_vec = match v8_array_to_vec_str(scope, patterns) {
+    let mut patterns_vec = match v8_array_to_vec_str(scope, patterns) {
         Ok(patterns) => patterns,
         Err(_) => return Ok(false), // Silently fail on error
+    };
+    let command = match parse_command_spec(command_spec) {
+        // A `command` tag alias: the prefilter regex is derived host-side from
+        // the word, and the runtime spec decides firing and captures
+        // (`Trigger::run_command`), exactly as for an editor-saved Command.
+        Ok(Some(spec)) => {
+            patterns_vec = vec![command_prefilter(&spec.name)];
+            Some(CommandSpec {
+                name: spec.name,
+                args: spec.args,
+                parse: spec.parse,
+            })
+        }
+        Ok(None) => None,
+        Err(()) => return Ok(false), // Silently fail on error (parity with the pattern conversion)
     };
 
     let origin = creator_origin(state, creator_id)?;
@@ -4662,6 +4748,7 @@ fn op_smudgy_create_javascript_function_alias<'s>(
             fallthrough,
             fire_limit: self_limit(fire_limit),
             script_source: script_source_arc(script_source),
+            command,
         },
     );
     Ok(true)

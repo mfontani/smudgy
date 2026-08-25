@@ -902,10 +902,18 @@ declare module "smudgy:core" {
     priority?: number;
     /** Continue checking later aliases from the same script/package. Defaults to `true`. */
     fallthrough?: boolean;
+    /** Whether text this alias sends may match this same alias again — the
+     *  editor's "Allow this alias's sent text to match itself". Defaults to
+     *  `false`. */
+    allowSelfMatch?: boolean;
     /** Defaults to `"plaintext"`. */
     language?: ScriptLang;
     /** Optional folder grouping in the automations window. */
     package?: string;
+    /** The editor's authoring sidecar (how the pattern was written: a Command
+     *  or Simple pattern). Preserved verbatim across a get/save round trip —
+     *  the editor authors it; carry it, don't build it. */
+    matcher?: unknown;
   }
 
   /** A saved trigger, as stored in `triggers.json` and shown in the
@@ -1794,6 +1802,60 @@ declare module "smudgy:core" {
     contains(strings: TemplateStringsArray, ...values: unknown[]): RegExp;
   }
 
+  /** One argument of a {@link command} value, in declaration order. */
+  export type CommandArg = {
+    readonly name: string;
+    readonly kind: "required" | "optional" | "rest";
+  };
+
+  /**
+   * A parsed command`...` value: the command word plus its argument spec.
+   * Hand it to {@link createAlias} in the pattern position; the tag is the
+   * only way to make one.
+   */
+  export interface Command {
+    readonly word: string;
+    readonly args: readonly CommandArg[];
+    /** The canonical usage line (`greet <person> [words...]`) — what a
+     *  missing required argument echoes. */
+    readonly usage: string;
+  }
+
+  /**
+   * The `command` tagged template: a command-style alias matcher, written in
+   * the editor's Usage-line notation.
+   *
+   * ```ts
+   * import { command, createAlias, send } from "smudgy:core";
+   * createAlias(command`greet <person> [greeting] [words...]`, (m) => {
+   *   send(`say ${m.greeting || "Hello"}, ${m.person}! ${m.words}`);
+   * });
+   * ```
+   *
+   * The first token is the command word; `<name>` is a required argument,
+   * `[name]` optional, and `[name...]` takes the rest of the line (last
+   * position only) — exactly what the editor's Usage row prints, so a Usage
+   * line copies straight into a script. Arguments arrive as named entries on
+   * the {@link Matches} object (an absent optional reads `""`); `m[0]` is the
+   * line as typed, and in a string body `$name` substitutes each argument.
+   *
+   * The behavior matches an editor-made Command alias: typing the word with a
+   * missing required argument echoes the usage line and consumes the input
+   * without running the body; extra words nothing claims fall through to the
+   * game; words split on spaces, with quotes or braces grouping a multi-word
+   * argument; and the command word tab-completes in the input.
+   *
+   * Interpolated `${values}` are always literal word text, never syntax, so
+   * the word can come from data. A body that fails to parse throws. The alias
+   * is named after its word (pass `options.name` to label it yourself).
+   */
+  export const command: CommandTag;
+
+  /** The {@link command} tag's call shape. */
+  interface CommandTag {
+    (strings: TemplateStringsArray, ...values: unknown[]): Command;
+  }
+
   /** The three pattern lists a trigger can match with. Most triggers set only
    *  `patterns`. */
   export type TriggerPatterns = {
@@ -2072,14 +2134,17 @@ declare module "smudgy:core" {
 
   /**
    * Create an alias: a shortcut that watches what **you type** and runs a
-   * script instead of sending it. `patterns` is one regex or several; when
-   * your input matches, `script` runs: a command template string, or a
-   * function that receives the {@link Matches}.
+   * script instead of sending it. `patterns` is one regex or several — or a
+   * {@link command} value for word-and-arguments matching; when your input
+   * matches, `script` runs: a command template string, or a function that
+   * receives the {@link Matches}.
    *
    * ```ts
-   * import { createAlias } from "smudgy:core";
+   * import { command, createAlias } from "smudgy:core";
    * // Typing "gt any message here" sends "guildtell any message here".
    * createAlias("^gt (.+)$", "guildtell $1");
+   * // The same shortcut as a command, with tab completion and a usage line.
+   * createAlias(command`gt [words...]`, "guildtell $words");
    * ```
    *
    * The typed command is consumed by default (see {@link capture}). Aliases
@@ -2088,7 +2153,7 @@ declare module "smudgy:core" {
    * label one yourself). Returns an {@link Alias} handle.
    */
   export function createAlias(
-    patterns: Pattern | Pattern[],
+    patterns: Pattern | Pattern[] | Command,
     script: AutomationScript,
     options?: AliasOptions,
   ): Alias;
@@ -2433,6 +2498,7 @@ declare module "smudgy:core" {
     readonly style: StyleBuilder;
     readonly link: typeof link;
     readonly pattern: PatternTag;
+    readonly command: CommandTag;
     send(command: string): void;
     sendRaw(text: string): void;
     reload(): void;
