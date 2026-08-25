@@ -67,13 +67,20 @@ fn form_encoding_to_config(choice: &str) -> Option<String> {
     (choice != DEFAULT_ENCODING_CHOICE).then(|| choice.to_string())
 }
 
-/// The compression checkbox for the server form.
+/// The independent inbound-compression checkboxes for the server form.
 fn compression_field(state: &State) -> Element<'_, Message> {
-    checkbox(state.server_form_data.compression)
-        .label(t!("server-compression"))
-        .on_toggle(Message::ToggleServerCompression)
-        .size(16)
-        .into()
+    column![
+        checkbox(state.server_form_data.compression)
+            .label(t!("server-compression"))
+            .on_toggle(Message::ToggleServerCompression)
+            .size(16),
+        checkbox(state.server_form_data.mccp4_compression)
+            .label(t!("server-mccp4-compression"))
+            .on_toggle(Message::ToggleServerMccp4Compression)
+            .size(16),
+    ]
+    .spacing(4)
+    .into()
 }
 
 /// The TLS checkbox, with a nested "Verify certificate" shown only when TLS is on.
@@ -188,6 +195,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                 ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
             config.compression = state.server_form_data.compression;
+            config.mccp4_compression = Some(state.server_form_data.mccp4_compression);
             config.tls = state.server_form_data.tls;
             config.tls_verify = state.server_form_data.tls_verify;
             if let Err(e) = config.validate() {
@@ -225,6 +233,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             config.port = port;
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
             config.compression = state.server_form_data.compression;
+            config.mccp4_compression = Some(state.server_form_data.mccp4_compression);
             config.tls = state.server_form_data.tls;
             config.tls_verify = state.server_form_data.tls_verify;
             if let Err(e) = config.validate() {

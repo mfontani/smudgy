@@ -550,6 +550,23 @@ pub enum TlsMode {
     NoVerify,
 }
 
+/// Per-connection policy for accepting inbound compression negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundCompression {
+    mccp2: bool,
+    mccp4: bool,
+}
+
+impl InboundCompression {
+    pub const ALL: Self = Self::new(true, true);
+    pub const NONE: Self = Self::new(false, false);
+
+    #[must_use]
+    pub const fn new(mccp2: bool, mccp4: bool) -> Self {
+        Self { mccp2, mccp4 }
+    }
+}
+
 impl TlsMode {
     /// Resolve the two boolean settings (`tls`, `tls_verify`) into a mode.
     #[must_use]
@@ -742,6 +759,62 @@ fn codec_for(start: telnet::CompressionStart) -> Option<inflow::Codec> {
         telnet::CompressionStart::Zstd => Some(inflow::Codec::Zstd),
         telnet::CompressionStart::Unsupported => None,
     }
+}
+
+/// RFC 8878's standard zstd-frame magic, in its little-endian wire order.
+const ZSTD_FRAME_MAGIC: [u8; 4] = 0xFD2F_B528_u32.to_le_bytes();
+/// MCCPX's orderly-shutdown marker. It is the first plaintext after the final frame.
+const IAC_WONT_MCCPX: [u8; 3] = [
+    telnet::command::IAC,
+    telnet::command::WONT,
+    telnet::option::MCCPX,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MccpxZstdBoundary {
+    /// The available bytes are a proper prefix of one of the two valid markers.
+    NeedMore,
+    /// Another standard zstd frame follows under the same MCCPX activation.
+    NextFrame,
+    /// The compressed stream ended; route the marker and its tail as plain telnet.
+    Wont,
+    /// Neither a standard frame nor the required orderly MCCPX shutdown follows.
+    Invalid,
+}
+
+/// Classify the first bytes after a clean MCCPX zstd frame boundary. MCCPX narrows the
+/// otherwise general RFC 8878 frame sequence to standard data frames; skippable frames are
+/// not application data and are rejected here along with magicless/garbage input.
+fn classify_mccpx_zstd_boundary(input: &[u8]) -> MccpxZstdBoundary {
+    if input.starts_with(&IAC_WONT_MCCPX) {
+        MccpxZstdBoundary::Wont
+    } else if input.starts_with(&ZSTD_FRAME_MAGIC) {
+        MccpxZstdBoundary::NextFrame
+    } else if IAC_WONT_MCCPX.starts_with(input) || ZSTD_FRAME_MAGIC.starts_with(input) {
+        MccpxZstdBoundary::NeedMore
+    } else {
+        MccpxZstdBoundary::Invalid
+    }
+}
+
+/// Best-effort protocol rejection before a compression-grade disconnect. The connection may
+/// already be desynchronized, so failure to deliver `DONT` cannot change the teardown.
+async fn report_compression_error(
+    stream: &mut GameStream,
+    runtime_tx: &UnboundedSender<RuntimeAction>,
+    option: u8,
+    write_stall_timeout: Duration,
+) {
+    let dont = [telnet::command::IAC, telnet::command::DONT, option];
+    stream
+        .write_all_stall_guarded(&dont, write_stall_timeout)
+        .await
+        .ok();
+    runtime_tx
+        .send(RuntimeAction::Echo(Arc::new(
+            "Compression error — disconnecting.".to_string(),
+        )))
+        .ok();
 }
 
 /// Append to the raw wire log, disabling it on the first write failure. Once compression
@@ -1020,7 +1093,7 @@ impl Connection {
         port: u16,
         raw_log_path: Option<PathBuf>,
         encoding: Option<&'static encoding_rs::Encoding>,
-        compression: bool,
+        compression: InboundCompression,
         tls: TlsMode,
     ) {
         let addr = format!("{host}:{port}");
@@ -1055,11 +1128,17 @@ impl Connection {
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
             let mut telnet = telnet::TelnetParser::new();
-            telnet.set_accept_compression(compression);
+            telnet.set_accept_compression(compression.mccp2, compression.mccp4);
             // The MCCP stage ahead of the parser, plus its reused chunk buffer. (The
             // decompressed-bytes pacing counter is per-wake, declared in the read arm.)
             let mut inflow = inflow::Inflow::Plain;
             let mut inflate_buf: Vec<u8> = Vec::new();
+            // A clean MCCPX zstd frame end is not necessarily the end of compression: RFC
+            // 8878 permits concatenated frames. At each boundary, accept either another
+            // standard frame or the required plaintext `IAC WONT MCCPX`; a marker split
+            // across socket reads is retained here (at most three bytes).
+            let mut awaiting_mccpx_zstd_boundary = false;
+            let mut mccpx_zstd_boundary_prefix = Vec::with_capacity(ZSTD_FRAME_MAGIC.len());
             // Subnegotiation responder state (TTYPE cycle, NAWS reporting). Reads the
             // shared size cell at report time, so the first NAWS answer already carries
             // the size the UI last reported; `secure` sets the MTTS SSL bit.
@@ -1190,9 +1269,81 @@ impl Connection {
                                                     // zlib bytes. Negotiation replies flush per
                                                     // feed, not per batch, so handshakes stay
                                                     // timely even inside a large burst.
-                                                    let mut slice: &[u8] = &data;
+                                                    // If a boundary marker began in a prior
+                                                    // socket read, stitch its tiny prefix onto
+                                                    // this read so classification and routing see
+                                                    // the original wire bytes contiguously. The
+                                                    // owned buffer lives for this whole route.
+                                                    let stitched_boundary =
+                                                        if awaiting_mccpx_zstd_boundary
+                                                            && !mccpx_zstd_boundary_prefix.is_empty()
+                                                        {
+                                                            let mut bytes = std::mem::take(
+                                                                &mut mccpx_zstd_boundary_prefix,
+                                                            );
+                                                            bytes.extend_from_slice(&data);
+                                                            Some(bytes)
+                                                        } else {
+                                                            None
+                                                        };
+                                                    let mut slice: &[u8] = stitched_boundary
+                                                        .as_deref()
+                                                        .map_or(data.as_slice(), |bytes| bytes);
                                                     'route: while !slice.is_empty() {
-                                                        if inflow.is_plain() {
+                                                        if awaiting_mccpx_zstd_boundary {
+                                                            match classify_mccpx_zstd_boundary(slice) {
+                                                                MccpxZstdBoundary::NeedMore => {
+                                                                    // The next read will be stitched onto
+                                                                    // this proper marker prefix. No bytes
+                                                                    // reach either decoder or telnet yet.
+                                                                    mccpx_zstd_boundary_prefix
+                                                                        .extend_from_slice(slice);
+                                                                    slice = &[];
+                                                                }
+                                                                MccpxZstdBoundary::NextFrame => {
+                                                                    // Leave `slice` untouched: the fresh
+                                                                    // decoder must consume the frame magic.
+                                                                    if let Err(err) =
+                                                                        inflow.begin(inflow::Codec::Zstd)
+                                                                    {
+                                                                        warn!(
+                                                                            "MCCP4: failed to initialize the next zstd frame: {err}"
+                                                                        );
+                                                                        report_compression_error(
+                                                                            &mut stream,
+                                                                            &runtime_tx,
+                                                                            telnet::option::MCCPX,
+                                                                            write_stall_timeout,
+                                                                        )
+                                                                        .await;
+                                                                        dead = true;
+                                                                        break 'route;
+                                                                    }
+                                                                    awaiting_mccpx_zstd_boundary = false;
+                                                                }
+                                                                MccpxZstdBoundary::Wont => {
+                                                                    // `inflow` is already plain. Route the
+                                                                    // untouched WONT through telnet so its
+                                                                    // option state and any following plain
+                                                                    // bytes advance in normal wire order.
+                                                                    awaiting_mccpx_zstd_boundary = false;
+                                                                }
+                                                                MccpxZstdBoundary::Invalid => {
+                                                                    warn!(
+                                                                        "MCCP4: expected another zstd frame or IAC WONT at a frame boundary; disconnecting"
+                                                                    );
+                                                                    report_compression_error(
+                                                                        &mut stream,
+                                                                        &runtime_tx,
+                                                                        telnet::option::MCCPX,
+                                                                        write_stall_timeout,
+                                                                    )
+                                                                    .await;
+                                                                    dead = true;
+                                                                    break 'route;
+                                                                }
+                                                            }
+                                                        } else if inflow.is_plain() {
                                                             let consumed = feed_inbound(
                                                                 slice,
                                                                 &mut telnet,
@@ -1231,19 +1382,18 @@ impl Connection {
                                                                 // Begin the matching inflater; an
                                                                 // un-offered MCCPX encoding (`None`) or a
                                                                 // decoder init failure is disconnect-grade.
-                                                                match codec_for(start).map(|c| inflow.begin(c)) {
-                                                                    Some(Ok(())) => {}
-                                                                    _ => {
-                                                                        warn!("MCCPX: unusable compression start; disconnecting");
-                                                                        runtime_tx
-                                                                            .send(RuntimeAction::Echo(Arc::new(
-                                                                                "Compression error — disconnecting.".to_string(),
-                                                                            )))
-                                                                            .ok();
-                                                                        dead = true;
-                                                                        break 'route;
-                                                                    }
-                                                                }
+                                                                let Some(Ok(())) = codec_for(start)
+                                                                    .map(|c| inflow.begin(c))
+                                                                else {
+                                                                    warn!("MCCP4: unusable compression start; disconnecting");
+                                                                    runtime_tx
+                                                                        .send(RuntimeAction::Echo(Arc::new(
+                                                                            "Compression error — disconnecting.".to_string(),
+                                                                        )))
+                                                                        .ok();
+                                                                    dead = true;
+                                                                    break 'route;
+                                                                };
                                                             }
                                                         } else {
                                                             // Drain the decoder within this read:
@@ -1326,19 +1476,29 @@ impl Connection {
                                                                     // compression on the plain tail.
                                                                     let _ = telnet.take_compression_started();
                                                                     if ended {
-                                                                        // Orderly stream end: back to
-                                                                        // plain telnet. Clear both
-                                                                        // compression options' negotiated
-                                                                        // state (only one was on; the
-                                                                        // other clear is a no-op) so a
-                                                                        // later WILL renegotiates cleanly
-                                                                        // and releases the one-wrapper
-                                                                        // claim. The tail (`slice`) is
-                                                                        // plain again — the outer `'route`
-                                                                        // loop routes it.
+                                                                        // Zstd is offered only by MCCP4, so
+                                                                        // the active codec—not Telnet state
+                                                                        // that compressed bytes might have
+                                                                        // mutated—determines whether this is
+                                                                        // an MCCP4 frame boundary.
+                                                                        let mccp4_zstd_frame = inflow.is_zstd();
+                                                                        // A clean codec end does not revoke
+                                                                        // its Telnet option agreement. MCCP2
+                                                                        // may send another bare start marker
+                                                                        // after copyover; only an actual WONT
+                                                                        // disables the option and releases its
+                                                                        // exclusivity claim.
                                                                         inflow.end();
-                                                                        telnet.clear_remote(telnet::option::MCCP2);
-                                                                        telnet.clear_remote(telnet::option::MCCPX);
+                                                                        if mccp4_zstd_frame {
+                                                                            // A frame ended, but the RFC
+                                                                            // 8878 stream may continue with
+                                                                            // another frame. Preserve the
+                                                                            // MCCPX option claim until the
+                                                                            // required plaintext WONT is
+                                                                            // classified and parsed.
+                                                                            awaiting_mccpx_zstd_boundary = true;
+                                                                            mccpx_zstd_boundary_prefix.clear();
+                                                                        }
                                                                         break;
                                                                     } else if consumed == 0 && inflate_buf.is_empty() {
                                                                         // Decoder drained: it needs new
@@ -1360,23 +1520,13 @@ impl Connection {
                                                                         } else {
                                                                             telnet::option::MCCP2
                                                                         };
-                                                                    let dont = [
-                                                                        telnet::command::IAC,
-                                                                        telnet::command::DONT,
+                                                                    report_compression_error(
+                                                                        &mut stream,
+                                                                        &runtime_tx,
                                                                         compression_option,
-                                                                    ];
-                                                                    stream
-                                                                        .write_all_stall_guarded(
-                                                                            &dont,
-                                                                            write_stall_timeout,
-                                                                        )
-                                                                        .await
-                                                                        .ok();
-                                                                    runtime_tx
-                                                                        .send(RuntimeAction::Echo(Arc::new(
-                                                                            "Compression error — disconnecting.".to_string(),
-                                                                        )))
-                                                                        .ok();
+                                                                        write_stall_timeout,
+                                                                    )
+                                                                    .await;
                                                                     dead = true;
                                                                     break 'route;
                                                                 }
@@ -1645,6 +1795,51 @@ mod tests {
             ),
             runtime_rx,
         )
+    }
+
+    #[test]
+    fn mccpx_zstd_boundary_accepts_split_frame_magic_and_wont() {
+        for len in 0..ZSTD_FRAME_MAGIC.len() {
+            assert_eq!(
+                classify_mccpx_zstd_boundary(&ZSTD_FRAME_MAGIC[..len]),
+                MccpxZstdBoundary::NeedMore,
+                "standard-frame prefix length {len}"
+            );
+        }
+        assert_eq!(
+            classify_mccpx_zstd_boundary(&ZSTD_FRAME_MAGIC),
+            MccpxZstdBoundary::NextFrame
+        );
+
+        for len in 0..IAC_WONT_MCCPX.len() {
+            assert_eq!(
+                classify_mccpx_zstd_boundary(&IAC_WONT_MCCPX[..len]),
+                MccpxZstdBoundary::NeedMore,
+                "WONT prefix length {len}"
+            );
+        }
+        assert_eq!(
+            classify_mccpx_zstd_boundary(&IAC_WONT_MCCPX),
+            MccpxZstdBoundary::Wont
+        );
+    }
+
+    #[test]
+    fn mccpx_zstd_boundary_rejects_every_other_prefix() {
+        assert_eq!(
+            classify_mccpx_zstd_boundary(b"plain"),
+            MccpxZstdBoundary::Invalid
+        );
+        assert_eq!(
+            classify_mccpx_zstd_boundary(&[ZSTD_FRAME_MAGIC[0], 0]),
+            MccpxZstdBoundary::Invalid
+        );
+        // RFC 8878 skippable-frame magic in wire order. MCCPX carries Telnet application
+        // data, so only standard data frames are accepted between BEGIN and WONT.
+        assert_eq!(
+            classify_mccpx_zstd_boundary(&[0x50, 0x2A, 0x4D, 0x18]),
+            MccpxZstdBoundary::Invalid
+        );
     }
 
     /// Run one inbound buffer through the real ingest bridge (telnet
@@ -2342,7 +2537,7 @@ mod tests {
             port,
             None,
             Some(encoding_rs::WINDOWS_1252),
-            true,
+            InboundCompression::ALL,
             TlsMode::Off,
         );
         expect_connected(&mut runtime_rx).await;
@@ -2557,7 +2752,7 @@ mod tests {
             port,
             None,
             Some(encoding_rs::WINDOWS_1252),
-            true,
+            InboundCompression::ALL,
             TlsMode::Off,
         );
         expect_connected(&mut runtime_rx).await;
@@ -2614,7 +2809,14 @@ mod tests {
         });
 
         let (mut connection, mut runtime_rx) = test_connection();
-        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
         expect_connected(&mut runtime_rx).await;
         requested_rx.await.expect("the REQUEST reached the server");
         connection
@@ -2673,7 +2875,7 @@ mod tests {
             port,
             None,
             Some(encoding_rs::WINDOWS_1252),
-            true,
+            InboundCompression::ALL,
             TlsMode::Off,
         );
         expect_connected(&mut runtime_rx).await;
@@ -2795,7 +2997,14 @@ mod tests {
         let (port, release_tx, server) = never_reading_server();
 
         let (mut connection, mut runtime_rx) = test_connection();
-        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
         expect_connected(&mut runtime_rx).await;
 
         connection
@@ -2838,7 +3047,14 @@ mod tests {
 
         let (mut connection, mut runtime_rx) = test_connection();
         connection.write_stall_timeout = Duration::from_millis(300);
-        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
         expect_connected(&mut runtime_rx).await;
 
         connection
@@ -2890,7 +3106,14 @@ mod tests {
         });
 
         let (mut connection, mut runtime_rx) = test_connection();
-        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
 
         let mut connected = false;
         let mut received_line = false;
@@ -2934,7 +3157,14 @@ mod tests {
         });
 
         let (mut connection, mut runtime_rx) = test_connection();
-        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
 
         timeout(Duration::from_secs(5), async {
             loop {

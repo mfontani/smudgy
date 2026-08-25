@@ -234,6 +234,7 @@ server-cached-images-pending = Зображення в кеші: …
 server-clear-image-cache = Очистити кеш зображень
 server-save-add-profile = Зберегти й додати профіль
 server-compression = Дозволити стиснення (MCCP2)
+server-mccp4-compression = Дозволити стиснення (MCCP4)
 server-tls = Безпечне з'єднання (TLS)
 server-tls-verify = Перевіряти сертифікат
 server-tls-insecure-help = Знімайте позначку лише для серверів із самопідписаними сертифікатами (незахищено).

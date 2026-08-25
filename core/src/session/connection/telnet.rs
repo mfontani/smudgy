@@ -108,9 +108,9 @@ pub mod option {
     pub const MCCP3: u8 = 87;
     /// Mud eXtension Protocol.
     pub const MXP: u8 = 91;
-    /// MCCPX (draft, taranion/mudstandards) — negotiated-algorithm compression. Inbound only:
-    /// the server offers `WILL MCCPX`, we reply the encodings we accept, and it begins a
-    /// `deflate` or `zstd` stream. We never initiate it outbound (same oracle as MCCP3).
+    /// MCCP4 (called MCCPX in the draft and internal identifiers) — negotiated-algorithm
+    /// compression. Inbound only: the server offers this option, we reply with the encodings
+    /// we accept, and it begins a `deflate` or `zstd` stream. We never initiate it outbound.
     pub const MCCPX: u8 = 88;
     /// ATCP — the legacy GMCP predecessor.
     pub const ATCP: u8 = 200;
@@ -167,7 +167,7 @@ const fn option_name(option: u8) -> &'static str {
         option::MSSP => "MSSP",
         option::MCCP2 => "MCCP2",
         option::MCCP3 => "MCCP3",
-        option::MCCPX => "MCCPX",
+        option::MCCPX => "MCCP4",
         option::MXP => "MXP",
         option::ATCP => "ATCP",
         option::GMCP => "GMCP",
@@ -400,12 +400,13 @@ pub struct TelnetParser {
     remote_enabled: [bool; 256],
     /// `local_enabled[opt]` — we have this option enabled on *our* side (we sent `WILL`).
     local_enabled: [bool; 256],
-    /// Whether inbound compression offers (`WILL MCCP2` / `WILL MCCPX`) are accepted — the
-    /// per-server "Allow compression" setting. Off ⇒ every compression option is declined.
-    accept_compression: bool,
+    /// Whether inbound MCCP2 offers are accepted by this server configuration.
+    accept_mccp2_compression: bool,
+    /// Whether inbound MCCP4 offers are accepted by this server configuration.
+    accept_mccp4_compression: bool,
     /// A compression option is negotiated on the stream. Exactly one compression wrapper is
     /// allowed at a time (MCCPX draft MUST); while set, every *other* compression option is
-    /// declined. Cleared by [`clear_remote`](Self::clear_remote) at stream end.
+    /// declined. A codec stream ending does not revoke the Telnet agreement; only `WONT` does.
     compression_claimed: bool,
     /// Set when a negotiated compression-start marker just completed, carrying the codec, so
     /// the caller switches to its inflater. A latch (not inferred from the consumed count): a
@@ -434,7 +435,8 @@ impl TelnetParser {
             sub_buf: Vec::with_capacity(64),
             remote_enabled: [false; 256],
             local_enabled: [false; 256],
-            accept_compression: true,
+            accept_mccp2_compression: true,
+            accept_mccp4_compression: true,
             compression_claimed: false,
             compression_started: None,
         }
@@ -447,18 +449,22 @@ impl TelnetParser {
         self.compression_started.take()
     }
 
-    /// Set whether compression offers are accepted (the per-server setting). Takes effect
-    /// on future negotiations; call before the first bytes flow.
-    pub fn set_accept_compression(&mut self, accept: bool) {
-        self.accept_compression = accept;
+    /// Set which inbound compression protocols this server may negotiate. Takes effect on
+    /// future negotiations; call before the first bytes flow.
+    pub fn set_accept_compression(&mut self, mccp2: bool, mccp4: bool) {
+        self.accept_mccp2_compression = mccp2;
+        self.accept_mccp4_compression = mccp4;
     }
 
     /// The full remote-side acceptance policy: the static table, plus the compression gate
     /// (the per-server setting **and** the one-wrapper-at-a-time mutual exclusion — the first
     /// compression option to be accepted claims the stream; the rest are declined).
     fn accepts_remote(&self, option: u8) -> bool {
-        if option == option::MCCP2 || option == option::MCCPX {
-            return self.accept_compression && !self.compression_claimed;
+        if option == option::MCCP2 {
+            return self.accept_mccp2_compression && !self.compression_claimed;
+        }
+        if option == option::MCCPX {
+            return self.accept_mccp4_compression && !self.compression_claimed;
         }
         accept_remote(option)
     }
@@ -469,7 +475,9 @@ impl TelnetParser {
     /// `Unsupported` — still a halt, so the compressed tail never feeds the parser as telnet).
     fn compression_start_for(&self, option: u8, payload: &[u8]) -> Option<CompressionStart> {
         match option {
-            option::MCCP2 if self.remote_enabled[usize::from(option::MCCP2)] => {
+            option::MCCP2
+                if self.remote_enabled[usize::from(option::MCCP2)] && payload.is_empty() =>
+            {
                 Some(CompressionStart::Deflate)
             }
             option::MCCPX
@@ -495,19 +503,6 @@ impl TelnetParser {
     #[must_use]
     pub fn local_enabled(&self, option: u8) -> bool {
         self.local_enabled[usize::from(option)]
-    }
-
-    /// Clear the server-side negotiated state for `option` without sending a reply — for
-    /// an option whose lifecycle ends out-of-band rather than via a telnet `WONT`. MCCP2 /
-    /// MCCPX are the case: an orderly stream end ends the compression at the codec layer, and
-    /// clearing the flag lets a later server `WILL` renegotiate cleanly instead of being
-    /// swallowed as already-enabled. Ending a compression option also releases the
-    /// one-wrapper-at-a-time claim so a *different* compressor may be negotiated next.
-    pub fn clear_remote(&mut self, option: u8) {
-        self.remote_enabled[usize::from(option)] = false;
-        if option == option::MCCP2 || option == option::MCCPX {
-            self.compression_claimed = false;
-        }
     }
 
     /// Feed a received buffer through the parser, driving `sink` with the decoded output.
@@ -1080,7 +1075,7 @@ mod tests {
     fn mccp2_marker_without_negotiation_does_not_arm() {
         use super::option::MCCP2;
         let mut p = TelnetParser::new();
-        p.set_accept_compression(false);
+        p.set_accept_compression(false, true);
         let mut r = Recorder::default();
         // Decline the offer, then the server (wrongly) sends the marker anyway.
         let _ = p.receive(&[IAC, WILL, MCCP2], &mut r);
@@ -1094,6 +1089,22 @@ mod tests {
             "a declined marker never arms"
         );
         assert_eq!(r.data, b"ok", "the tail parses as ordinary data");
+    }
+
+    /// MCCP2's start marker is the exact empty subnegotiation. A non-empty payload is not a
+    /// compression boundary and must not divert following plaintext into an inflater.
+    #[test]
+    fn mccp2_nonempty_subnegotiation_does_not_arm() {
+        use super::option::MCCP2;
+        let mut p = TelnetParser::new();
+        let mut r = Recorder::default();
+        let _ = p.receive(&[IAC, WILL, MCCP2], &mut r);
+
+        let input = [IAC, SB, MCCP2, b'x', IAC, SE, b'o', b'k'];
+        assert_eq!(p.receive(&input, &mut r), input.len());
+        assert_eq!(p.take_compression_started(), None);
+        assert_eq!(r.data, b"ok");
+        assert_eq!(r.subs, vec![(MCCP2, vec![b'x'])]);
     }
 
     /// MCCPX: `WILL MCCPX` is accepted (`DO`), and the `BEGIN_ENCODING <codec>` marker halts
@@ -1157,21 +1168,29 @@ mod tests {
         assert_eq!(r.sent, &[IAC, DO, MCCPX, IAC, DONT, MCCP2]);
     }
 
-    /// The claim releases at stream end (`clear_remote`) so a *different* compressor can be
-    /// negotiated afterward.
+    /// A clean MCCP2 stream end leaves the Telnet option negotiated, so another bare start
+    /// marker can create a fresh zlib stream (as servers do across copyover).
     #[test]
-    fn ending_a_compression_stream_releases_the_claim() {
-        use super::option::{MCCP2, MCCPX};
+    fn mccp2_start_marker_can_repeat_under_one_negotiation() {
+        use super::option::MCCP2;
         let mut p = TelnetParser::new();
         let mut r = Recorder::default();
         let _ = p.receive(&[IAC, WILL, MCCP2], &mut r);
-        p.clear_remote(MCCP2);
-        let _ = p.receive(&[IAC, WILL, MCCPX], &mut r);
+        let marker = [IAC, SB, MCCP2, IAC, SE];
+
+        let _ = p.receive(&marker, &mut r);
         assert_eq!(
-            r.sent,
-            &[IAC, DO, MCCP2, IAC, DO, MCCPX],
-            "MCCPX now accepted"
+            p.take_compression_started(),
+            Some(super::CompressionStart::Deflate)
         );
+        assert!(p.remote_enabled(MCCP2));
+
+        let _ = p.receive(&marker, &mut r);
+        assert_eq!(
+            p.take_compression_started(),
+            Some(super::CompressionStart::Deflate)
+        );
+        assert_eq!(r.sent, &[IAC, DO, MCCP2], "no second WILL/DO is needed");
     }
 
     /// A compression option turned off via telnet `WONT` (not a codec stream-end) must
@@ -1189,7 +1208,7 @@ mod tests {
         assert_eq!(
             r.sent,
             &[IAC, DO, MCCP2, IAC, DONT, MCCP2, IAC, DO, MCCPX],
-            "the claim released on WONT, so MCCPX is accepted"
+            "the claim released on WONT, so MCCP4 is accepted"
         );
     }
 
@@ -1205,17 +1224,22 @@ mod tests {
         assert!(r.options.is_empty(), "MCCP3 never becomes locally enabled");
     }
 
-    /// With compression disallowed (the per-server setting off), `WILL MCCP2` is declined,
-    /// so no start marker can legitimately follow.
+    /// MCCP2 and MCCP4 have independent per-server gates.
     #[test]
-    fn mccp2_is_declined_when_compression_is_off() {
-        use super::option::MCCP2;
-        let mut p = TelnetParser::new();
-        p.set_accept_compression(false);
-        let mut r = Recorder::default();
-        let _ = p.receive(&[IAC, WILL, MCCP2], &mut r);
-        assert_eq!(r.sent, &[IAC, DONT, MCCP2]);
-        assert!(!p.remote_enabled(MCCP2));
+    fn mccp2_and_mccp4_can_be_enabled_independently() {
+        use super::option::{MCCP2, MCCPX};
+
+        let mut only_mccp4 = TelnetParser::new();
+        only_mccp4.set_accept_compression(false, true);
+        let mut mccp4_replies = Recorder::default();
+        let _ = only_mccp4.receive(&[IAC, WILL, MCCP2, IAC, WILL, MCCPX], &mut mccp4_replies);
+        assert_eq!(mccp4_replies.sent, &[IAC, DONT, MCCP2, IAC, DO, MCCPX]);
+
+        let mut only_mccp2 = TelnetParser::new();
+        only_mccp2.set_accept_compression(true, false);
+        let mut mccp2_replies = Recorder::default();
+        let _ = only_mccp2.receive(&[IAC, WILL, MCCPX, IAC, WILL, MCCP2], &mut mccp2_replies);
+        assert_eq!(mccp2_replies.sent, &[IAC, DONT, MCCPX, IAC, DO, MCCP2]);
     }
 
     #[test]

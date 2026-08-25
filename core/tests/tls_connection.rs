@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use smudgy_core::session::connection::{Connection, TlsMode, responders};
+use smudgy_core::session::connection::{Connection, InboundCompression, TlsMode, responders};
 use smudgy_core::session::runtime::RuntimeAction;
 
 /// A self-signed cert + key for `localhost`, and a rustls server config using them.
@@ -105,7 +105,14 @@ async fn tls_no_verify_accepts_self_signed_and_data_flows_both_ways() {
 
     let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut connection = new_connection(runtime_tx);
-    connection.connect("localhost", port, None, None, true, TlsMode::NoVerify);
+    connection.connect(
+        "localhost",
+        port,
+        None,
+        None,
+        InboundCompression::ALL,
+        TlsMode::NoVerify,
+    );
 
     // Give the handshake a moment, then send a command over TLS — retry until the socket
     // task has registered (write() errors until then). The reply proves the outbound write
@@ -139,7 +146,14 @@ async fn tls_verify_rejects_a_self_signed_certificate() {
     let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut connection = new_connection(runtime_tx);
     // Full verification against the OS trust store: a self-signed cert must fail.
-    connection.connect("localhost", port, None, None, true, TlsMode::Verify);
+    connection.connect(
+        "localhost",
+        port,
+        None,
+        None,
+        InboundCompression::ALL,
+        TlsMode::Verify,
+    );
 
     let (lines, echoes) = drain(&mut runtime_rx, Duration::from_secs(10));
     assert!(

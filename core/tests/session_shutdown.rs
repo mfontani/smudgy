@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use smudgy_core::session::connection::{TlsMode, shutdown_io_runtime};
+use smudgy_core::session::connection::{InboundCompression, TlsMode, shutdown_io_runtime};
 use smudgy_core::session::registry;
 use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 use smudgy_core::session::{SessionEvent, SessionId, SessionParams, spawn};
@@ -59,7 +59,7 @@ async fn connected_session_runtime_joins_on_shutdown() {
         send_on_connect: None,
         send_on_connect_redactions: Arc::new(Vec::new()),
         encoding: None,
-        compression: false,
+        compression: InboundCompression::NONE,
         tls: TlsMode::Off,
     })
     .unwrap();

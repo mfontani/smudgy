@@ -94,9 +94,8 @@ pub enum RuntimeAction {
         /// label (`ServerConfig::encoding`); `None` = UTF-8. Resolved at
         /// dispatch; CHARSET negotiation overrides it mid-connection.
         encoding: Option<Arc<String>>,
-        /// Whether inbound compression offers (MCCP2) are accepted
-        /// (`ServerConfig::compression`).
-        compression: bool,
+        /// Which inbound compression protocols this server may negotiate.
+        compression: crate::session::connection::InboundCompression,
         /// The transport mode resolved from `ServerConfig::tls` + `tls_verify`.
         tls: crate::session::connection::TlsMode,
     },

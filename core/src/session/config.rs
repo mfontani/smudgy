@@ -427,13 +427,17 @@ pub fn load_connect_action(server_name: &str, profile_name: &str) -> Result<Runt
         (Some(Arc::new(text)), redactions)
     };
 
+    let mccp4_compression = server.config.accepts_mccp4_compression();
     Ok(RuntimeAction::Connect {
         host: server.config.host.into(),
         port: server.config.port,
         send_on_connect,
         send_on_connect_redactions: Arc::new(send_on_connect_redactions),
         encoding: server.config.encoding.map(Arc::new),
-        compression: server.config.compression,
+        compression: crate::session::connection::InboundCompression::new(
+            server.config.compression,
+            mccp4_compression,
+        ),
         tls: crate::session::connection::TlsMode::from_settings(
             server.config.tls,
             server.config.tls_verify,
