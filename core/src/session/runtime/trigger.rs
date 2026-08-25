@@ -724,6 +724,7 @@ impl Manager {
         allow_self_match: bool,
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
+        command: Option<crate::models::matchers::CommandSpec>,
     ) -> Result<()> {
         self.add_or_update_alias(
             Trigger::new_alias(
@@ -737,6 +738,7 @@ impl Manager {
                 fire_limit,
             )?
             .with_source(source)
+            .with_command(command)
             .with_allow_self_match(allow_self_match),
         );
         Ok(())

@@ -323,6 +323,9 @@ pub enum RuntimeAction {
         /// The handler's `toString()`, passed in good faith from JS-land for the read-only
         /// detail pane. `None` when the caller supplied no source. Display-only.
         script_source: Option<Arc<str>>,
+        /// A `command` tag alias's argument parser. When set, `patterns` holds the derived
+        /// prefilter and the spec decides firing and captures (`Trigger::run_command`).
+        command: Option<crate::models::matchers::CommandSpec>,
     },
     AddTrigger {
         isolate: IsolateId,

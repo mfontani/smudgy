@@ -2028,6 +2028,7 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const style = __api.style;\n\
          export const link = __api.link;\n\
          export const pattern = __api.pattern;\n\
+         export const command = __api.command;\n\
          export const reload = __api.reload;\n\
          export const capture = __api.capture;\n\
          export const fallthrough = __api.fallthrough;\n\

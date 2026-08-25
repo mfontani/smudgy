@@ -1236,6 +1236,7 @@ impl Inner<'_> {
                 fallthrough,
                 fire_limit,
                 script_source,
+                command,
             } => {
                 self.trigger_manager.push_javascript_function_alias(
                     isolate,
@@ -1251,7 +1252,9 @@ impl Inner<'_> {
                     true,
                     fire_limit,
                     script_source,
+                    command,
                 )?;
+                self.push_command_names_if_changed().await?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::AddTrigger {
