@@ -216,21 +216,32 @@ impl Inner<'_> {
         }
     }
 
-    /// The outgoing-line pipeline entry shared by `Send` and the typed-submission
-    /// actions: the raw-line prefix sends the remainder verbatim — no separator
-    /// splitting AND no alias matching — exactly like `RuntimeAction::SendRaw`
+    /// The outgoing-line pipeline entry shared by `Send`, `SendScripted`, and the
+    /// typed-submission actions: the raw-line prefix sends the remainder verbatim — no
+    /// separator splitting AND no alias matching — exactly like `RuntimeAction::SendRaw`
     /// ('\n' still splits). It is checked before the legacy `=` prefix, which skips
     /// splitting but still alias-matches. Because the check lives here, script
     /// `send("\\...")` inherits raw behavior by design — and a `sys:input`
     /// replacement does too, since a submission completes into this same entry.
-    async fn dispatch_send(&mut self, line: Arc<String>) -> Result<ActionResult, anyhow::Error> {
+    ///
+    /// `depth`/`sender` are the expansion context of a scripted send (zero/`None` for
+    /// typed input); every command split out of `line` carries them into alias matching.
+    async fn dispatch_send(
+        &mut self,
+        line: Arc<String>,
+        depth: u32,
+        sender: Option<trigger::AliasSender>,
+    ) -> Result<ActionResult, anyhow::Error> {
         if !self.raw_line_prefix.is_empty()
             && let Some(rest) = line.strip_prefix(self.raw_line_prefix.as_str())
         {
             self.send_verbatim_lines(rest).await?;
             Ok(ActionResult::None)
         } else if let Some(rest) = line.strip_prefix('=') {
-            match self.trigger_manager.process_outgoing_line(rest) {
+            match self
+                .trigger_manager
+                .process_outgoing_line(rest, depth, sender.as_ref())
+            {
                 Ok(()) => Ok(ActionResult::None),
                 Err(err) => Ok(ActionResult::Echo(format!(
                     "Error processing command {err:?}"
@@ -240,7 +251,11 @@ impl Inner<'_> {
             Ok(ActionResult::Run(
                 trigger::split_commands(&line, &self.command_separator)
                     .into_iter()
-                    .map(|line| RuntimeAction::ProcessOutgoingLine(Arc::new(line.to_string())))
+                    .map(|line| RuntimeAction::ProcessOutgoingLine {
+                        line: Arc::new(line.to_string()),
+                        depth,
+                        sender: sender.clone(),
+                    })
                     .collect(),
             ))
         }
@@ -655,7 +670,12 @@ impl Inner<'_> {
                 self.route_partial_line(processed_line, &routing);
                 Ok(ActionResult::None)
             }
-            RuntimeAction::Send(line) => self.dispatch_send(line).await,
+            RuntimeAction::Send(line) => self.dispatch_send(line, 0, None).await,
+            RuntimeAction::SendScripted {
+                text,
+                depth,
+                sender,
+            } => self.dispatch_send(text, depth, sender).await,
             RuntimeAction::SubmitInput(line) => {
                 // The typed-submission pipeline entry: `sys:input` fires here, before
                 // raw-prefix/`=` handling and separator splitting, so handlers see the
@@ -669,7 +689,7 @@ impl Inner<'_> {
                     serde_json::json!({ "text": line.as_str() }).to_string()
                 });
                 if handlers.is_empty() {
-                    self.dispatch_send(line).await
+                    self.dispatch_send(line, 0, None).await
                 } else {
                     // Install the generation-stamped submission the handlers act on.
                     self.input_submission.borrow_mut().install(line);
@@ -688,18 +708,26 @@ impl Inner<'_> {
                 let submission = self.input_submission.borrow_mut().take();
                 match submission {
                     Some(submission) if !submission.is_cancelled() => {
-                        self.dispatch_send(submission.into_text()).await
+                        self.dispatch_send(submission.into_text(), 0, None).await
                     }
                     _ => Ok(ActionResult::None),
                 }
             }
-            RuntimeAction::ProcessOutgoingLine(line) => {
+            RuntimeAction::ProcessOutgoingLine {
+                line,
+                depth,
+                sender,
+            } => {
                 // Pre-match reset of the capture flag; the per-eval set/get bracket below
                 // re-primes it on the actual target isolate, so resetting Main here is
                 // harmless regardless (each eval overrides it).
                 self.script_engine.set_is_captured(&IsolateId::Main, false);
 
-                match self.trigger_manager.process_outgoing_line(line.as_str()) {
+                match self.trigger_manager.process_outgoing_line(
+                    line.as_str(),
+                    depth,
+                    sender.as_ref(),
+                ) {
                     Ok(()) => {
                         // sys:send — the command (post-alias) about to reach the game.
                         let payload = serde_json::json!({ "command": line.as_str() }).to_string();
@@ -758,6 +786,14 @@ impl Inner<'_> {
                 self.trigger_manager
                     .record_fire(&isolate, &origin, &name, is_alias);
 
+                // A running alias is the sender of everything its body sends; that identity
+                // rides every nested outgoing pass so its own output cannot re-match it.
+                let sender = is_alias.then(|| trigger::AliasSender {
+                    isolate: isolate.clone(),
+                    origin: origin.clone(),
+                    name: name.clone(),
+                });
+
                 let mut continue_matching = fallthrough;
                 let result = match script {
                     ScriptAction::EvalJavascript(id) => {
@@ -765,7 +801,14 @@ impl Inner<'_> {
                         self.script_engine.set_is_captured(&isolate, true);
                         let result = self
                             .script_engine
-                            .run_script(&self.trigger_manager, &isolate, id, &matches, depth)
+                            .run_script(
+                                &self.trigger_manager,
+                                &isolate,
+                                id,
+                                &matches,
+                                depth,
+                                sender,
+                            )
                             .unwrap_or_else(|err| {
                                 ActionResult::Echo(format!("JavaScript Error: {err:?}"))
                             });
@@ -788,6 +831,7 @@ impl Inner<'_> {
                                 id,
                                 &matches,
                                 depth,
+                                sender,
                             )
                             .unwrap_or_else(|err| {
                                 ActionResult::Echo(format!("Error in Javascript Function: {err:?}"))
@@ -804,8 +848,12 @@ impl Inner<'_> {
                         if let Some(is_captured) = &is_captured {
                             is_captured.store(true, Ordering::Relaxed);
                         }
-                        self.trigger_manager
-                            .run_simple_automation(&script, &matches, depth)?;
+                        self.trigger_manager.run_simple_automation(
+                            &script,
+                            &matches,
+                            depth,
+                            sender.as_ref(),
+                        )?;
                         ActionResult::None
                     }
                     ScriptAction::SendRaw(script) => {
@@ -853,7 +901,7 @@ impl Inner<'_> {
 
                 let result = self
                     .script_engine
-                    .run_script(&self.trigger_manager, &isolate, id, &matches, depth)
+                    .run_script(&self.trigger_manager, &isolate, id, &matches, depth, None)
                     .unwrap_or_else(|err| ActionResult::Echo(format!("JavaScript Error: {err:?}")));
 
                 if self.script_engine.get_is_captured(&isolate)
@@ -875,7 +923,14 @@ impl Inner<'_> {
 
                 let result = self
                     .script_engine
-                    .call_javascript_function(&self.trigger_manager, &isolate, id, &matches, depth)
+                    .call_javascript_function(
+                        &self.trigger_manager,
+                        &isolate,
+                        id,
+                        &matches,
+                        depth,
+                        None,
+                    )
                     .unwrap_or_else(|err| {
                         ActionResult::Echo(format!("Error in Javascript Function: {err:?}"))
                     });
@@ -1066,8 +1121,10 @@ impl Inner<'_> {
                         ScriptAction::SendSimple(script) => Ok(ActionResult::Run(
                             trigger::split_commands(script, &self.command_separator)
                                 .into_iter()
-                                .map(|line| {
-                                    RuntimeAction::ProcessOutgoingLine(Arc::new(line.to_string()))
+                                .map(|line| RuntimeAction::ProcessOutgoingLine {
+                                    line: Arc::new(line.to_string()),
+                                    depth: 0,
+                                    sender: None,
                                 })
                                 .collect(),
                         )),
@@ -1082,6 +1139,7 @@ impl Inner<'_> {
                                     *script_id,
                                     &Arc::new(vec![]),
                                     0,
+                                    None,
                                 )
                                 .unwrap_or_else(|err| {
                                     ActionResult::Echo(format!(
@@ -1100,6 +1158,7 @@ impl Inner<'_> {
                                     *function_id,
                                     &Arc::new(vec![]),
                                     0,
+                                    None,
                                 )
                                 .unwrap_or_else(|err| {
                                     ActionResult::Echo(format!(
@@ -1140,6 +1199,7 @@ impl Inner<'_> {
                             alias.script.unwrap_or_default().into(),
                             alias.priority,
                             alias.fallthrough,
+                            alias.allow_self_match,
                             fire_limit,
                             command,
                         )?;
@@ -1155,6 +1215,7 @@ impl Inner<'_> {
                             script_id,
                             alias.priority,
                             alias.fallthrough,
+                            alias.allow_self_match,
                             fire_limit,
                             Some(Arc::from(src)),
                             command,
@@ -1184,6 +1245,10 @@ impl Inner<'_> {
                     function_id,
                     priority,
                     fallthrough,
+                    // Script-created function aliases keep the historical semantics —
+                    // their own output may re-match them (the depth limit still bounds
+                    // a runaway loop). The default-off protection is for saved aliases.
+                    true,
                     fire_limit,
                     script_source,
                 )?;

@@ -15,6 +15,10 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn is_zero(value: &i32) -> bool {
     *value == 0
 }
@@ -45,6 +49,12 @@ pub struct AliasDefinition {
     /// Whether matching continues to later aliases after this one runs. Defaults to true.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub fallthrough: bool,
+    /// Whether text this alias sends may match this same alias again. Defaults
+    /// to false: an alias's own output is excluded from re-matching it, which
+    /// closes the easiest infinite-loop footgun (deliberately recursive
+    /// aliases opt back in).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_self_match: bool,
     /// The language of the script. Defaults to Plaintext.
     #[serde(default)]
     pub language: ScriptLang,
@@ -256,6 +266,7 @@ mod tests {
             enabled: true,
             priority: 0,
             fallthrough: true,
+            allow_self_match: false,
             language: super::ScriptLang::Plaintext,
             matcher: Some(AliasMatcherSource::Pattern {
                 source: "greet {person}".to_string(),
@@ -274,18 +285,23 @@ mod tests {
         let old: AliasDefinition = serde_json::from_str(r#"{"pattern":"^look$"}"#).unwrap();
         assert_eq!(old.priority, 0);
         assert!(old.fallthrough);
+        assert!(!old.allow_self_match);
         assert!(old.matcher.is_none());
 
         let default_json = serde_json::to_string(&old).unwrap();
         assert!(!default_json.contains("priority"));
         assert!(!default_json.contains("fallthrough"));
+        assert!(!default_json.contains("allow_self_match"));
         assert!(!default_json.contains("matcher"));
 
-        let configured: AliasDefinition =
-            serde_json::from_str(r#"{"pattern":"^look$","priority":7,"fallthrough":false}"#)
-                .unwrap();
+        let configured: AliasDefinition = serde_json::from_str(
+            r#"{"pattern":"^look$","priority":7,"fallthrough":false,"allow_self_match":true}"#,
+        )
+        .unwrap();
+        assert!(configured.allow_self_match);
         let configured_json = serde_json::to_string(&configured).unwrap();
         assert!(configured_json.contains("\"priority\":7"));
         assert!(configured_json.contains("\"fallthrough\":false"));
+        assert!(configured_json.contains("\"allow_self_match\":true"));
     }
 }

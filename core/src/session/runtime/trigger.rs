@@ -40,6 +40,17 @@ type AutomationNamespace = HashMap<String, AutomationEntry>;
 /// suppress another package's (or the user's) automations.
 type FallthroughScopes = HashMap<(IsolateId, Origin), Arc<AtomicBool>>;
 
+/// The identity of the alias whose expansion produced the line currently being matched.
+/// Carried through every nested outgoing-line pass so that alias's own sent text is
+/// excluded from re-matching it (unless the alias opts in via `allow_self_match`), and so
+/// the depth-limit bail can name the looping alias.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasSender {
+    pub isolate: IsolateId,
+    pub origin: Origin,
+    pub name: Arc<String>,
+}
+
 /// The introspection mirror the `get`/`list`/`exists` ops read. Keyed by
 /// `(IsolateId, Origin)` exactly like the [`Manager`]'s own indices, so a caller only ever
 /// sees its OWN `(isolate, origin)` automations (origin-scoped). Shared (the same
@@ -655,6 +666,7 @@ impl Manager {
         script_id: ScriptId,
         priority: i32,
         fallthrough: bool,
+        allow_self_match: bool,
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
         command: Option<crate::models::matchers::CommandSpec>,
@@ -671,7 +683,8 @@ impl Manager {
                 fire_limit,
             )?
             .with_source(source)
-            .with_command(command),
+            .with_command(command)
+            .with_allow_self_match(allow_self_match),
         );
         Ok(())
     }
@@ -708,6 +721,7 @@ impl Manager {
         function_id: FunctionId,
         priority: i32,
         fallthrough: bool,
+        allow_self_match: bool,
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
     ) -> Result<()> {
@@ -722,7 +736,8 @@ impl Manager {
                 fallthrough,
                 fire_limit,
             )?
-            .with_source(source),
+            .with_source(source)
+            .with_allow_self_match(allow_self_match),
         );
         Ok(())
     }
@@ -737,6 +752,7 @@ impl Manager {
         script: Arc<String>,
         priority: i32,
         fallthrough: bool,
+        allow_self_match: bool,
         fire_limit: Option<u32>,
         command: Option<crate::models::matchers::CommandSpec>,
     ) -> Result<()> {
@@ -751,7 +767,8 @@ impl Manager {
                 fallthrough,
                 fire_limit,
             )?
-            .with_command(command),
+            .with_command(command)
+            .with_allow_self_match(allow_self_match),
         );
         Ok(())
     }
@@ -1120,6 +1137,7 @@ impl Manager {
         &self,
         line: &str,
         depth: u32,
+        sender: Option<&AliasSender>,
         pattern_set: &PatternSet,
         triggers: &[Trigger],
         regex_set_to_triggers_map: &[usize],
@@ -1130,9 +1148,15 @@ impl Manager {
         fired: &mut Vec<usize>,
     ) -> Result<()> {
         if depth > 100 {
-            bail!(
-                "Script processor bailing, depth limit reached. Do you have an alias that triggers itself?"
-            );
+            match sender {
+                Some(sender) => bail!(
+                    "Script processor bailing, depth limit reached while expanding alias \"{}\". Does it trigger itself?",
+                    sender.name
+                ),
+                None => bail!(
+                    "Script processor bailing, depth limit reached. Do you have an alias that triggers itself?"
+                ),
+            }
         }
         // Time the match only when debug logging is compiled in: `log_enabled!(Debug)`
         // const-folds to `false` under `release_max_level_info` (release/bench), so the timer is
@@ -1155,6 +1179,20 @@ impl Manager {
                 if !trigger.enabled
                     || fired.contains(&trigger_idx)
                     || trigger.anti_patterns.is_match(line)
+                {
+                    continue;
+                }
+
+                // An alias's own sent text does not re-match it unless it opts
+                // in: the direct self-recursion loop never starts, instead of
+                // spinning until the depth limit.
+                if trigger.is_alias
+                    && !trigger.allow_self_match
+                    && sender.is_some_and(|sender| {
+                        sender.isolate == trigger.isolate
+                            && sender.origin == trigger.origin
+                            && *sender.name == trigger.name
+                    })
                 {
                     continue;
                 }
@@ -1230,7 +1268,15 @@ impl Manager {
         }
     }
 
-    pub fn process_outgoing_line(&mut self, line: &str) -> Result<()> {
+    /// Match one outgoing line against the alias set. `sender` names the alias whose
+    /// expansion produced the line, when one did (typed input passes `None`), and `depth`
+    /// counts nested expansions toward the loop-bail limit.
+    pub fn process_outgoing_line(
+        &mut self,
+        line: &str,
+        depth: u32,
+        sender: Option<&AliasSender>,
+    ) -> Result<()> {
         // Lazily rebuild the alias PatternSet here (mirrors how
         // `process_incoming_line` rebuilds the trigger set) so alias inserts at
         // load time stay O(1) and we pay one rebuild on the first command.
@@ -1238,10 +1284,15 @@ impl Manager {
             self.rebuild_alias_regex_set();
             self.alias_regex_set_dirty = false;
         }
-        self.process_nested_outgoing_line(line, 0)
+        self.process_nested_outgoing_line(line, depth, sender)
     }
 
-    pub fn process_nested_outgoing_line(&self, line: &str, depth: u32) -> Result<()> {
+    pub fn process_nested_outgoing_line(
+        &self,
+        line: &str,
+        depth: u32,
+        sender: Option<&AliasSender>,
+    ) -> Result<()> {
         let is_captured = Arc::new(AtomicBool::new(false));
         let mut fallthrough_scopes = FallthroughScopes::new();
         // Aliases evaluate in a single pass, so the fired list is inert here; it exists
@@ -1251,6 +1302,7 @@ impl Manager {
         self.process_line_inner(
             line,
             depth,
+            sender,
             &self.alias_regex_set,
             &self.aliases,
             &self.alias_regex_set_map,
@@ -1272,16 +1324,18 @@ impl Manager {
 
     /// Execute a matched plaintext command template. This happens at dispatch time (rather than
     /// match-discovery time) so a prior automation can stop this invocation before it captures or
-    /// sends anything. Each separated command begins its own alias frame.
+    /// sends anything. Each separated command begins its own alias frame; `sender` is the alias
+    /// whose body is being expanded (`None` for a trigger body).
     pub(crate) fn run_simple_automation(
         &self,
         script: &str,
         captures: &[MatchCapture],
         depth: u32,
+        sender: Option<&AliasSender>,
     ) -> Result<()> {
         let evaluated = expand_template(script, captures);
         for line in split_commands(&evaluated, &self.command_separator) {
-            self.process_nested_outgoing_line(line, depth)?;
+            self.process_nested_outgoing_line(line, depth, sender)?;
         }
         Ok(())
     }
@@ -1345,6 +1399,7 @@ impl Manager {
             self.process_line_inner(
                 line,
                 0,
+                None,
                 &self.raw_trigger_regex_set,
                 &self.triggers,
                 &self.raw_trigger_regex_set_map,
@@ -1359,6 +1414,7 @@ impl Manager {
         self.process_line_inner(
             line,
             0,
+            None,
             &self.trigger_regex_set,
             &self.triggers,
             &self.trigger_regex_set_map,
@@ -1398,6 +1454,7 @@ impl Manager {
             self.process_line_inner(
                 line,
                 0,
+                None,
                 &self.prompt_raw_trigger_regex_set,
                 &self.triggers,
                 &self.prompt_raw_trigger_regex_set_map,
@@ -1412,6 +1469,7 @@ impl Manager {
         self.process_line_inner(
             &line,
             0,
+            None,
             &self.prompt_trigger_regex_set,
             &self.triggers,
             &self.prompt_trigger_regex_set_map,
@@ -1455,6 +1513,10 @@ struct Trigger {
     priority: i32,
     /// Whether later matches in this automation's creator scope may run.
     fallthrough: bool,
+    /// Alias-only: whether text this alias sends may match this same alias again. `false`
+    /// excludes the alias from matching its own expansion output (see
+    /// [`Manager::process_line_inner`]); inert for triggers.
+    allow_self_match: bool,
     /// Whether this entry lives in the alias `Vec` (matched on outgoing input) vs the trigger
     /// `Vec` (matched on incoming lines). Drives the `RemoveAlias`/`RemoveTrigger` self-limit
     /// removal kind. `Trigger` is reused for both by construction; this is the discriminant.
@@ -1534,6 +1596,7 @@ impl Trigger {
             enabled,
             priority,
             fallthrough,
+            allow_self_match: false,
             is_alias: false,
             fire_limit,
             line_limit,
@@ -1562,7 +1625,11 @@ impl Trigger {
             isolate,
             origin,
             name,
-            patterns,
+            // An empty pattern compiles to a regex that matches EVERY command —
+            // never what an alias saved without a pattern means. Dropping it
+            // here makes such an alias match nothing, on every registration
+            // path. (A deliberate catch-all is still expressible as `.*`.)
+            patterns.filter(|pattern| !pattern.as_ref().is_empty()),
             std::iter::empty::<&str>(),
             std::iter::empty::<&str>(),
             script,
@@ -1590,6 +1657,14 @@ impl Trigger {
     #[must_use]
     fn with_command(mut self, command: Option<crate::models::matchers::CommandSpec>) -> Self {
         self.command = command;
+        self
+    }
+
+    /// Sets whether this alias's own sent text may match it again (see
+    /// [`Trigger::allow_self_match`]).
+    #[must_use]
+    fn with_allow_self_match(mut self, allow_self_match: bool) -> Self {
+        self.allow_self_match = allow_self_match;
         self
     }
 
@@ -1998,12 +2073,15 @@ mod tests {
                     std::sync::Arc::new("say $1 $who".to_string()),
                     0,
                     true,
+                    false,
                     None,
                     None,
                 )
                 .unwrap();
 
-            manager.process_outgoing_line("NUM One Two").unwrap();
+            manager
+                .process_outgoing_line("NUM One Two", 0, None)
+                .unwrap();
 
             let captures = queue
                 .borrow_mut()
@@ -2069,6 +2147,7 @@ mod tests {
                     Arc::new("say hi to $person".to_string()),
                     0,
                     true,
+                    false,
                     None,
                     Some(spec),
                 )
@@ -2102,7 +2181,7 @@ mod tests {
         fn fired_command_produces_parser_captures() {
             let (mut manager, queue) = manager_with_command(greet_spec(ArgKind::Required));
             manager
-                .process_outgoing_line(r#"greet "big ugly troll""#)
+                .process_outgoing_line(r#"greet "big ugly troll""#, 0, None)
                 .unwrap();
 
             let actions = drain(&queue);
@@ -2121,7 +2200,7 @@ mod tests {
         #[test]
         fn missing_required_echoes_usage_and_captures() {
             let (mut manager, queue) = manager_with_command(greet_spec(ArgKind::Required));
-            manager.process_outgoing_line("greet").unwrap();
+            manager.process_outgoing_line("greet", 0, None).unwrap();
 
             let actions = drain(&queue);
             assert_eq!(count_runs(&actions), 0, "no fire on a missing required arg");
@@ -2141,7 +2220,9 @@ mod tests {
         #[test]
         fn unclaimed_tokens_fall_through() {
             let (mut manager, queue) = manager_with_command(greet_spec(ArgKind::Required));
-            manager.process_outgoing_line("greet Mira Bob").unwrap();
+            manager
+                .process_outgoing_line("greet Mira Bob", 0, None)
+                .unwrap();
 
             let actions = drain(&queue);
             assert_eq!(count_runs(&actions), 0);
@@ -2197,12 +2278,156 @@ mod tests {
                     Arc::new("say hi".to_string()),
                     0,
                     true,
+                    false,
                     None,
                     Some(greet_spec(ArgKind::Optional)),
                 )
                 .unwrap();
-            manager.process_outgoing_line("greetz hi").unwrap();
+            manager.process_outgoing_line("greetz hi", 0, None).unwrap();
             assert_eq!(count_runs(&drain(&queue)), 0);
+        }
+    }
+
+    mod alias_matching_guards {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use super::super::{ActionQueue, AliasSender, Manager};
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+
+        fn manager() -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            (
+                Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default()),
+                queue,
+            )
+        }
+
+        fn push(
+            manager: &mut Manager,
+            name: &str,
+            pattern: &str,
+            body: &str,
+            allow_self_match: bool,
+        ) {
+            manager
+                .push_simple_alias(
+                    IsolateId::Main,
+                    Origin::User,
+                    Arc::new(name.to_string()),
+                    Arc::new(vec![pattern.to_string()]),
+                    Arc::new(body.to_string()),
+                    0,
+                    true,
+                    allow_self_match,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        fn drain_runs(queue: &ActionQueue) -> usize {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+                .count()
+        }
+
+        fn sender(name: &str) -> AliasSender {
+            AliasSender {
+                isolate: IsolateId::Main,
+                origin: Origin::User,
+                name: Arc::new(name.to_string()),
+            }
+        }
+
+        #[test]
+        fn empty_pattern_alias_never_matches() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, "empty", "", "say hi", false);
+
+            manager
+                .process_outgoing_line("anything at all", 0, None)
+                .unwrap();
+
+            let actions: Vec<RuntimeAction> = queue.borrow_mut().drain(..).collect();
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, RuntimeAction::RunAutomation { .. })),
+                "an empty pattern must not match every command"
+            );
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    RuntimeAction::SendRawUnless(_, line) if line.as_str() == "anything at all"
+                )),
+                "the typed line still falls through to the wire"
+            );
+        }
+
+        #[test]
+        fn own_output_skips_the_sending_alias_by_default() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, "loop", "^spin$", "spin", false);
+
+            manager.process_outgoing_line("spin", 0, None).unwrap();
+            assert_eq!(drain_runs(&queue), 1, "typed input matches normally");
+
+            manager
+                .process_outgoing_line("spin", 1, Some(&sender("loop")))
+                .unwrap();
+            assert_eq!(
+                drain_runs(&queue),
+                0,
+                "the alias's own output must not re-match it"
+            );
+        }
+
+        #[test]
+        fn allow_self_match_opts_back_in() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, "walk", "^walk$", "walk", true);
+
+            manager
+                .process_outgoing_line("walk", 1, Some(&sender("walk")))
+                .unwrap();
+            assert_eq!(
+                drain_runs(&queue),
+                1,
+                "an opted-in alias may match its own output"
+            );
+        }
+
+        #[test]
+        fn another_alias_output_still_matches() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, "target", "^spin$", "say hi", false);
+
+            manager
+                .process_outgoing_line("spin", 1, Some(&sender("other")))
+                .unwrap();
+            assert_eq!(
+                drain_runs(&queue),
+                1,
+                "only the SENDING alias is excluded from its output"
+            );
+        }
+
+        #[test]
+        fn depth_bail_names_the_looping_alias() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, "loop", "^spin$", "spin", true);
+
+            let err = manager
+                .process_outgoing_line("spin", 101, Some(&sender("loop")))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("\"loop\""),
+                "the bail should name the alias: {err}"
+            );
         }
     }
 

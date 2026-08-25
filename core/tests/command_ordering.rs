@@ -161,6 +161,7 @@ fn plaintext_alias(pattern: &str, script: &str) -> AliasDefinition {
         enabled: true,
         priority: 0,
         fallthrough: true,
+        allow_self_match: false,
         language: ScriptLang::Plaintext,
         matcher: None,
     }
@@ -175,6 +176,7 @@ async fn plaintext_alias_expansion_preserves_command_order() {
         enabled: true,
         priority: 0,
         fallthrough: true,
+        allow_self_match: false,
         language: ScriptLang::Plaintext,
         matcher: None,
     };
@@ -199,6 +201,7 @@ async fn script_alias_sends_preserve_command_order() {
         enabled: true,
         priority: 0,
         fallthrough: true,
+        allow_self_match: false,
         language: ScriptLang::JS,
         matcher: None,
     };
@@ -278,4 +281,43 @@ async fn depth_first_order_preserved_across_isolates() {
     // "deep" (in the package isolate) fully expands before the "tail" sibling — depth-first
     // across the boundary. "deep"/"outer" themselves are consumed by alias expansion.
     assert_eq!(seen, vec!["deep_a", "deep_b", "tail"]);
+}
+
+/// A plaintext alias whose body is its own matching text: with `allow_self_match` off
+/// (the saved-alias default), the expansion is excluded from re-matching the alias and
+/// falls through to the wire instead of looping to the depth bail.
+#[tokio::test]
+async fn plaintext_alias_own_output_falls_through_by_default() {
+    let seen = run_scenario(
+        9005,
+        plaintext_alias("^selfy$", "selfy"),
+        "selfy;after",
+        &["selfy", "after"],
+    )
+    .await;
+
+    assert_eq!(seen, vec!["selfy", "after"]);
+}
+
+/// The JS `send()` counterpart: a script alias that sends its own matching text. The send
+/// carries the alias's identity (via the op's dispatch context), so the text is excluded
+/// from re-matching it and reaches the wire — historically this path restarted at depth
+/// zero and looped forever.
+#[tokio::test]
+async fn js_alias_send_of_own_pattern_falls_through_by_default() {
+    let alias = AliasDefinition {
+        pattern: "^jsself$".to_string(),
+        script: Some(r#"send("jsself"); send("jsdone");"#.to_string()),
+        package: None,
+        enabled: true,
+        priority: 0,
+        fallthrough: true,
+        allow_self_match: false,
+        language: ScriptLang::JS,
+        matcher: None,
+    };
+
+    let seen = run_scenario(9006, alias, "jsself", &["jsself", "jsdone"]).await;
+
+    assert_eq!(seen, vec!["jsself", "jsdone"]);
 }

@@ -7,6 +7,7 @@ use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceR
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
+use crate::session::runtime::trigger::AliasSender;
 use crate::session::runtime::trigger::MatchCapture;
 use crate::session::runtime::trigger::SharedAutomationRegistry;
 use crate::session::runtime::{
@@ -1062,6 +1063,13 @@ fn op_smudgy_validate_name(#[string] name: &str) -> Option<String> {
 /// its subscribers one level deeper and the chain terminates at [`MAX_EVENT_DEPTH`].
 #[derive(Clone, Copy, Default)]
 pub struct EventDepth(pub u32);
+
+/// The alias whose dispatch is currently running in this isolate — `None` outside an alias
+/// handler. Stashed into `OpState` beside [`EventDepth`] (same save/restore bracket) by
+/// `call_javascript_function`/`run_script`, and stamped by `op_smudgy_session_send` onto its
+/// queued action so an alias's own sent text is excluded from re-matching it.
+#[derive(Clone, Default)]
+pub struct AliasContext(pub Option<AliasSender>);
 
 /// One event subscriber: which isolate registered the handler and its `FunctionId` in that
 /// isolate's `script_functions`. Cloned out before queueing so the registry borrow is released.
@@ -4304,11 +4312,26 @@ fn op_smudgy_session_send(
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send, "send")?;
     reserve_script_send(state, line)?;
-    route_session_action(
-        state,
-        target,
-        RuntimeAction::Send(Arc::new(line.to_string())),
-    );
+    let action = if target == *state.borrow::<SessionId>() {
+        // An own-session send carries its dispatch context: one deeper than the
+        // running handler (mirroring the returned-string path), plus the alias
+        // identity when that handler IS an alias — so a self-matching send loop
+        // is excluded (or, opted in, still bounded by the depth limit) instead
+        // of restarting at depth zero forever. A cross-session send lands on
+        // the other runtime like fresh input.
+        let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
+        let sender = state
+            .try_borrow::<AliasContext>()
+            .and_then(|context| context.0.clone());
+        RuntimeAction::SendScripted {
+            text: Arc::new(line.to_string()),
+            depth: depth + 1,
+            sender,
+        }
+    } else {
+        RuntimeAction::Send(Arc::new(line.to_string()))
+    };
+    route_session_action(state, target, action);
     Ok(())
 }
 
@@ -4419,6 +4442,10 @@ fn op_smudgy_create_simple_alias(
         enabled: true,
         priority,
         fallthrough,
+        // Script-created aliases keep the historical semantics — their own output
+        // may re-match them, bounded by the depth limit (see the
+        // `AddJavascriptFunctionAlias` dispatch arm).
+        allow_self_match: true,
         language: ScriptLang::Plaintext,
         matcher: None,
     };
