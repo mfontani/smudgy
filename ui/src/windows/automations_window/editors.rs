@@ -262,6 +262,7 @@ impl AutomationsWindow {
                 enabled: true,
                 priority: 0,
                 fallthrough: true,
+                allow_self_match: false,
                 language: ScriptLang::Plaintext,
                 matcher: None,
             }),
@@ -279,7 +280,7 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
         self.parsing_open = false;
-        // No rows yet: the pane opens at the teaching-cards state.
+        // No rows yet: the pane opens at the unselected-cards state.
         self.trigger_row_contents = Vec::new();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
@@ -1196,9 +1197,11 @@ impl AutomationsWindow {
         priority: i32,
         fallthrough: bool,
         prompt: Option<bool>,
+        allow_self_match: Option<bool>,
         trigger: bool,
     ) -> Elem<'a> {
-        let non_default = priority != 0 || !fallthrough || prompt == Some(true);
+        let non_default =
+            priority != 0 || !fallthrough || prompt == Some(true) || allow_self_match == Some(true);
         if !non_default && !self.order_revealed {
             let label = if trigger {
                 crate::i18n::t!("editor-reveal-order-triggers")
@@ -1264,6 +1267,15 @@ impl AutomationsWindow {
             .text_size(13.0);
 
         let mut inner = column![priority_row, continue_row].spacing(10.0);
+        if let Some(allow_self_match) = allow_self_match {
+            inner = inner.push(
+                checkbox(allow_self_match)
+                    .label(crate::i18n::ts!("editor-allow-self-match"))
+                    .on_toggle(|_| Message::ToggleAllowSelfMatch)
+                    .size(14.0)
+                    .text_size(13.0),
+            );
+        }
         if let Some(prompt) = prompt {
             inner = inner.push(
                 column![
@@ -1707,7 +1719,13 @@ impl AutomationsWindow {
             }
         }
         body = body.push(self.tester_box(true, false));
-        body = body.push(self.order_module(alias.priority, alias.fallthrough, None, false));
+        body = body.push(self.order_module(
+            alias.priority,
+            alias.fallthrough,
+            None,
+            Some(alias.allow_self_match),
+            false,
+        ));
         let references = self.alias_capture_references(alias.language);
         if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
@@ -1863,10 +1881,10 @@ impl AutomationsWindow {
                 .into(),
         ));
 
-        // The matcher module (README §4): teaching cards at zero matchers, the
-        // same cards as a selector plus one full-width field at one, compact
-        // role-grouped rows at two or more. Exceptions and Raw render as
-        // labeled groups only when populated; every adder is a text link.
+        // The matcher module (README §4): unselected cards at zero matchers,
+        // the same cards as a selector plus one full-width field at one,
+        // compact role-grouped rows at two or more. Exceptions and Raw render
+        // as labeled groups only when populated; every adder is a text link.
         let match_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Match);
         let anti_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Anti);
         let raw_ids: Vec<usize> = row_ids_with_role(rows, PatternKind::Raw);
@@ -1875,7 +1893,7 @@ impl AutomationsWindow {
         let mut matchers = Column::new().spacing(12.0);
         match matcher_count {
             0 => {
-                matchers = matchers.push(self.trigger_cards(None, true));
+                matchers = matchers.push(self.trigger_cards(None));
             }
             1 => {
                 let index = match_ids
@@ -1884,8 +1902,8 @@ impl AutomationsWindow {
                     .copied()
                     .expect("exactly one matcher row");
                 let trigger_row = &rows[index];
-                matchers = matchers
-                    .push(self.trigger_cards(Some(TriggerCard::of_row(trigger_row)), false));
+                matchers =
+                    matchers.push(self.trigger_cards(Some(TriggerCard::of_row(trigger_row))));
                 if let Some(content) = self.trigger_row_contents.get(index) {
                     matchers = matchers.push(
                         row![
@@ -2011,7 +2029,7 @@ impl AutomationsWindow {
             .iter()
             .any(|row| row.role == PatternKind::Raw && !row.source.trim().is_empty());
         body = body.push(self.tester_box(false, has_raw));
-        body = body.push(self.order_module(priority, fallthrough, Some(prompt), true));
+        body = body.push(self.order_module(priority, fallthrough, Some(prompt), None, true));
         let references = Self::trigger_capture_references(rows, language);
         if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
@@ -2041,7 +2059,6 @@ impl AutomationsWindow {
                 title: crate::i18n::ts!("editor-kind-command"),
                 example: crate::i18n::ts!("editor-card-example-command"),
                 badge: None,
-                blurb: None,
                 hue: common::KIND_COMMAND,
                 selected: selected == AliasKind::Command,
                 message: Message::SetAliasKind(AliasKind::Command),
@@ -2050,7 +2067,6 @@ impl AutomationsWindow {
                 title: crate::i18n::ts!("editor-kind-pattern"),
                 example: crate::i18n::ts!("editor-example-alias-simple"),
                 badge: None,
-                blurb: None,
                 hue: common::KIND_PATTERN,
                 selected: selected == AliasKind::Pattern,
                 message: Message::SetAliasKind(AliasKind::Pattern),
@@ -2059,7 +2075,6 @@ impl AutomationsWindow {
                 title: crate::i18n::ts!("editor-kind-regex"),
                 example: crate::i18n::ts!("editor-example-alias-regex"),
                 badge: Some(crate::i18n::ts!("editor-badge-advanced")),
-                blurb: None,
                 hue: common::KIND_REGEX,
                 selected: selected == AliasKind::Regex,
                 message: Message::SetAliasKind(AliasKind::Regex),
@@ -2069,17 +2084,15 @@ impl AutomationsWindow {
         .into()
     }
 
-    /// The trigger pane's three matcher cards: teaching cards (with blurbs)
-    /// while no matcher exists, a selector for the single matcher's kind+role
-    /// while exactly one does.
-    fn trigger_cards<'a>(&self, selected: Option<TriggerCard>, teach: bool) -> Elem<'a> {
-        let blurb = |key: &'static str| teach.then_some(key);
+    /// The trigger pane's three matcher cards: a create control while no
+    /// matcher exists, a selector for the single matcher's kind+role while
+    /// exactly one does.
+    fn trigger_cards<'a>(&self, selected: Option<TriggerCard>) -> Elem<'a> {
         row![
             kind_card(KindCard {
                 title: crate::i18n::ts!("editor-kind-pattern"),
                 example: crate::i18n::ts!("editor-example-trigger-pattern"),
                 badge: None,
-                blurb: blurb(crate::i18n::ts!("editor-card-blurb-pattern")),
                 hue: common::KIND_PATTERN,
                 selected: selected == Some(TriggerCard::Pattern),
                 message: Message::SetTriggerCard(TriggerCard::Pattern),
@@ -2088,7 +2101,6 @@ impl AutomationsWindow {
                 title: crate::i18n::ts!("editor-kind-regex"),
                 example: crate::i18n::ts!("editor-example-trigger-regex"),
                 badge: Some(crate::i18n::ts!("editor-badge-advanced")),
-                blurb: blurb(crate::i18n::ts!("editor-card-blurb-regex")),
                 hue: common::KIND_REGEX,
                 selected: selected == Some(TriggerCard::Regex),
                 message: Message::SetTriggerCard(TriggerCard::Regex),
@@ -2097,7 +2109,6 @@ impl AutomationsWindow {
                 title: crate::i18n::ts!("editor-kind-raw"),
                 example: crate::i18n::ts!("editor-example-trigger-raw"),
                 badge: Some(crate::i18n::ts!("editor-badge-wizardry")),
-                blurb: blurb(crate::i18n::ts!("editor-card-blurb-raw")),
                 hue: common::KIND_RAW,
                 selected: selected == Some(TriggerCard::Raw),
                 message: Message::SetTriggerCard(TriggerCard::Raw),
@@ -2221,85 +2232,58 @@ impl AutomationsWindow {
         .into()
     }
 
-    /// The Command kind's field block: the mode radio (with the command-word
-    /// override beside it once revealed), the argument rows, the generated
-    /// usage line, and (Advanced only) the parsing picker.
+    /// The Command kind's field block: the command word beside the mode radio,
+    /// the argument rows, the generated usage line, and (Advanced only) the
+    /// parsing picker.
     ///
-    /// The alias's name *is* the command, so there is normally no command
-    /// field at all. `alias_name` is that name, already trimmed.
+    /// The alias's name *is* the command, so the Command row is read-only:
+    /// the Name field above is where the word is edited. A definition saved
+    /// with a different stored word (legacy data) shows that word until the
+    /// name is next edited, which clears it.
     fn alias_command_fields<'a>(
         &'a self,
         mut body: Column<'a, Message, Theme>,
         alias_name: &'a str,
     ) -> Column<'a, Message, Theme> {
         let draft = &self.alias_draft;
-        let mode_radios = || {
-            row![
-                radio(
-                    crate::i18n::ts!("editor-cmd-simple"),
-                    CmdMode::Simple,
-                    Some(draft.cmd_mode),
-                    Message::SetCmdMode,
-                )
-                .size(14.0)
-                .text_size(13.0),
-                radio(
-                    crate::i18n::ts!("editor-cmd-advanced"),
-                    CmdMode::Advanced,
-                    Some(draft.cmd_mode),
-                    Message::SetCmdMode,
-                )
-                .size(14.0)
-                .text_size(13.0),
-            ]
-            .spacing(12.0)
-            .align_y(Vertical::Center)
-        };
+        let mode_radios = row![
+            radio(
+                crate::i18n::ts!("editor-cmd-simple"),
+                CmdMode::Simple,
+                Some(draft.cmd_mode),
+                Message::SetCmdMode,
+            )
+            .size(14.0)
+            .text_size(13.0),
+            radio(
+                crate::i18n::ts!("editor-cmd-advanced"),
+                CmdMode::Advanced,
+                Some(draft.cmd_mode),
+                Message::SetCmdMode,
+            )
+            .size(14.0)
+            .text_size(13.0),
+        ]
+        .spacing(12.0)
+        .align_y(Vertical::Center);
 
-        if draft.shows_command_override(alias_name) {
-            body = body.push(field_row(
-                crate::i18n::ts!("editor-command"),
-                row![
-                    text_input(
-                        crate::i18n::ts!("editor-example-command"),
-                        draft.command_override.as_deref().unwrap_or_default(),
-                    )
-                    .on_input(Message::SetCommandName)
-                    .size(14.0)
-                    .width(Length::Fill),
-                    mode_radios(),
-                ]
-                .spacing(12.0)
-                .align_y(Vertical::Center)
-                .into(),
-            ));
+        let command_word = draft.command_word(alias_name);
+        let word_display = if command_word.is_empty() {
+            text(crate::i18n::t!("editor-command-name-empty"))
+                .size(13.0)
+                .style(common::muted)
         } else {
-            // No override: the row shows the word inherited from the name —
-            // read-only, because the Name field above is where it is edited —
-            // with the escape hatch for words a name cannot spell.
-            let inherited = if alias_name.is_empty() {
-                text(crate::i18n::t!("editor-command-name-empty"))
-                    .size(13.0)
-                    .style(common::muted)
-            } else {
-                text(alias_name).size(14.0).font(fonts::GEIST_MONO_VF)
-            };
-            body = body.push(field_row(
-                crate::i18n::ts!("editor-command"),
-                row![
-                    inherited,
-                    mode_radios(),
-                    Space::new().width(Length::Fill),
-                    button(text(crate::i18n::t!("editor-command-override")).size(13.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::RevealCommandOverride)
-                        .padding(6),
-                ]
+            text(command_word.to_string())
+                .size(14.0)
+                .font(fonts::GEIST_MONO_VF)
+        };
+        body = body.push(field_row(
+            crate::i18n::ts!("editor-command"),
+            row![word_display, mode_radios]
                 .spacing(12.0)
                 .align_y(Vertical::Center)
                 .into(),
-            ));
-        }
+        ));
 
         let mut args = Column::new().spacing(6.0);
         let last = draft.args.len().saturating_sub(1);
@@ -3445,7 +3429,6 @@ struct KindCard<'a> {
     title: &'a str,
     example: &'a str,
     badge: Option<&'a str>,
-    blurb: Option<&'a str>,
     hue: iced::Color,
     selected: bool,
     message: Message,
@@ -3512,7 +3495,7 @@ fn kind_card<'a>(card: KindCard<'a>) -> Elem<'a> {
         title_row = title_row.push(iced::widget::space::horizontal());
         title_row = title_row.push(kind_badge(badge, strength));
     }
-    let mut inner = column![
+    let inner = column![
         title_row,
         text(card.example)
             .size(12.0)
@@ -3522,9 +3505,6 @@ fn kind_card<'a>(card: KindCard<'a>) -> Elem<'a> {
             }),
     ]
     .spacing(6.0);
-    if let Some(blurb) = card.blurb {
-        inner = inner.push(text(blurb).size(12.0).style(common::muted));
-    }
     let hue = card.hue;
     let selected = card.selected;
     button(inner)

@@ -284,10 +284,6 @@ pub enum Message {
     AliasRegexAction(text_editor::Action),
     // alias matcher draft
     SetAliasKind(model::AliasKind),
-    SetCommandName(String),
-    /// Reveal the command-word override row (the alias name drives the
-    /// command until then).
-    RevealCommandOverride,
     SetArgName(usize, String),
     SetArgKind(usize, smudgy_core::models::matchers::ArgKind),
     AddArg,
@@ -314,6 +310,8 @@ pub enum Message {
     SetBehavior(ScriptLang),
     AdjustPriority(i32),
     ToggleFallthrough,
+    /// Flip the open alias's "sent text may match itself" opt-in.
+    ToggleAllowSelfMatch,
     ScriptEditorAction(text_editor::Action),
     /// An edit in the send-text action draft.
     SendTextAction(text_editor::Action),
@@ -329,7 +327,7 @@ pub enum Message {
     /// Add a raw row (always Regex syntax).
     AddRawRow,
     /// A click on one of the trigger pane's matcher cards: creates the first
-    /// matcher row at the teaching state, or re-shapes the single existing
+    /// matcher row at the zero-matcher state, or re-shapes the single existing
     /// matcher at the selector state (README §4).
     SetTriggerCard(model::TriggerCard),
     RemovePattern(usize),
@@ -1231,6 +1229,12 @@ impl AutomationsWindow {
             Message::SetName(name) => {
                 if let Pane::Editor(state) = &mut self.pane {
                     state.name = name;
+                    // The name IS the command: editing it drops any stored
+                    // command-word override a legacy save carried, so the
+                    // command follows the name from here on.
+                    if matches!(state.node, EditNode::Alias(_)) {
+                        self.alias_draft.command_override = None;
+                    }
                 }
                 Update::none()
             }
@@ -1244,16 +1248,6 @@ impl AutomationsWindow {
             }
             Message::SetAliasKind(kind) => {
                 self.alias_draft.kind = kind;
-                Update::none()
-            }
-            Message::SetCommandName(name) => {
-                self.alias_draft.command_override = Some(name);
-                Update::none()
-            }
-            Message::RevealCommandOverride => {
-                self.alias_draft
-                    .command_override
-                    .get_or_insert_with(String::new);
                 Update::none()
             }
             Message::SetArgName(i, name) => {
@@ -1394,6 +1388,16 @@ impl AutomationsWindow {
                         }
                         EditNode::Hotkey(_) => {}
                     }
+                }
+                Update::none()
+            }
+            Message::ToggleAllowSelfMatch => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Alias(alias),
+                    ..
+                }) = &mut self.pane
+                {
+                    alias.allow_self_match = !alias.allow_self_match;
                 }
                 Update::none()
             }
@@ -2021,8 +2025,6 @@ impl AutomationsWindow {
             }
             Message::SetName(_)
             | Message::SetAliasKind(_)
-            | Message::SetCommandName(_)
-            | Message::RevealCommandOverride
             | Message::SetArgName(_, _)
             | Message::SetArgKind(_, _)
             | Message::AddArg
@@ -2035,6 +2037,7 @@ impl AutomationsWindow {
             | Message::SetBehavior(_)
             | Message::AdjustPriority(_)
             | Message::ToggleFallthrough
+            | Message::ToggleAllowSelfMatch
             | Message::AddPattern
             | Message::AddExceptionRow
             | Message::AddRawRow
@@ -2061,8 +2064,6 @@ impl AutomationsWindow {
                 matches!(action, text_editor::Action::Edit(_))
             }
             Message::SetAliasKind(_)
-            | Message::SetCommandName(_)
-            | Message::RevealCommandOverride
             | Message::SetArgName(_, _)
             | Message::SetArgKind(_, _)
             | Message::AddArg

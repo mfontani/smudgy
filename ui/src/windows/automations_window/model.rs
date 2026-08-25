@@ -281,7 +281,7 @@ pub enum AliasKind {
     Regex,
 }
 
-/// The trigger pane's three matcher cards (README §4): teaching cards while
+/// The trigger pane's three matcher cards (README §4): a create control while
 /// no matcher exists, a kind+role selector while exactly one does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerCard {
@@ -318,10 +318,10 @@ impl TriggerCard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasMatcherDraft {
     pub kind: AliasKind,
-    /// The pinned command word, when the author chose one that differs from
-    /// the alias's name. `None` — the ordinary case — inherits the name, and
-    /// the Command row stays out of the deck entirely. `Some("")` is the row
-    /// revealed but not yet filled, which still inherits.
+    /// A stored command word that differs from the alias's name — legacy data
+    /// from when the editor offered a separate command field. `None` — the
+    /// ordinary case — inherits the name. Displayed while present, and cleared
+    /// by any edit to the Name field: the name is the command.
     pub command_override: Option<String>,
     pub args: Vec<ArgSpec>,
     pub parse: ParseMode,
@@ -435,14 +435,6 @@ impl AliasMatcherDraft {
             .map(str::trim)
             .filter(|word| !word.is_empty())
             .unwrap_or_else(|| alias_name.trim())
-    }
-
-    /// Whether the Command row belongs in the deck: once an override is
-    /// pinned it stays visible, and it reveals itself unasked when the name
-    /// cannot serve as a command word — otherwise the alias could never fire
-    /// and nothing would say why.
-    pub fn shows_command_override(&self, alias_name: &str) -> bool {
-        self.command_override.is_some() || alias_name.trim().contains(char::is_whitespace)
     }
 
     /// The stored pattern this draft saves, or a display-ready error.
@@ -594,7 +586,7 @@ pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<TriggerRow> {
             ..TriggerRow::new(PatternKind::Raw)
         }));
     }
-    // A trigger with no matchers opens at the teaching-cards state (README §4)
+    // A trigger with no matchers opens at the unselected-cards state (README §4)
     // rather than with a blank row pre-created.
     rows
 }
@@ -1018,6 +1010,7 @@ mod tests {
                 enabled: true,
                 priority: 0,
                 fallthrough: true,
+                allow_self_match: false,
                 language: smudgy_core::models::ScriptLang::Plaintext,
                 matcher,
             }
@@ -1074,18 +1067,17 @@ mod tests {
                 draft.to_matcher(),
                 Some(AliasMatcherSource::Command { name: None, .. })
             ));
-            assert!(!draft.shows_command_override("obe"));
 
-            // A pinned override wins and keeps its row on screen.
+            // A saved override (legacy data) still wins until the name is
+            // edited again.
             let pinned = AliasMatcherDraft {
                 command_override: Some("*".to_string()),
                 ..draft.clone()
             };
             assert_eq!(pinned.command_word("star-emote"), "*");
             assert_eq!(pinned.to_pattern("star-emote").unwrap(), r"^\*(?:\s|$)");
-            assert!(pinned.shows_command_override("star-emote"));
 
-            // Revealed but blank is no override: it still inherits, and it
+            // A blank override is no override: it still inherits, and it
             // still saves as an absent field.
             let blank = AliasMatcherDraft {
                 command_override: Some("  ".to_string()),
@@ -1096,7 +1088,6 @@ mod tests {
                 blank.to_matcher(),
                 Some(AliasMatcherSource::Command { name: None, .. })
             ));
-            assert!(blank.shows_command_override("obe"));
         }
 
         #[test]
@@ -1106,12 +1097,12 @@ mod tests {
                 ..AliasMatcherDraft::default()
             };
             // Names may contain spaces; command words are one token, so the
-            // override row reveals itself and the save refuses until it is
-            // filled in.
+            // save refuses until the alias gets a one-word name.
             assert!(draft.to_pattern("guild tell").is_err());
-            assert!(draft.shows_command_override("guild tell"));
             assert!(draft.to_pattern("   ").is_err());
 
+            // A legacy saved override still rescues such a name until the name
+            // field is next edited (which clears the override).
             let rescued = AliasMatcherDraft {
                 command_override: Some("gt".to_string()),
                 ..draft
