@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::models::triggers::TriggerDefinition;
-use smudgy_core::session::connection::TlsMode;
+use smudgy_core::session::connection::{InboundCompression, TlsMode};
 use smudgy_core::session::runtime::{IsolateId, Origin, RuntimeAction};
 use smudgy_core::session::{SessionEvent, SessionId, SessionParams, spawn};
 
@@ -109,7 +109,7 @@ async fn profile_text_waits_for_first_processed_display_packet() {
         send_on_connect: Some(Arc::new("login".to_string())),
         send_on_connect_redactions: Arc::new(Vec::new()),
         encoding: None,
-        compression: false,
+        compression: InboundCompression::NONE,
         tls: TlsMode::Off,
     })
     .expect("connect session");
@@ -205,7 +205,7 @@ async fn replaced_sockets_late_disconnected_keeps_the_new_pending_send() {
         send_on_connect: None,
         send_on_connect_redactions: Arc::new(Vec::new()),
         encoding: None,
-        compression: false,
+        compression: InboundCompression::NONE,
         tls: TlsMode::Off,
     })
     .expect("connect first socket");
@@ -227,7 +227,7 @@ async fn replaced_sockets_late_disconnected_keeps_the_new_pending_send() {
         send_on_connect: Some(Arc::new("login".to_string())),
         send_on_connect_redactions: Arc::new(Vec::new()),
         encoding: None,
-        compression: false,
+        compression: InboundCompression::NONE,
         tls: TlsMode::Off,
     })
     .expect("connect second socket");

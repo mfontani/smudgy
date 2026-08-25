@@ -57,6 +57,22 @@ fn test_cancel_server_form_resets_state() {
 }
 
 #[test]
+fn server_form_toggles_mccp2_and_mccp4_independently() {
+    let mut state = initial_state();
+    state.server_action = Some(ServerCrudAction::Create);
+    assert!(state.server_form_data.compression);
+    assert!(state.server_form_data.mccp4_compression);
+
+    let _ = update(&mut state, Message::ToggleServerMccp4Compression(false));
+    assert!(state.server_form_data.compression);
+    assert!(!state.server_form_data.mccp4_compression);
+
+    let _ = update(&mut state, Message::ToggleServerCompression(false));
+    assert!(!state.server_form_data.compression);
+    assert!(!state.server_form_data.mccp4_compression);
+}
+
+#[test]
 fn test_submit_server_form_create_valid() {
     let mut state = initial_state();
     state.server_action = Some(ServerCrudAction::Create);

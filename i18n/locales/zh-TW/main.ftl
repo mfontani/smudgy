@@ -228,6 +228,7 @@ server-cached-images-pending = 已快取圖片：…
 server-clear-image-cache = 清除圖片快取
 server-save-add-profile = 儲存並新增設定檔
 server-compression = 允許壓縮（MCCP2）
+server-mccp4-compression = 允許壓縮（MCCP4）
 server-tls = 安全連線（TLS）
 server-tls-verify = 驗證憑證
 server-tls-insecure-help = 只有使用自簽憑證的伺服器才應取消勾選（不安全）。

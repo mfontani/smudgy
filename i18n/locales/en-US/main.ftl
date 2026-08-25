@@ -232,6 +232,7 @@ server-cached-images-pending = Cached images: …
 server-clear-image-cache = Clear image cache
 server-save-add-profile = Save & add profile
 server-compression = Allow compression (MCCP2)
+server-mccp4-compression = Allow compression (MCCP4)
 server-tls = Secure connection (TLS)
 server-tls-verify = Verify certificate
 server-tls-insecure-help = Uncheck only for servers with self-signed certificates (insecure).

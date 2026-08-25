@@ -97,6 +97,7 @@ pub enum Message {
     // Server Form Interaction
     UpdateServerFormField(ServerFormField, String),
     ToggleServerCompression(bool),
+    ToggleServerMccp4Compression(bool),
     ToggleServerTls(bool),
     ToggleServerTlsVerify(bool),
     SubmitServerForm,
@@ -166,8 +167,10 @@ pub struct ServerConfigFormData {
     /// The encoding dropdown's display value; [`server::DEFAULT_ENCODING_CHOICE`]
     /// stands for "no override" (UTF-8, `ServerConfig::encoding = None`).
     pub encoding: String,
-    /// Whether inbound compression offers (MCCP2) are accepted.
+    /// Whether inbound MCCP2 compression offers are accepted.
     pub compression: bool,
+    /// Whether inbound MCCP4 compression offers are accepted.
+    pub mccp4_compression: bool,
     /// Connect over TLS.
     pub tls: bool,
     /// When `tls`, verify the server certificate (off = accept any, insecure).
@@ -182,6 +185,7 @@ impl Default for ServerConfigFormData {
             port: String::new(),
             encoding: server::DEFAULT_ENCODING_CHOICE.to_string(),
             compression: true,
+            mccp4_compression: true,
             tls: false,
             tls_verify: true,
         }
@@ -637,6 +641,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                         .clone()
                         .unwrap_or_else(|| server::DEFAULT_ENCODING_CHOICE.to_string()),
                     compression: server_to_edit.config.compression,
+                    mccp4_compression: server_to_edit.config.accepts_mccp4_compression(),
                     tls: server_to_edit.config.tls,
                     tls_verify: server_to_edit.config.tls_verify,
                 };
@@ -713,6 +718,14 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
             ) {
                 state.server_form_data.compression = value;
+            }
+        }
+        Message::ToggleServerMccp4Compression(value) => {
+            if matches!(
+                state.server_action,
+                Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
+            ) {
+                state.server_form_data.mccp4_compression = value;
             }
         }
         Message::ToggleServerTls(value) => {

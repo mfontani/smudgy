@@ -59,8 +59,9 @@ pub enum InflateStep {
     /// `consumed` input bytes were read; the stream continues. The output buffer may hold
     /// up to [`INFLATE_CHUNK`] decompressed bytes (possibly zero while the codec buffers).
     Progress { consumed: usize },
-    /// The stream ended cleanly after `consumed` input bytes; whatever input follows is plain
-    /// telnet again, and the server may renegotiate later.
+    /// The codec reached a clean boundary after `consumed` input bytes: the end of a zlib
+    /// stream, or the end of one zstd frame. The caller decides whether following bytes are
+    /// plain telnet or another frame as required by the negotiated protocol.
     End { consumed: usize },
 }
 
@@ -68,6 +69,11 @@ impl Inflow {
     #[must_use]
     pub const fn is_plain(&self) -> bool {
         matches!(self, Self::Plain)
+    }
+
+    #[must_use]
+    pub const fn is_zstd(&self) -> bool {
+        matches!(self, Self::Zstd(_))
     }
 
     /// Begin a compression stream with `codec` (compression starts with the byte after the
@@ -129,18 +135,19 @@ impl Inflow {
                 // whose output exceeds one window.
                 out.clear();
                 out.reserve_exact(INFLATE_CHUNK);
-                let mut in_buf = InBuffer::around(input);
-                let mut out_buf = OutBuffer::around(&mut *out);
-                let hint = dec.run(&mut in_buf, &mut out_buf)?;
-                let consumed = in_buf.pos();
-                let produced = out_buf.pos();
-                // Drop the OutBuffer so its `WriteBuf::filled_until` syncs `out.len()` to
-                // `produced` before the caller reads `out`.
-                drop(out_buf);
+                let (hint, consumed, produced) = {
+                    let mut in_buf = InBuffer::around(input);
+                    let mut out_buf = OutBuffer::around(&mut *out);
+                    let hint = dec.run(&mut in_buf, &mut out_buf)?;
+                    (hint, in_buf.pos(), out_buf.pos())
+                };
+                // Ending the scope drops the OutBuffer so its `WriteBuf::filled_until`
+                // syncs `out.len()` to `produced` before the caller reads `out`.
                 debug_assert_eq!(out.len(), produced);
-                // `run` returns 0 at a frame boundary. The MCCPX draft terminates a stream
-                // with a single finished frame (`ZSTD_e_end`), so a frame boundary is the
-                // stream end — revert to plain telnet.
+                // `run` returns 0 at a frame boundary. Surface it without deciding whether
+                // the MCCPX stream ended: RFC 8878 permits concatenated frames, while the
+                // protocol's plaintext `IAC WONT MCCPX` terminates compression after the
+                // final frame. The caller classifies the unconsumed bytes at this boundary.
                 if hint == 0 {
                     Ok(InflateStep::End { consumed })
                 } else {

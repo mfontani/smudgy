@@ -43,10 +43,14 @@ pub struct ServerConfig {
     /// life of that connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
-    /// Whether inbound compression offers (MCCP2) are accepted. On by default;
-    /// off declines every compression option with `DONT`.
+    /// Whether inbound MCCP2 compression offers are accepted. On by default.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub compression: bool,
+    /// Whether inbound MCCP4 compression offers are accepted. `None` is the legacy on-disk
+    /// representation: inherit [`compression`](Self::compression), which preserves the old
+    /// checkbox's behavior for configurations written before the two protocols were split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mccp4_compression: Option<bool>,
     /// Connect over TLS. Off by default (don't silently change existing plain servers).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tls: bool,
@@ -76,9 +80,16 @@ impl ServerConfig {
             trust_all_links: false,
             encoding: None,
             compression: true,
+            mccp4_compression: None,
             tls: false,
             tls_verify: true,
         }
+    }
+
+    /// Whether MCCP4 is enabled after applying the legacy shared-compression fallback.
+    #[must_use]
+    pub fn accepts_mccp4_compression(&self) -> bool {
+        self.mccp4_compression.unwrap_or(self.compression)
     }
 
     /// Whether a server-sent link needs no confirm dialog: `host` is `None`
@@ -633,5 +644,30 @@ mod link_trust_tests {
         let old: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
         assert!(old.trusted_link_hosts.is_empty());
         assert!(!old.trust_all_links);
+    }
+
+    #[test]
+    fn legacy_compression_setting_also_controls_mccp4() {
+        let enabled: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
+        assert!(enabled.compression);
+        assert!(enabled.accepts_mccp4_compression());
+
+        let disabled: ServerConfig =
+            serde_json::from_str(r#"{"host":"h","port":1,"compression":false}"#).unwrap();
+        assert!(!disabled.compression);
+        assert!(!disabled.accepts_mccp4_compression());
+    }
+
+    #[test]
+    fn explicit_mccp4_setting_is_independent_and_round_trips() {
+        let mut config = ServerConfig::new("h".to_string(), 1);
+        config.compression = false;
+        config.mccp4_compression = Some(true);
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""mccp4_compression":true"#));
+        let decoded: ServerConfig = serde_json::from_str(&json).unwrap();
+        assert!(!decoded.compression);
+        assert!(decoded.accepts_mccp4_compression());
     }
 }

@@ -234,6 +234,7 @@ server-cached-images-pending = Obrazy w pamięci podręcznej: …
 server-clear-image-cache = Wyczyść pamięć podręczną obrazów
 server-save-add-profile = Zapisz i dodaj profil
 server-compression = Zezwól na kompresję (MCCP2)
+server-mccp4-compression = Zezwól na kompresję (MCCP4)
 server-tls = Bezpieczne połączenie (TLS)
 server-tls-verify = Weryfikuj certyfikat
 server-tls-insecure-help = Odznacz tylko w przypadku serwerów z certyfikatami z podpisem własnym (niezabezpieczone).
