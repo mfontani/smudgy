@@ -902,10 +902,18 @@ declare module "smudgy:core" {
     priority?: number;
     /** Continue checking later aliases from the same script/package. Defaults to `true`. */
     fallthrough?: boolean;
+    /** Whether text this alias sends may match this same alias again — the
+     *  editor's "Allow this alias's sent text to match itself". Defaults to
+     *  `false`. */
+    allowSelfMatch?: boolean;
     /** Defaults to `"plaintext"`. */
     language?: ScriptLang;
     /** Optional folder grouping in the automations window. */
     package?: string;
+    /** The editor's authoring sidecar (how the pattern was written: a Command
+     *  or Simple pattern). Preserved verbatim across a get/save round trip —
+     *  the editor authors it; carry it, don't build it. */
+    matcher?: unknown;
   }
 
   /** A saved trigger, as stored in `triggers.json` and shown in the

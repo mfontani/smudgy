@@ -1340,10 +1340,15 @@ interface SavedAlias {
     priority?: number;
     /** Continue checking later aliases after a match. Defaults to true. */
     fallthrough?: boolean;
+    /** Whether text this alias sends may match this same alias again. Defaults to false. */
+    allowSelfMatch?: boolean;
     /** Defaults to "plaintext". */
     language?: ScriptLang;
     /** Optional package-folder grouping in the automations window. */
     package?: string;
+    /** The editor's authoring sidecar, preserved verbatim across a get/save
+     *  round trip. The editor authors it; scripts should carry it, not build it. */
+    matcher?: unknown;
 }
 
 /** A persisted user-side trigger (the shape saved in `triggers.json`). */
@@ -4189,9 +4194,13 @@ const aliasToWire = (def: SavedAlias) => ({
     enabled: def.enabled ?? true,
     priority: def.priority ?? 0,
     fallthrough: def.fallthrough ?? true,
+    allow_self_match: def.allowSelfMatch ?? false,
     language: langToWire(def.language),
     ...(def.script !== undefined ? { script: String(def.script) } : {}),
     ...(def.package !== undefined ? { package: String(def.package) } : {}),
+    // The editor's authoring sidecar rides verbatim, so a get/save round trip
+    // cannot strip it (the save op validates the shape on deserialization).
+    ...(def.matcher !== undefined && def.matcher !== null ? { matcher: def.matcher } : {}),
 });
 const triggerToWire = (def: SavedTrigger) => ({
     enabled: def.enabled ?? true,
@@ -4221,8 +4230,10 @@ const aliasFromWire = (w: any): SavedAlias => ({
     enabled: w.enabled,
     priority: w.priority ?? 0,
     fallthrough: w.fallthrough ?? true,
+    allowSelfMatch: w.allow_self_match ?? false,
     language: langFromWire(w.language),
     package: w.package ?? undefined,
+    matcher: w.matcher ?? undefined,
 });
 const triggerFromWire = (w: any): SavedTrigger => ({
     patterns: patternArray(w.pattern, w.patterns),
