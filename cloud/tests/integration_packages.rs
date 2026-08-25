@@ -1,7 +1,8 @@
 //! End-to-end test of [`PackageApiClient`] against a self-contained, contract-shaped
 //! mock of the `/packages` routes. Exercises the full client wire path:
 //! create namespace → publish a version → resolve → fetch a module body (with the
-//! client's SHA-256 integrity check).
+//! client's SHA-256 integrity check), plus the batched `check-updates` sweep (and its
+//! absence on an old server).
 //!
 //! This is a focused, standalone mock (its own tiny Axum app) so it doesn't touch the
 //! shared `tests/support` `MockState`. The canonical mock for the broader suite still
@@ -23,7 +24,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use smudgy_cloud::{
-    CloudError, Credential, CredentialSource, PackageApiClient, PublishDependency, PublishModule,
+    CheckUpdatesEntry, CheckUpdatesHave, CloudError, Credential, CredentialSource,
+    PackageApiClient, PublishDependency, PublishModule, UpdateCheckInstalled,
     highest_satisfying_version,
 };
 
@@ -64,6 +66,11 @@ struct MockState {
     owner_nickname: String,
     packages: Vec<MockPackage>,
     blobs: HashMap<String, Vec<u8>>, // content_hash -> body (any bytes)
+    /// When set, a `latest` whose walked closure exceeds this many distinct nodes
+    /// answers with `closure: []` while status/installed/latest stay intact — the
+    /// server's over-cap contract (no 400; only the request caps 400). Tests set it
+    /// to exercise the client's cannot-evaluate handling of an elided closure.
+    closure_node_cap: Option<usize>,
 }
 
 type Shared = Arc<Mutex<MockState>>;
@@ -458,6 +465,209 @@ async fn resolve(
     )
 }
 
+/// Publish-shaped locked deps → the check-updates dependency shape: the owner field is
+/// named `owner` (not `owner_nickname`) and each edge carries its relation `kind`. The
+/// mock's publish wire records dependency edges only, so every row is `"dependency"`
+/// (the real server also surfaces `"requires"` rows the same way).
+fn check_deps_json(deps: &Value) -> Vec<Value> {
+    deps.as_array()
+        .map(|deps| {
+            deps.iter()
+                .map(|d| {
+                    json!({
+                        "owner": d["owner_nickname"], "name": d["name"], "range": d["range"],
+                        "resolved_version": d["resolved_version"], "kind": "dependency",
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `(owner, name, resolved_version)` targets of a publish-shaped dep list — the
+/// edges the closure walk follows (`kind = "dependency"` only, which is all the mock
+/// publishes).
+fn dep_targets(deps: &Value) -> Vec<(String, String, String)> {
+    deps.as_array()
+        .map(|deps| {
+            deps.iter()
+                .map(|d| {
+                    (
+                        d["owner_nickname"].as_str().unwrap_or_default().to_string(),
+                        d["name"].as_str().unwrap_or_default().to_string(),
+                        d["resolved_version"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The server's `latest` ordering, mirrored: `ORDER BY major DESC, minor DESC,
+/// patch DESC, (prerelease IS NULL) DESC, prerelease DESC` — the numeric triple,
+/// then a release above any prerelease of the same triple, then the prerelease tag
+/// compared LEXICOGRAPHICALLY as text. That last leg is deliberately not semver
+/// precedence: on the server `1.0.0-beta.2` outranks `1.0.0-beta.11` ("beta.2" >
+/// "beta.11" as strings), and the mirror reproduces the wart rather than "fixing"
+/// it — the client must see the same latest the server would pick. (The server
+/// parses every published version into those columns, so unparseable strings can't
+/// exist there; the lexical fallback is mock robustness only.)
+fn server_latest_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(va), Ok(vb)) => (va.major, va.minor, va.patch)
+            .cmp(&(vb.major, vb.minor, vb.patch))
+            .then_with(|| match (va.pre.is_empty(), vb.pre.is_empty()) {
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                _ => va.pre.as_str().cmp(vb.pre.as_str()),
+            }),
+        (Ok(_), Err(_)) => Ordering::Greater,
+        (Err(_), Ok(_)) => Ordering::Less,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
+}
+
+/// `POST /packages/check-updates` — the batched lockfile sweep, mirroring the server's
+/// semantics the client exercises: results in request order; the uniform `not_found`
+/// for an unknown package; the installed version's yanked/deleted status; `latest` =
+/// the highest live non-yanked version (see [`server_latest_order`]) with modules +
+/// kind-bearing dependencies and NO content URLs; the dependency-kind closure at
+/// locked versions minus the request's `have` list (matched case-folded), emptied
+/// wholesale when it exceeds the closure-node cap; entry/have caps → 400.
+#[allow(clippy::too_many_lines)]
+async fn check_updates(State(state): State<Shared>, body: String) -> Response {
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return mock_bad_request("invalid JSON body");
+    };
+    let entries = req["entries"].as_array().cloned().unwrap_or_default();
+    let have_in = req["have"].as_array().cloned().unwrap_or_default();
+    if entries.len() > 64 {
+        return mock_bad_request("too many entries");
+    }
+    if have_in.len() > 512 {
+        return mock_bad_request("too many have entries");
+    }
+    // Owner nicknames and package names are case-insensitive identities, so the
+    // server folds them when matching `have` entries; the version is exact.
+    let have: std::collections::HashSet<(String, String, String)> = have_in
+        .iter()
+        .map(|h| {
+            (
+                h["owner"].as_str().unwrap_or_default().to_ascii_lowercase(),
+                h["name"].as_str().unwrap_or_default().to_ascii_lowercase(),
+                h["version"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+
+    let st = state.lock().unwrap();
+    let mut results = Vec::new();
+    for entry in &entries {
+        let owner = entry["owner"].as_str().unwrap_or_default();
+        let name = entry["name"].as_str().unwrap_or_default();
+        let pkg = (owner == st.owner_nickname)
+            .then(|| st.packages.iter().find(|p| p.name == name))
+            .flatten();
+        let Some(pkg) = pkg else {
+            results.push(json!({
+                "owner": owner, "name": name, "status": "not_found",
+                "installed": Value::Null, "latest": Value::Null, "closure": [],
+            }));
+            continue;
+        };
+        // Installed status: yanked for a live version, deleted for a retired number,
+        // null for a version the server has never seen (or none sent).
+        let installed = entry["installed"].as_str().map_or(Value::Null, |version| {
+            if let Some(v) = pkg.versions.iter().find(|v| v.version == version) {
+                json!({ "yanked": v.yanked, "deleted": false })
+            } else if pkg.retired.iter().any(|r| r == version) {
+                json!({ "yanked": false, "deleted": true })
+            } else {
+                Value::Null
+            }
+        });
+        // Latest = the highest live non-yanked version by the SERVER'S ordering.
+        let latest = pkg
+            .versions
+            .iter()
+            .filter(|v| !v.yanked)
+            .max_by(|a, b| server_latest_order(&a.version, &b.version));
+        let (latest_json, closure_json) = match latest {
+            None => (Value::Null, json!([])),
+            Some(v) => {
+                let modules: Vec<Value> = v
+                    .modules
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "subpath": m.subpath, "content_hash": m.content_hash,
+                            "media_type": m.media_type, "byte_size": m.byte_size,
+                            "is_entry": m.is_entry,
+                        })
+                    })
+                    .collect();
+                // Closure: the distinct transitive dependency-kind nodes at their
+                // locked versions, minus anything the caller's `have` covers (the
+                // node is still WALKED through so its own deps join the closure).
+                let mut closure = Vec::new();
+                let mut queue = dep_targets(&v.dependencies);
+                let mut seen = std::collections::HashSet::new();
+                while let Some((dep_owner, dep_name, dep_version)) = queue.pop() {
+                    if !seen.insert((dep_owner.clone(), dep_name.clone(), dep_version.clone())) {
+                        continue;
+                    }
+                    let Some(dep_pkg) = (dep_owner == st.owner_nickname)
+                        .then(|| st.packages.iter().find(|p| p.name == dep_name))
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    let Some(dep_v) = dep_pkg.versions.iter().find(|dv| dv.version == dep_version)
+                    else {
+                        continue;
+                    };
+                    queue.extend(dep_targets(&dep_v.dependencies));
+                    if have.contains(&(
+                        dep_owner.to_ascii_lowercase(),
+                        dep_name.to_ascii_lowercase(),
+                        dep_version.clone(),
+                    )) {
+                        continue;
+                    }
+                    closure.push(json!({
+                        "owner": dep_owner, "name": dep_name, "version": dep_version,
+                        "manifest": dep_v.manifest,
+                        "dependencies": check_deps_json(&dep_v.dependencies),
+                    }));
+                }
+                // Over-cap: the whole closure is withheld — never a 400 — leaving
+                // status/installed/latest intact; the client sees an uncoverable
+                // closure and classifies the entry as cannot-evaluate.
+                if st.closure_node_cap.is_some_and(|cap| seen.len() > cap) {
+                    closure.clear();
+                }
+                (
+                    json!({
+                        "version": v.version, "published_at": "2026-06-20T00:00:00Z",
+                        "manifest": v.manifest, "modules": modules,
+                        "dependencies": check_deps_json(&v.dependencies),
+                    }),
+                    Value::Array(closure),
+                )
+            }
+        };
+        results.push(json!({
+            "owner": owner, "name": name, "status": "ok",
+            "installed": installed, "latest": latest_json, "closure": closure_json,
+        }));
+    }
+    envelope(200, json!({ "results": results }))
+}
+
 async fn get_blob(State(state): State<Shared>, Path(hash): Path<String>) -> Response {
     let st = state.lock().unwrap();
     match st.blobs.get(&hash) {
@@ -475,6 +685,17 @@ fn package_view(pkg: &MockPackage) -> Value {
 }
 
 async fn spawn_mock() -> (String, Shared) {
+    spawn_mock_router(true).await
+}
+
+/// The mock WITHOUT `POST /packages/check-updates` — a server predating the route.
+/// Axum answers the unknown path with a bare 404, which the client must surface as the
+/// route-missing condition its legacy per-package probe fallback keys on.
+async fn spawn_mock_without_check_updates() -> (String, Shared) {
+    spawn_mock_router(false).await
+}
+
+async fn spawn_mock_router(with_check_updates: bool) -> (String, Shared) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
@@ -483,7 +704,7 @@ async fn spawn_mock() -> (String, Shared) {
         owner_nickname: "wbk".to_string(),
         ..MockState::default()
     }));
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/packages", post(create_package))
         .route("/packages/:id/versions", get(list_versions))
         .route("/packages/:id/versions/begin", post(begin_version))
@@ -494,8 +715,11 @@ async fn spawn_mock() -> (String, Shared) {
         )
         .route("/packages/resolve", get(resolve))
         .route("/packages/blob/:hash", get(get_blob))
-        .route("/packages/upload/:hash", put(upload_blob))
-        .with_state(state.clone());
+        .route("/packages/upload/:hash", put(upload_blob));
+    if with_check_updates {
+        app = app.route("/packages/check-updates", post(check_updates));
+    }
+    let app = app.with_state(state.clone());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -935,4 +1159,331 @@ async fn list_versions_is_semver_ordered_with_deleted_interleaved() {
         ["2.0.0", "1.5.0", "1.0.0"],
         "newest-first by semver, deleted interleaved"
     );
+}
+
+/// Publish one single-module version of `name` (creating the namespace when absent),
+/// returning the package id — the check-updates tests' fixture press.
+async fn publish_simple(
+    api: &PackageApiClient,
+    name: &str,
+    version: &str,
+    deps: &[PublishDependency],
+) -> Uuid {
+    let pkg = api.create_package(name, "").await.expect("create");
+    let modules = vec![PublishModule {
+        subpath: "index.ts".to_string(),
+        content: format!("export const v = \"{name}@{version}\";").into_bytes(),
+        media_type: "application/typescript".to_string(),
+        is_entry: true,
+    }];
+    let manifest = json!({ "name": name, "version": version });
+    api.publish_version(pkg.id, version, &manifest, &modules, deps, None)
+        .await
+        .expect("publish");
+    pkg.id
+}
+
+fn entry(name: &str, installed: Option<&str>) -> CheckUpdatesEntry {
+    CheckUpdatesEntry {
+        owner: "wbk".to_string(),
+        name: name.to_string(),
+        installed: installed.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn check_updates_round_trips_the_batched_shape() {
+    let (base_url, _state) = spawn_mock().await;
+    let api = client(&base_url);
+
+    // util has two versions; app@1.0.0 locks util@1.4.0.
+    publish_simple(&api, "util", "1.2.0", &[]).await;
+    publish_simple(&api, "util", "1.4.0", &[]).await;
+    let dep = PublishDependency {
+        owner_nickname: "wbk".to_string(),
+        name: "util".to_string(),
+        range: "^1.2".to_string(),
+        resolved_version: "1.4.0".to_string(),
+    };
+    publish_simple(&api, "app", "1.0.0", std::slice::from_ref(&dep)).await;
+
+    let response = api
+        .check_updates(&[entry("app", Some("1.0.0")), entry("ghost", None)], &[])
+        .await
+        .expect("check-updates round-trips");
+
+    assert_eq!(response.results.len(), 2, "one result per entry");
+    let app = &response.results[0];
+    assert_eq!(
+        (app.name.as_str(), app.status.as_str()),
+        ("app", "ok"),
+        "results come back in request order"
+    );
+    assert_eq!(
+        app.installed,
+        Some(UpdateCheckInstalled {
+            yanked: false,
+            deleted: false
+        })
+    );
+    let latest = app.latest.as_ref().expect("a live latest");
+    assert_eq!(latest.version, "1.0.0");
+    assert_eq!(
+        latest.manifest["name"], "app",
+        "the manifest rides verbatim"
+    );
+    assert_eq!(latest.modules.len(), 1);
+    assert!(latest.modules[0].is_entry);
+    assert!(
+        !latest.modules[0].content_hash.is_empty(),
+        "modules carry hashes (never content URLs)"
+    );
+    assert_eq!(latest.dependencies.len(), 1);
+    assert_eq!(latest.dependencies[0].owner, "wbk");
+    assert_eq!(latest.dependencies[0].name, "util");
+    assert_eq!(latest.dependencies[0].resolved_version, "1.4.0");
+    assert_eq!(latest.dependencies[0].kind, "dependency");
+    assert_eq!(app.closure.len(), 1, "the locked dep joins the closure");
+    assert_eq!(app.closure[0].name, "util");
+    assert_eq!(app.closure[0].version, "1.4.0");
+    assert_eq!(app.closure[0].manifest["name"], "util");
+
+    // The unknown package is the uniform miss: no installed status, no latest, an
+    // empty closure — indistinguishable from "not visible", by design.
+    let ghost = &response.results[1];
+    assert_eq!(
+        (ghost.name.as_str(), ghost.status.as_str()),
+        ("ghost", "not_found")
+    );
+    assert_eq!(ghost.installed, None);
+    assert!(ghost.latest.is_none());
+    assert!(ghost.closure.is_empty());
+}
+
+#[tokio::test]
+async fn check_updates_honors_the_have_elision() {
+    let (base_url, _state) = spawn_mock().await;
+    let author = client(&base_url);
+    publish_simple(&author, "util", "1.4.0", &[]).await;
+    let dep = PublishDependency {
+        owner_nickname: "wbk".to_string(),
+        name: "util".to_string(),
+        range: "^1.4".to_string(),
+        resolved_version: "1.4.0".to_string(),
+    };
+    publish_simple(&author, "app", "1.0.0", std::slice::from_ref(&dep)).await;
+
+    // An ANONYMOUS caller — check-updates rides the public read surface, so no
+    // credential must not short-circuit — declaring it already holds util@1.4.0.
+    // The have entry arrives oddly cased: owner/name are case-insensitive
+    // identities, so the server folds them when matching (the version is exact).
+    let anon = PackageApiClient::new(&base_url, CredentialSource::new(None));
+    let response = anon
+        .check_updates(
+            &[entry("app", Some("1.0.0"))],
+            &[CheckUpdatesHave {
+                owner: "WBK".to_string(),
+                name: "Util".to_string(),
+                version: "1.4.0".to_string(),
+            }],
+        )
+        .await
+        .expect("anonymous check-updates");
+
+    let app = &response.results[0];
+    assert!(
+        app.closure.is_empty(),
+        "a have-covered node is elided from the closure, case-folded"
+    );
+    assert_eq!(
+        app.latest.as_ref().expect("latest").dependencies.len(),
+        1,
+        "the dependency edge itself still rides — coverage is judged against have + cache"
+    );
+}
+
+#[tokio::test]
+async fn check_updates_latest_uses_the_servers_lexicographic_prerelease_order() {
+    // Among prereleases of one numeric triple the server picks latest by RAW TEXT
+    // comparison of the prerelease tag (`prerelease DESC` in SQL), not semver
+    // precedence: "beta.2" > "beta.11". The mirror must reproduce that wart so the
+    // client sees the same latest the server would serve.
+    let (base_url, _state) = spawn_mock().await;
+    let api = client(&base_url);
+    publish_simple(&api, "edge", "1.0.0-beta.11", &[]).await;
+    publish_simple(&api, "edge", "1.0.0-beta.2", &[]).await;
+
+    let response = api
+        .check_updates(&[entry("edge", Some("1.0.0-beta.11"))], &[])
+        .await
+        .expect("check-updates round-trips");
+    assert_eq!(
+        response.results[0]
+            .latest
+            .as_ref()
+            .map(|l| l.version.as_str()),
+        Some("1.0.0-beta.2"),
+        "lexicographic prerelease order — semver precedence would say beta.11"
+    );
+
+    // A release of the same triple still outranks every prerelease
+    // (`(prerelease IS NULL) DESC`).
+    publish_simple(&api, "edge", "1.0.0", &[]).await;
+    let response = api
+        .check_updates(&[entry("edge", Some("1.0.0-beta.11"))], &[])
+        .await
+        .expect("check-updates round-trips");
+    assert_eq!(
+        response.results[0]
+            .latest
+            .as_ref()
+            .map(|l| l.version.as_str()),
+        Some("1.0.0")
+    );
+}
+
+#[tokio::test]
+async fn check_updates_over_cap_closure_is_withheld_not_an_error() {
+    // The over-cap contract: a closure past the node cap comes back EMPTY with
+    // status/installed/latest intact — never a 400 (only the request caps 400) —
+    // and the rest of the batch is answered normally. The client side of this
+    // shape (dependencies without coverage => cannot evaluate, no offer, no
+    // staging) is pinned by the checker's uncoverable-closure test.
+    let (base_url, state) = spawn_mock().await;
+    let api = client(&base_url);
+    publish_simple(&api, "util", "1.4.0", &[]).await;
+    let dep = PublishDependency {
+        owner_nickname: "wbk".to_string(),
+        name: "util".to_string(),
+        range: "^1.4".to_string(),
+        resolved_version: "1.4.0".to_string(),
+    };
+    publish_simple(&api, "app", "1.0.0", std::slice::from_ref(&dep)).await;
+    state.lock().unwrap().closure_node_cap = Some(0);
+
+    let response = api
+        .check_updates(
+            &[entry("app", Some("1.0.0")), entry("util", Some("1.4.0"))],
+            &[],
+        )
+        .await
+        .expect("an over-cap closure is not an HTTP error");
+
+    let app = &response.results[0];
+    assert_eq!(app.status, "ok");
+    let latest = app.latest.as_ref().expect("latest rides intact");
+    assert_eq!(latest.version, "1.0.0");
+    assert_eq!(
+        latest.dependencies.len(),
+        1,
+        "the dependency edges still ride — only the closure nodes are withheld"
+    );
+    assert!(app.closure.is_empty(), "the over-cap closure is withheld");
+    assert_eq!(
+        app.installed,
+        Some(UpdateCheckInstalled {
+            yanked: false,
+            deleted: false
+        })
+    );
+    // The other entry is unaffected: entries are answered independently.
+    let util = &response.results[1];
+    assert_eq!(util.status, "ok");
+    assert_eq!(
+        util.latest.as_ref().map(|l| l.version.as_str()),
+        Some("1.4.0")
+    );
+}
+
+#[tokio::test]
+async fn check_updates_reports_installed_yank_and_delete() {
+    let (base_url, _state) = spawn_mock().await;
+    let api = client(&base_url);
+    let id = publish_simple(&api, "mapper", "1.0.0", &[]).await;
+    publish_simple(&api, "mapper", "2.0.0", &[]).await;
+
+    // Yank the installed 2.0.0: the entry reports yanked, and latest steps back to
+    // the highest live version.
+    api.set_version_yanked(id, "2.0.0", true).await.unwrap();
+    let response = api
+        .check_updates(&[entry("mapper", Some("2.0.0"))], &[])
+        .await
+        .unwrap();
+    let result = &response.results[0];
+    assert_eq!(
+        result.installed,
+        Some(UpdateCheckInstalled {
+            yanked: true,
+            deleted: false
+        })
+    );
+    assert_eq!(
+        result.latest.as_ref().map(|l| l.version.as_str()),
+        Some("1.0.0"),
+        "latest skips the yanked version"
+    );
+
+    // Hard-delete the installed 1.0.0 (yank first — the two-step rule): the entry
+    // reports deleted, and with only a yanked version left there is NO latest — the
+    // combination that forms the definitive deletion signal.
+    api.set_version_yanked(id, "1.0.0", true).await.unwrap();
+    api.delete_version(id, "1.0.0").await.unwrap();
+    let response = api
+        .check_updates(&[entry("mapper", Some("1.0.0"))], &[])
+        .await
+        .unwrap();
+    let result = &response.results[0];
+    assert_eq!(
+        result.installed,
+        Some(UpdateCheckInstalled {
+            yanked: false,
+            deleted: true
+        })
+    );
+    assert!(
+        result.latest.is_none(),
+        "no live versions remain — deleted + no latest is the definitive signal"
+    );
+    assert!(result.closure.is_empty());
+}
+
+#[tokio::test]
+async fn check_updates_caps_are_a_400() {
+    let (base_url, _state) = spawn_mock().await;
+    let api = client(&base_url);
+
+    let too_many_entries: Vec<CheckUpdatesEntry> =
+        (0..65).map(|i| entry(&format!("p{i}"), None)).collect();
+    match api.check_updates(&too_many_entries, &[]).await {
+        Err(CloudError::InvalidInput(_)) => {}
+        other => panic!("65 entries must be a 400, got {other:?}"),
+    }
+
+    let too_much_have: Vec<CheckUpdatesHave> = (0..513)
+        .map(|i| CheckUpdatesHave {
+            owner: "wbk".to_string(),
+            name: format!("p{i}"),
+            version: "1.0.0".to_string(),
+        })
+        .collect();
+    match api
+        .check_updates(&[entry("app", None)], &too_much_have)
+        .await
+    {
+        Err(CloudError::InvalidInput(_)) => {}
+        other => panic!("513 have entries must be a 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_missing_check_updates_route_reports_route_missing() {
+    // A server predating the endpoint 404s the path itself. Per-entry misses are
+    // body-level not_found results, so this top-level 404 is unambiguous — the
+    // condition the checker's legacy per-package probe fallback keys on.
+    let (base_url, _state) = spawn_mock_without_check_updates().await;
+    let api = client(&base_url);
+    match api.check_updates(&[entry("app", Some("1.0.0"))], &[]).await {
+        Err(CloudError::NotFoundOrNoAccess) => {}
+        other => panic!("an absent route must surface as NotFoundOrNoAccess, got {other:?}"),
+    }
 }

@@ -50,7 +50,7 @@ use deno_core::url::Url;
 
 mod mapper_api;
 mod ops;
-pub(crate) mod package_cache;
+pub mod package_cache;
 mod package_provider;
 mod package_solver;
 
@@ -1544,7 +1544,10 @@ impl<'a> ScriptEngine<'a> {
                 if let Some(provider) = &pkg_cloud {
                     // Permission-capped resolution (`PACKAGE-ISOLATES-CONSENT-TRUST.md`): a sandboxed
                     // package loads at the highest version whose CLOSURE permission union fits the
-                    // user's consented grant — never a newer version that demands more access. If no
+                    // user's consented grant — never a newer version that demands more access. With
+                    // a warm cache the staged version is verified against the grant purely from
+                    // disk (`closure_union_from_cache`); the `cap_version` network walk runs only
+                    // when that verification cannot complete or fails. If no
                     // version fits, refuse to load it (the user must review + grant the update). A
                     // local dev-override (the author's own package) is NOT version-capped — it loads
                     // the manifest version on disk — and is sandboxed to that manifest's permissions
@@ -1560,9 +1563,33 @@ impl<'a> ScriptEngine<'a> {
                             .find(&specifier)
                             .and_then(|locked| locked.consented_permissions.clone())
                             .unwrap_or_default();
-                        let capped = params
-                            .tokio_runtime
-                            .block_on(async { provider.cap_version(&specifier, &consented).await });
+                        // Disk-only consent verification — the cache-first fast path IN FRONT of
+                        // `cap_version`, never a replacement: the staged version's closure union
+                        // is folded purely from cached metas, and only a complete fold that fits
+                        // the consented grant and passes the version floor loads without the
+                        // network. Any gap — no staged version, a missing meta, a union exceeding
+                        // consent, a floor refusal — falls back to the legacy network walk below,
+                        // with every `CapRefusal` notice intact.
+                        let verified = consent_lock
+                            .find(&specifier)
+                            .and_then(|locked| locked.staged_version().map(str::to_string))
+                            .filter(|staged| {
+                                provider
+                                    .closure_union_from_cache(&spec.package_key(), staged)
+                                    .is_some_and(|(union, floor)| {
+                                        union.is_within(&consented)
+                                            && floor
+                                                .refusal(&crate::models::shared_packages::running_smudgy_release())
+                                                .is_none()
+                                    })
+                            });
+                        let capped = if let Some(staged) = verified {
+                            Ok(staged)
+                        } else {
+                            params.tokio_runtime.block_on(async {
+                                provider.cap_version(&specifier, &consented).await
+                            })
+                        };
                         let capped = match capped {
                             Ok(capped) => capped,
                             Err(package_provider::CapRefusal::Permissions) => {

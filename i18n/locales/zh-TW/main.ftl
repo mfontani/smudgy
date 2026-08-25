@@ -378,6 +378,33 @@ shell-visit-download = 前往下載頁面
 shell-remind-later = 稍後提醒我
 shell-skip-version = 略過此版本
 
+# 套件更新提示（主視窗底部的膠囊提示）
+toast-package-updates-ready = 套件更新已就緒（{ $count }）
+toast-package-reload-scripts = 重新載入指令碼
+toast-package-ignore = 忽略
+toast-package-needs-permissions = { $name } 的更新需要新的權限
+toast-package-review = 檢視…
+toast-package-pin-current = 固定目前版本
+toast-package-later = 稍後
+toast-package-attention = { $count } 個套件更新需要處理
+toast-package-open-automations = 在自動化視窗中檢視
+toast-package-update-failed = 下載 { $name } 的更新時發生錯誤。若要重試，請關閉並重新開啟此工作階段。
+
+# 套件更新檢視視窗
+package-update-modal-title = 套件更新
+package-update-versions = { $current } → { $latest }
+package-update-version-new = 新版本 { $latest }
+package-update-asks = 此更新需要額外的權限：
+package-update-needs-smudgy = 此更新需要 smudgy { $version } 或更新版本。請先更新 smudgy。
+package-update-grant = 授權並更新
+package-update-pin = 固定目前版本
+package-update-not-now = 暫時不要
+
+# Package-update terminal notices (echoed into the owning session)
+notice-package-deleted-uninstalled = [package] { $name } 已被發佈者刪除，並已解除安裝
+notice-package-update-ready = [package] { $name } 更新 { $from } → { $to } 已就緒
+notice-package-staged-ready = [package] { $name } { $to } 已就緒
+
 # 雲端錯誤
 cloud-error-email-unverified = 請先驗證電子郵件才能使用此功能。
 cloud-error-not-found = 找不到項目。

@@ -13,6 +13,7 @@ use crate::theme::Element;
 // Import modal implementation modules
 pub mod connect;
 pub mod layouts;
+pub mod package_update;
 
 /// Enum representing the currently active modal.
 // At most one modal exists per window, so the size spread between the
@@ -22,6 +23,7 @@ pub mod layouts;
 pub enum Modal {
     Connect(connect::State),
     Layouts(layouts::State),
+    PackageUpdate(package_update::State),
 }
 
 /// Messages that can be sent to the active modal.
@@ -29,6 +31,7 @@ pub enum Modal {
 pub enum Message {
     Connect(ConnectMessage),
     Layouts(layouts::Message),
+    PackageUpdate(package_update::Message),
 }
 
 /// Events that can be emitted by the active modal.
@@ -36,6 +39,7 @@ pub enum Message {
 pub enum Event {
     Connect(ConnectEvent),
     Layouts(layouts::Event),
+    PackageUpdate(package_update::Event),
 }
 
 impl Modal {
@@ -52,6 +56,13 @@ impl Modal {
             (Modal::Layouts(state), Message::Layouts(msg)) => {
                 let (task, event) = layouts::update(state, msg);
                 (task.map(Message::Layouts), event.map(Event::Layouts))
+            }
+            (Modal::PackageUpdate(state), Message::PackageUpdate(msg)) => {
+                let (task, event) = package_update::update(state, msg);
+                (
+                    task.map(Message::PackageUpdate),
+                    event.map(Event::PackageUpdate),
+                )
             }
             // A message for a modal that is no longer the active one (a
             // task settling after the modal switched): dropped.
@@ -73,6 +84,12 @@ impl Modal {
                 560.0,
                 480.0,
                 layouts::view(state).map(Message::Layouts),
+            ),
+            Modal::PackageUpdate(state) => (
+                crate::i18n::t!("package-update-modal-title"),
+                560.0,
+                480.0,
+                package_update::view(state).map(Message::PackageUpdate),
             ),
         };
 
@@ -107,6 +124,8 @@ impl Modal {
             Modal::Connect(state) => state.icon_refresh_task().map(Message::Connect),
             // The layouts modal lists its store synchronously too.
             Modal::Layouts(_) => Task::none(),
+            // The review modal renders entirely from the offer it was opened with.
+            Modal::PackageUpdate(_) => Task::none(),
         }
     }
 }

@@ -301,6 +301,130 @@ pub struct StaleDependencyView {
     pub latest_version: String,
 }
 
+/// One lockfile install to check (`POST /packages/check-updates` request `entries`).
+/// The server caps a request at 64 entries (400 beyond).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckUpdatesEntry {
+    pub owner: String,
+    pub name: String,
+    /// The installed (staged) version, when known — the server reports its
+    /// yanked/deleted status in [`CheckUpdatesResult::installed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+}
+
+/// One closure node the client already holds cached metadata for (request `have`, capped
+/// at 512): the server elides it from every result's `closure` — the client's meta cache
+/// is immutable truth, so re-sending the manifest would be pure waste.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckUpdatesHave {
+    pub owner: String,
+    pub name: String,
+    pub version: String,
+}
+
+/// `POST /packages/check-updates` response: one result per request entry, in request
+/// order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckUpdatesResponse {
+    #[serde(default)]
+    pub results: Vec<CheckUpdatesResult>,
+}
+
+/// One entry's update-check verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckUpdatesResult {
+    pub owner: String,
+    pub name: String,
+    /// `"ok"`, or the uniform `"not_found"` — absent OR not visible to this viewer,
+    /// indistinguishable by design (existence privacy), so it must never trigger
+    /// destructive cleanup.
+    pub status: String,
+    /// Status of the entry's `installed` version; `None` when no version was sent or
+    /// the server doesn't know it.
+    #[serde(default)]
+    pub installed: Option<UpdateCheckInstalled>,
+    /// The newest non-yanked version; `None` when no live versions remain.
+    #[serde(default)]
+    pub latest: Option<UpdateCheckLatest>,
+    /// The distinct transitive nodes of `latest`'s dependency closure at their locked
+    /// versions (walked over `kind = "dependency"` edges only), minus anything the
+    /// request's `have` covered — and additionally filtered to viewer-visible packages,
+    /// so it can be INCOMPLETE relative to the dependency edges. A caller must detect
+    /// an uncoverable closure (an edge whose node is neither here nor in its own meta
+    /// cache) rather than assume completeness. Always present (`[]` when empty).
+    #[serde(default)]
+    pub closure: Vec<UpdateCheckClosureNode>,
+}
+
+/// Yank/delete status of an installed version. `deleted` alone is not a cleanup
+/// signal — only `deleted` combined with `latest: None` (no live versions remain) is
+/// the definitive one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheckInstalled {
+    #[serde(default)]
+    pub yanked: bool,
+    /// Published then hard-deleted: the number stays permanently reserved but its
+    /// content is gone (a resolve would 404).
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// The newest live version in a check-updates result — everything a cached resolution
+/// needs *except* content URLs (no presigns anywhere in this endpoint), so every part
+/// of it is immutably cacheable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateCheckLatest {
+    pub version: String,
+    pub published_at: DateTime<Utc>,
+    /// The manifest (`smudgy.package.json`) as stored, verbatim.
+    #[serde(default)]
+    pub manifest: Value,
+    #[serde(default)]
+    pub modules: Vec<ModuleMetaView>,
+    /// The version's locked dependency edges — BOTH `kind = "dependency"` (import
+    /// closure) and `kind = "requires"` (co-install) rows.
+    #[serde(default)]
+    pub dependencies: Vec<UpdateCheckDependency>,
+}
+
+/// One locked dependency edge in a check-updates result. Unlike [`ResolvedDependency`]
+/// the owner field is named `owner` on this wire, and the edge carries its relation
+/// `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheckDependency {
+    pub owner: String,
+    pub name: String,
+    #[serde(default)]
+    pub range: String,
+    pub resolved_version: String,
+    /// `"dependency"` (imported into the dependent's isolate) or `"requires"`
+    /// (co-installed alongside it). An omitted kind defaults to `"dependency"` —
+    /// the closure walks filter on that kind, and an elided field must never drop
+    /// an edge from them.
+    #[serde(default = "default_dependency_kind")]
+    pub kind: String,
+}
+
+fn default_dependency_kind() -> String {
+    "dependency".to_string()
+}
+
+/// One transitive node of a `latest`'s dependency closure: metadata for permission
+/// folds and meta-cache writes, never for code loads — closure nodes carry no module
+/// lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateCheckClosureNode {
+    pub owner: String,
+    pub name: String,
+    pub version: String,
+    /// The node's manifest as stored, verbatim.
+    #[serde(default)]
+    pub manifest: Value,
+    #[serde(default)]
+    pub dependencies: Vec<UpdateCheckDependency>,
+}
+
 fn default_media_type() -> String {
     "text/plain".to_string()
 }
@@ -824,6 +948,30 @@ impl PackageApiClient {
         self.get("/packages/stale-deps").await
     }
 
+    /// Checks a whole lockfile's installs for updates in one call
+    /// (`POST /packages/check-updates`). Part of the public read surface: anonymous
+    /// callers get the public-only view, per-entry, as the uniform `"not_found"`
+    /// status — the same visibility rule as `resolve`. Results come back in request
+    /// order; `have` lists closure nodes the caller already holds cached metadata for,
+    /// which the server elides from every `closure`. Server caps: 64 `entries`, 512
+    /// `have` (400 beyond either).
+    ///
+    /// # Errors
+    /// [`CloudError::NotFoundOrNoAccess`] means the server predates the route (the
+    /// endpoint reports per-entry misses as `status: "not_found"` results, never as an
+    /// HTTP 404) — callers fall back to the legacy per-package `resolve` +
+    /// `list_versions` probe. [`CloudError::InvalidInput`] for an over-cap request;
+    /// otherwise transport/parse failures.
+    pub async fn check_updates(
+        &self,
+        entries: &[CheckUpdatesEntry],
+        have: &[CheckUpdatesHave],
+    ) -> CloudResult<CheckUpdatesResponse> {
+        let body = json!({ "entries": entries, "have": have });
+        self.post_public("/packages/check-updates", Some(&body))
+            .await
+    }
+
     /// Fetches a module body as raw bytes from its content-addressed URL and verifies its
     /// SHA-256 against `expected_hash` (lowercase hex). The URL is presigned in production, so
     /// no `Authorization` header is sent. Use this for binary modules; text callers can use
@@ -1018,6 +1166,19 @@ impl PackageApiClient {
         Self::parse_data(response).await
     }
 
+    /// Public-read counterpart of [`Self::post`] (see [`Self::get_public`]): sends the
+    /// credential only when signed in, so a logged-out client gets the anonymous,
+    /// public-only view rather than an `Unauthorized` short-circuit.
+    async fn post_public<T>(&self, path: &str, body: Option<&Value>) -> CloudResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let response = self
+            .send(Method::POST, path, &[], body, Auth::Optional)
+            .await?;
+        Self::parse_data(response).await
+    }
+
     async fn patch<T>(&self, path: &str, body: &Value) -> CloudResult<T>
     where
         T: serde::de::DeserializeOwned,
@@ -1098,6 +1259,85 @@ mod tests {
         assert_eq!(resolved.dependencies[0].name, "util");
         assert_eq!(resolved.dependencies[0].range, "^1.2");
         assert_eq!(resolved.dependencies[0].resolved_version, "1.4.0");
+    }
+
+    #[test]
+    fn check_updates_result_parses_the_mirrored_contract() {
+        // The full ok-shaped result: installed status, latest with modules +
+        // kind-carrying dependencies (owner named `owner` on this wire, not
+        // `owner_nickname`), and a closure node without modules.
+        let json = serde_json::json!({
+            "owner": "wbk", "name": "duo", "status": "ok",
+            "installed": { "yanked": false, "deleted": false },
+            "latest": {
+                "version": "1.3.0",
+                "published_at": "2026-06-20T00:00:00Z",
+                "manifest": { "name": "duo", "version": "1.3.0" },
+                "modules": [
+                    { "subpath": "index.ts", "content_hash": "abc", "media_type":
+                      "application/typescript", "byte_size": 12, "is_entry": true }
+                ],
+                "dependencies": [
+                    { "owner": "wbk", "name": "duo-core", "range": "^1",
+                      "resolved_version": "1.1.0", "kind": "dependency" },
+                    { "owner": "wbk", "name": "duo-data", "range": "^2",
+                      "resolved_version": "2.0.0", "kind": "requires" },
+                    { "owner": "wbk", "name": "duo-extra", "range": "^1",
+                      "resolved_version": "1.0.0" }
+                ]
+            },
+            "closure": [
+                { "owner": "wbk", "name": "duo-core", "version": "1.1.0",
+                  "manifest": { "name": "duo-core", "version": "1.1.0" },
+                  "dependencies": [] }
+            ]
+        });
+        let result: CheckUpdatesResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result.installed,
+            Some(UpdateCheckInstalled {
+                yanked: false,
+                deleted: false
+            })
+        );
+        let latest = result.latest.expect("latest");
+        assert_eq!(latest.version, "1.3.0");
+        assert!(latest.modules[0].is_entry);
+        assert_eq!(latest.dependencies[0].owner, "wbk");
+        assert_eq!(latest.dependencies[0].kind, "dependency");
+        assert_eq!(latest.dependencies[1].kind, "requires");
+        assert_eq!(
+            latest.dependencies[2].kind, "dependency",
+            "an omitted kind defaults to the dependency relation, never an empty \
+             string a kind filter would drop"
+        );
+        assert_eq!(result.closure.len(), 1);
+        assert_eq!(result.closure[0].version, "1.1.0");
+
+        // The uniform miss: nulls for installed/latest, an empty closure.
+        let miss: CheckUpdatesResult = serde_json::from_value(serde_json::json!({
+            "owner": "wbk", "name": "ghost", "status": "not_found",
+            "installed": null, "latest": null, "closure": []
+        }))
+        .unwrap();
+        assert_eq!(miss.status, "not_found");
+        assert_eq!(miss.installed, None);
+        assert!(miss.latest.is_none());
+        assert!(miss.closure.is_empty());
+    }
+
+    #[test]
+    fn check_updates_entry_omits_an_absent_installed_version() {
+        // `installed` is optional on the request wire — an entry without one
+        // serializes without the key at all (mirroring the server's contract).
+        let bare = serde_json::to_value(CheckUpdatesEntry {
+            owner: "wbk".into(),
+            name: "duo".into(),
+            installed: None,
+        })
+        .unwrap();
+        assert_eq!(bare, serde_json::json!({ "owner": "wbk", "name": "duo" }));
     }
 
     #[test]

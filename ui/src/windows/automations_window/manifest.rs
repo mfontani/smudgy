@@ -2518,12 +2518,12 @@ fn manifest_tab_system(draft: &ManifestDraft) -> Elem<'_> {
 }
 
 /// Whether any non-blank path entry escapes the package's own `$DATA` dir (the author-side twin
-/// of the installer-facing risk cliff — see `packages::data_scoped`).
+/// of the installer-facing risk cliff — see `permissions::data_scoped`).
 fn escapes_data(paths: &[String]) -> bool {
     paths
         .iter()
         .filter(|p| !p.trim().is_empty())
-        .any(|p| !super::packages::data_scoped(p))
+        .any(|p| !crate::components::permissions::data_scoped(p))
 }
 
 /// The author-facing "this is a full-access ask" warning under a `run`/`ffi`/escaping-`write`

@@ -32,10 +32,12 @@ pub use connection::{
 pub use error::{CloudError, CloudResult};
 pub use mapper::{AreaImportDocument, AreaLoadSource, AreaLoadStat, LoadMapsSummary, Mapper};
 pub use package_api::{
-    CommentView, ModuleMetaView, PackageApiClient, PackageDetail, PackageGrantView,
-    PackageSearchResult, PackageView, PublishDependency, PublishModule, PublishedVersionView,
-    ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire, SearchCategory, ShareClosureItem,
-    StaleDependencyView, VersionListItem, highest_satisfying_version,
+    CheckUpdatesEntry, CheckUpdatesHave, CheckUpdatesResponse, CheckUpdatesResult, CommentView,
+    ModuleMetaView, PackageApiClient, PackageDetail, PackageGrantView, PackageSearchResult,
+    PackageView, PublishDependency, PublishModule, PublishedVersionView, ResolvedDependency,
+    ResolvedModuleWire, ResolvedPackageWire, SearchCategory, ShareClosureItem, StaleDependencyView,
+    UpdateCheckClosureNode, UpdateCheckDependency, UpdateCheckInstalled, UpdateCheckLatest,
+    VersionListItem, highest_satisfying_version,
 };
 pub use relocation::{
     AtlasRelocation, MapRelocation, PartialRelocation, RelocationError, RelocationMode,

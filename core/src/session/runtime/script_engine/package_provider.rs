@@ -20,14 +20,19 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use smudgy_cloud::{CloudError, PackageApiClient, ResolvedDependency, ResolvedModuleWire};
+use smudgy_cloud::{
+    CloudError, PackageApiClient, ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire,
+};
 use smudgy_script::{
     PackageError, PackageKey, PackageManifest, PackageModuleSource, PackageParameter,
     PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage, canonical_url,
 };
 
-use super::package_cache::{CachedModule, CachedResolution, PackageCache, is_code_module};
+use super::package_cache::{
+    CachedModule, CachedResolution, PackageCache, is_code_module, package_integrity,
+};
 use super::package_solver::{self, DepEdge, DepRequirement, Solve};
 use crate::models::shared_packages::{self, LockedPackage, SharedPackageLock, UpdateMode};
 
@@ -71,6 +76,26 @@ pub enum CapRefusal {
 /// `(locked version, is_exact_pin)`.
 type LockedDeps = HashMap<PackageKey, (String, bool)>;
 
+/// Staleness bound on the wire-metadata memo: the wire carries *presigned* module URLs
+/// (900 s server TTL), so a memo hit older than this refetches rather than hand an
+/// expired URL to a blob-cache-miss body fetch. Every hit within one engine build — the
+/// burst the memo exists to collapse — lands far inside the bound.
+const WIRE_MEMO_TTL: Duration = Duration::from_mins(10);
+
+/// Wire-metadata memo entries: the fetch instant (for the [`WIRE_MEMO_TTL`] staleness
+/// bound) and the resolve wire itself, keyed by `(package, concrete version)`.
+type WireMemo = HashMap<(PackageKey, String), (Instant, Rc<ResolvedPackageWire>)>;
+
+/// The slice of a resolve wire the metadata walks consume: the concrete version, the
+/// parsed manifest, and the locked dependency edges. Divorcing the walks from the full
+/// wire lets a cached [`CachedResolution`] serve them without the network — see
+/// [`fetch_walk_meta`](SmudgyPackageProvider::fetch_walk_meta).
+struct WalkMeta {
+    version: String,
+    manifest: Option<PackageManifest>,
+    dependencies: Vec<ResolvedDependency>,
+}
+
 /// Resolves and fetches `smudgy://` packages over the cloud API for **one isolate**. Built once
 /// for the main isolate, then [`fork`](Self::fork)ed per sandboxed package isolate; the forks
 /// share `client` / `disk_cache` / `lock` and each owns its solve state (`PACKAGE-ISOLATES-RESOLUTION.md`).
@@ -85,6 +110,9 @@ pub struct SmudgyPackageProvider {
     lock: Rc<RefCell<SharedPackageLock>>,
     /// Auto packages whose resolved version changed vs the lockfile this load —
     /// `(specifier, from_version, to_version)` — drained by the engine for a session line.
+    /// Naturally quiet under staged serving (a load that serves what the lockfile stages
+    /// records no change): it fires only where a network resolve actually moves the
+    /// version, such as a never-resolved install's first solve or a fallback path.
     version_changes: RefCell<Vec<VersionChange>>,
     /// Fetched module sets, keyed by `(package, resolved version)`.
     cache: RefCell<HashMap<(PackageKey, String), Rc<ResolvedPackage>>>,
@@ -127,6 +155,14 @@ pub struct SmudgyPackageProvider {
     /// Persistent, content-addressed on-disk cache (immutable versions cached forever;
     /// enables offline + skips re-downloading bodies). `None` if it couldn't be opened.
     disk_cache: Option<PackageCache>,
+    /// In-memory memo of resolve wires by `(package, concrete version)`. A published
+    /// version's wire metadata is immutable, and one engine build asks for the same node
+    /// from several angles (`cap_version`'s candidate walk, the closure solves,
+    /// `resolve_impl`), so each node is fetched at most once per build. Entries age out
+    /// after [`WIRE_MEMO_TTL`] — the wire's presigned module URLs must stay live.
+    /// **Shared** across forks like `disk_cache`: the memoized facts are
+    /// isolate-independent even though each isolate solves its closure independently.
+    wire_memo: Rc<RefCell<WireMemo>>,
     /// The current account's nickname, for the local-package dev-override
     /// (resolve `smudgy://<yourhandle>/<name>` to a local folder). `None` when
     /// logged out / no handle allocated.
@@ -173,6 +209,7 @@ impl SmudgyPackageProvider {
             installed_min_versions: RefCell::new(Vec::new()),
             closure_permission_union: RefCell::new(PackagePermissions::default()),
             disk_cache: PackageCache::new().ok(),
+            wire_memo: Rc::new(RefCell::new(HashMap::new())),
             account_nickname: crate::models::auth::load_account().and_then(|a| a.nickname),
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
@@ -196,6 +233,8 @@ impl SmudgyPackageProvider {
     ///
     /// - `client` — clones share the connection pool; fetching bytes is isolate-independent.
     /// - `disk_cache` — content-addressed immutable blobs; a hit in one isolate serves all.
+    /// - `wire_memo` — immutable per-version resolve wires; one fetch serves every
+    ///   isolate's metadata walk.
     /// - `lock` — one in-memory view per session (`Rc`), so partitioned lockfile writes across
     ///   isolates stay consistent.
     ///
@@ -209,6 +248,9 @@ impl SmudgyPackageProvider {
             server_name: Arc::clone(&self.server_name),
             lock: Rc::clone(&self.lock),
             disk_cache: self.disk_cache.clone(),
+            // Shared like the disk cache: wire metadata is an isolate-independent,
+            // immutable fact, so one fetch serves every isolate's walk.
+            wire_memo: Rc::clone(&self.wire_memo),
             account_nickname: self.account_nickname.clone(),
             // Per-isolate solve state — each starts empty and solves its own closure.
             version_changes: RefCell::new(Vec::new()),
@@ -362,8 +404,120 @@ impl SmudgyPackageProvider {
         }))
     }
 
-    /// Persists a package's resolved version + integrity to the lockfile (for offline
-    /// reuse and reproducibility). Best-effort: a write failure is logged, not fatal.
+    /// Resolve `key`'s wire metadata at `version` (`None` = latest) over the network,
+    /// memoized by concrete version. The solve pre-pass, `cap_version`'s candidate walk,
+    /// and `resolve_impl` all ask for the same nodes; a published version's metadata is
+    /// immutable, so one fetch serves them all (entries age out after [`WIRE_MEMO_TTL`]
+    /// to keep the wire's presigned module URLs live). Every successful fetch also
+    /// persists the version's [`CachedResolution`] — metadata walks warm the offline
+    /// cache, not just code loads. `None` asks the network unconditionally: what
+    /// "latest" means is a mutable fact, though the concrete answer still lands in the
+    /// memo for later versioned asks.
+    async fn fetch_wire(
+        &self,
+        key: &PackageKey,
+        version: Option<&str>,
+    ) -> Result<Rc<ResolvedPackageWire>, CloudError> {
+        if let Some(version) = version {
+            let memoized = self
+                .wire_memo
+                .borrow()
+                .get(&(key.clone(), version.to_string()))
+                .filter(|(fetched_at, _)| fetched_at.elapsed() < WIRE_MEMO_TTL)
+                .map(|(_, wire)| Rc::clone(wire));
+            if let Some(wire) = memoized {
+                return Ok(wire);
+            }
+        }
+        let wire = Rc::new(
+            self.client
+                .resolve_package(&key.owner, &key.name, version)
+                .await?,
+        );
+        self.write_meta_for_wire(key, &wire);
+        self.wire_memo.borrow_mut().insert(
+            (key.clone(), wire.version.clone()),
+            (Instant::now(), Rc::clone(&wire)),
+        );
+        Ok(wire)
+    }
+
+    /// Persist a resolve wire's metadata to the disk cache, making the version
+    /// offline-reconstructable (once its code blobs are cached too) and its transitive
+    /// imports referrer-aware offline. Runs on every successful network resolve — the
+    /// solve/cap metadata walks warm the cache alongside code loads. Write-once in the
+    /// common case (versions are immutable), but self-healing: a cache file written
+    /// before `CachedResolution` carried dependency edges (or with fewer modules than
+    /// the wire) is refreshed rather than frozen — see
+    /// [`PackageCache::refresh_meta`]. Best-effort: no cache, an unparseable manifest,
+    /// or a failed write costs only the cache entry (the code-load path surfaces
+    /// `InvalidManifest` itself).
+    fn write_meta_for_wire(&self, key: &PackageKey, wire: &ResolvedPackageWire) {
+        let Some(cache) = &self.disk_cache else {
+            return;
+        };
+        let Ok(manifest) = PackageManifest::parse(&wire.manifest.to_string()) else {
+            return;
+        };
+        let meta = CachedResolution {
+            version: wire.version.clone(),
+            integrity: package_integrity(&wire.modules),
+            manifest,
+            modules: wire
+                .modules
+                .iter()
+                .map(|module| CachedModule {
+                    subpath: module.subpath.clone(),
+                    content_hash: module.content_hash.clone(),
+                    media_type: module.media_type.clone(),
+                })
+                .collect(),
+            dependencies: wire.dependencies.clone(),
+        };
+        let _ = cache.refresh_meta(key, &wire.version, &meta);
+    }
+
+    /// Resolve the metadata slice the closure walks consume — the concrete version, the
+    /// parsed manifest (`None` when it won't parse; the walk degrades, never aborts),
+    /// and the locked dependency edges — **cache-first**: a concrete `version` whose
+    /// [`CachedResolution`] is on disk is served from it, because a published version's
+    /// metadata is immutable and the cached copy IS the network's answer. Only a cache
+    /// gap, or `version == None` (what "latest" means is a mutable question), reaches
+    /// [`fetch_wire`](Self::fetch_wire). Module URLs are the one thing the cache cannot
+    /// supply, and the walks never read them — code loads go through `resolve_impl`,
+    /// which fetches its own wire when the blob cache has a gap.
+    async fn fetch_walk_meta(
+        &self,
+        key: &PackageKey,
+        version: Option<&str>,
+    ) -> Result<WalkMeta, CloudError> {
+        if let Some(version) = version
+            && let Some(meta) = self
+                .disk_cache
+                .as_ref()
+                .and_then(|cache| cache.read_meta(key, version))
+        {
+            return Ok(WalkMeta {
+                version: meta.version,
+                manifest: Some(meta.manifest),
+                dependencies: meta.dependencies,
+            });
+        }
+        let wire = self.fetch_wire(key, version).await?;
+        Ok(WalkMeta {
+            version: wire.version.clone(),
+            manifest: PackageManifest::parse(&wire.manifest.to_string()).ok(),
+            dependencies: wire.dependencies.clone(),
+        })
+    }
+
+    /// Persists a package's resolved version — and, for a network-verified load, its
+    /// integrity — to the lockfile (for offline reuse and reproducibility).
+    /// `verified_integrity` is `Some` only when this load verified the content against
+    /// the registry (the network resolve path); a cache-first serve passes `None` and
+    /// leaves any existing stamp untouched — `integrity` records what was most recently
+    /// *verified*, and reading a trusted cache file verifies nothing. Best-effort: a
+    /// write failure is logged, not fatal.
     ///
     /// Persistence is an entry-level read-modify-write against the **on-disk** lock — never a
     /// flush of this session's whole in-memory view, which can be seconds stale by the time a
@@ -371,45 +525,58 @@ impl SmudgyPackageProvider {
     /// uninstalled entry would resurrect; a fresh enable/disable would revert). An entry that
     /// was installed when this session loaded but is gone from disk was uninstalled meanwhile:
     /// its resolution metadata dies with it.
-    fn record_resolution(&self, specifier: &str, version: &str, integrity: &str) {
+    ///
+    /// One write is refused outright: an on-disk entry staging a DIFFERENT version with
+    /// `integrity` unstamped is a background stage this load did not serve (staging
+    /// clears the stamp; only a load that serves the staged version re-stamps it).
+    /// Recording this load's engine-build-start decision over it would silently revert
+    /// the pending stage, so the entry — disk and in-memory view alike — is left
+    /// exactly as staged. A stamped entry records as always, downgrades included.
+    fn record_resolution(&self, specifier: &str, version: &str, verified_integrity: Option<&str>) {
         let fresh_entry = || LockedPackage {
             specifier: specifier.to_string(),
             mode: UpdateMode::Auto,
             last_resolved_version: Some(version.to_string()),
-            integrity: Some(integrity.to_string()),
+            integrity: verified_integrity.map(str::to_string),
+            dismissed_update_version: None,
             trusted: false,
             consented_permissions: None,
             enabled: true,
             installed_as_requirement: false,
             audio_used: false,
         };
-        let known_install = {
-            let mut lock = self.lock.borrow_mut();
-            if let Some(entry) = lock.packages.iter_mut().find(|p| p.specifier == specifier) {
-                // An AUTO package that resolved to a new version since last load: record a
-                // notice (a pin, or a first-ever resolve with no prior, never notifies).
-                if matches!(entry.mode, UpdateMode::Auto)
-                    && let Some(prior) = &entry.last_resolved_version
-                    && prior != version
-                {
-                    self.version_changes.borrow_mut().push((
-                        specifier.to_string(),
-                        prior.clone(),
-                        version.to_string(),
-                    ));
-                }
-                entry.last_resolved_version = Some(version.to_string());
-                entry.integrity = Some(integrity.to_string());
-                true
-            } else {
-                lock.upsert(fresh_entry());
-                false
+        // How an existing entry adopts this resolution: the version always lands; the
+        // integrity stamp only from a verified load. An unverified serve that MOVES
+        // the version clears the old version's stamp rather than letting it lie
+        // (integrity describes `last_resolved_version`, nothing else).
+        let apply = |entry: &mut LockedPackage| {
+            let moved = entry.last_resolved_version.as_deref() != Some(version);
+            entry.last_resolved_version = Some(version.to_string());
+            match verified_integrity {
+                Some(integrity) => entry.integrity = Some(integrity.to_string()),
+                None if moved => entry.integrity = None,
+                None => {}
             }
         };
+        let known_install = self
+            .lock
+            .borrow()
+            .packages
+            .iter()
+            .any(|p| p.specifier == specifier);
+        let mut stage_pending = false;
         let persisted = shared_packages::mutate_lock(&self.server_name, |disk| {
             if let Some(entry) = disk.packages.iter_mut().find(|p| p.specifier == specifier) {
-                entry.last_resolved_version = Some(version.to_string());
-                entry.integrity = Some(integrity.to_string());
+                let staged_elsewhere = entry.integrity.is_none()
+                    && entry
+                        .last_resolved_version
+                        .as_deref()
+                        .is_some_and(|staged| staged != version);
+                if staged_elsewhere {
+                    stage_pending = true;
+                    return Ok(((), false));
+                }
+                apply(entry);
                 Ok(((), true))
             } else if known_install {
                 // Uninstalled since this session loaded — don't resurrect it just to stamp
@@ -417,13 +584,34 @@ impl SmudgyPackageProvider {
                 Ok(((), false))
             } else {
                 // Not an install at all (a top-level resolve outside the lockfile): record it
-                // on disk the same way it was recorded in memory.
+                // on disk the same way it is recorded in memory.
                 disk.upsert(fresh_entry());
                 Ok(((), true))
             }
         });
         if let Err(err) = persisted {
             warn!("Failed to persist package lock for {specifier}: {err:#}");
+        }
+        if stage_pending {
+            return;
+        }
+        let mut lock = self.lock.borrow_mut();
+        if let Some(entry) = lock.packages.iter_mut().find(|p| p.specifier == specifier) {
+            // An AUTO package that resolved to a new version since last load: record a
+            // notice (a pin, or a first-ever resolve with no prior, never notifies).
+            if matches!(entry.mode, UpdateMode::Auto)
+                && let Some(prior) = &entry.last_resolved_version
+                && prior != version
+            {
+                self.version_changes.borrow_mut().push((
+                    specifier.to_string(),
+                    prior.clone(),
+                    version.to_string(),
+                ));
+            }
+            apply(entry);
+        } else {
+            lock.upsert(fresh_entry());
         }
     }
 
@@ -504,6 +692,7 @@ impl SmudgyPackageProvider {
         self.solve_closure_inner(&specifiers, &forced).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn solve_closure_inner(
         &self,
         installs: &[String],
@@ -525,40 +714,58 @@ impl SmudgyPackageProvider {
                 continue;
             };
             // A permission-capped root resolves at exactly its capped version (treated as a pin for
-            // this load, exempt from collapse). Otherwise honor a user install-pin, else latest.
+            // this load, exempt from collapse). Otherwise honor a user install-pin. An Auto root
+            // with a staged prior resolution solves AT that staged version (still collapsible, not
+            // a pin): session start loads what the lockfile stages, and version movement belongs
+            // to whatever advances `last_resolved_version`, not to this walk. Only a
+            // never-resolved Auto root still asks the network what latest means.
             let (forced, is_pin) = if let Some(version) = forced_root_versions.get(specifier) {
                 (Some(version.clone()), true)
             } else {
-                let pin = self
-                    .lock
-                    .borrow()
-                    .find(specifier)
-                    .and_then(|locked| locked.pinned_version().map(str::to_string));
-                let is_pin = pin.is_some();
-                (pin, is_pin)
+                let lock = self.lock.borrow();
+                let entry = lock.find(specifier);
+                match entry.and_then(|locked| locked.pinned_version().map(str::to_string)) {
+                    Some(pin) => (Some(pin), true),
+                    None => (
+                        entry.and_then(|locked| locked.last_resolved_version.clone()),
+                        false,
+                    ),
+                }
             };
             stack.push((spec.package_key(), forced, is_pin, true));
         }
 
         while let Some((key, forced, is_pin, is_top_level)) = stack.pop() {
-            let wire = match self
-                .client
-                .resolve_package(&key.owner, &key.name, forced.as_deref())
-                .await
+            // Dedup BEFORE the fetch when the node arrives with a concrete version
+            // (every dep edge does): a diamond reached by N paths costs one fetch, not
+            // N. The duplicate requirement is still counted — the solver weighs every
+            // edge. Top-level roots fall through: they also register as roots and
+            // collect params/floors from the manifest (their fetch is a cache or memo
+            // hit when a dep edge got there first).
+            if !is_top_level
+                && let Some(version) = &forced
+                && seen.contains(&(key.clone(), version.clone()))
             {
-                Ok(wire) => wire,
-                Err(_) => continue,
+                requirements.push(DepRequirement {
+                    package: key.clone(),
+                    version: version.clone(),
+                    is_pin,
+                });
+                continue;
+            }
+            let Ok(meta) = self.fetch_walk_meta(&key, forced.as_deref()).await else {
+                continue;
             };
-            let version = wire.version.clone();
+            let version = meta.version.clone();
             let requirement = DepRequirement {
                 package: key.clone(),
                 version: version.clone(),
                 is_pin,
             };
             requirements.push(requirement.clone());
-            // Parse the manifest once: the top-level params gate and the closure permission
-            // union both read it (a parse failure degrades both, never aborts the walk).
-            let manifest = PackageManifest::parse(&wire.manifest.to_string()).ok();
+            // The top-level params gate and the closure permission union both read the
+            // manifest (an unparseable one degrades both, never aborts the walk).
+            let manifest = meta.manifest;
             if is_top_level {
                 roots.push(requirement);
                 if let Some(manifest) = &manifest {
@@ -581,7 +788,7 @@ impl SmudgyPackageProvider {
             if let Some(manifest) = &manifest {
                 permissions_union.merge(&manifest.permissions);
             }
-            for dep in &wire.dependencies {
+            for dep in &meta.dependencies {
                 let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) else {
                     continue;
                 };
@@ -666,11 +873,7 @@ impl SmudgyPackageProvider {
         } else {
             // Resolve once to learn the package id (and a latest-version fallback), then list its
             // versions newest-first. If listing fails, fall back to just the latest.
-            match self
-                .client
-                .resolve_package(&key.owner, &key.name, None)
-                .await
-            {
+            match self.fetch_wire(&key, None).await {
                 Ok(latest) => match self.client.list_versions(latest.package_id).await {
                     Ok(list) => {
                         let mut versions: Vec<semver::Version> = list
@@ -685,7 +888,7 @@ impl SmudgyPackageProvider {
                         versions.reverse();
                         versions.into_iter().map(|v| v.to_string()).collect()
                     }
-                    Err(_) => vec![latest.version],
+                    Err(_) => vec![latest.version.clone()],
                 },
                 // Offline, or signed out and the package isn't public (the anonymous viewer
                 // can't see it): we can't shop for a newer version, so fall back to the last
@@ -752,11 +955,7 @@ impl SmudgyPackageProvider {
             if !seen.insert((key.clone(), version.clone())) {
                 continue;
             }
-            let Ok(wire) = self
-                .client
-                .resolve_package(&key.owner, &key.name, Some(&version))
-                .await
-            else {
+            let Ok(wire) = self.fetch_wire(&key, Some(&version)).await else {
                 continue;
             };
             if let Ok(manifest) = PackageManifest::parse(&wire.manifest.to_string()) {
@@ -770,6 +969,44 @@ impl SmudgyPackageProvider {
             }
         }
         (union, floor)
+    }
+
+    /// The fold of [`closure_union_for`](Self::closure_union_for) computed **entirely
+    /// from the disk cache** — the staged-version consent verification at session
+    /// start. Walks `root_key@root_version`'s dependency closure over cached
+    /// [`CachedResolution`]s at their locked versions, unioning each distinct node's
+    /// manifest permissions and folding its `min_smudgy_version` floor. Returns `None`
+    /// on ANY missing meta (or no disk cache at all): an incomplete fold proves
+    /// nothing, and the caller must fall back to the network path, which keeps the
+    /// [`CapRefusal`] semantics and their session notices. Unlike the network fold this
+    /// one fails closed on gaps — best-effort skipping is only sound where the network
+    /// was actually asked.
+    #[must_use]
+    pub fn closure_union_from_cache(
+        &self,
+        root_key: &PackageKey,
+        root_version: &str,
+    ) -> Option<(PackagePermissions, shared_packages::SmudgyVersionFloor)> {
+        let cache = self.disk_cache.as_ref()?;
+        let mut union = PackagePermissions::default();
+        let mut floor = shared_packages::SmudgyVersionFloor::default();
+        let mut seen: HashSet<(PackageKey, String)> = HashSet::new();
+        let mut stack: Vec<(PackageKey, String)> =
+            vec![(root_key.clone(), root_version.to_string())];
+        while let Some((key, version)) = stack.pop() {
+            if !seen.insert((key.clone(), version.clone())) {
+                continue;
+            }
+            let meta = cache.read_meta(&key, &version)?;
+            union.merge(&meta.manifest.permissions);
+            floor.fold(&key.name, meta.manifest.min_smudgy_version.as_deref());
+            for dep in &meta.dependencies {
+                if let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) {
+                    stack.push((dep_key, dep.resolved_version.clone()));
+                }
+            }
+        }
+        Some((union, floor))
     }
 
     /// Each top-level install's `(specifier, declared params)`, collected by the last
@@ -822,8 +1059,9 @@ fn dep_package_key(owner_nickname: &str, name: &str) -> Option<PackageKey> {
 }
 
 impl SmudgyPackageProvider {
-    // Genuinely multi-path: in-session dedup, local dev-override, network resolve with
-    // offline fallback, content-addressed body cache, and metadata persistence.
+    // Genuinely multi-path: in-session dedup, local dev-override, cache-first serve of
+    // determined versions, network resolve with offline fallback, content-addressed
+    // body cache, and metadata persistence.
     //
     // `track` separates a code load from a kind-scheme stub fetch: a code load records the
     // instance in `cache` (whose keys are `loaded_packages()`, the stumble diagnostic's
@@ -840,14 +1078,14 @@ impl SmudgyPackageProvider {
     ) -> Result<Rc<ResolvedPackage>, PackageError> {
         let specifier = key.to_user_specifier();
 
-        // Mode + offline fallback version from the lockfile (don't hold the borrow over
-        // the await below).
-        let (pinned, last_known) = {
+        // Mode + staged version from the lockfile (don't hold the borrow over the
+        // awaits below).
+        let (pinned, staged) = {
             let lock = self.lock.borrow();
             let entry = lock.find(&specifier);
             (
                 entry.and_then(|p| p.pinned_version().map(str::to_string)),
-                entry.and_then(|p| p.last_resolved_version.clone()),
+                entry.and_then(|p| p.staged_version().map(str::to_string)),
             )
         };
 
@@ -865,6 +1103,14 @@ impl SmudgyPackageProvider {
             None => self.top_level_solved.borrow().get(key).cloned(),
         };
         let selected = solved.or_else(|| pinned.clone());
+
+        // The version this resolve is already DETERMINED to serve, decided from local
+        // facts alone (this load's solve + the lockfile, never the network): a referrer
+        // edge's locked (solve-collapsed) version, a top-level install's solved version,
+        // the user's pin, or the staged version of an Auto install
+        // ([`LockedPackage::staged_version`]). `None` only when discovery genuinely
+        // needs the cloud — a never-resolved Auto root with no solve entry.
+        let determined = selected.clone().or_else(|| staged.clone());
 
         // Already resolved this version this session → reuse that instance. Keyed by the
         // *selected* version, so two importers that locked different versions coexist (two
@@ -890,16 +1136,70 @@ impl SmudgyPackageProvider {
             return Ok(local);
         }
 
-        let wire = match self
-            .client
-            .resolve_package(&key.owner, &key.name, selected.as_deref())
-            .await
+        // Cache-first serve: for a resolve whose version is already determined, the
+        // disk cache is the PRIMARY source, not the error fallback — the version
+        // names immutable published content, so cached metadata + code blobs ARE the
+        // network's answer. A cache gap (or `determined == None`) falls through to the
+        // network below. Stub fetches (`track == false`) ride this path too — a stub
+        // of an installed producer must see the version the producer's isolate
+        // actually runs (its staged/pinned/solved version, not latest) — while their
+        // no-footprint contract is kept by the `track` gates below.
+        if let Some(version) = &determined
+            && let Some(package) = self.build_from_cache(key, version)
         {
+            // The cached meta was written by a resolve that passed the version-floor
+            // gate — but under a possibly NEWER smudgy since downgraded, so re-check
+            // the cached manifest's floor before serving (the same guard the offline
+            // fallback below applies).
+            if let Some(reason) = manifest_floor_refusal(&key.name, &package.manifest) {
+                return Err(PackageError::Other(format!(
+                    "{specifier} not loaded: {reason}"
+                )));
+            }
+            // The required-param load-gate the network path applies at resolution time:
+            // a cached package with unset required params must not evaluate
+            // misconfigured just because it was served from disk.
+            let missing = crate::models::shared_packages::missing_required_params(
+                &self.server_name,
+                &specifier,
+                &package.manifest.params,
+            );
+            if !missing.is_empty() {
+                return Err(PackageError::Other(format!(
+                    "{specifier} not loaded: required param(s) {} are unset; configure them in settings",
+                    missing.join(", ")
+                )));
+            }
+            // Track exactly as the network path would for the same version — the
+            // served set (`loaded_packages()`), the reported version, and the
+            // lockfile's staged version — EXCEPT the integrity stamp: it records the
+            // hash most recently *verified*, and a cache-first serve verifies
+            // nothing, so the entry's existing stamp is left untouched (`None` until
+            // a network-verified load). A stub fetch records none of it.
+            if track {
+                self.cache
+                    .borrow_mut()
+                    .insert((key.clone(), version.clone()), package.clone());
+                if referrer.is_none() {
+                    self.resolved_versions
+                        .borrow_mut()
+                        .insert(key.clone(), version.clone());
+                    self.record_resolution(&specifier, version, None);
+                }
+            }
+            return Ok(package);
+        }
+
+        // The network resolve targets the DETERMINED version where one exists (the
+        // cache-first serve above had a gap to fill) — only genuine discovery (a
+        // never-resolved Auto root) asks what latest means.
+        let wire = match self.fetch_wire(key, determined.as_deref()).await {
             Ok(wire) => wire,
             Err(err) => {
                 // Offline: serve from the in-memory session cache, then the persistent
-                // disk cache (works for pinned + auto, the latter via last-resolved).
-                if let Some(version) = selected.clone().or(last_known) {
+                // disk cache (works for pinned + auto, the latter via the staged
+                // version — the paths a cache-first gap lands here with).
+                if let Some(version) = determined {
                     if let Some(package) = self
                         .cache
                         .borrow()
@@ -1028,28 +1328,6 @@ impl SmudgyPackageProvider {
             modules,
         });
 
-        // Persist the version's metadata (incl. its locked deps) so a pinned package
-        // resolves fully offline next load and its transitive imports stay referrer-aware
-        // (bodies are already in the blob cache above).
-        if let Some(cache) = &self.disk_cache {
-            let meta = CachedResolution {
-                version: version.clone(),
-                integrity: integrity.clone(),
-                manifest: resolved.manifest.clone(),
-                modules: wire
-                    .modules
-                    .iter()
-                    .map(|module| CachedModule {
-                        subpath: module.subpath.clone(),
-                        content_hash: module.content_hash.clone(),
-                        media_type: module.media_type.clone(),
-                    })
-                    .collect(),
-                dependencies: wire.dependencies.clone(),
-            };
-            let _ = cache.write_meta(key, &version, &meta);
-        }
-
         if track {
             self.cache
                 .borrow_mut()
@@ -1062,7 +1340,7 @@ impl SmudgyPackageProvider {
                 self.resolved_versions
                     .borrow_mut()
                     .insert(key.clone(), version.clone());
-                self.record_resolution(&specifier, &version, &integrity);
+                self.record_resolution(&specifier, &version, Some(&integrity));
             }
         }
 
@@ -1193,17 +1471,6 @@ impl PackageProvider for SmudgyPackageProvider {
     fn user_code_imports(&self) -> Vec<PackageKey> {
         self.user_imports.borrow().clone()
     }
-}
-
-/// A deterministic package-level integrity fingerprint over the per-module content
-/// hashes (each is already a SHA-256). Detects any module change for the lockfile.
-fn package_integrity(modules: &[ResolvedModuleWire]) -> String {
-    let mut entries: Vec<String> = modules
-        .iter()
-        .map(|module| format!("{}={}", module.subpath, module.content_hash))
-        .collect();
-    entries.sort();
-    entries.join(";")
 }
 
 /// Maps a module-body fetch error onto a [`PackageError`], distinguishing an integrity
@@ -1384,8 +1651,8 @@ mod tests {
         let main = test_provider();
         let sandbox = main.fork();
 
-        main.record_resolution("smudgy://wbk/mapper", "1.4.0", "main-integrity");
-        sandbox.record_resolution("smudgy://cor/combat", "2.0.0", "sandbox-integrity");
+        main.record_resolution("smudgy://wbk/mapper", "1.4.0", Some("main-integrity"));
+        sandbox.record_resolution("smudgy://cor/combat", "2.0.0", Some("sandbox-integrity"));
 
         // One shared lock holds BOTH installs at their own versions — partitioned, not clobbered.
         for provider in [&main, &sandbox] {
@@ -1452,6 +1719,123 @@ mod tests {
                 .map(String::as_str),
             Some("1.2.0")
         );
+    }
+
+    /// Point the process-global smudgy home at a temp directory (first caller wins;
+    /// another lib test may have won already — either way the home is disposable).
+    /// Tests that assert on-disk lockfile state call this before touching it.
+    fn use_temp_smudgy_home() {
+        static TEST_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("smudgy-provider-test-home-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp home");
+            crate::set_smudgy_home(dir.clone());
+            dir
+        });
+    }
+
+    /// A provider over `server` whose in-memory lockfile view is exactly `packages` —
+    /// the snapshot a session holds, independent of what is on disk by now.
+    fn provider_with_view(server: &str, packages: Vec<LockedPackage>) -> SmudgyPackageProvider {
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let provider = SmudgyPackageProvider::new(client, Arc::new(server.to_string()));
+        provider.lock.borrow_mut().packages = packages;
+        provider
+    }
+
+    #[test]
+    fn record_resolution_preserves_a_pending_background_stage() {
+        // The checker staged 1.3.0 mid-reload (staging clears `integrity`); the
+        // reload's record — decided from its engine-build-start snapshot of 1.2.0 —
+        // must NOT revert the pending stage, on disk or in the session's view.
+        use_temp_smudgy_home();
+        let server = "RecordResolutionStageGuardTest";
+        let specifier = "smudgy://wbk/mapper";
+        shared_packages::mutate_lock(server, |lock| {
+            let mut entry = LockedPackage::new(specifier, UpdateMode::Auto);
+            entry.last_resolved_version = Some("1.3.0".into());
+            entry.integrity = None;
+            lock.upsert(entry);
+            Ok(((), true))
+        })
+        .expect("seed the staged entry");
+        let mut loaded = LockedPackage::new(specifier, UpdateMode::Auto);
+        loaded.last_resolved_version = Some("1.2.0".into());
+        loaded.integrity = Some("stamped-at-load".into());
+        let provider = provider_with_view(server, vec![loaded]);
+
+        provider.record_resolution(specifier, "1.2.0", Some("net-integrity"));
+
+        let disk = shared_packages::load_lock(server).expect("lock loads");
+        let entry = disk.find(specifier).expect("the entry survives");
+        assert_eq!(
+            entry.last_resolved_version.as_deref(),
+            Some("1.3.0"),
+            "the pending stage is preserved, not reverted to the load's version"
+        );
+        assert_eq!(
+            entry.integrity, None,
+            "the staged version still awaits its first serving load"
+        );
+        assert_eq!(
+            provider
+                .lock
+                .borrow()
+                .find(specifier)
+                .and_then(|e| e.last_resolved_version.clone())
+                .as_deref(),
+            Some("1.2.0"),
+            "the in-memory view keeps describing what this load served — no clobber"
+        );
+        assert!(
+            provider.take_version_changes().is_empty(),
+            "a refused record raises no auto-update notice"
+        );
+    }
+
+    #[test]
+    fn record_resolution_still_records_stamped_and_initial_entries() {
+        use_temp_smudgy_home();
+        let server = "RecordResolutionNormalTest";
+        let specifier = "smudgy://wbk/mapper";
+        // A stamped entry records as always — a legitimate downgrade included: the
+        // guard keys on the unstamped fresh-stage signature, nothing else.
+        shared_packages::mutate_lock(server, |lock| {
+            let mut entry = LockedPackage::new(specifier, UpdateMode::Auto);
+            entry.last_resolved_version = Some("1.3.0".into());
+            entry.integrity = Some("verified-1.3.0".into());
+            lock.upsert(entry);
+            Ok(((), true))
+        })
+        .expect("seed the stamped entry");
+        let mut loaded = LockedPackage::new(specifier, UpdateMode::Auto);
+        loaded.last_resolved_version = Some("1.3.0".into());
+        loaded.integrity = Some("verified-1.3.0".into());
+        let provider = provider_with_view(server, vec![loaded]);
+
+        provider.record_resolution(specifier, "1.2.0", Some("verified-1.2.0"));
+
+        let disk = shared_packages::load_lock(server).expect("lock loads");
+        let entry = disk.find(specifier).expect("the entry survives");
+        assert_eq!(entry.last_resolved_version.as_deref(), Some("1.2.0"));
+        assert_eq!(entry.integrity.as_deref(), Some("verified-1.2.0"));
+
+        // An initial install — version and integrity both None — records too.
+        let fresh = "smudgy://wbk/fresh";
+        shared_packages::mutate_lock(server, |lock| {
+            lock.upsert(LockedPackage::new(fresh, UpdateMode::Auto));
+            Ok(((), true))
+        })
+        .expect("seed the fresh install");
+        provider.record_resolution(fresh, "0.1.0", Some("verified-0.1.0"));
+        let disk = shared_packages::load_lock(server).expect("lock loads");
+        let entry = disk.find(fresh).expect("the entry survives");
+        assert_eq!(entry.last_resolved_version.as_deref(), Some("0.1.0"));
+        assert_eq!(entry.integrity.as_deref(), Some("verified-0.1.0"));
     }
 
     #[test]
@@ -1539,6 +1923,674 @@ mod tests {
         assert_eq!(
             provider.referrer_locked_version(&referrer("app", "2.0.0"), &util),
             Some(("2.5.0".to_string(), false))
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Counting mock registry — pins exactly how much network a resolve
+    // path generates (cache-first serve + the dedup/memo waste fixes).
+    // ------------------------------------------------------------------
+
+    use std::io::{Read as _, Write as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One published package the mock registry serves: a single `index.ts` whose body is
+    /// `body`, a manifest assembled from `manifest_extra` (verbatim JSON appended inside
+    /// the manifest object), and locked deps as `(owner, name, range, resolved_version)`.
+    /// The last entry declared for an `(owner, name)` is also its `latest`.
+    struct MockPackage {
+        owner: &'static str,
+        name: &'static str,
+        version: &'static str,
+        manifest_extra: &'static str,
+        deps: &'static [(&'static str, &'static str, &'static str, &'static str)],
+        body: &'static str,
+    }
+
+    /// Handle on a [`spawn_registry`] server: `resolve_hits` counts `/packages/resolve`
+    /// calls, `body_hits` counts module-body fetches — the two network costs the
+    /// provider's cache/memo/dedup layers exist to eliminate.
+    struct MockRegistry {
+        base_url: String,
+        resolve_hits: Arc<AtomicUsize>,
+        body_hits: Arc<AtomicUsize>,
+    }
+
+    fn sha256_hex(body: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    /// Serve `packages` over real HTTP on an OS-assigned port, counting hits per route
+    /// class. Sequential accept loop with `Connection: close` per response — matching
+    /// the sequential resolve traffic one provider generates (the same shape as
+    /// `package_isolates_enforcement.rs`'s servers).
+    fn spawn_registry(packages: &[MockPackage]) -> MockRegistry {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let port = listener.local_addr().expect("local_addr").port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let mut resolves: HashMap<(String, String, String), String> = HashMap::new();
+        let mut bodies: HashMap<String, String> = HashMap::new();
+        for package in packages {
+            let hash = sha256_hex(package.body);
+            bodies.insert(hash.clone(), package.body.to_string());
+            let deps = package
+                .deps
+                .iter()
+                .map(|(owner, name, range, version)| {
+                    format!(
+                        r#"{{"owner_nickname":"{owner}","name":"{name}","range":"{range}","resolved_version":"{version}"}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let (owner, name, version) = (package.owner, package.name, package.version);
+            let extra = package.manifest_extra;
+            let wire = format!(
+                r#"{{"data":{{"package_id":"00000000-0000-0000-0000-000000000001","owner_nickname":"{owner}","name":"{name}","version":"{version}","manifest":{{"name":"{name}","version":"{version}"{extra}}},"modules":[{{"subpath":"index.ts","content_hash":"{hash}","media_type":"application/typescript","content_url":"{base_url}/blob/{hash}"}}],"dependencies":[{deps}]}}}}"#
+            );
+            resolves.insert((owner.into(), name.into(), version.into()), wire.clone());
+            resolves.insert((owner.into(), name.into(), "latest".into()), wire);
+        }
+
+        let resolve_hits = Arc::new(AtomicUsize::new(0));
+        let body_hits = Arc::new(AtomicUsize::new(0));
+        let resolve_count = Arc::clone(&resolve_hits);
+        let body_count = Arc::clone(&body_hits);
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut request = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&buf[..n]);
+                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let target = request.split_whitespace().nth(1).unwrap_or_default();
+                let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                let payload = if path == "/packages/resolve" {
+                    resolve_count.fetch_add(1, Ordering::SeqCst);
+                    let (mut owner, mut name, mut version) = ("", "", "latest");
+                    for pair in query.split('&') {
+                        match pair.split_once('=') {
+                            Some(("owner", value)) => owner = value,
+                            Some(("name", value)) => name = value,
+                            Some(("version", value)) => version = value,
+                            _ => {}
+                        }
+                    }
+                    resolves
+                        .get(&(owner.to_string(), name.to_string(), version.to_string()))
+                        .cloned()
+                } else if let Some(hash) = path.strip_prefix("/blob/") {
+                    body_count.fetch_add(1, Ordering::SeqCst);
+                    bodies.get(hash).cloned()
+                } else {
+                    None
+                };
+                let (status, body) = match payload {
+                    Some(body) => ("200 OK", body),
+                    None => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        MockRegistry {
+            base_url,
+            resolve_hits,
+            body_hits,
+        }
+    }
+
+    /// A provider backed by a [`spawn_registry`] mock, scrubbed of ambient process
+    /// state: the smudgy home is a process-global another lib test may (or may not)
+    /// have pointed at a reused directory, so the constructor's opened disk cache and
+    /// loaded lockfile are dropped — hit counting must start from a blank slate. Tests
+    /// that need a disk cache or lock entries inject their own.
+    fn provider_for(registry: &MockRegistry) -> SmudgyPackageProvider {
+        let client = PackageApiClient::new(
+            registry.base_url.clone(),
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider =
+            SmudgyPackageProvider::new(client, Arc::new("CacheFirstProviderTest".to_string()));
+        provider.disk_cache = None;
+        provider.lock.borrow_mut().packages.clear();
+        provider
+    }
+
+    /// A ready-to-serve disk cache entry for `owner/name@version`: the meta (with the
+    /// given locked dep edges) plus its single `index.ts` blob, so `build_from_cache`
+    /// succeeds. Returns the cache.
+    fn warm_cache(
+        dir: &std::path::Path,
+        key: &PackageKey,
+        version: &str,
+        manifest_extra: &str,
+        body: &str,
+        deps: &[ResolvedDependency],
+    ) -> PackageCache {
+        let cache = PackageCache::with_root(dir.to_path_buf());
+        let hash = sha256_hex(body);
+        cache.write_blob(&hash, body).expect("write blob");
+        let manifest_json = format!(
+            r#"{{"name":"{name}","version":"{version}"{manifest_extra}}}"#,
+            name = key.name
+        );
+        let meta = CachedResolution {
+            version: version.to_string(),
+            integrity: "cached-integrity".to_string(),
+            manifest: PackageManifest::parse(&manifest_json).expect("valid manifest"),
+            modules: vec![CachedModule {
+                subpath: "index.ts".to_string(),
+                content_hash: hash,
+                media_type: "application/typescript".to_string(),
+            }],
+            dependencies: deps.to_vec(),
+        };
+        cache.write_meta(key, version, &meta).expect("write meta");
+        cache
+    }
+
+    /// An installed Auto lock entry whose staged (`last_resolved_version`) is `version`.
+    fn staged_lock_entry(specifier: &str, version: &str) -> LockedPackage {
+        let mut entry = LockedPackage::new(specifier, UpdateMode::Auto);
+        entry.last_resolved_version = Some(version.to_string());
+        entry
+    }
+
+    #[tokio::test]
+    async fn solve_closure_fetches_each_distinct_node_once_for_a_diamond() {
+        // app -> left -> base and app -> right -> base: base is reached by two paths but
+        // is one distinct (package, version) node, so the walk costs four fetches — the
+        // dedup runs BEFORE the fetch (and the wire memo backstops any re-ask).
+        let registry = spawn_registry(&[
+            MockPackage {
+                owner: "wbk",
+                name: "base",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[],
+                body: "export const base = 1;",
+            },
+            MockPackage {
+                owner: "wbk",
+                name: "left",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[("wbk", "base", "^1", "1.0.0")],
+                body: "export const left = 1;",
+            },
+            MockPackage {
+                owner: "wbk",
+                name: "right",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[("wbk", "base", "^1", "1.0.0")],
+                body: "export const right = 1;",
+            },
+            MockPackage {
+                owner: "wbk",
+                name: "app",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[
+                    ("wbk", "left", "^1", "1.0.0"),
+                    ("wbk", "right", "^1", "1.0.0"),
+                ],
+                body: "export const app = 1;",
+            },
+        ]);
+        let provider = provider_for(&registry);
+
+        provider
+            .solve_closure(&["smudgy://wbk/app".to_string()])
+            .await;
+
+        assert!(provider.solve.borrow().is_some(), "the walk completed");
+        assert_eq!(
+            registry.resolve_hits.load(Ordering::SeqCst),
+            4,
+            "one fetch per distinct closure node — the diamond's shared base is not re-fetched per path"
+        );
+        assert_eq!(
+            registry.body_hits.load(Ordering::SeqCst),
+            0,
+            "a metadata walk fetches no code bodies"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_walks_share_one_wire_fetch_per_version() {
+        // The full sandboxed-load sequence — cap_version, the capped closure solve, and
+        // the code-load resolve — asks about the same (package, version) from three
+        // angles; the wire memo collapses them to cap_version's single latest probe.
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "solo",
+            version: "1.0.0",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const solo = 1;",
+        }]);
+        let provider = provider_for(&registry);
+
+        let capped = provider
+            .cap_version("smudgy://wbk/solo", &PackagePermissions::default())
+            .await
+            .expect("caps to the only version");
+        assert_eq!(capped, "1.0.0");
+        provider
+            .solve_closure_capped(&[("smudgy://wbk/solo".to_string(), capped)])
+            .await;
+        let resolved = provider
+            .resolve_package(&pkg_key("solo"), None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(resolved.resolved_version, "1.0.0");
+        assert_eq!(
+            registry.resolve_hits.load(Ordering::SeqCst),
+            1,
+            "cap_version's latest probe is the only wire fetch; the closure fold, the \
+             capped solve, and the code load all reuse it"
+        );
+        assert_eq!(
+            registry.body_hits.load(Ordering::SeqCst),
+            1,
+            "the single module body is fetched once (then blob-cached where a disk cache exists)"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_walks_write_the_offline_meta_cache() {
+        // A solve pre-pass alone — no code load — persists every walked version's
+        // metadata, so the offline cache warms even for packages never imported this
+        // session (blob presence still gates offline serving).
+        let registry = spawn_registry(&[
+            MockPackage {
+                owner: "wbk",
+                name: "base",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[],
+                body: "export const base = 1;",
+            },
+            MockPackage {
+                owner: "wbk",
+                name: "app",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[("wbk", "base", "^1", "1.0.0")],
+                body: "export const app = 1;",
+            },
+        ]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        provider.disk_cache = Some(PackageCache::with_root(dir.path().to_path_buf()));
+
+        provider
+            .solve_closure(&["smudgy://wbk/app".to_string()])
+            .await;
+
+        let cache = provider.disk_cache.as_ref().expect("cache");
+        assert!(
+            cache.read_meta(&pkg_key("app"), "1.0.0").is_some(),
+            "the walked root's resolve persisted its metadata"
+        );
+        assert!(
+            cache.read_meta(&pkg_key("base"), "1.0.0").is_some(),
+            "transitive nodes persist too"
+        );
+        assert_eq!(registry.body_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_staged_version_serves_from_cache_with_zero_network() {
+        // The cache-first contract: a tracked resolve whose version is staged in the
+        // lockfile and fully cached (meta + code blobs) touches the network not at all —
+        // the registry would serve a newer 9.9.9, and must never even be asked.
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "app",
+            version: "9.9.9",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const newer = 1;",
+        }]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            "",
+            "export const x = 1;",
+            &[],
+        ));
+        provider
+            .lock
+            .borrow_mut()
+            .packages
+            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+
+        let resolved = provider
+            .resolve_package(&pkg_key("app"), None)
+            .await
+            .expect("serves from cache");
+
+        assert_eq!(
+            resolved.resolved_version, "1.2.0",
+            "the staged version is served, not the registry's newer latest"
+        );
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.body_hits.load(Ordering::SeqCst), 0);
+        // Tracking parity with the network path: the served set, the reported version,
+        // and the lockfile's staged version all recorded the load.
+        assert_eq!(provider.loaded_packages(), vec![pkg_key("app")]);
+        assert_eq!(
+            provider
+                .resolved_versions
+                .borrow()
+                .get(&pkg_key("app"))
+                .map(String::as_str),
+            Some("1.2.0")
+        );
+        assert_eq!(
+            provider
+                .lock
+                .borrow()
+                .find("smudgy://wbk/app")
+                .and_then(|entry| entry.last_resolved_version.as_deref()),
+            Some("1.2.0")
+        );
+        assert_eq!(
+            provider
+                .lock
+                .borrow()
+                .find("smudgy://wbk/app")
+                .and_then(|entry| entry.integrity.as_deref()),
+            None,
+            "integrity records what a load VERIFIED; a cache-first serve verifies \
+             nothing, so the stamp stays absent until a network-verified load"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_first_serve_leaves_a_prior_integrity_stamp_untouched() {
+        // The entry's `integrity` records the hash most recently VERIFIED. A
+        // cache-first serve of the same staged version verifies nothing, so a stamp
+        // left by an earlier network-verified load must survive it unchanged.
+        let registry = spawn_registry(&[]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            "",
+            "export const x = 1;",
+            &[],
+        ));
+        let mut entry = staged_lock_entry("smudgy://wbk/app", "1.2.0");
+        entry.integrity = Some("verified-earlier".into());
+        provider.lock.borrow_mut().packages.push(entry);
+
+        provider
+            .resolve_package(&pkg_key("app"), None)
+            .await
+            .expect("serves from cache");
+
+        assert_eq!(
+            provider
+                .lock
+                .borrow()
+                .find("smudgy://wbk/app")
+                .and_then(|e| e.integrity.as_deref().map(str::to_string)),
+            Some("verified-earlier".into()),
+            "the last VERIFIED stamp survives an unverified cache serve"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_first_serve_still_enforces_the_version_floor() {
+        // The floor re-check that guards the offline fallback guards the cache-first
+        // serve too: a cached version whose manifest floor exceeds this smudgy is
+        // refused, not served (and the network is still never consulted — the floor
+        // gate refuses before discovery could matter).
+        let registry = spawn_registry(&[]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            r#","min_smudgy_version":"999.0.0""#,
+            "export const x = 1;",
+            &[],
+        ));
+        provider
+            .lock
+            .borrow_mut()
+            .packages
+            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+
+        let err = provider
+            .resolve_package(&pkg_key("app"), None)
+            .await
+            .expect_err("the floor refuses the cached serve");
+
+        assert!(
+            err.to_string().contains("requires smudgy 999.0.0"),
+            "the refusal names the floor: {err}"
+        );
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            provider.loaded_packages().is_empty(),
+            "a refused serve leaves no code-load footprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stub_fetch_serves_the_staged_version_from_cache_with_no_footprint() {
+        // A stub fetch (track == false) of an installed producer resolves the SAME
+        // determined version the producer's isolate runs — its staged version, from
+        // the cache, with zero network (the registry's newer 9.9.9 must never be
+        // asked about, and a handle set from latest would be a phantom) — while
+        // keeping the no-footprint contract exactly: no served set, no reported
+        // version, no lockfile touch.
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "app",
+            version: "9.9.9",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const newer = 1;",
+        }]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            "",
+            "export const x = 1;",
+            &[],
+        ));
+        provider
+            .lock
+            .borrow_mut()
+            .packages
+            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+
+        let resolved = provider
+            .resolve_package_for_stub(&pkg_key("app"))
+            .await
+            .expect("the cache serves the stub");
+
+        assert_eq!(
+            resolved.resolved_version, "1.2.0",
+            "the stub resolves the staged version the producer's isolate runs"
+        );
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.body_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            provider.loaded_packages().is_empty(),
+            "a stub fetch lands nothing in the served set"
+        );
+        assert!(
+            provider.resolved_versions.borrow().is_empty(),
+            "a stub fetch reports no resolved version"
+        );
+        assert_eq!(
+            provider
+                .lock
+                .borrow()
+                .find("smudgy://wbk/app")
+                .and_then(|entry| entry.integrity.as_deref()),
+            None,
+            "a stub fetch stamps no resolution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn solve_closure_serves_staged_roots_from_cached_meta_with_zero_network() {
+        // The trusted/main pre-pass contract: an Auto root with a staged version solves
+        // AT that version, and the whole walk — root and dep edges alike — reads cached
+        // metas instead of the wire. The registry would serve a newer 9.9.9 latest, and
+        // must never even be asked.
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "app",
+            version: "9.9.9",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const newer = 1;",
+        }]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        warm_cache(
+            dir.path(),
+            &pkg_key("base"),
+            "1.0.0",
+            "",
+            "export const base = 1;",
+            &[],
+        );
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            "",
+            "export const x = 1;",
+            &[dep("base", "^1", "1.0.0")],
+        ));
+        provider
+            .lock
+            .borrow_mut()
+            .packages
+            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+
+        provider
+            .solve_closure(&["smudgy://wbk/app".to_string()])
+            .await;
+
+        assert!(provider.solve.borrow().is_some(), "the walk completed");
+        assert_eq!(
+            provider
+                .top_level_solved
+                .borrow()
+                .get(&pkg_key("app"))
+                .map(String::as_str),
+            Some("1.2.0"),
+            "the Auto root solved at its staged version, not the registry's latest"
+        );
+        assert_eq!(
+            registry.resolve_hits.load(Ordering::SeqCst),
+            0,
+            "a fully cached staged closure is walked without a single wire fetch"
+        );
+        assert_eq!(registry.body_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn closure_union_from_cache_folds_the_closure_and_fails_closed_on_gaps() {
+        let registry = spawn_registry(&[]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        // app@1.2.0 -> base@1.0.0, both metas cached: base grants `net`, app declares a
+        // version floor — the fold must union the one and carry the other.
+        warm_cache(
+            dir.path(),
+            &pkg_key("base"),
+            "1.0.0",
+            r#","permissions":{"net":["example.com"]}"#,
+            "export const base = 1;",
+            &[],
+        );
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            r#","min_smudgy_version":"0.1.0""#,
+            "export const x = 1;",
+            &[dep("base", "^1", "1.0.0")],
+        ));
+
+        let (union, floor) = provider
+            .closure_union_from_cache(&pkg_key("app"), "1.2.0")
+            .expect("a fully cached closure folds");
+        assert_eq!(
+            union.net,
+            vec!["example.com".to_string()],
+            "the dep's manifest permissions joined the union"
+        );
+        assert_eq!(
+            floor.refusal(&semver::Version::new(0, 0, 1)).as_deref(),
+            Some(
+                "app requires smudgy 0.1.0 or newer \u{2014} this smudgy is 0.0.1; \
+                 update smudgy to use it"
+            ),
+            "the root's floor was folded"
+        );
+
+        // A dep edge whose meta is NOT cached voids the whole fold — an incomplete
+        // union proves nothing, so the caller must fall back to the network path.
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("gappy"),
+            "1.0.0",
+            "",
+            "export const g = 1;",
+            &[dep("ghost", "^1", "1.0.0")],
+        ));
+        assert_eq!(
+            provider
+                .closure_union_from_cache(&pkg_key("gappy"), "1.0.0")
+                .map(|_| ()),
+            None,
+            "a missing dep meta fails the fold closed"
+        );
+        assert_eq!(
+            registry.resolve_hits.load(Ordering::SeqCst),
+            0,
+            "the disk fold never touches the network, complete or not"
         );
     }
 }

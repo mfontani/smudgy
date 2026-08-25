@@ -79,6 +79,13 @@ pub struct LockedPackage {
     /// The content hash most recently verified for `last_resolved_version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity: Option<String>,
+    /// An update offer the user dismissed ("Later"): the offered version. Suppresses
+    /// re-offering that update until a strictly newer version appears; cleared by
+    /// [`stage_resolved_version`] once the staged version reaches (or passes) it, so a
+    /// stale dismissal never outlives the offer it silenced. Absent for lockfiles
+    /// predating the field and whenever nothing is dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update_version: Option<String>,
     /// Whether the user has **trusted** this package, promoting it (and its closure) onto
     /// the trusted main isolate — allow-all, shared instances — instead of its own
     /// sandboxed per-package isolate (`script/PACKAGE-ISOLATES.md`). A per-profile
@@ -143,6 +150,7 @@ impl LockedPackage {
             mode,
             last_resolved_version: None,
             integrity: None,
+            dismissed_update_version: None,
             trusted: false,
             consented_permissions: None,
             enabled: true,
@@ -158,6 +166,19 @@ impl LockedPackage {
             UpdateMode::Pinned { version } => Some(version),
             UpdateMode::Auto => None,
         }
+    }
+
+    /// The concrete version this install is already staged to serve without consulting
+    /// the network: the user's pin, else the last resolution a load recorded. `None` for
+    /// a never-resolved [`UpdateMode::Auto`] install — the one case where version
+    /// discovery genuinely needs the cloud. A staged version names immutable published
+    /// content, so a resolve that has one can be served entirely from the local package
+    /// cache; version *movement* for an Auto install happens where this field is
+    /// advanced, not at load.
+    #[must_use]
+    pub fn staged_version(&self) -> Option<&str> {
+        self.pinned_version()
+            .or(self.last_resolved_version.as_deref())
     }
 }
 
@@ -628,6 +649,7 @@ pub fn record_resolution(
                 mode: UpdateMode::Auto,
                 last_resolved_version: Some(version.to_string()),
                 integrity: Some(integrity.to_string()),
+                dismissed_update_version: None,
                 trusted: false,
                 consented_permissions: None,
                 enabled: true,
@@ -637,6 +659,84 @@ pub fn record_resolution(
         }
         Ok(((), true))
     })
+}
+
+/// Advances the version an installed package is **staged** to serve
+/// ([`LockedPackage::staged_version`]) from *outside* a session — the background
+/// checker's write once it has verified `new_version` fits the consented grant and
+/// prefetched its content. Returns the `last_resolved_version` it replaced. Entry-level
+/// under [`LOCK_MUTATIONS`] with the no-resurrect rule: only an existing entry is
+/// mutated, never inserted, so an install uninstalled between the caller's sweep and
+/// this write stays uninstalled (the not-installed error reports that nothing was
+/// written). When the version actually moves, `integrity` is cleared — it records what
+/// a load last *verified*, and no load has served `new_version` yet; the next session
+/// load re-stamps it. A [`dismissed_update_version`](LockedPackage::dismissed_update_version)
+/// at or below `new_version` is cleared too, so only a strictly newer offer re-surfaces.
+///
+/// # Errors
+/// Returns an error if the package isn't installed (nothing is written), or the
+/// lockfile can't be loaded or saved.
+pub fn stage_resolved_version(
+    server_name: &str,
+    specifier: &str,
+    new_version: &str,
+) -> Result<Option<String>> {
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|p| p.specifier == specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        let previous = package
+            .last_resolved_version
+            .replace(new_version.to_string());
+        if previous.as_deref() != Some(new_version) {
+            package.integrity = None;
+        }
+        if package
+            .dismissed_update_version
+            .as_deref()
+            .is_some_and(|dismissed| !version_is_newer(dismissed, new_version))
+        {
+            package.dismissed_update_version = None;
+        }
+        Ok((previous, true))
+    })
+}
+
+/// Records that the user dismissed ("Later") the update offer for `version` of an
+/// already-installed package: the offer stays suppressed until a strictly newer version
+/// appears. Mirrors [`set_update_mode`].
+///
+/// # Errors
+/// Returns an error if the package isn't installed, or the lockfile can't be saved.
+pub fn set_dismissed_update_version(
+    server_name: &str,
+    specifier: &str,
+    version: &str,
+) -> Result<()> {
+    mutate_lock(server_name, |lock| {
+        let package = lock
+            .packages
+            .iter_mut()
+            .find(|p| p.specifier == specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        package.dismissed_update_version = Some(version.to_string());
+        Ok(((), true))
+    })
+}
+
+/// Whether `candidate` names a strictly newer version than `baseline` — semver order
+/// when both parse, else a conservative "different means newer" so an unparseable
+/// dismissal is kept rather than silently cleared.
+fn version_is_newer(candidate: &str, baseline: &str) -> bool {
+    match (
+        semver::Version::parse(candidate),
+        semver::Version::parse(baseline),
+    ) {
+        (Ok(candidate), Ok(baseline)) => candidate > baseline,
+        _ => candidate != baseline,
+    }
 }
 
 fn load_lock_in(dir: &Path) -> Result<SharedPackageLock> {
@@ -1013,6 +1113,7 @@ mod tests {
             },
             last_resolved_version: Some("1.2.0".into()),
             integrity: Some("sha256-abc".into()),
+            dismissed_update_version: None,
             trusted: false,
             consented_permissions: None,
             enabled: true,
@@ -1084,6 +1185,101 @@ mod tests {
         assert!(package.audio_used);
         assert_eq!(package.last_resolved_version.as_deref(), Some("2.0.0"));
         assert_eq!(package.integrity.as_deref(), Some("sha256-new"));
+    }
+
+    #[test]
+    fn stage_resolved_version_advances_and_returns_the_previous() {
+        use_temp_smudgy_home();
+        let server = "package-stage-advance";
+        let specifier = "smudgy://wbk/duo";
+        install_package(server, specifier, UpdateMode::Auto, true).unwrap();
+        record_resolution(server, specifier, "1.2.0", "sha256-old").unwrap();
+
+        let previous = stage_resolved_version(server, specifier, "1.3.0").unwrap();
+
+        assert_eq!(previous.as_deref(), Some("1.2.0"));
+        let saved = load_lock(server).unwrap();
+        let package = saved.find(specifier).unwrap();
+        assert_eq!(package.last_resolved_version.as_deref(), Some("1.3.0"));
+        assert_eq!(
+            package.integrity, None,
+            "no load has verified the newly staged version yet"
+        );
+        assert_eq!(package.mode, UpdateMode::Auto, "the mode is untouched");
+    }
+
+    #[test]
+    fn stage_resolved_version_never_resurrects_an_uninstalled_entry() {
+        use_temp_smudgy_home();
+        let server = "package-stage-no-resurrect";
+        let specifier = "smudgy://wbk/gone";
+        install_package(server, specifier, UpdateMode::Auto, true).unwrap();
+        uninstall_package(server, specifier).unwrap();
+
+        // The install vanished between the checker's sweep and its staging write: the
+        // call reports it did nothing, and the entry stays uninstalled.
+        let staged = stage_resolved_version(server, specifier, "2.0.0");
+
+        assert!(staged.is_err(), "an uninstalled entry is not staged");
+        assert_eq!(
+            load_lock(server).unwrap().find(specifier),
+            None,
+            "the uninstalled entry was not resurrected"
+        );
+    }
+
+    #[test]
+    fn staging_clears_a_dismissal_the_staged_version_reaches() {
+        use_temp_smudgy_home();
+        let server = "package-stage-dismissal";
+        let specifier = "smudgy://wbk/duo";
+        install_package(server, specifier, UpdateMode::Auto, true).unwrap();
+        record_resolution(server, specifier, "1.2.0", "sha256-old").unwrap();
+
+        // The user dismissed the 1.3.0 offer; staging 1.3.0 itself (a later grant, or
+        // the pane's explicit update) makes the dismissal moot.
+        set_dismissed_update_version(server, specifier, "1.3.0").unwrap();
+        stage_resolved_version(server, specifier, "1.3.0").unwrap();
+        assert_eq!(
+            load_lock(server)
+                .unwrap()
+                .find(specifier)
+                .unwrap()
+                .dismissed_update_version,
+            None,
+            "a dismissal at the staged version is cleared"
+        );
+
+        // A dismissal STRICTLY ahead of the staged version stays: 2.0.0 was refused,
+        // and advancing to 1.4.0 does not reach it.
+        set_dismissed_update_version(server, specifier, "2.0.0").unwrap();
+        stage_resolved_version(server, specifier, "1.4.0").unwrap();
+        assert_eq!(
+            load_lock(server)
+                .unwrap()
+                .find(specifier)
+                .unwrap()
+                .dismissed_update_version
+                .as_deref(),
+            Some("2.0.0"),
+            "a dismissal beyond the staged version survives"
+        );
+    }
+
+    #[test]
+    fn lockfiles_predating_dismissed_update_version_load_clean() {
+        // An old lockfile without the field parses to `None`, and an entry with
+        // nothing dismissed serializes without the key at all.
+        let entry: LockedPackage = serde_json::from_str(
+            r#"{"specifier":"smudgy://wbk/duo","mode":{"mode":"auto"},"last_resolved_version":"1.2.0","enabled":true}"#,
+        )
+        .expect("old lockfile entry parses");
+        assert_eq!(entry.dismissed_update_version, None);
+        let json = serde_json::to_string(&entry).expect("serializes");
+        assert!(
+            !json.contains("dismissed_update_version"),
+            "an absent dismissal writes no key: {json}"
+        );
     }
 
     #[test]

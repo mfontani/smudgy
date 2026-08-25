@@ -10,6 +10,7 @@ pub mod matchers;
 pub mod modules;
 pub mod naming;
 pub mod observed;
+pub mod package_updates;
 pub mod packages;
 pub mod persistence;
 pub mod profile;

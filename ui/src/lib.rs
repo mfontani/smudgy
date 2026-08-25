@@ -35,6 +35,7 @@ mod cloud_account;
 mod discord_presence;
 mod i18n;
 mod images;
+mod package_update_checker;
 mod pane_drag;
 mod pane_groups;
 pub mod prefs;
@@ -372,6 +373,22 @@ enum Message {
     /// from store-routed updates and daemon fan-outs (settings changes,
     /// script reloads, widget wake-ups).
     SessionAction(SessionId, session_store::Message),
+    /// A granted package update's staging task settled: on success, live-reload
+    /// the server's sessions so they pick the staged version up from cache; on
+    /// failure, surface a toast — the user granted, so silence would read as
+    /// "nothing happened" (`name` names the package for that toast).
+    PackageUpdateStaged {
+        server_name: String,
+        name: String,
+        result: Result<(), String>,
+    },
+    /// The once-per-open background package-update check settled: route its
+    /// toasts to the window hosting the owning session and echo its notices
+    /// into that session's terminal.
+    PackageCheckCompleted {
+        session_id: SessionId,
+        report: package_update_checker::CheckReport,
+    },
     NewSmudgyWindow(window::Id),
     /// The raw HWND of a freshly opened main window, delivered so the
     /// Windows-only native hooks can be installed on it: the Restart Manager
@@ -3323,6 +3340,105 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     smudgy.account.dismiss_upgrade_for_version();
                     task
                 }
+                Some(SmudgyWindowEvent::PackageReloadScripts { server_name }) => {
+                    // The toast's Reload scripts takes the same live-reload path
+                    // as the Automations window's ScriptsChanged: every session
+                    // on the server reloads (serving the staged versions from
+                    // cache, so the reload is near-instant).
+                    let reload_tasks = smudgy
+                        .sessions
+                        .iter()
+                        .filter(|(_, session)| session.server_name.as_str() == server_name.as_str())
+                        .map(|(session_id, _)| {
+                            Task::done(Message::SessionAction(
+                                session_id,
+                                session_store::Message::Reload,
+                            ))
+                        });
+                    Task::batch([task, Task::batch(reload_tasks)])
+                }
+                Some(SmudgyWindowEvent::PackageUpdateDismissed {
+                    server_name,
+                    specifier,
+                    version,
+                }) => {
+                    if let Err(e) =
+                        smudgy_core::models::shared_packages::set_dismissed_update_version(
+                            &server_name,
+                            &specifier,
+                            &version,
+                        )
+                    {
+                        log::warn!("failed to record the dismissed update for {specifier}: {e}");
+                    }
+                    task
+                }
+                Some(SmudgyWindowEvent::PackageUpdatePinned {
+                    server_name,
+                    specifier,
+                    version,
+                }) => {
+                    if let Err(e) = smudgy_core::models::shared_packages::set_update_mode(
+                        &server_name,
+                        &specifier,
+                        smudgy_core::models::shared_packages::UpdateMode::Pinned { version },
+                    ) {
+                        log::warn!("failed to pin {specifier}: {e}");
+                    }
+                    task
+                }
+                Some(SmudgyWindowEvent::PackageUpdateGranted { offer }) => {
+                    // Consent lands first — enforcement reads the lockfile, so the
+                    // staged closure union must already sit within it before any
+                    // reload can serve the new version.
+                    match smudgy_core::models::shared_packages::record_consent(
+                        &offer.server_name,
+                        &offer.specifier,
+                        &offer.new_union,
+                    ) {
+                        Ok(()) => {
+                            let handles = smudgy.account.handles();
+                            let client = smudgy_cloud::package_api::PackageApiClient::new(
+                                handles.base_url.as_str(),
+                                handles.credentials.clone(),
+                            );
+                            let server_name = offer.server_name.clone();
+                            let name = offer.name.clone();
+                            let stage = Task::perform(
+                                package_update_checker::stage_offer(client, *offer),
+                                move |result| Message::PackageUpdateStaged {
+                                    server_name: server_name.clone(),
+                                    name: name.clone(),
+                                    result,
+                                },
+                            );
+                            Task::batch([task, stage])
+                        }
+                        Err(e) => {
+                            log::warn!("failed to record consent for {}: {e}", offer.specifier);
+                            task
+                        }
+                    }
+                }
+                Some(SmudgyWindowEvent::OpenAutomationsForServer { server_name }) => {
+                    // The collapsed toast points at the Automations window, where
+                    // the per-package update cards live. Any of the server's
+                    // sessions works as the window's session context.
+                    let open = smudgy
+                        .sessions
+                        .iter()
+                        .find(|(_, session)| session.server_name.as_str() == server_name.as_str())
+                        .map(|(session_id, _)| {
+                            Task::done(Message::CreateAutomationsWindow {
+                                server_name: Arc::new(server_name.clone()),
+                                session_id,
+                            })
+                        });
+                    match open {
+                        Some(open) => Task::batch([task, open]),
+                        None => task,
+                    }
+                }
                 Some(SmudgyWindowEvent::PaneVisibilityToggled { slot, hidden }) => {
                     // The window flipped optimistically; the def lives on the
                     // pane's session runtime, which echoes `PaneUpdated` to
@@ -3573,10 +3689,27 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 _ => None,
             };
             let runtime_ready = matches!(event, SessionEvent::RuntimeReady(_));
+            // The once-per-open package-update check fires on the FIRST readiness
+            // only (a reload re-emits `RuntimeReady`), and only now — the load's
+            // own lockfile writes (`record_resolution`) are settled, so staging
+            // can never race them. The task is built before the session adopts
+            // its channel (which flips `has_runtime`), but runs after this
+            // update cycle returns.
+            let package_check = if runtime_ready
+                && smudgy
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|session| !session.has_runtime())
+            {
+                start_package_update_check(smudgy, session_id)
+            } else {
+                Task::none()
+            };
             if let Some(session) = smudgy.sessions.get_mut(session_id) {
                 let task = session
                     .update(session_store::Message::SessionEvent(event))
                     .map(move |msg| Message::SessionAction(session_id, msg));
+                let task = Task::batch([task, package_check]);
                 if runtime_ready {
                     // The runtime can accept reports now (the session just
                     // adopted its channel): flush the owed eyeball replays —
@@ -3720,6 +3853,76 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Task::none()
             }
         }
+        Message::PackageCheckCompleted { session_id, report } => {
+            if let Some(session) = smudgy.sessions.get(session_id) {
+                for notice in &report.notices {
+                    session.echo_notice(notice.clone());
+                }
+            }
+            if !report.toasts.is_empty() {
+                // Offers surface in the window hosting the session whose open
+                // triggered the check; a session torn down mid-check just drops
+                // them (the parked outcomes re-surface on the next open).
+                if let Some(window) = smudgy
+                    .smudgy_windows
+                    .values_mut()
+                    .find(|window| window.hosts_session(session_id))
+                {
+                    for toast in report.toasts {
+                        window.push_toast(toast);
+                    }
+                } else {
+                    log::info!("package-update toasts dropped: no window hosts the session");
+                }
+            }
+            Task::none()
+        }
+        Message::PackageUpdateStaged {
+            server_name,
+            name,
+            result,
+        } => match result {
+            Ok(()) => {
+                // The staged versions are on disk; a live reload serves them
+                // from cache, so it is near-instant.
+                let reload_tasks = smudgy
+                    .sessions
+                    .iter()
+                    .filter(|(_, session)| session.server_name.as_str() == server_name.as_str())
+                    .map(|(session_id, _)| {
+                        Task::done(Message::SessionAction(
+                            session_id,
+                            session_store::Message::Reload,
+                        ))
+                    });
+                Task::batch(reload_tasks)
+            }
+            Err(e) => {
+                // The lockfile was left unmoved, so nothing is half-staged; the
+                // consent record is simply ahead of the staged version, which a
+                // later check cycle reconciles as a plain within-consent update.
+                // The user GRANTED, though, so the failure must be visible: toast
+                // the window hosting one of the server's sessions.
+                log::warn!("failed to stage the granted update for {server_name}: {e}");
+                let hosting_window = smudgy
+                    .sessions
+                    .iter()
+                    .find(|(_, session)| session.server_name.as_str() == server_name.as_str())
+                    .map(|(session_id, _)| session_id)
+                    .and_then(|session_id| {
+                        smudgy
+                            .smudgy_windows
+                            .values_mut()
+                            .find(|window| window.hosts_session(session_id))
+                    });
+                if let Some(window) = hosting_window {
+                    window.push_toast(components::toast::Toast::StageFailed { server_name, name });
+                } else {
+                    log::info!("stage-failure toast dropped: no window hosts the server");
+                }
+                Task::none()
+            }
+        },
         Message::SessionAction(session_id, msg) => {
             #[cfg(feature = "web-audio-cpal")]
             if let session_store::Message::AudioOutputFailed(cause) = &msg {
@@ -4411,6 +4614,34 @@ fn purge_sessions_from_windows(smudgy: &mut Smudgy, dead: &[SessionId]) -> Task<
 /// the map (their `CloseWindow` event is in flight): counting them would let
 /// two independently-emptied windows each decide another survives, close both,
 /// and exit the app.
+/// Build the once-per-open background package-update check for `session_id`'s
+/// server: a fresh package client off the shared credential slot plus the context
+/// the checker's local-override rule needs. The report routes back through
+/// [`Message::PackageCheckCompleted`].
+fn start_package_update_check(smudgy: &Smudgy, session_id: SessionId) -> Task<Message> {
+    let Some(session) = smudgy.sessions.get(session_id) else {
+        return Task::none();
+    };
+    let handles = smudgy.account.handles();
+    let client = smudgy_cloud::package_api::PackageApiClient::new(
+        handles.base_url.as_str(),
+        handles.credentials.clone(),
+    );
+    let ctx = package_update_checker::CheckContext {
+        server_name: session.server_name.clone(),
+        account_nickname: handles
+            .snapshot
+            .get()
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.nickname.clone()),
+    };
+    Task::perform(
+        package_update_checker::run_session_check(client, ctx),
+        move |report| Message::PackageCheckCompleted { session_id, report },
+    )
+}
+
 fn close_emptied_windows(smudgy: &mut Smudgy, emptied: Vec<window::Id>) -> Task<Message> {
     let mut tasks: Vec<Task<Message>> = Vec::new();
     let mut remaining = smudgy

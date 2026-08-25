@@ -387,6 +387,33 @@ shell-visit-download = Odwiedź stronę pobierania
 shell-remind-later = Przypomnij później
 shell-skip-version = Pomiń tę wersję
 
+# Powiadomienia o aktualizacjach pakietów (dolna pigułka głównego okna)
+toast-package-updates-ready = Aktualizacje pakietów gotowe ({ $count })
+toast-package-reload-scripts = Przeładuj skrypty
+toast-package-ignore = Ignoruj
+toast-package-needs-permissions = Aktualizacja { $name } wymaga nowych uprawnień
+toast-package-review = Przejrzyj…
+toast-package-pin-current = Przypnij bieżącą
+toast-package-later = Później
+toast-package-attention = Aktualizacje pakietów wymagające uwagi: { $count }
+toast-package-open-automations = Przejrzyj w oknie automatyzacji
+toast-package-update-failed = Wystąpił błąd podczas pobierania aktualizacji { $name }. Aby spróbować ponownie, zamknij i otwórz ponownie tę sesję.
+
+# Okno przeglądu aktualizacji pakietu
+package-update-modal-title = Aktualizacja pakietu
+package-update-versions = { $current } → { $latest }
+package-update-version-new = Nowa wersja { $latest }
+package-update-asks = Ta aktualizacja wymaga dodatkowych uprawnień:
+package-update-needs-smudgy = Ta aktualizacja wymaga smudgy { $version } lub nowszego. Najpierw zaktualizuj smudgy.
+package-update-grant = Udziel zgody i zaktualizuj
+package-update-pin = Przypnij bieżącą wersję
+package-update-not-now = Nie teraz
+
+# Package-update terminal notices (echoed into the owning session)
+notice-package-deleted-uninstalled = [package] { $name } został usunięty przez wydawcę i został odinstalowany
+notice-package-update-ready = [package] aktualizacja { $name } { $from } → { $to } jest gotowa
+notice-package-staged-ready = [package] { $name } { $to } jest gotowy
+
 # Cloud errors
 cloud-error-email-unverified = Zweryfikuj swój adres e-mail, aby korzystać z tej funkcji.
 cloud-error-not-found = Nie znaleziono.
