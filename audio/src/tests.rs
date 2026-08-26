@@ -1569,6 +1569,22 @@ fn accepted_session_retirement_settles_after_device_failure_cleanup() {
 }
 
 #[test]
+fn late_session_retirement_uses_clean_terminal_output_proof() {
+    let probe = RenderProbe::default();
+    let service =
+        MixerService::start_with_driver::<TestBackend>(settings(probe.clone()), TEST_RATE).unwrap();
+    let session = service.add_session(AudioSessionId(290)).unwrap();
+
+    assert!(probe.fail_output());
+    eventually(|| service.owner_status.retired.load(Ordering::Acquire));
+
+    assert_eq!(block_on(session.retire()), Ok(()));
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, Some(MixerOutputFailure::BackendFailure));
+}
+
+#[test]
 fn gain_authorities_fail_typed_after_output_death_and_joined_shutdown() {
     let probe = RenderProbe::default();
     let service =
@@ -1628,6 +1644,31 @@ fn unproven_backend_join_never_false_acks_session_retirement() {
         assert!(!shutdown.clean);
         assert_eq!(
             block_on(retirement),
+            Err(MixerSessionRetirementError::OwnerUncertain)
+        );
+    }
+}
+
+#[test]
+fn late_session_retirement_never_false_acks_unproven_backend_join() {
+    for panic_close in [false, true] {
+        let service = MixerService::start_with_driver_and_limits::<UnjoinedBackend>(
+            UnjoinedSettings {
+                probe: RenderProbe::default(),
+                panic_close,
+            },
+            MixerFormat {
+                sample_rate: TEST_RATE,
+            },
+            1,
+            1,
+        )
+        .unwrap();
+        let session = service.add_session(AudioSessionId(340)).unwrap();
+
+        assert!(!service.shutdown().clean);
+        assert_eq!(
+            block_on(session.retire()),
             Err(MixerSessionRetirementError::OwnerUncertain)
         );
     }
@@ -1822,6 +1863,8 @@ fn session_retirement_queue_failure_is_typed_and_leaves_old_clones_inert() {
             id: AudioSessionId(28),
             generation: 1,
         }));
+        let (completion, retirement) = oneshot::channel();
+        let _completion = (!disconnected).then_some(completion);
         let stale_bus = MixerScriptBusHandle(MixerBusHandle {
             control: Arc::downgrade(&control),
             session: Arc::clone(&session),
@@ -1830,6 +1873,7 @@ fn session_retirement_queue_failure_is_typed_and_leaves_old_clones_inert() {
         let owner = MixerSessionOwner {
             control: Arc::downgrade(&control),
             session: Some(session),
+            retirement: Some(retirement),
         };
         let mut retirement = owner.retire();
         let safe_waker = Waker::from(Arc::new(WakeProbe::default()));
@@ -3038,7 +3082,9 @@ fn failure_notification_full_or_disconnect_retains_all_authority() {
         )
         .unwrap();
         let session = mixer.add_session(AudioSessionId(905)).unwrap();
-        let record = mixer.reserve(session.key, SessionBus::Script).unwrap();
+        let record = mixer
+            .reserve(session.control.key, SessionBus::Script)
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let observer_drops = Arc::new(AtomicUsize::new(0));
         let source_drops = Arc::new(AtomicUsize::new(0));
@@ -3098,13 +3144,12 @@ fn impossible_kira_track_undercount_terminalizes_with_structural_session_error()
     .unwrap();
     let retiring = mixer.add_session(AudioSessionId(950)).unwrap();
     let _sibling = mixer.add_session(AudioSessionId(951)).unwrap();
-    retiring.begin_close().unwrap();
-    let (completion, completed) = oneshot::channel();
+    retiring.control.begin_close().unwrap();
+    let completed = retiring.retirement;
     assert!(
         mixer
             .begin_session_retirement(SessionRetirementRequest {
-                key: retiring.key,
-                completion,
+                key: retiring.control.key,
             })
             .is_ok()
     );
@@ -3143,13 +3188,12 @@ fn stalled_render_callbacks_terminalize_session_retirement() {
     )
     .unwrap();
     let retiring = mixer.add_session(AudioSessionId(952)).unwrap();
-    retiring.begin_close().unwrap();
-    let (completion, completed) = oneshot::channel();
+    retiring.control.begin_close().unwrap();
+    let completed = retiring.retirement;
     assert!(
         mixer
             .begin_session_retirement(SessionRetirementRequest {
-                key: retiring.key,
-                completion,
+                key: retiring.control.key,
             })
             .is_ok()
     );

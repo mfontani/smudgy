@@ -1554,7 +1554,6 @@ struct SessionTrackHandles {
 }
 
 struct SessionRetirementState {
-    completion: oneshot::Sender<Result<(), MixerSessionRetirementError>>,
     clean: bool,
     failure: Option<MixerSessionRetirementError>,
     inputs_closed: bool,
@@ -1568,7 +1567,15 @@ struct SessionTracks {
     key: SessionKey,
     gain: MixerGainState,
     control: Arc<SessionControl>,
+    // Minted with this exact generation so terminal owner cleanup can resolve
+    // retirement even after it has stopped accepting retirement requests.
+    retirement_completion: Option<oneshot::Sender<Result<(), MixerSessionRetirementError>>>,
     retirement: Option<SessionRetirementState>,
+}
+
+struct OpenedMixerSession {
+    control: Arc<SessionControl>,
+    retirement: oneshot::Receiver<Result<(), MixerSessionRetirementError>>,
 }
 
 impl SessionTracks {
@@ -1675,7 +1682,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
     fn add_session(
         &mut self,
         id: AudioSessionId,
-    ) -> Result<Arc<SessionControl>, MixerMutationError> {
+    ) -> Result<OpenedMixerSession, MixerMutationError> {
         if let Some(session) = self.sessions.get(&id) {
             return Err(
                 if session.retirement.is_some() || session.control.is_closing() {
@@ -1747,6 +1754,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         let (script, script_pool) = build_bus(SessionBus::Script)?;
         let (native, native_pool) = build_bus(SessionBus::Native)?;
         let (speech, speech_pool) = build_bus(SessionBus::Speech)?;
+        let (retirement_completion, retirement) = oneshot::channel();
         self.sessions.insert(
             id,
             SessionTracks {
@@ -1758,10 +1766,14 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 key,
                 gain: MixerGainState::default(),
                 control: Arc::clone(&session_control),
+                retirement_completion: Some(retirement_completion),
                 retirement: None,
             },
         );
-        Ok(session_control)
+        Ok(OpenedMixerSession {
+            control: session_control,
+            retirement,
+        })
     }
 
     fn reserve(
@@ -1882,7 +1894,6 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             return Err(request);
         }
         session.retirement = Some(SessionRetirementState {
-            completion: request.completion,
             clean: session.control.cleanup_clean.load(Ordering::Acquire),
             failure: None,
             inputs_closed: false,
@@ -2100,7 +2111,11 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             } else {
                 Err(MixerSessionRetirementError::CleanupFailed)
             };
-            send_session_completion(retirement.completion, result);
+            let completion = session
+                .retirement_completion
+                .take()
+                .expect("retired session lost completion authority");
+            send_session_completion(completion, result);
         }
         true
     }
@@ -2108,19 +2123,28 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
     fn finish_session_retirements_after_backend(&mut self, backend_clean: bool) {
         let sessions = std::mem::take(&mut self.sessions);
         for (_, mut session) in sessions {
-            let Some(retirement) = session.retirement.take() else {
-                continue;
-            };
-            let result = if let Some(error) = retirement.failure {
+            let retirement = session.retirement.take();
+            let failure = retirement
+                .as_ref()
+                .and_then(|retirement| retirement.failure);
+            let clean = retirement.as_ref().map_or(
+                session.control.cleanup_clean.load(Ordering::Acquire),
+                |retirement| retirement.clean,
+            );
+            let result = if let Some(error) = failure {
                 Err(error)
-            } else if backend_clean && retirement.clean {
-                Ok(())
-            } else if backend_clean {
-                Err(MixerSessionRetirementError::CleanupFailed)
-            } else {
+            } else if !backend_clean {
                 Err(MixerSessionRetirementError::OwnerUncertain)
+            } else if clean {
+                Ok(())
+            } else {
+                Err(MixerSessionRetirementError::CleanupFailed)
             };
-            send_session_completion(retirement.completion, result);
+            let completion = session
+                .retirement_completion
+                .take()
+                .expect("terminal session lost completion authority");
+            send_session_completion(completion, result);
         }
     }
 
@@ -2183,7 +2207,13 @@ struct RetirementRequest {
 
 struct SessionRetirementRequest {
     key: SessionKey,
-    completion: oneshot::Sender<Result<(), MixerSessionRetirementError>>,
+}
+
+enum SessionRetirementSubmission {
+    Queued,
+    // The exact generation's pre-minted completion will be resolved by
+    // terminal cleanup or canceled if the owner exits without proof.
+    AwaitCompletion,
 }
 
 struct CleanupJob {
@@ -2213,7 +2243,7 @@ enum CleanupTask {
 enum OwnerCommand {
     AddSession(
         AudioSessionId,
-        SyncSender<Result<Arc<SessionControl>, MixerMutationError>>,
+        SyncSender<Result<OpenedMixerSession, MixerMutationError>>,
     ),
     Reserve(
         SessionKey,
@@ -2396,21 +2426,17 @@ impl ControlInner {
     fn submit_session_retirement(
         &self,
         request: SessionRetirementRequest,
-    ) -> Result<(), (MixerSessionRetirementError, SessionRetirementRequest)> {
+    ) -> Result<SessionRetirementSubmission, MixerSessionRetirementError> {
         let Ok(gate) = self.gate.lock() else {
-            return Err((MixerSessionRetirementError::OwnerUncertain, request));
+            return Err(MixerSessionRetirementError::OwnerUncertain);
         };
         if !gate.accepting_session_retirements {
-            return Err((MixerSessionRetirementError::OwnerUncertain, request));
+            return Ok(SessionRetirementSubmission::AwaitCompletion);
         }
         let result = match self.session_retirements.try_send(request) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(request)) => {
-                Err((MixerSessionRetirementError::QueueInvariant, request))
-            }
-            Err(TrySendError::Disconnected(request)) => {
-                Err((MixerSessionRetirementError::OwnerUncertain, request))
-            }
+            Ok(()) => Ok(SessionRetirementSubmission::Queued),
+            Err(TrySendError::Full(_)) => Err(MixerSessionRetirementError::QueueInvariant),
+            Err(TrySendError::Disconnected(_)) => Ok(SessionRetirementSubmission::AwaitCompletion),
         };
         drop(gate);
         result
@@ -2520,7 +2546,7 @@ impl From<MixerMutationError> for MixerControlError {
 /// Failure to prove exact retirement of one mixer session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixerSessionRetirementError {
-    /// The owner or retirement channel disappeared before accepting the work.
+    /// The owner or retirement channel disappeared without a clean terminal proof.
     OwnerUncertain,
     /// A queue invariant failed; the exact session remains sealed fail-closed.
     QueueInvariant,
@@ -3572,11 +3598,7 @@ typed_bus_handle!(MixerNativeBusHandle);
 typed_bus_handle!(MixerSpeechBusHandle);
 
 enum SessionRetirementReceiptState {
-    Accepted(oneshot::Receiver<Result<(), MixerSessionRetirementError>>),
-    RetainedError {
-        _request: SessionRetirementRequest,
-        error: MixerSessionRetirementError,
-    },
+    Awaiting(oneshot::Receiver<Result<(), MixerSessionRetirementError>>),
     Ready(Option<Result<(), MixerSessionRetirementError>>),
     Finished,
 }
@@ -3599,7 +3621,7 @@ impl Future for MixerSessionRetirement {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.state {
-            SessionRetirementReceiptState::Accepted(receiver) => {
+            SessionRetirementReceiptState::Awaiting(receiver) => {
                 match Pin::new(receiver).poll(cx) {
                     Poll::Ready(Ok(result)) => {
                         self.state = SessionRetirementReceiptState::Finished;
@@ -3612,7 +3634,6 @@ impl Future for MixerSessionRetirement {
                     Poll::Pending => Poll::Pending,
                 }
             }
-            SessionRetirementReceiptState::RetainedError { error, .. } => Poll::Ready(Err(*error)),
             SessionRetirementReceiptState::Ready(result) => Poll::Ready(
                 result
                     .take()
@@ -3628,34 +3649,27 @@ impl Future for MixerSessionRetirement {
 fn submit_session_retirement(
     session: &Arc<SessionControl>,
     control: &Weak<ControlInner>,
+    receiver: oneshot::Receiver<Result<(), MixerSessionRetirementError>>,
 ) -> MixerSessionRetirement {
     if let Err(error) = session.begin_close() {
         return MixerSessionRetirement {
             state: SessionRetirementReceiptState::Ready(Some(Err(error))),
         };
     }
-    let (completion, receiver) = oneshot::channel();
-    let request = SessionRetirementRequest {
-        key: session.key,
-        completion,
-    };
+    let request = SessionRetirementRequest { key: session.key };
     let Some(control) = control.upgrade() else {
         return MixerSessionRetirement {
-            state: SessionRetirementReceiptState::RetainedError {
-                _request: request,
-                error: MixerSessionRetirementError::OwnerUncertain,
-            },
+            state: SessionRetirementReceiptState::Awaiting(receiver),
         };
     };
     match control.submit_session_retirement(request) {
-        Ok(()) => MixerSessionRetirement {
-            state: SessionRetirementReceiptState::Accepted(receiver),
-        },
-        Err((error, request)) => MixerSessionRetirement {
-            state: SessionRetirementReceiptState::RetainedError {
-                _request: request,
-                error,
-            },
+        Ok(SessionRetirementSubmission::Queued | SessionRetirementSubmission::AwaitCompletion) => {
+            MixerSessionRetirement {
+                state: SessionRetirementReceiptState::Awaiting(receiver),
+            }
+        }
+        Err(error) => MixerSessionRetirement {
+            state: SessionRetirementReceiptState::Ready(Some(Err(error))),
         },
     }
 }
@@ -3668,6 +3682,7 @@ fn submit_session_retirement(
 pub struct MixerSessionOwner {
     control: Weak<ControlInner>,
     session: Option<Arc<SessionControl>>,
+    retirement: Option<oneshot::Receiver<Result<(), MixerSessionRetirementError>>>,
 }
 
 impl fmt::Debug for MixerSessionOwner {
@@ -3750,21 +3765,26 @@ impl MixerSessionOwner {
     /// Close this exact generation and return its proof-bearing retirement receipt.
     #[must_use = "session retirement is complete only after awaiting this receipt"]
     pub fn retire(mut self) -> MixerSessionRetirement {
-        let Some(session) = self.session.take() else {
+        let (Some(session), Some(retirement)) = (self.session.take(), self.retirement.take())
+        else {
             return MixerSessionRetirement {
                 state: SessionRetirementReceiptState::Ready(Some(Err(
                     MixerSessionRetirementError::Structural,
                 ))),
             };
         };
-        submit_session_retirement(&session, &self.control)
+        submit_session_retirement(&session, &self.control, retirement)
     }
 }
 
 impl Drop for MixerSessionOwner {
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            drop(submit_session_retirement(&session, &self.control));
+        if let (Some(session), Some(retirement)) = (self.session.take(), self.retirement.take()) {
+            drop(submit_session_retirement(
+                &session,
+                &self.control,
+                retirement,
+            ));
         }
     }
 }
@@ -4023,7 +4043,8 @@ fn add_session(
         .map_err(MixerControlError::from)?;
     Ok(MixerSessionOwner {
         control: Arc::downgrade(control),
-        session: Some(session),
+        session: Some(session.control),
+        retirement: Some(session.retirement),
     })
 }
 
@@ -4392,12 +4413,8 @@ fn drain_session_retirements<D: JoinedOutputDriver>(
     retirements: &Receiver<SessionRetirementRequest>,
 ) {
     for request in retirements.try_iter() {
-        if let Err(request) = mixer.begin_session_retirement(request) {
+        if mixer.begin_session_retirement(request).is_err() {
             mixer.cleanup_clean = false;
-            send_session_completion(
-                request.completion,
-                Err(MixerSessionRetirementError::Structural),
-            );
         }
     }
 }

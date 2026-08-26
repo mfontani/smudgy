@@ -1871,16 +1871,10 @@ async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
         assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
     }
 
-    // Once process output has failed, its owner has absorbingly stopped accepting session
-    // retirements. Explicit late retirement must report that uncertainty rather than false-ack.
-    assert_eq!(
-        target_registration.retire().await,
-        Err(smudgy_audio::MixerSessionRetirementError::OwnerUncertain)
-    );
-    assert_eq!(
-        sibling_registration.retire().await,
-        Err(smudgy_audio::MixerSessionRetirementError::OwnerUncertain)
-    );
+    // The stopped owner no longer accepts retirement requests, but its joined terminal cleanup
+    // resolves the exact generation receipts for both the failed and silent sessions.
+    assert_eq!(target_registration.retire().await, Ok(()));
+    assert_eq!(sibling_registration.retire().await, Ok(()));
     drop(target_scope);
     drop(sibling_scope);
     drop(target_script_bus);

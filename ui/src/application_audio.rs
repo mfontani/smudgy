@@ -3285,7 +3285,7 @@ mod tests {
 
         let report = application.shutdown();
         assert_eq!(report.sessions.len(), 1);
-        assert!(report.sessions[0].is_clean());
+        assert!(report.sessions[0].is_clean(), "{report}");
         assert!(matches!(
             report.output,
             ApplicationAudioOutputShutdown::Physical(MixerShutdown {
