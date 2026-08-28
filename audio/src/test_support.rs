@@ -305,7 +305,7 @@ struct TestDriver {
 impl JoinedOutputDriver for TestDriver {
     type Settings = TestDriverSettings;
     type Error = TestDriverError;
-    const CALLBACKS_RUN_AUTONOMOUSLY: bool = false;
+    const CALLBACK_STALL_POLICY: crate::CallbackStallPolicy = crate::CallbackStallPolicy::Manual;
 
     fn setup(
         settings: Self::Settings,
@@ -444,7 +444,7 @@ mod tests {
     use super::*;
     use crate::{
         AudioSessionId, MAX_PHYSICAL_CALLBACK_FRAMES, MixerControlError, MixerFrame, MixerInput,
-        MixerInputStatus, MixerOutputFailure, MixerStartupFailure, PhysicalSampleFormat,
+        MixerInputStatus, MixerOutputFailure, MixerStartupFailure,
     };
 
     struct LengthInput {
@@ -612,15 +612,7 @@ mod tests {
             ..TestDriverConfig::default()
         };
         let (service, probe) = start_test_mixer(48_000, config).unwrap();
-        let physical = service.physical_output_format();
-        assert_eq!(physical.sample_rate(), 48_000);
-        assert_eq!(physical.number_of_channels(), 2);
-        assert_eq!(physical.sample_format(), PhysicalSampleFormat::I16);
-        assert_eq!(physical.buffer_frames_hint(), Some(512));
-        assert_eq!(
-            physical.max_frames_per_callback(),
-            MAX_PHYSICAL_CALLBACK_FRAMES
-        );
+        assert_eq!(service.format().sample_rate(), 48_000);
         assert!(probe.provisional_callback_was_silent());
         assert_eq!(probe.setup_count(), 1);
         assert_eq!(probe.start_count(), 1);

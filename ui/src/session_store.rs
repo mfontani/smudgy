@@ -193,8 +193,6 @@ pub struct SessionStore {
     next_session_id: Option<SessionId>,
     #[cfg(feature = "web-audio-cpal")]
     audio: Option<ApplicationAudioController>,
-    #[cfg(feature = "web-audio-cpal")]
-    audio_degradation: Option<String>,
 }
 
 impl SessionStore {
@@ -206,8 +204,6 @@ impl SessionStore {
             next_session_id: Some(0.into()),
             #[cfg(feature = "web-audio-cpal")]
             audio: None,
-            #[cfg(feature = "web-audio-cpal")]
-            audio_degradation: None,
         }
     }
 
@@ -261,15 +257,6 @@ impl SessionStore {
             Ok(session) => session,
             Err(error) => return Err(error),
         };
-        #[cfg(feature = "web-audio-cpal")]
-        if let Some(cause) = session
-            .audio_unavailable_cause
-            .as_ref()
-            .and_then(crate::application_audio::SessionAudioUnavailable::system)
-        {
-            self.audio_degradation
-                .get_or_insert_with(|| cause.to_string());
-        }
         self.sessions.insert(session_id, session);
         Ok(session_id)
     }
@@ -296,11 +283,6 @@ impl SessionStore {
 
     pub fn iter(&self) -> impl Iterator<Item = (SessionId, &ManagedSession)> {
         self.sessions.iter().map(|(id, session)| (*id, session))
-    }
-
-    #[cfg(feature = "web-audio-cpal")]
-    pub fn take_audio_degradation(&mut self) -> Option<String> {
-        self.audio_degradation.take()
     }
 
     #[cfg(feature = "web-audio-cpal")]
@@ -696,8 +678,6 @@ pub enum Message {
     /// Reserved keyboard request bubbled to the hosting main window.
     #[cfg(feature = "web-audio-cpal")]
     OpenAudioPanel,
-    #[cfg(feature = "web-audio-cpal")]
-    AudioOutputFailed(String),
     /// A click released over the main pane's terminal (bubbled — the terminal
     /// deliberately leaves presses uncaptured). Focuses the session input
     /// when the click didn't create a selection.
@@ -1191,7 +1171,7 @@ impl ManagedSession {
     }
 
     #[cfg(feature = "web-audio-cpal")]
-    fn prepare_audio_reload(&mut self) -> Result<Option<String>, AudioReloadPreparationError> {
+    fn prepare_audio_reload(&mut self) -> Result<(), AudioReloadPreparationError> {
         // Resolve the exact package snapshot before touching any live state.
         // A malformed/unreadable lock must leave the old runtime, rows, and
         // hotkeys intact instead of silently staging an empty package set.
@@ -1216,7 +1196,7 @@ impl ManagedSession {
                 row.applied = false;
             }
             self.audio_packages = next_packages;
-            return Ok(None);
+            return Ok(());
         };
         if self.audio_unavailable_cause.is_some() {
             if self.audio_preference_only {
@@ -1232,7 +1212,7 @@ impl ManagedSession {
                 );
             }
             self.audio_packages = next_packages;
-            return Ok(None);
+            return Ok(());
         }
         let packages = next_packages.iter().filter(|row| !row.trusted).map(|row| {
             (
@@ -1253,7 +1233,7 @@ impl ManagedSession {
             Ok(()) => {
                 self.audio_gain = session_gain;
                 self.audio_packages = next_packages;
-                Ok(None)
+                Ok(())
             }
             Err(crate::application_audio::ApplicationAudioControlError::NotApplicable(cause)) => {
                 // Mixer-free registrations expose the saved desired policy as
@@ -1265,7 +1245,7 @@ impl ManagedSession {
                     row.applied = false;
                 }
                 self.audio_packages = next_packages;
-                Ok(None)
+                Ok(())
             }
             Err(error) => {
                 use crate::application_audio::{
@@ -1313,7 +1293,7 @@ impl ManagedSession {
                     }
                 }
                 self.audio_packages = next_packages;
-                Ok(output_failed.then(|| error.to_string()))
+                Ok(())
             }
         }
     }
@@ -2566,8 +2546,6 @@ impl ManagedSession {
             }
             #[cfg(feature = "web-audio-cpal")]
             Message::OpenAudioPanel => Task::none(),
-            #[cfg(feature = "web-audio-cpal")]
-            Message::AudioOutputFailed(_) => Task::none(),
             Message::LinkActivated(event) => {
                 self.handle_link_activation(event);
                 Task::none()
@@ -2998,8 +2976,8 @@ impl ManagedSession {
                     self.audio_preference_only,
                 );
                 #[cfg(feature = "web-audio-cpal")]
-                let audio_output_failure = match self.prepare_audio_reload() {
-                    Ok(failure) => failure,
+                match self.prepare_audio_reload() {
+                    Ok(()) => {}
                     Err(error) => {
                         log::error!(
                             "refusing script reload for session {} because its saved audio policy could not be staged safely: {error}",
@@ -3027,16 +3005,7 @@ impl ManagedSession {
                     return Task::none();
                 }
                 self.input.clear_hotkeys();
-                #[cfg(feature = "web-audio-cpal")]
-                {
-                    audio_output_failure.map_or_else(Task::none, |cause| {
-                        Task::done(Message::AudioOutputFailed(cause))
-                    })
-                }
-                #[cfg(not(feature = "web-audio-cpal"))]
-                {
-                    Task::none()
-                }
+                Task::none()
             }
             Message::Reconnect => {
                 info!("Connecting to server");

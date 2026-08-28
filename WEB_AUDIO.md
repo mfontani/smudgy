@@ -15,9 +15,19 @@ prevents the terminal client or Web Audio globals from starting. A no-argument
 default `AudioContext` and explicit `sinkId: "none"` both remain normal,
 joinable graphs backed by hosted silent output. The visible controls can save a
 next-physical-start preference in that emulated mode and label it "not
-applied." A stale or closing live session, inactive package scope, or output
-that dies after physical operation began is a visible control failure and is
-not persisted as a successful change.
+applied."
+
+After physical output starts, recoverable CPAL runtime events such as device
+loss, stream invalidation, backend failure, or stalled render callbacks rebuild
+the endpoint in process against the then-current compatible default device.
+The process mixer is retained, so its logical contexts, sessions, inputs, and
+volume/mute controls remain live. While no compatible default can be opened,
+the mixer advances silently and retries with bounded exponential backoff.
+Permanent or protocol-level backend errors, or any failure that leaves native
+stream teardown uncertain, still terminalize physical output for the launch
+and require a process restart. A stale or closing live session, inactive
+package scope, or terminal physical-output failure is a visible control failure
+and is not persisted as a successful change.
 
 ## Volume and mute controls
 
@@ -104,7 +114,7 @@ existing Restart Manager and rounded-frame native subclass hooks.
 | --- | --- | --- |
 | No feature (crate default) | Not installed in ordinary sessions | No audio device dependency |
 | `web-audio` | Available only to callers that construct an explicit audio-scoped session | An injected logical output, including `sinkId: "none"`; no CPAL device backend |
-| `web-audio-cpal` (official desktop packages) | Enables the desktop audio coordinator and includes `web-audio` | One shared default-device stream when available; otherwise default output and `sinkId: "none"` use hosted silent emulation |
+| `web-audio-cpal` (official desktop packages) | Enables the desktop audio coordinator and includes `web-audio` | One shared current-default-device stream when available; startup unavailability uses hosted silent emulation, while recoverable runtime loss retains and silently advances the process mixer as the physical endpoint retries |
 
 For a physical source build:
 
@@ -205,26 +215,48 @@ table is intentionally evidence-bounded:
 
 | Platform | Backend | Current runtime evidence | Still pending |
 | --- | --- | --- | --- |
-| Windows | WASAPI | Default-device stream open, suspend/resume, clean close, and immediate reopen | Packaged-app launch, audible playback, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, restart-only physical recovery, live removal, default-device change |
-| Linux Flatpak | ALSA via PulseAudio/PipeWire | None; release manifest and CI are configuration only on this Windows-authored checkpoint | Packaged-app runtime, playback, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, restart-only physical recovery, close/reopen, live removal, default-device change |
-| macOS | CoreAudio | None; release script and CI are configuration only on this Windows-authored checkpoint | Packaged-app runtime, playback, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, restart-only physical recovery, close/reopen, live removal, default-device change |
+| Windows | WASAPI | Default-device stream open, suspend/resume, clean close, and immediate reopen; injected runtime invalidation, missing-device retry, callback-stall rebuild, and terminal-failure classification | Packaged-app launch, audible playback and continuity, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, live removal/recovery, and default-route recovery |
+| Linux Flatpak | ALSA via PulseAudio/PipeWire | Injected runtime recovery and terminal-failure classification only; release manifest and CI compilation are not physical-backend runtime evidence | Packaged-app runtime, audible playback and continuity, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, close/reopen, live removal/recovery, and default-route recovery |
+| macOS | CoreAudio | Injected runtime recovery and terminal-failure classification only; release script and CI compilation are not physical-backend runtime evidence | Packaged-app runtime, audible playback and continuity, ordered application shutdown, manual no-device boot with time-advancing default and `"none"` contexts, truthful not-applied controls, close/reopen, live removal/recovery, and default-route recovery |
 
 Deterministic injected tests separately cover unavailable startup, a
 time-advancing emulated no-argument default context, `sinkId: "none"`, truthful
-not-applied controls, and restart-only physical recovery. Those proofs do not
-replace any packaged-app/manual gate, including a host with its device removed
-or disabled.
+not-applied controls, recoverable runtime invalidation, temporary absence of a
+compatible default device with silent mixer advancement and later reopen,
+callback-stall rebuild, preservation of installed inputs, and terminalization
+for permanent errors or unproven stream teardown. These are control-flow and
+ownership proofs against injected hosts. They do not establish that a real
+platform backend emits a particular event for removal or route change, nor do
+they replace any packaged-app/manual audible-continuity gate.
 
 For removal, keep at least two default-output contexts and one `sinkId: "none"`
-context alive. Confirm the first operational failure seals new physical
-admission and notifies each physical endpoint once, while the no-device context
-continues independently. Then close the sessions and confirm the application
-reports logical endpoint, callback/source, mixer-session, and physical-driver
-cleanup separately.
+context alive, with a stateful source or scheduled event that can demonstrate
+logical-time progress. Remove or disable the active output device and record
+the exact CPAL/backend classification. For a recoverable event, confirm that
+the existing contexts and sessions remain registered, new sessions and
+volume/mute controls remain usable, `sinkId: "none"` continues independently,
+and the physical output stays silent while no compatible default exists.
+Confirm the stateful source or scheduled event continues to advance through
+that silent interval. Restore a compatible device or select a compatible new
+default, then confirm automatic retry resumes audible output from the retained
+contexts without restarting and without resetting their saved or live control
+state. Finally close the sessions and confirm logical endpoint,
+callback/source, mixer-session, and physical-driver cleanup separately. If the
+backend instead reports a permanent/protocol error, or stream teardown cannot
+be proven, confirm that output terminalizes visibly and remains restart-only;
+record that path separately from recoverable device loss.
 
 For a default-device change, record whether the operating system keeps the
-existing stream alive or reports failure; Smudgy does not promise live migration
-in this release. A later service start should use the then-current default.
+existing stream alive, emits an advisory route-change notification, or
+invalidates the stream. Smudgy does not proactively replace a still-usable
+stream on an advisory notification. If the old stream is invalidated or its
+device is removed, confirm that the in-process recovery loop opens the
+then-current compatible default and retained contexts become audible there
+without a process restart. Also exercise a period with no compatible default
+and confirm silent advancement plus backoff before adding or selecting one.
+Until these checks are recorded on packaged Windows, Linux, and macOS builds,
+the injected tests are not evidence of backend-specific live-route behavior or
+audible continuity.
 
 Smudgy's shutdown proof covers its own joined physical-driver loop and exact
 logical callback/source retirement. CPAL and an operating-system backend may

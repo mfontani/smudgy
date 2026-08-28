@@ -9,6 +9,8 @@ use iced::widget::{center, text};
 use iced::window;
 use iced::window::settings::PlatformSpecific;
 use iced::{Point, Rectangle, Size, Subscription, Task};
+#[cfg(feature = "web-audio-cpal")]
+use smudgy_audio::{MixerOutputFailure, MixerOutputFailureReceiver};
 use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
 use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, Mapper};
 use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
@@ -102,6 +104,10 @@ pub(crate) const DOWNLOAD_URL: &str = "https://www.smudgy.org/download";
 struct Smudgy {
     #[cfg(feature = "web-audio-cpal")]
     audio_status: AudioBootStatus,
+    #[cfg(feature = "web-audio-cpal")]
+    pending_audio_announcement: Option<String>,
+    #[cfg(feature = "web-audio-cpal")]
+    terminal_audio_failure_presented: bool,
     #[cfg(feature = "web-audio-cpal")]
     audio_panel: AudioPanelState,
     account: CloudAccount,
@@ -225,12 +231,82 @@ impl AudioBootStatus {
                 "audio-output-unavailable",
                 "cause" => cause.as_ref()
             )),
-            Self::Failed(cause) => Some(i18n::t!(
-                "audio-output-failed",
-                "cause" => cause.as_ref()
-            )),
+            // Backend details remain in the log. The same concise localized
+            // event message is used for the banner, panel notice, and screen
+            // reader announcement.
+            Self::Failed(_) => Some(i18n::t!("audio-notice-output-dead")),
         }
     }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn apply_terminal_audio_failure(
+    status: &mut AudioBootStatus,
+    notice: &mut Option<String>,
+    presented: &mut bool,
+    failure: MixerOutputFailure,
+) -> Option<String> {
+    if *presented {
+        log::debug!("ignoring duplicate terminal physical audio output notification");
+        return None;
+    }
+    *presented = true;
+    let cause: Arc<str> = application_audio::ApplicationAudioControlError::OutputFailed(failure)
+        .to_string()
+        .into();
+    log::error!("physical audio output terminalized: {cause}");
+    *status = AudioBootStatus::Failed(cause);
+    let message = i18n::t!("audio-notice-output-dead");
+    *notice = Some(message.clone());
+    Some(message)
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_output_failure_task(receiver: Option<MixerOutputFailureReceiver>) -> Task<Message> {
+    receiver.map_or_else(Task::none, |receiver| {
+        Task::run(receiver, Message::AudioOutputTerminated)
+    })
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn audio_announcement_window<T>(
+    tracker: &pane_drag::WindowTracker,
+    main_windows: &BTreeMap<window::Id, T>,
+) -> Option<window::Id> {
+    tracker
+        .mru_order()
+        .into_iter()
+        .find(|id| main_windows.contains_key(id))
+        .or_else(|| main_windows.keys().next().copied())
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn announce_terminal_audio_failure<T>(
+    tracker: &pane_drag::WindowTracker,
+    main_windows: &BTreeMap<window::Id, T>,
+    pending: &mut Option<String>,
+    message: String,
+) -> Task<Message> {
+    use iced_runtime::window::AnnouncementPriority::Assertive;
+
+    if let Some(window_id) = audio_announcement_window(tracker, main_windows) {
+        window::announce(window_id, message, Assertive)
+    } else {
+        *pending = Some(message);
+        Task::none()
+    }
+}
+
+#[cfg(feature = "web-audio-cpal")]
+fn announce_pending_audio_failure(
+    pending: &mut Option<String>,
+    window_id: window::Id,
+) -> Task<Message> {
+    use iced_runtime::window::AnnouncementPriority::Assertive;
+
+    pending.take().map_or_else(Task::none, |message| {
+        window::announce(window_id, message, Assertive)
+    })
 }
 
 #[cfg(feature = "web-audio-cpal")]
@@ -339,6 +415,10 @@ enum Message {
     /// register it and land it on the Audio pane.
     #[cfg(feature = "web-audio-cpal")]
     NewAudioSettingsWindow(window::Id),
+    /// The shared physical mixer reached an absorbing terminal failure. This
+    /// is a one-shot event; recoverable endpoint interruptions stay internal.
+    #[cfg(feature = "web-audio-cpal")]
+    AudioOutputTerminated(MixerOutputFailure),
     #[cfg(feature = "web-audio-cpal")]
     AudioPanelTraverse {
         window_id: window::Id,
@@ -590,6 +670,7 @@ where
 
 fn init(
     #[cfg(feature = "web-audio-cpal")] audio: Option<application_audio::ApplicationAudioController>,
+    #[cfg(feature = "web-audio-cpal")] audio_output_failures: Option<MixerOutputFailureReceiver>,
     #[cfg(feature = "web-audio-cpal")] audio_status: AudioBootStatus,
     #[cfg(feature = "web-audio-cpal")] master_live: AudioGainSettings,
 ) -> (Smudgy, Task<Message>) {
@@ -681,11 +762,17 @@ fn init(
     let mut open_tasks: Vec<Task<Message>> = Vec::new();
     let (_id, open) = window::open(smudgy_window_settings());
     open_tasks.push(open.map(Message::NewSmudgyWindow));
+    #[cfg(feature = "web-audio-cpal")]
+    let audio_output_failure_task = audio_output_failure_task(audio_output_failures);
 
     (
         Smudgy {
             #[cfg(feature = "web-audio-cpal")]
             audio_status,
+            #[cfg(feature = "web-audio-cpal")]
+            pending_audio_announcement: None,
+            #[cfg(feature = "web-audio-cpal")]
+            terminal_audio_failure_presented: false,
             #[cfg(feature = "web-audio-cpal")]
             audio_panel: AudioPanelState {
                 focused_widgets: HashMap::new(),
@@ -727,6 +814,8 @@ fn init(
             account_task.map(Message::Account),
             reconcile_task,
             update_check_task,
+            #[cfg(feature = "web-audio-cpal")]
+            audio_output_failure_task,
         ]),
     )
 }
@@ -782,7 +871,7 @@ pub fn run() -> anyhow::Result<()> {
     i18n::activate(&startup_settings.locale);
 
     #[cfg(feature = "web-audio-cpal")]
-    let application_audio = application_audio::ApplicationAudio::start();
+    let mut application_audio = application_audio::ApplicationAudio::start();
     #[cfg(feature = "web-audio-cpal")]
     let mut audio_status = AudioBootStatus::from_availability(&application_audio.availability());
     #[cfg(feature = "web-audio-cpal")]
@@ -847,10 +936,23 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "web-audio-cpal")]
+    let audio_output_failures =
+        std::sync::Mutex::new(application_audio.take_output_failure_events());
+
+    #[cfg(feature = "web-audio-cpal")]
     let daemon = iced::daemon(
         move || {
+            // iced's boot callback is typed as `Fn`, even though it is called
+            // once. Interior mutability moves the unique receiver into that
+            // one initializer task without making it cloneable application
+            // state or a recurring subscription.
+            let audio_output_failures = audio_output_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             init(
                 Some(audio_controller.clone()),
+                audio_output_failures,
                 audio_status.clone(),
                 master_live,
             )
@@ -1578,7 +1680,6 @@ enum AudioAnnouncement {
     ChangeFailed,
     PreferenceSaved,
     PreferenceSaveFailed,
-    OutputFailed,
 }
 
 #[cfg(feature = "web-audio-cpal")]
@@ -1608,9 +1709,6 @@ fn localized_audio_announcement(
             translator.translate("audio-announcement-preference-save-failed"),
             Assertive,
         ),
-        AudioAnnouncement::OutputFailed => {
-            (translator.translate("audio-notice-output-dead"), Assertive)
-        }
     }
 }
 
@@ -1727,11 +1825,10 @@ fn handle_audio_control(
                     }
                 }
                 Err(error) => {
-                    if matches!(
-                        error,
-                        application_audio::ApplicationAudioControlError::OutputFailed(_)
-                    ) {
-                        smudgy.audio_status = AudioBootStatus::Failed(error.to_string().into());
+                    if let application_audio::ApplicationAudioControlError::OutputFailed(failure) =
+                        &error
+                    {
+                        return Task::done(Message::AudioOutputTerminated(failure.clone()));
                     }
                     smudgy.audio_panel.notice = Some(i18n::t!(
                         "audio-notice-failed",
@@ -1763,10 +1860,7 @@ fn handle_audio_control(
                 }
             }
         }
-        AudioControlRoute::Failed => {
-            smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
-            AudioAnnouncement::OutputFailed
-        }
+        AudioControlRoute::Failed => return Task::none(),
     };
     let notice = smudgy
         .audio_panel
@@ -1923,13 +2017,6 @@ fn spike_autosession_target() -> Option<(String, String)> {
 
 fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     let task = update_body(smudgy, message);
-    #[cfg(feature = "web-audio-cpal")]
-    if let Some(cause) = smudgy.sessions.take_audio_degradation()
-        && matches!(smudgy.audio_status, AudioBootStatus::Physical)
-    {
-        smudgy.audio_status = AudioBootStatus::Failed(cause.into());
-        smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
-    }
     // Structural pane mutations mark their window's grid dirty instead of
     // rebuilding eagerly; settling them here coalesces every mutation an
     // update cycle landed into one rebuild per window, re-deriving the
@@ -2874,6 +2961,23 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 scoped_audio_focus(id, master.clone()),
                 reveal_audio_focus(id, master),
             ])
+        }
+        #[cfg(feature = "web-audio-cpal")]
+        Message::AudioOutputTerminated(failure) => {
+            let Some(message) = apply_terminal_audio_failure(
+                &mut smudgy.audio_status,
+                &mut smudgy.audio_panel.notice,
+                &mut smudgy.terminal_audio_failure_presented,
+                failure,
+            ) else {
+                return Task::none();
+            };
+            announce_terminal_audio_failure(
+                &smudgy.window_tracker,
+                &smudgy.smudgy_windows,
+                &mut smudgy.pending_audio_announcement,
+                message,
+            )
         }
         #[cfg(feature = "web-audio-cpal")]
         Message::AudioPanelTraverse {
@@ -3924,11 +4028,6 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         },
         Message::SessionAction(session_id, msg) => {
-            #[cfg(feature = "web-audio-cpal")]
-            if let session_store::Message::AudioOutputFailed(cause) = &msg {
-                smudgy.audio_status = AudioBootStatus::Failed(cause.clone().into());
-                smudgy.audio_panel.notice = Some(i18n::t!("audio-notice-output-dead"));
-            }
             // Store-routed task continuations (notably script input.focus())
             // carry no window wrapper. Reconcile their confirmed focus edge
             // here so they obey the same single-focused-input invariant as a
@@ -4029,8 +4128,13 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             } else {
                 Task::none()
             };
+            #[cfg(feature = "web-audio-cpal")]
+            let audio_announcement =
+                announce_pending_audio_failure(&mut smudgy.pending_audio_announcement, id);
             Task::batch([
                 spike_task,
+                #[cfg(feature = "web-audio-cpal")]
+                audio_announcement,
                 // Install the Windows native hooks on this window's HWND:
                 // the Restart Manager shutdown watcher (installer upgrades
                 // over a running smudgy) and the WM_NCHITTEST chrome
@@ -7188,11 +7292,6 @@ mod tests {
                 "audio-announcement-preference-save-failed",
                 Assertive,
             ),
-            (
-                AudioAnnouncement::OutputFailed,
-                "audio-notice-output-dead",
-                Assertive,
-            ),
         ];
 
         for catalog in smudgy_i18n::available_catalogs() {
@@ -7301,6 +7400,173 @@ mod tests {
 
         assert_eq!(preferences, before);
         assert_eq!(preferences.sessions.len(), 256);
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn initializer_task_owns_buffered_terminal_output_receiver() {
+        use iced_runtime::futures::futures::StreamExt;
+
+        let (mut sender, receiver) = futures::channel::mpsc::channel(1);
+        sender
+            .try_send(MixerOutputFailure::BackendFailure)
+            .expect("the terminal event is buffered before iced initialization");
+        drop(sender);
+
+        let task = audio_output_failure_task(Some(receiver));
+        assert_eq!(task.units(), 1);
+        let mut stream = iced_runtime::task::into_stream(task).expect("initializer task stream");
+        let action = futures::executor::block_on(stream.next())
+            .expect("buffered terminal event is delivered immediately");
+        assert!(matches!(
+            action,
+            iced_runtime::Action::Output(Message::AudioOutputTerminated(
+                MixerOutputFailure::BackendFailure
+            ))
+        ));
+        assert!(futures::executor::block_on(stream.next()).is_none());
+        assert_eq!(audio_output_failure_task(None).units(), 0);
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn terminal_output_uses_generic_message_and_is_presented_once() {
+        let boot_failure = Arc::from("failure observed while applying startup policy");
+        let mut status = AudioBootStatus::Failed(Arc::clone(&boot_failure));
+        let mut notice = None;
+        let mut presented = false;
+        let message = apply_terminal_audio_failure(
+            &mut status,
+            &mut notice,
+            &mut presented,
+            MixerOutputFailure::BackendFailure,
+        )
+        .expect("the buffered event still presents a failure already seen during boot");
+        assert_eq!(message, i18n::t!("audio-notice-output-dead"));
+        assert_eq!(notice.as_deref(), Some(message.as_str()));
+        assert_eq!(status.banner().as_deref(), Some(message.as_str()));
+        assert!(!message.contains("BackendFailure"));
+
+        assert!(
+            apply_terminal_audio_failure(
+                &mut status,
+                &mut notice,
+                &mut presented,
+                MixerOutputFailure::BackendFailure,
+            )
+            .is_none(),
+            "a duplicate observation cannot create a second notice or announcement"
+        );
+        assert_eq!(notice.as_deref(), Some(message.as_str()));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn terminal_output_prefers_the_mru_tracked_main_window() {
+        use iced_runtime::futures::futures::{FutureExt, StreamExt};
+        use iced_runtime::window::AnnouncementPriority::Assertive;
+
+        let older = window::Id::unique();
+        let recent = window::Id::unique();
+        let non_main = window::Id::unique();
+        let mut tracker = pane_drag::WindowTracker::default();
+        tracker.apply(older, pane_drag::TrackEvent::Focused);
+        tracker.apply(recent, pane_drag::TrackEvent::Focused);
+        tracker.apply(non_main, pane_drag::TrackEvent::Focused);
+        let main_windows = BTreeMap::from([(older, ()), (recent, ())]);
+        assert_eq!(
+            audio_announcement_window(&tracker, &main_windows),
+            Some(recent)
+        );
+
+        let mut pending = None;
+        let message = i18n::t!("audio-notice-output-dead");
+        let task =
+            announce_terminal_audio_failure(&tracker, &main_windows, &mut pending, message.clone());
+        assert!(pending.is_none());
+        let mut stream = iced_runtime::task::into_stream(task).expect("announcement task stream");
+        let action = stream
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("assertive announcement action");
+        assert!(matches!(
+            action,
+            iced_runtime::Action::Window(iced_runtime::window::Action::Announce(
+                id,
+                ref text,
+                Assertive,
+            )) if id == recent && text == &message
+        ));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn terminal_output_before_a_window_is_flushed_when_one_opens() {
+        use iced_runtime::futures::futures::{FutureExt, StreamExt};
+        use iced_runtime::window::AnnouncementPriority::Assertive;
+
+        let early = "early terminal audio failure".to_string();
+        let mut pending = None;
+        let task = announce_terminal_audio_failure(
+            &pane_drag::WindowTracker::default(),
+            &BTreeMap::<window::Id, ()>::new(),
+            &mut pending,
+            early.clone(),
+        );
+        assert_eq!(task.units(), 0);
+        assert_eq!(pending.as_deref(), Some(early.as_str()));
+
+        let first = window::Id::unique();
+        let task = announce_pending_audio_failure(&mut pending, first);
+        assert!(pending.is_none());
+        let mut stream = iced_runtime::task::into_stream(task).expect("deferred announcement");
+        let action = stream
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("deferred assertive announcement action");
+        assert!(matches!(
+            action,
+            iced_runtime::Action::Window(iced_runtime::window::Action::Announce(
+                id,
+                ref text,
+                Assertive,
+            )) if id == first && text == &early
+        ));
+    }
+
+    #[cfg(feature = "web-audio-cpal")]
+    #[test]
+    fn terminal_output_uses_an_existing_main_window_before_tracking_arrives() {
+        use iced_runtime::futures::futures::{FutureExt, StreamExt};
+        use iced_runtime::window::AnnouncementPriority::Assertive;
+
+        let first = window::Id::unique();
+        let main_windows = BTreeMap::from([(first, ())]);
+        let message = "terminal audio failure during tracking startup".to_string();
+        let mut pending = None;
+        let task = announce_terminal_audio_failure(
+            &pane_drag::WindowTracker::default(),
+            &main_windows,
+            &mut pending,
+            message.clone(),
+        );
+        assert!(pending.is_none());
+        let mut stream = iced_runtime::task::into_stream(task).expect("announcement task");
+        let action = stream
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("assertive announcement action");
+        assert!(matches!(
+            action,
+            iced_runtime::Action::Window(iced_runtime::window::Action::Announce(
+                id,
+                ref text,
+                Assertive,
+            )) if id == first && text == &message
+        ));
     }
 
     #[cfg(feature = "web-audio-cpal")]
@@ -7971,40 +8237,52 @@ mod tests {
 
     #[cfg(feature = "web-audio-cpal")]
     #[test]
-    fn confirmed_post_start_output_death_still_opens_terminal_and_reports_degradation() {
+    fn terminal_driver_state_makes_later_sessions_emulated_without_ui_latch() {
         let _core_runtime_lock = application_audio::lock_core_runtime_test();
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test Tokio runtime");
         let _tokio_guard = tokio.enter();
-        let (application, probe) = application_audio::test_application_audio_with_core_runtime();
+        let (mut application, probe) =
+            application_audio::test_application_audio_with_core_runtime();
+        let mut failures = application
+            .take_output_failure_events()
+            .expect("physical application exposes its unique terminal event receiver");
+        let _renderer = application_audio::TestAudioRenderer::start(probe.clone());
         let controller = application.controller();
-        assert!(probe.fail_output());
-        assert!(matches!(
-            controller.set_master_muted(true),
-            Err(application_audio::ApplicationAudioControlError::OutputFailed(_))
-        ));
         let (ui_commands, _ui_events) = smudgy_core::session::ui_command::channel();
         let mut sessions = SessionStore::with_ui_commands_and_audio(
             crate::cloud_account::test_handles(),
             ui_commands,
             controller,
         );
-        let session_id = sessions
+        // The application-global receiver remains live without any session.
+        assert!(probe.fail_output());
+        let failure = futures::executor::block_on(async {
+            use futures::StreamExt;
+            failures.next().await
+        })
+        .expect("the global receiver wakes without a session or timer poll");
+        assert_eq!(failure, MixerOutputFailure::BackendFailure);
+
+        let later = sessions
             .open_session(
                 "missing-dead-output-server".to_string(),
-                "offline-profile".to_string(),
+                "emulated-profile".to_string(),
                 false,
             )
-            .expect("audio failure never blocks the terminal");
+            .expect("terminal output failure never blocks a later terminal session");
 
-        assert!(smudgy_core::session::registry::get_runtime(session_id).is_some());
-        assert!(sessions.take_audio_degradation().is_some());
-        assert!(sessions.shutdown_and_remove(session_id));
+        assert!(smudgy_core::session::registry::get_runtime(later).is_some());
+        assert!(!sessions.uses_physical_audio_for_test(later));
+        assert!(sessions.shutdown_and_remove(later));
         let report = application.shutdown();
         assert_eq!(report.sessions.len(), 1);
-        assert!(report.sessions[0].is_clean());
+        assert!(
+            report.sessions.iter().all(|session| session.is_clean()),
+            "{report}"
+        );
         assert!(
             report.is_clean(),
             "the retained output death stays visible without turning proven cleanup into a failed exit"

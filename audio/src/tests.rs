@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::*;
-use futures::executor::block_on;
+use futures::{StreamExt, executor::block_on};
 
 const TEST_RATE: u32 = 48_000;
 
@@ -95,7 +95,7 @@ fn record_backend_owner(threads: &Mutex<Vec<thread::ThreadId>>, enforce_owner_th
 impl JoinedOutputDriver for TestBackend {
     type Settings = TestBackendSettings;
     type Error = TestBackendError;
-    const CALLBACKS_RUN_AUTONOMOUSLY: bool = false;
+    const CALLBACK_STALL_POLICY: CallbackStallPolicy = CallbackStallPolicy::Manual;
 
     fn setup(
         settings: Self::Settings,
@@ -168,6 +168,34 @@ impl Drop for TestBackend {
     }
 }
 
+struct MixerManagedTestBackend(TestBackend);
+
+impl JoinedOutputDriver for MixerManagedTestBackend {
+    type Settings = TestBackendSettings;
+    type Error = TestBackendError;
+
+    fn setup(
+        settings: Self::Settings,
+        internal_buffer_size: usize,
+        failures: DriverFailureSignal,
+    ) -> Result<(Self, PhysicalOutputFormat), Self::Error> {
+        let (driver, format) = TestBackend::setup(settings, internal_buffer_size, failures)?;
+        Ok((Self(driver), format))
+    }
+
+    fn start(&mut self, renderer: JoinedRenderer) -> Result<(), Self::Error> {
+        self.0.start(renderer)
+    }
+
+    fn play(&mut self) -> Result<(), Self::Error> {
+        self.0.play()
+    }
+
+    fn close_and_join(&mut self) -> bool {
+        self.0.close_and_join()
+    }
+}
+
 struct UnjoinedBackend {
     probe: RenderProbe,
     panic_close: bool,
@@ -181,7 +209,7 @@ struct UnjoinedSettings {
 impl JoinedOutputDriver for UnjoinedBackend {
     type Settings = UnjoinedSettings;
     type Error = TestBackendError;
-    const CALLBACKS_RUN_AUTONOMOUSLY: bool = false;
+    const CALLBACK_STALL_POLICY: CallbackStallPolicy = CallbackStallPolicy::Manual;
 
     fn setup(
         settings: Self::Settings,
@@ -448,6 +476,15 @@ fn test_control(
     let driver_status = Arc::new(DriverStatus::new());
     assert!(driver_status.mark_live());
     let (session_retirements, _session_retirement_receiver) = mpsc::sync_channel(1);
+    test_control_with_status(commands, retirements, session_retirements, driver_status)
+}
+
+fn test_control_with_status(
+    commands: SyncSender<OwnerCommand>,
+    retirements: SyncSender<RetirementRequest>,
+    session_retirements: SyncSender<SessionRetirementRequest>,
+    driver_status: Arc<DriverStatus>,
+) -> Arc<ControlInner> {
     Arc::new(ControlInner {
         gate: Mutex::new(GateState {
             production_sealed: false,
@@ -3172,7 +3209,7 @@ fn impossible_kira_track_undercount_terminalizes_with_structural_session_error()
 }
 
 #[test]
-fn stalled_render_callbacks_terminalize_session_retirement() {
+fn stalled_render_callbacks_get_post_resume_grace_then_terminalize() {
     let status = Arc::new(DriverStatus::new());
     let probe = RenderProbe::default();
     let mut backend_settings = settings(probe);
@@ -3215,12 +3252,163 @@ fn stalled_render_callbacks_terminalize_session_retirement() {
     mixer.reported_sub_track_count = Some(1);
     mixer.session_track_retirement_timeout = Some(SESSION_TRACK_RETIREMENT_TIMEOUT);
 
+    assert!(mixer.complete_rendered_session_retirements(&status));
+    assert_eq!(status.failure(), None);
+    assert!(
+        mixer.sessions[&AudioSessionId(952)]
+            .retirement
+            .as_ref()
+            .unwrap()
+            .callback_stall
+            .is_some()
+    );
+
+    // A callback arriving after the owner wakes proves the device made
+    // progress and restarts the full grace period.
+    status.record_render_callback();
+    assert!(mixer.complete_rendered_session_retirements(&status));
+    assert_eq!(status.failure(), None);
+    mixer
+        .sessions
+        .get_mut(&AudioSessionId(952))
+        .unwrap()
+        .retirement
+        .as_mut()
+        .unwrap()
+        .callback_stall
+        .as_mut()
+        .unwrap()
+        .observed_at = Instant::now()
+        .checked_sub(SESSION_TRACK_RETIREMENT_TIMEOUT)
+        .expect("the monotonic clock has advanced past the retirement timeout");
+
     assert!(!mixer.complete_rendered_session_retirements(&status));
-    assert_eq!(status.failure(), Some(MixerOutputFailure::BackendFailure));
+    assert_eq!(status.failure(), Some(MixerOutputFailure::CallbackStalled));
     assert!(!mixer.cleanup_clean);
     assert!(retire_backend(&mut mixer));
     mixer.finish_session_retirements_after_backend(true);
     assert_eq!(block_on(completed).unwrap(), Ok(()));
+}
+
+#[test]
+fn mixer_managed_retirement_stall_publishes_terminal_event_before_owner_exit() {
+    let status = Arc::new(DriverStatus::new());
+    let probe = RenderProbe::default();
+    let mut backend_settings = settings(probe);
+    backend_settings.enforce_owner_thread = false;
+    let backend_closes = Arc::clone(&backend_settings.backend_closes);
+    let backend_drops = Arc::clone(&backend_settings.backend_drops);
+    let (mut mixer, _) = MixerCore::<MixerManagedTestBackend>::with_limits(
+        backend_settings,
+        Arc::clone(&status),
+        MixerFormat {
+            sample_rate: TEST_RATE,
+        },
+        1,
+        1,
+    )
+    .unwrap();
+    let retiring = mixer.add_session(AudioSessionId(953)).unwrap();
+    retiring.control.begin_close().unwrap();
+    let completed = retiring.retirement;
+    assert!(
+        mixer
+            .begin_session_retirement(SessionRetirementRequest {
+                key: retiring.control.key,
+            })
+            .is_ok()
+    );
+    mixer.close_drained_session_inputs();
+    mixer.drop_ready_session_tracks();
+    let stale = Instant::now()
+        .checked_sub(SESSION_TRACK_RETIREMENT_TIMEOUT)
+        .unwrap();
+    let retirement = mixer
+        .sessions
+        .get_mut(&AudioSessionId(953))
+        .unwrap()
+        .retirement
+        .as_mut()
+        .unwrap();
+    retirement.tracks_dropped_at = Some(stale);
+    retirement.callback_stall = Some(CallbackStallObservation {
+        epoch: status.callback_epoch(),
+        observed_at: stale,
+    });
+    // Kira still reports the dropped track because this test driver never
+    // advances callbacks autonomously.
+    mixer.reported_sub_track_count = Some(1);
+
+    let (commands_sender, commands) = mpsc::sync_channel(1);
+    let (retirements_sender, retirements) = mpsc::sync_channel(1);
+    let (session_retirements_sender, session_retirements) = mpsc::sync_channel(1);
+    let control = test_control_with_status(
+        commands_sender,
+        retirements_sender,
+        session_retirements_sender,
+        Arc::clone(&status),
+    );
+    let control_weak = Arc::downgrade(&control);
+    let (cleanup_sender, cleanup_receiver) = mpsc::sync_channel(1);
+    let (cleanup_results_sender, cleanup_results) = mpsc::sync_channel(1);
+    let cleanup_owner = thread::spawn(move || {
+        run_cleanup_worker(&cleanup_receiver, &cleanup_results_sender);
+    });
+    let (failure_sender, mut failures) = futures_mpsc::channel(1);
+    let mut output_failure_sender = Some(failure_sender);
+    let mut pending = Vec::new();
+
+    run_active_owner(
+        &mut mixer,
+        &commands,
+        &retirements,
+        &session_retirements,
+        &cleanup_sender,
+        &cleanup_results,
+        &control_weak,
+        &mut pending,
+        &status,
+        &mut output_failure_sender,
+    );
+
+    assert_eq!(status.failure(), Some(MixerOutputFailure::CallbackStalled));
+    assert!(lock_recover(&control.gate).production_sealed);
+    assert_eq!(
+        block_on(failures.next()),
+        Some(MixerOutputFailure::CallbackStalled)
+    );
+    assert_eq!(block_on(failures.next()), None);
+    assert!(!terminal_owner_cleanup(
+        &mut mixer,
+        &retirements,
+        &session_retirements,
+        &control_weak,
+        &mut pending,
+        cleanup_sender,
+        &cleanup_results,
+        cleanup_owner,
+        &status,
+    ));
+    assert_eq!(block_on(completed).unwrap(), Ok(()));
+    assert_eq!(backend_closes.load(Ordering::Relaxed), 1);
+    assert_eq!(backend_drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn manual_driver_disables_wall_clock_stall_detection_except_when_injected() {
+    assert_eq!(
+        TestBackend::CALLBACK_STALL_POLICY,
+        CallbackStallPolicy::Manual
+    );
+    assert_eq!(
+        MixerCore::<TestBackend>::rendered_session_retirement_timeout(None),
+        None
+    );
+    let injected = Duration::from_millis(7);
+    assert_eq!(
+        MixerCore::<TestBackend>::rendered_session_retirement_timeout(Some(injected)),
+        Some(injected)
+    );
 }
 
 #[test]
