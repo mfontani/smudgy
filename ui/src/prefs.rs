@@ -321,6 +321,8 @@ pub struct TerminalPrefs {
     /// ECHO`). Negotiation is answered either way; this only gates whether
     /// the input masks. Non-visual, so it never bumps `generation`.
     pub mask_input_on_server_echo: bool,
+    /// Whether Up/Down history-prefix matching is case-sensitive.
+    pub history_case_sensitive_match: bool,
     /// Hide pane headers unless the window's toolbar is expanded (the
     /// distraction-free rule; per-pane `always-show` overrides it). Read per
     /// frame by the pane-grid view; chrome-level, so it never bumps
@@ -390,6 +392,7 @@ impl TerminalPrefs {
             theme_extended_colors: settings.theme_extended_colors,
             command_input_behavior: settings.command_input_behavior,
             mask_input_on_server_echo: settings.mask_input_on_server_echo,
+            history_case_sensitive_match: settings.history_case_sensitive_match,
             hide_pane_headers: settings.hide_pane_headers,
             generation,
         }
@@ -595,6 +598,21 @@ pub fn apply(settings: &Settings) {
     }
     publish_markdown_colors(&next.palette);
     PREFS.store(Arc::new(next));
+}
+
+/// Serialize tests that call [`apply`] against the process-wide `PREFS`
+/// global, as `cargo test` runs tests in parallel threads within one process.
+/// Only tests that actually call `apply` need this; reading [`current`]
+/// against the untouched default (as most tests already do, e.g.
+/// `command_input_behavior` assertions elsewhere) needs no lock.
+#[cfg(test)]
+static PREFS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_prefs_test() -> std::sync::MutexGuard<'static, ()> {
+    PREFS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Resolves the Markdown-widget colors for the effective palette and publishes

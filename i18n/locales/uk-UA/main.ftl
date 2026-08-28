@@ -148,6 +148,8 @@ preferences-discord-rich-presence-help = Відображає напис «Playi
 preferences-updates = Оновлення
 preferences-auto-updates = Автоматично перевіряти наявність оновлень
 preferences-mask-password-input = Приховувати введений текст, коли сервер запитує пароль
+preferences-history-case-sensitive-match = Враховувати регістр при пошуку в історії
+preferences-history-case-sensitive-match-help = Up/Down перебирає лише записи історії, що починаються з тексту, який залишився невиділеним. Вимкнено за замовчуванням — пошук без урахування регістру; увімкніть для точного збігу регістру.
 preferences-invalid-value = некоректне значення
 
 # Theme editor

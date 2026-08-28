@@ -169,6 +169,7 @@ pub enum Message {
     PrefRawPrefixSubmitted,
     PrefCommandInputBehaviorSelected(CommandInputBehavior),
     PrefMaskOnServerEchoToggled(bool),
+    PrefHistoryCaseSensitiveMatchToggled(bool),
     PrefHidePaneHeadersToggled(bool),
     PrefLoggingToggled(bool),
     PrefRawLoggingToggled(bool),
@@ -768,6 +769,10 @@ impl SettingsWindow {
             }
             Message::PrefMaskOnServerEchoToggled(mask) => {
                 self.settings.mask_input_on_server_echo = mask;
+                self.settings_changed()
+            }
+            Message::PrefHistoryCaseSensitiveMatchToggled(enabled) => {
+                self.settings.history_case_sensitive_match = enabled;
                 self.settings_changed()
             }
             Message::PrefHidePaneHeadersToggled(hide) => {
@@ -1524,6 +1529,15 @@ impl SettingsWindow {
                      dots instead of your text (with an eye button to peek). Turn off \
                      to keep your typing visible.",
                 ),
+            ]
+            .spacing(2),
+        );
+        col = col.push(
+            column![
+                checkbox(self.settings.history_case_sensitive_match)
+                    .label(t!("preferences-history-case-sensitive-match"))
+                    .on_toggle(Message::PrefHistoryCaseSensitiveMatchToggled),
+                dim_text_owned(t!("preferences-history-case-sensitive-match-help")),
             ]
             .spacing(2),
         );

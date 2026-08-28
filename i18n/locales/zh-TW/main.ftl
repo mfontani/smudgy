@@ -142,6 +142,8 @@ preferences-discord-rich-presence-help = 在這台電腦的 Discord 應用程式
 preferences-updates = 更新
 preferences-auto-updates = 自動檢查更新
 preferences-mask-password-input = 伺服器要求密碼時隱藏輸入內容
+preferences-history-case-sensitive-match = 歷史比對區分大小寫
+preferences-history-case-sensitive-match-help = Up/Down 只會在以「未選取的文字」開頭的歷史紀錄中循環。預設關閉，比對時不分大小寫；開啟後則需完全符合大小寫。
 preferences-invalid-value = 無效的值
 
 # 主題編輯器

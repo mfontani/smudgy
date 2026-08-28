@@ -329,6 +329,12 @@ pub struct Settings {
     /// unmasked (the Mudlet `mDisablePasswordMasking` opt-out).
     #[serde(default = "default_true")]
     pub mask_input_on_server_echo: bool,
+    /// Up/Down history navigation always cycles through entries that have
+    /// the *unselected* part of the current input as a prefix (an empty, or
+    /// fully selected input matches *every* entry).
+    /// This prefix matching can optionally be case-sensitive. Off by default.
+    #[serde(default)]
+    pub history_case_sensitive_match: bool,
 
     /// Hide session/pane headers (title bars) unless the window's toolbar is
     /// expanded — the distraction-free default. Off shows every header all
@@ -853,6 +859,7 @@ impl Default for Settings {
             raw_line_prefix: default_raw_line_prefix(),
             command_input_behavior: CommandInputBehavior::default(),
             mask_input_on_server_echo: true,
+            history_case_sensitive_match: false,
             hide_pane_headers: true,
             disabled_map_areas: Vec::new(),
             map_area_prefs: Vec::new(),
@@ -1595,6 +1602,24 @@ mod tests {
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&opted_out).unwrap()).expect("parse");
         assert!(!parsed.mask_input_on_server_echo);
+    }
+
+    #[test]
+    fn history_case_sensitive_match_defaults_off_and_round_trips_on() {
+        // A settings file predating the field deserializes to off (case-
+        // insensitive history-prefix matching being the default), not an
+        // error.
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("parse");
+        assert!(!settings.history_case_sensitive_match);
+
+        let opted_in = Settings {
+            history_case_sensitive_match: true,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&opted_in).unwrap()).expect("parse");
+        assert!(parsed.history_case_sensitive_match);
     }
 
     #[test]
