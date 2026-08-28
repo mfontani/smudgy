@@ -240,7 +240,12 @@ def main() -> None:
             f"got {sorted(observed_consumers[dependency])}",
         )
 
-    require_feature(audio, "physical-output", {"dep:cpal"}, crate="smudgy_audio")
+    require_feature(
+        audio,
+        "physical-output",
+        {"dep:cpal", "dep:rtrb"},
+        crate="smudgy_audio",
+    )
     require_feature(script, "web-audio", {"dep:deno_audio"}, crate="smudgy_script")
     require_feature(
         core,
