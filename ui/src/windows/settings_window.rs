@@ -151,6 +151,7 @@ pub enum Message {
     PrefFontSelected(String),
     PrefFontLigaturesToggled(bool),
     PrefBoldModeSelected(TerminalBoldMode),
+    PrefDisableBlinkToggled(bool),
     PrefLocaleSelected(LocaleChoice),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
@@ -656,6 +657,10 @@ impl SettingsWindow {
             }
             Message::PrefBoldModeSelected(mode) => {
                 self.settings.terminal_bold_mode = mode;
+                self.settings_changed()
+            }
+            Message::PrefDisableBlinkToggled(disable) => {
+                self.settings.terminal_disable_blink = disable;
                 self.settings_changed()
             }
             Message::PrefLocaleSelected(locale) => {
@@ -1386,6 +1391,15 @@ impl SettingsWindow {
                 .text_size(13)
                 .width(280),
                 dim_text_owned(t!("preferences-bold-is-bright-help")),
+            ]
+            .spacing(2),
+        );
+        col = col.push(
+            column![
+                checkbox(self.settings.terminal_disable_blink)
+                    .label(t!("preferences-disable-blink"))
+                    .on_toggle(Message::PrefDisableBlinkToggled),
+                dim_text_owned(t!("preferences-disable-blink-help")),
             ]
             .spacing(2),
         );

@@ -1842,11 +1842,16 @@ where
                         continue;
                     }
                     let regions = cache.paragraph.span_bounds(span_idx);
-                    let blink_hidden = match metadata.blink {
-                        smudgy_core::session::styled_line::Blink::None => false,
-                        smudgy_core::session::styled_line::Blink::Slow => !state.slow_blink_visible,
-                        smudgy_core::session::styled_line::Blink::Fast => !state.fast_blink_visible,
-                    };
+                    let blink_hidden = !prefs.disable_blink
+                        && match metadata.blink {
+                            smudgy_core::session::styled_line::Blink::None => false,
+                            smudgy_core::session::styled_line::Blink::Slow => {
+                                !state.slow_blink_visible
+                            }
+                            smudgy_core::session::styled_line::Blink::Fast => {
+                                !state.fast_blink_visible
+                            }
+                        };
 
                     if let Some(highlight) = span.highlight {
                         for region in &regions {
@@ -1943,8 +1948,12 @@ where
                     }
                 }
 
-                let hide_slow = cache.blink_modes & SLOW_BLINK != 0 && !state.slow_blink_visible;
-                let hide_fast = cache.blink_modes & FAST_BLINK != 0 && !state.fast_blink_visible;
+                let hide_slow = !prefs.disable_blink
+                    && cache.blink_modes & SLOW_BLINK != 0
+                    && !state.slow_blink_visible;
+                let hide_fast = !prefs.disable_blink
+                    && cache.blink_modes & FAST_BLINK != 0
+                    && !state.fast_blink_visible;
                 let at = iced::Point::new(layout.bounds().x, y);
                 if hide_slow || hide_fast {
                     let mut hidden = cache.hidden_blink_paragraphs.borrow_mut();

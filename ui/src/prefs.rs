@@ -296,6 +296,9 @@ pub struct TerminalPrefs {
     pub ligatures: bool,
     /// Whether SGR bold changes font weight, ANSI palette brightness, or both.
     pub bold_mode: TerminalBoldMode,
+    /// When true, SGR blink is suppressed (at draw time), so it renders as if
+    /// no blink SGR was sent.
+    pub disable_blink: bool,
     pub line_height: f32,
     /// Maximum line length in columns; `None` wraps at the pane width.
     pub line_length: Option<u16>,
@@ -373,6 +376,7 @@ impl TerminalPrefs {
             font_size,
             ligatures: settings.terminal_font_ligatures,
             bold_mode: settings.terminal_bold_mode,
+            disable_blink: settings.terminal_disable_blink,
             line_height: (font_size * 1.25).round(),
             // Clamp here too: hand-edited settings.json bypasses the UI
             // validation, and 0 columns would shape zero-width paragraphs.
@@ -788,5 +792,15 @@ mod tests {
             };
             assert_eq!(TerminalPrefs::from_settings(&settings, 0).bold_mode, mode);
         }
+    }
+
+    #[test]
+    fn disable_blink_defaults_off_and_follows_settings() {
+        assert!(!TerminalPrefs::from_settings(&Settings::default(), 0).disable_blink);
+        let settings = Settings {
+            terminal_disable_blink: true,
+            ..Settings::default()
+        };
+        assert!(TerminalPrefs::from_settings(&settings, 0).disable_blink);
     }
 }
