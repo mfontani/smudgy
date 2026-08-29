@@ -278,6 +278,10 @@ pub struct Settings {
     /// migrates the former boolean (`false` = bold, `true` = both).
     #[serde(default, alias = "terminal_bold_is_bright")]
     pub terminal_bold_mode: TerminalBoldMode,
+    /// When enabled, ANSI blink (SGR slow/rapid blink) has no visual effect.
+    /// Off by default.
+    #[serde(default)]
+    pub terminal_disable_blink: bool,
     /// Maximum terminal line length in columns; `None` wraps to the pane
     /// width. This is client-side wrapping only (no NAWS negotiation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -838,6 +842,7 @@ impl Default for Settings {
             terminal_font_size: default_terminal_font_size(),
             terminal_font_ligatures: false,
             terminal_bold_mode: TerminalBoldMode::default(),
+            terminal_disable_blink: false,
             terminal_line_length: None,
             link_tooltip_delay_ms: 0,
             theme: default_theme(),
@@ -1349,6 +1354,23 @@ mod tests {
             let parsed: Settings = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed.terminal_bold_mode, mode);
         }
+    }
+
+    #[test]
+    fn terminal_disable_blink_defaults_off_and_round_trips_on() {
+        // A settings file predating the field deserializes to off (blink
+        // renders normally, today's behavior), not an error.
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("parse");
+        assert!(!settings.terminal_disable_blink);
+
+        let opted_in = Settings {
+            terminal_disable_blink: true,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&opted_in).unwrap()).expect("parse");
+        assert!(parsed.terminal_disable_blink);
     }
 
     #[test]

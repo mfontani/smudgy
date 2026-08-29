@@ -1099,6 +1099,7 @@ pub(super) struct State<P: text::Paragraph> {
     /// must outlive the draw call instead of being a transient local.
     link_tooltip_paragraph: RefCell<Option<LinkTooltipParagraphCache<P>>>,
     /// Common timebase and current visibility phases for SGR 5/6 text.
+    /// `update` resolves the phases every frame; `draw` only reads them.
     blink_epoch: Instant,
     slow_blink_visible: bool,
     fast_blink_visible: bool,
@@ -2104,25 +2105,38 @@ where
             {
                 shell.request_redraw_at(*now + Duration::from_millis(TOOLTIP_SPINNER_FRAME_MS));
             }
-            let blink_modes = state
-                .cache
-                .iter()
-                .fold(0, |modes, cache| modes | cache.blink_modes);
+            // Resolve both phases here, so `draw` never consults the
+            // preference. A rate that is off screen or switched off resets to
+            // visible: a stale `false` would leave a line painted transparent
+            // with no timer left to restore it. Zeroing `blink_modes` for the
+            // preference also stops the timer.
+            let blink_modes = if crate::prefs::current().disable_blink {
+                0
+            } else {
+                state
+                    .cache
+                    .iter()
+                    .fold(0, |modes, cache| modes | cache.blink_modes)
+            };
+            let elapsed_ms = now.saturating_duration_since(state.blink_epoch).as_millis();
+            let mut next_ms = u128::MAX;
+            if blink_modes & SLOW_BLINK != 0 {
+                state.slow_blink_visible =
+                    (elapsed_ms / SLOW_BLINK_HALF_PERIOD_MS).is_multiple_of(2);
+                next_ms =
+                    next_ms.min(SLOW_BLINK_HALF_PERIOD_MS - elapsed_ms % SLOW_BLINK_HALF_PERIOD_MS);
+            } else {
+                state.slow_blink_visible = true;
+            }
+            if blink_modes & FAST_BLINK != 0 {
+                state.fast_blink_visible =
+                    (elapsed_ms / FAST_BLINK_HALF_PERIOD_MS).is_multiple_of(2);
+                next_ms =
+                    next_ms.min(FAST_BLINK_HALF_PERIOD_MS - elapsed_ms % FAST_BLINK_HALF_PERIOD_MS);
+            } else {
+                state.fast_blink_visible = true;
+            }
             if blink_modes != 0 {
-                let elapsed_ms = now.saturating_duration_since(state.blink_epoch).as_millis();
-                let mut next_ms = u128::MAX;
-                if blink_modes & SLOW_BLINK != 0 {
-                    state.slow_blink_visible =
-                        (elapsed_ms / SLOW_BLINK_HALF_PERIOD_MS).is_multiple_of(2);
-                    next_ms = next_ms
-                        .min(SLOW_BLINK_HALF_PERIOD_MS - elapsed_ms % SLOW_BLINK_HALF_PERIOD_MS);
-                }
-                if blink_modes & FAST_BLINK != 0 {
-                    state.fast_blink_visible =
-                        (elapsed_ms / FAST_BLINK_HALF_PERIOD_MS).is_multiple_of(2);
-                    next_ms = next_ms
-                        .min(FAST_BLINK_HALF_PERIOD_MS - elapsed_ms % FAST_BLINK_HALF_PERIOD_MS);
-                }
                 shell.request_redraw_at(
                     *now + Duration::from_millis(u64::try_from(next_ms).unwrap_or(1)),
                 );

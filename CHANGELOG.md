@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Blinking text can be turned off.** Preferences gains "Disable blinking text": with
+  it ticked, text sent as SGR blink — and text a script marks as blinking — renders
+  as if the blink attribute was never there, still carrying every other style it was
+  given. The setting takes effect on the text already on screen the moment you tick
+  it, in both directions, and while it is on smudgy stops animating entirely rather
+  than continuing to redraw a blink you cannot see.
 - **Script Exits name the Connection they belong to.** Every `Exit` a script
   reads now carries `connection_id`, the shared Connection both traversals of a
   two-way link belong to. Mapper packages use it to address a connection's
