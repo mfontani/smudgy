@@ -255,8 +255,8 @@ server-details-missing = Nie znaleziono szczegółów serwera.
 
 # Zaobserwowane metadane serwera (MSSP) na ekranie połączenia
 observed-players = { $players ->
-    [one] 1 gracz podczas ostatniego połączenia · { $ago }
-   *[other] { $players } graczy podczas ostatniego połączenia · { $ago }
+    [one] 1 gracz
+   *[other] { $players } graczy
 }
 observed-last-connected = Ostatnie połączenie { $ago }
 observed-uptime = { $days ->
