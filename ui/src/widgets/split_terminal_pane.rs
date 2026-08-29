@@ -42,6 +42,8 @@ pub enum ScrolledLayout {
 pub(crate) enum ScrollRequest {
     PageUp,
     PageDown,
+    Pages(i32),
+    Lines(i32),
     Home,
     End,
     RevealLine(usize),
@@ -446,6 +448,16 @@ fn apply_scroll_request(
             (current - step).max(oldest_full_page)
         }
         ScrollRequest::PageDown => (current + split_page).min(max_line),
+        ScrollRequest::Pages(pages) if pages < 0 => {
+            let count = pages.unsigned_abs() as f32;
+            let first_step = if state.is_split { split_page } else { page };
+            (current - first_step - split_page * (count - 1.0)).max(oldest_full_page)
+        }
+        ScrollRequest::Pages(pages) if pages > 0 => {
+            (current + split_page * pages as f32).min(max_line)
+        }
+        ScrollRequest::Pages(_) => current,
+        ScrollRequest::Lines(lines) => (current + lines as f32).clamp(min_line + 1.0, max_line),
         ScrollRequest::Home => oldest_full_page,
         ScrollRequest::End => max_line,
         ScrollRequest::RevealLine(line) => {
@@ -910,5 +922,48 @@ mod tests {
         );
         assert_eq!(state.scroll_bar_value, 70.0);
         assert!(state.is_split);
+    }
+
+    #[test]
+    fn page_delta_matches_repeated_page_requests() {
+        let mut state = State::default();
+
+        apply_scroll_request(&mut state, ScrollRequest::Pages(-3), 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 56.0);
+        assert!(state.is_split);
+
+        apply_scroll_request(&mut state, ScrollRequest::Pages(2), 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 80.0);
+        assert!(state.is_split);
+    }
+
+    #[test]
+    fn line_delta_clamps_to_retained_lines() {
+        let mut state = State::default();
+
+        apply_scroll_request(&mut state, ScrollRequest::Lines(-5), 0.0, 100.0, 20.0, 12.0);
+        assert_eq!(state.scroll_bar_value, 95.0);
+        assert!(state.is_split);
+
+        apply_scroll_request(
+            &mut state,
+            ScrollRequest::Lines(-200),
+            0.0,
+            100.0,
+            20.0,
+            12.0,
+        );
+        assert_eq!(state.scroll_bar_value, 1.0);
+
+        apply_scroll_request(
+            &mut state,
+            ScrollRequest::Lines(200),
+            0.0,
+            100.0,
+            20.0,
+            12.0,
+        );
+        assert_eq!(state.scroll_bar_value, 100.0);
+        assert!(!state.is_split);
     }
 }

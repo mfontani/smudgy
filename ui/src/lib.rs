@@ -4798,6 +4798,9 @@ fn pane_command_dependencies(command: &PaneCommand) -> Vec<PaneRef> {
         PaneCommand::Resize {
             session_id, key, ..
         }
+        | PaneCommand::Scroll {
+            session_id, key, ..
+        }
         | PaneCommand::Select { session_id, key }
         | PaneCommand::TearOut {
             session_id, key, ..
@@ -4895,6 +4898,7 @@ fn pane_command_has_closed_session(smudgy: &Smudgy, command: &PaneCommand) -> bo
         PaneCommand::Open { session_id, .. }
         | PaneCommand::Close { session_id, .. }
         | PaneCommand::Resize { session_id, .. }
+        | PaneCommand::Scroll { session_id, .. }
         | PaneCommand::Relocate { session_id, .. }
         | PaneCommand::Select { session_id, .. }
         | PaneCommand::TearOut { session_id, .. } => closed(*session_id),
@@ -4980,6 +4984,9 @@ fn pane_command_mentions_session(command: &PaneCommand, session_id: SessionId) -
             session_id: target, ..
         }
         | PaneCommand::Resize {
+            session_id: target, ..
+        }
+        | PaneCommand::Scroll {
             session_id: target, ..
         }
         | PaneCommand::Close {
@@ -5080,6 +5087,18 @@ fn apply_pane_command(smudgy: &mut Smudgy, command: PaneCommand) -> Task<Message
                 }
             }
             report_pane_sizes(smudgy)
+        }
+        PaneCommand::Scroll {
+            session_id,
+            key,
+            request,
+        } => {
+            if let Some(session) = smudgy.sessions.get(session_id)
+                && !session.scroll_pane(key, request)
+            {
+                log::warn!("Dropping scroll request for terminal pane {key}");
+            }
+            Task::none()
         }
         PaneCommand::Relocate {
             session_id,

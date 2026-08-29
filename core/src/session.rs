@@ -15,7 +15,9 @@ use crate::{
     models::hotkeys::HotkeyDefinition,
     session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
-    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition},
+    session::runtime::pane::{
+        PaneDef, PaneKey, PanePlacement, PaneScrollRequest, SplitDirection, TabPosition,
+    },
 };
 
 pub mod config;
@@ -97,6 +99,11 @@ pub enum SessionEvent {
         key: PaneKey,
         width: Option<f32>,
         height: Option<f32>,
+    },
+    /// A script changed a terminal pane's vertical viewport.
+    PaneScroll {
+        key: PaneKey,
+        request: PaneScrollRequest,
     },
     /// A script asked to move a pane next to `reference` (`pane.relocate`):
     /// the synthetic version of a manual drop — re-parent the pane's leaf on

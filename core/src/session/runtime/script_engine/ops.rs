@@ -90,6 +90,8 @@ deno_core::extension!(
     op_smudgy_pane_set_font_size,
     op_smudgy_pane_def_state,
     op_smudgy_pane_resize,
+    op_smudgy_pane_scroll_to,
+    op_smudgy_pane_scroll_by,
     op_smudgy_pane_relocate,
     op_smudgy_pane_group_with,
     op_smudgy_pane_select,
@@ -6700,6 +6702,24 @@ fn resolve_live_pane(
     Ok(def.key)
 }
 
+/// Resolve a terminal pane in the target session.
+fn resolve_terminal_pane(
+    state: &OpState,
+    target: SessionId,
+    name: &str,
+) -> Result<pane::PaneKey, PaneCallError> {
+    let namespace = pane_namespace(state);
+    let registry = target_pane_registry(state, target)?;
+    let registry = registry.lock().unwrap();
+    let def = registry
+        .resolve(&namespace, name)
+        .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
+    if def.kind != pane::PaneKind::Terminal {
+        return Err(PaneOpError(format!("pane '{name}' has no terminal")).into());
+    }
+    Ok(def.key)
+}
+
 /// A placement dimension from the facade: `<= 0` encodes "not given" (the
 /// same convention as the split spec's filtered sizes), non-finite is
 /// dropped too.
@@ -6738,6 +6758,70 @@ fn op_smudgy_pane_resize(
         },
         target,
         RuntimeAction::PaneResize { key, width, height },
+    );
+    Ok(())
+}
+
+/// Move a terminal pane to an absolute scrollback position.
+#[op2(fast)]
+fn op_smudgy_pane_scroll_to(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    #[string] target_name: &str,
+    line: u32,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let key = resolve_terminal_pane(state, target, name)?;
+    let request = match target_name {
+        "start" => pane::PaneScrollRequest::Start,
+        "end" => pane::PaneScrollRequest::End,
+        "line" if line > 0 => pane::PaneScrollRequest::Line(line),
+        _ => return Err(PaneOpError("invalid pane scroll target".to_string()).into()),
+    };
+    route_pane_command(
+        state,
+        PaneCommand::Scroll {
+            session_id: target,
+            key,
+            request,
+        },
+        target,
+        RuntimeAction::PaneScroll { key, request },
+    );
+    Ok(())
+}
+
+/// Move a terminal pane by pages or logical lines.
+#[op2(fast)]
+fn op_smudgy_pane_scroll_by(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    #[string] unit: &str,
+    amount: i32,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let key = resolve_terminal_pane(state, target, name)?;
+    let request = match unit {
+        "pages" => pane::PaneScrollRequest::Pages(amount),
+        "lines" => pane::PaneScrollRequest::Lines(amount),
+        _ => return Err(PaneOpError("invalid pane scroll unit".to_string()).into()),
+    };
+    if amount == 0 {
+        return Ok(());
+    }
+    route_pane_command(
+        state,
+        PaneCommand::Scroll {
+            session_id: target,
+            key,
+            request,
+        },
+        target,
+        RuntimeAction::PaneScroll { key, request },
     );
     Ok(())
 }
