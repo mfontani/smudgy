@@ -297,7 +297,9 @@ pub struct TerminalPrefs {
     /// Whether SGR bold changes font weight, ANSI palette brightness, or both.
     pub bold_mode: TerminalBoldMode,
     /// When true, SGR blink is suppressed (at draw time), so it renders as if
-    /// no blink SGR was sent.
+    /// no blink SGR was sent. Deliberately absent from `visually_equal`:
+    /// nothing bakes this into a paragraph, and evaluating it per frame is
+    /// what lets a toggle apply to the text already on screen.
     pub disable_blink: bool,
     pub line_height: f32,
     /// Maximum line length in columns; `None` wraps at the pane width.
