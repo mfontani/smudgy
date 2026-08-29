@@ -1,0 +1,192 @@
+{
+  "formatVersion": 1,
+  "scenarios": {
+    "dense-grid/reflow": {
+      "aspiration": "only the three misobserved exits relaxed, zero routing violations, zero slack: the grid re-charts as a grid",
+      "edges": 755,
+      "quality": {
+        "cardinalRayViolations": 6,
+        "cardinalSlack": 0,
+        "exitPortViolations": 6,
+        "footprintArea": 225,
+        "footprintPerimeter": 60,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 6,
+        "reciprocalRayViolations": 6,
+        "roomObstructions": 0,
+        "routingViolations": 6
+      },
+      "rooms": 220
+    },
+    "disconnected/reflow": {
+      "aspiration": "both components compact with disjoint bounding boxes, zero violations, zero slack; the isolated room stays out of both",
+      "edges": 178,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 66,
+        "footprintPerimeter": 34,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 61
+    },
+    "hub/reflow": {
+      "aspiration": "all nine spokes untangled: cardinal spokes on their exact rays with zero slack, zero crossings among arrival and Other chains",
+      "edges": 99,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 192,
+        "footprintPerimeter": 56,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 52
+    },
+    "locked-cluster/constraint-repair": {
+      "aspiration": "repair proves the five-entry relaxation minimal (constraintOptimal) and removes every crossing the reflow left",
+      "edges": 476,
+      "quality": {
+        "cardinalRayViolations": 8,
+        "cardinalSlack": 27,
+        "exitPortViolations": 7,
+        "footprintArea": 208,
+        "footprintPerimeter": 58,
+        "linkCrossings": 2,
+        "reciprocalExitPortViolations": 6,
+        "reciprocalRayViolations": 6,
+        "roomObstructions": 3,
+        "routingViolations": 10
+      },
+      "rooms": 151
+    },
+    "locked-cluster/reflow": {
+      "aspiration": "only the five deliberately violating core entries relaxed; the districts re-chart cleanly around the pinned core",
+      "edges": 476,
+      "quality": {
+        "cardinalRayViolations": 10,
+        "cardinalSlack": 20,
+        "exitPortViolations": 7,
+        "footprintArea": 208,
+        "footprintPerimeter": 58,
+        "linkCrossings": 2,
+        "reciprocalExitPortViolations": 6,
+        "reciprocalRayViolations": 8,
+        "roomObstructions": 3,
+        "routingViolations": 10
+      },
+      "rooms": 151
+    },
+    "one-way-maze/reflow": {
+      "aspiration": "only the three observation knots relaxed (breaking a non-reciprocal chord wherever one suffices) and zero link crossings",
+      "edges": 225,
+      "quality": {
+        "cardinalRayViolations": 4,
+        "cardinalSlack": 0,
+        "exitPortViolations": 2,
+        "footprintArea": 120,
+        "footprintPerimeter": 44,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 2,
+        "reciprocalRayViolations": 2,
+        "roomObstructions": 2,
+        "routingViolations": 4
+      },
+      "rooms": 120
+    },
+    "tower/reflow": {
+      "aspiration": "zero violations of any kind and zero slack: stacks aligned across all ten levels, lofts on their projected diagonals",
+      "edges": 172,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 190,
+        "footprintPerimeter": 176,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 78
+    },
+    "truncated-growth/step-1": {
+      "aspiration": "each visit's growth lands without regressing the settled chart; the final snapshot matches a from-scratch reflow",
+      "edges": 61,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 56,
+        "footprintPerimeter": 30,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 30
+    },
+    "truncated-growth/step-2": {
+      "aspiration": "each visit's growth lands without regressing the settled chart; the final snapshot matches a from-scratch reflow",
+      "edges": 123,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 100,
+        "footprintPerimeter": 40,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 55
+    },
+    "truncated-growth/step-3": {
+      "aspiration": "each visit's growth lands without regressing the settled chart; the final snapshot matches a from-scratch reflow",
+      "edges": 192,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 100,
+        "footprintPerimeter": 40,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 80
+    },
+    "truncated-growth/step-4": {
+      "aspiration": "each visit's growth lands without regressing the settled chart; the final snapshot matches a from-scratch reflow",
+      "edges": 234,
+      "quality": {
+        "cardinalRayViolations": 0,
+        "cardinalSlack": 0,
+        "exitPortViolations": 0,
+        "footprintArea": 100,
+        "footprintPerimeter": 40,
+        "linkCrossings": 0,
+        "reciprocalExitPortViolations": 0,
+        "reciprocalRayViolations": 0,
+        "roomObstructions": 0,
+        "routingViolations": 0
+      },
+      "rooms": 100
+    }
+  }
+}

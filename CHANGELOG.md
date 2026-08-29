@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Script Exits name the Connection they belong to.** Every `Exit` a script
+  reads now carries `connection_id`, the shared Connection both traversals of a
+  two-way link belong to. Mapper packages use it to address a connection's
+  route and ports directly instead of re-deriving the pairing from room
+  numbers and directions.
+
 ### Fixed
 
+- **The map stays on the area you are actually in.** Rapid location updates
+  that hopped away and back — into another area and returning before the
+  crossfade finished — could leave the map committed to the area you had
+  already left: the stale transition survived the newer update and won after
+  the fade. The newest location now cancels any pending transition away from
+  its own area, reversing a partial fade-out instead of finishing it.
 - **Servers offering to negotiate a character set now get an answer.** When a server
   asks smudgy to choose an encoding, smudgy names its preference — UTF-8, or the
   server's manual encoding setting ahead of UTF-8 when one is set — instead of

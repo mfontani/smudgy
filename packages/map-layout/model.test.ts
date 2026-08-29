@@ -234,11 +234,33 @@ test("thorough reflow prioritizes violation neighborhoods and beats one anchored
     "the requested anchor is followed by endpoints of its remaining directional violations",
   );
   assert.equal(thorough.search?.selectedAnchor, null);
+  assert.equal(thorough.search?.completed, true);
   assert.ok((thorough.search?.planningPasses ?? 0) > (thorough.search?.anchorsTried.length ?? 0));
   for (const move of thorough.patch.moves) {
     assert.deepEqual(move.from, model.rooms.find((room) => room.id === move.id)?.position);
     assert.deepEqual(move.to, thorough.positions.get(move.id));
   }
+
+  for (const maxPlanningPasses of [0, Number.NEGATIVE_INFINITY]) {
+    const preview = planLayoutModel(
+      model,
+      { type: "reflow", anchor: "8" },
+      { effort: "thorough", maxPlanningPasses },
+    );
+    assert.equal(preview.search?.planningPasses, 1);
+    assert.deepEqual(preview.search?.anchorsTried, ["8"]);
+    assert.equal(preview.search?.completed, false);
+    assert.deepEqual(preview.positions, standard.positions);
+  }
+
+  const explicitInfinity = planLayoutModel(
+    model,
+    { type: "reflow", anchor: "8" },
+    { effort: "thorough", maxPlanningPasses: Number.POSITIVE_INFINITY },
+  );
+  assert.equal(explicitInfinity.search?.completed, true);
+  assert.deepEqual(explicitInfinity.positions, thorough.positions);
+  assert.equal(explicitInfinity.search?.planningPasses, thorough.search?.planningPasses);
 });
 
 test("thorough reflow preserves locked rooms and excludes them from derived anchors", () => {
@@ -264,4 +286,39 @@ test("thorough reflow preserves locked rooms and excludes them from derived anch
 
   assert.deepEqual(result.positions.get("locked"), at(10, 10));
   assert.equal(result.search?.anchorsTried.includes("locked"), false);
+});
+
+test("planned layouts surface engine route amendments for permanent fixed defects", () => {
+  const model = createLayoutModel({
+    rooms: [
+      { id: "west", roomNumber: 1, position: at(-2, 0), movable: false },
+      { id: "east", roomNumber: 2, position: at(2, 0), movable: false },
+      { id: "north", roomNumber: 3, position: at(0, -2), movable: false },
+      { id: "south", roomNumber: 4, position: at(0, 2), movable: false },
+    ],
+    edges: [
+      { from: "west", to: "east", direction: "Other" },
+      { from: "north", to: "south", direction: "Other" },
+    ],
+  });
+
+  const planned = planLayoutModel(model, { type: "reflow" });
+  assert.equal(planned.patch.moves.length, 0, "amendments never move rooms");
+  assert.equal(planned.quality.linkCrossings, 1, "metrics still score the straight segments");
+  const amendments = planned.routeAmendments;
+  assert.ok(amendments);
+  assert.equal(amendments.length, 1);
+  assert.ok(amendments[0].waypoints.length >= 1);
+
+  // The thorough tournament rebases every pass onto the caller's snapshot;
+  // amendments describe links between immovable rooms, so they survive it.
+  const thorough = planLayoutModel(model, { type: "reflow" }, { effort: "thorough" });
+  assert.deepEqual(thorough.routeAmendments, amendments);
+
+  // A model whose defect can move proposes movement, not amendments.
+  const movable = createLayoutModel({
+    ...model,
+    rooms: model.rooms.map((room) => room.id === "south" ? { ...room, movable: true } : room),
+  });
+  assert.equal(planLayoutModel(movable, { type: "reflow" }).routeAmendments, undefined);
 });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { reflowPolicy } from "./reflow-policy.ts";
 
-test("an intermediate topology snapshot places discoveries and defers movement", () => {
+test("the prompt topology lane places discoveries and defers movement", () => {
   assert.deepEqual(reflowPolicy(true, false, false, true), {
     runPlanner: true,
     moveExisting: false,
@@ -10,7 +10,7 @@ test("an intermediate topology snapshot places discoveries and defers movement",
   });
 });
 
-test("the newest snapshot performs and clears a deferred reflow", () => {
+test("the quiet full-reflow lane performs and clears deferred movement", () => {
   assert.deepEqual(reflowPolicy(false, true, true, true), {
     runPlanner: true,
     moveExisting: true,
@@ -31,5 +31,18 @@ test("coordinate locking never creates deferred movement work", () => {
     runPlanner: true,
     moveExisting: false,
     deferExistingReflow: false,
+  });
+});
+
+test("revoking full-reflow permission preserves discoveries and defers existing moves", () => {
+  assert.deepEqual(reflowPolicy(true, false, true, true), {
+    runPlanner: true,
+    moveExisting: true,
+    deferExistingReflow: false,
+  });
+  assert.deepEqual(reflowPolicy(true, false, false, true), {
+    runPlanner: true,
+    moveExisting: false,
+    deferExistingReflow: true,
   });
 });

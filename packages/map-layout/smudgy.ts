@@ -1,18 +1,30 @@
 import { mapper } from "smudgy:core";
-import type { LayoutDirection, LayoutEdge } from "./layout.ts";
+import type {
+  LayoutDirection,
+  LayoutEdge,
+  LayoutWorkerControlOptions,
+} from "./layout.ts";
 import {
   createLayoutModel,
-  planLayoutModel,
   resolveElevationGeometry,
   type LayoutChange,
   type LayoutModel,
   type PlanLayoutOptions,
   type PlannedLayout,
 } from "./model.ts";
+import {
+  planStableLayoutSnapshot,
+  StaleLayoutSnapshotError,
+} from "./stable-snapshot.ts";
+
+export { StaleLayoutSnapshotError };
 
 export interface LoadLayoutModelOptions {
   isRoomMovable?: (room: Room) => boolean;
 }
+
+export interface PlanAreaChangeOptions
+  extends PlanLayoutOptions, LoadLayoutModelOptions, LayoutWorkerControlOptions {}
 
 /** Stateless façade result: the temporary layout model stays private. */
 export type AreaChangePlan = Pick<PlannedLayout, "patch" | "positions" | "quality" | "search">;
@@ -96,9 +108,27 @@ export function loadLayoutModel(
 export async function planAreaChange(
   area: Area | AreaId,
   change: LayoutChange,
-  options: PlanLayoutOptions & LoadLayoutModelOptions = {},
+  options: PlanAreaChangeOptions = {},
 ): Promise<AreaChangePlan> {
-  const model = loadLayoutModel(area, options);
-  const { patch, positions, quality, search } = planLayoutModel(model, change, options);
+  // Always re-resolve a host wrapper by ID. An Area supplied by the caller may
+  // itself be an immutable snapshot and cannot validate a later Worker result.
+  const liveArea: AreaId = "room_numbers" in area
+    ? [area.id[0], area.id[1]]
+    : [area[0], area[1]];
+  const planOptions: PlanLayoutOptions = {
+    allowExistingMoves: options.allowExistingMoves,
+    fixedRooms: options.fixedRooms,
+    defaultElevation: options.defaultElevation,
+    effort: options.effort,
+    maxPlanningPasses: options.maxPlanningPasses,
+    trace: options.trace,
+  };
+  const result = await planStableLayoutSnapshot(
+    () => loadLayoutModel(liveArea, { isRoomMovable: options.isRoomMovable }),
+    change,
+    planOptions,
+    { signal: options.signal, timeoutMs: options.timeoutMs },
+  );
+  const { patch, positions, quality, search } = result;
   return { patch, positions, quality, search };
 }

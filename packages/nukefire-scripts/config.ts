@@ -53,6 +53,9 @@ export const chatFontSize = numberParam("chatFontSize", 12);
 /** Whether Comms leaves an empty terminal line before each chat message. */
 export const separateChatMessages = boolParam("separateChatMessages", true);
 
+/** Show live map-layout Worker telemetry beneath the MapView. */
+export const showLayoutState = boolParam("showLayoutState", false);
+
 /** Baseline used to scale the package's existing widget type hierarchy. */
 export const widgetFontSize = numberParam("widgetFontSize", DEFAULT_WIDGET_FONT_SIZE);
 

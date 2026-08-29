@@ -18,10 +18,11 @@ interface VerticalRelation {
  * chart: Room.Info vertical exits normally cross from the current Map.Local
  * plane to a durable resident which Map.Local cannot include. Once that seam
  * fixes one chart node's level, ordinary chart edges carry the same level
- * translation through the rest of that observed plane. Levels between
- * established rooms are never changed here, and a forced stack that would
- * make two new rooms share a chart cell is abandoned rather than risking an
- * unplaceable rigid chart.
+ * through the rest of that observed plane. Their raw Map.Local z values are
+ * not authoritative: only Up/Down traversals may change a room's level.
+ * Levels between established rooms are never changed here, and a forced
+ * stack that would make two new rooms share a chart cell is abandoned rather
+ * than risking an unplaceable rigid chart.
  */
 export function stackVerticalTraversals(
   nodes: readonly LayoutNode[],
@@ -81,13 +82,11 @@ export function stackVerticalTraversals(
       relate(edge.from, edge.to, -1);
       relate(edge.to, edge.from, 1);
     } else if (byId.has(edge.from) && byId.has(edge.to)) {
-      // Map.Local never crosses a level boundary. Preserve its observed level
-      // difference so a vertical resident seam lifts or lowers the entire
-      // connected chart plane instead of only the arrival room.
-      const delta = (byId.get(edge.to) as LayoutNode).relative.level -
-        (byId.get(edge.from) as LayoutNode).relative.level;
-      relate(edge.from, edge.to, delta);
-      relate(edge.to, edge.from, -delta);
+      // Map.Local's ordinary chart edges never cross a level boundary. Treat
+      // their z observations as noise and carry one plane through the whole
+      // connected chart; only explicit Up/Down traversals introduce +/-1.
+      relate(edge.from, edge.to, 0);
+      relate(edge.to, edge.from, 0);
     }
   }
   for (const values of relations.values()) {

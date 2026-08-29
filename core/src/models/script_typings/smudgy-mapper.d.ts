@@ -247,6 +247,8 @@ interface MutateAreaOptions {
  */
 interface Exit {
     readonly id: ExitId;
+    /** The shared Connection this traversal belongs to. */
+    readonly connection_id: ConnectionId;
     readonly from_direction: ExitDirection;
     readonly from_area_id: AreaId;
     readonly from_room_number: RoomNumber;
