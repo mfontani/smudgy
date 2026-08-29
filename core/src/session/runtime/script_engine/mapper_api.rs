@@ -995,6 +995,7 @@ fn op_smudgy_mapper_has_tag(#[cppgc] room_wrapper: &JSRoom, #[string] tag: Strin
 #[derive(Debug, Serialize)]
 struct JSExit {
     id: (u64, u64),
+    connection_id: (u64, u64),
     from_direction: String,
     from_area_id: (u64, u64),
     from_room_number: i32,
@@ -1100,6 +1101,7 @@ fn op_smudgy_mapper_get_room_exits(#[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit
         .iter()
         .map(|exit| JSExit {
             id: exit.id.0.as_u64_pair(),
+            connection_id: exit.connection_id.0.as_u64_pair(),
             from_direction: exit.from_direction.to_string(),
             from_area_id: room_wrapper.1.0.as_u64_pair(),
             from_room_number: room_wrapper.0.get_room_number().0,

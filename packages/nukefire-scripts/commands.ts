@@ -406,6 +406,10 @@ async function reflowCurrentArea(): Promise<void> {
       await mapper.mutateArea(location.area, (mutation) => mutation.updateRooms(updates), {
         description: "Reflow NukeFire rooms",
       });
+      // Re-sending the active location makes mounted MapViews derive their
+      // translation from the player's newly committed room coordinates.
+      const current = mapper.getCurrentLocation();
+      if (current) mapper.setCurrentLocation(current.area, current.room);
     }
     const search = result.search;
     const improvementText = search && compareLayoutQuality(result.quality, search.baselineQuality) > 0

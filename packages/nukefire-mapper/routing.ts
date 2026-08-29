@@ -200,16 +200,19 @@ function search(
 
     for (let direction = 0; direction < STEPS.length; direction += 1) {
       const step = STEPS[direction];
+      // A generated detour must preserve the semantic exit wall. Soft costs
+      // allowed a North exit to leave through South when that shortened the
+      // path, making a layout obstruction look like a valid routed link.
+      if (current.direction < 0 && preferredStart && step.side !== preferredStart) continue;
       const x = current.x + step.x;
       const y = current.y + step.y;
       if (x < minX || x > maxX || y < minY || y > maxY) continue;
       const isGoal = x === endX && y === endY;
+      if (isGoal && preferredEnd && step.side !== OPPOSITE_SIDE[preferredEnd]) continue;
       if (!isGoal && blocked.has(pointKey(x, y))) continue;
 
       let cost = current.cost + 10;
       if (current.direction >= 0 && current.direction !== direction) cost += 3;
-      if (current.direction < 0 && preferredStart && step.side !== preferredStart) cost += 8;
-      if (isGoal && preferredEnd && step.side !== OPPOSITE_SIDE[preferredEnd]) cost += 8;
       const key = stateKey(x, y, direction);
       if ((bestCost.get(key) ?? Number.POSITIVE_INFINITY) <= cost) continue;
       const next: SearchState = {
@@ -282,6 +285,110 @@ export function routeEndSide(path: readonly GridPosition[]): RouteSide | undefin
   return STEPS.find((step) => step.x === dx && step.y === dy)?.side;
 }
 
+/** One engine route amendment, translated into this area's room numbers. */
+export interface ResolvedRouteAmendment {
+  fromRoomNumber: number;
+  toRoomNumber: number;
+  /** Elbow cells ordered from `fromRoomNumber` toward `toRoomNumber`. */
+  waypoints: readonly { x: number; y: number }[];
+}
+
+function amendmentPairKey(a: number, b: number): string {
+  return a <= b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+/**
+ * Translate a plan's engine route amendments into room-number space, keyed by
+ * their unordered room pair. Amendments whose endpoints do not resolve to
+ * known rooms are dropped — amendments are advisory, and a plan can describe
+ * rooms this area has not committed yet. Returns undefined when nothing
+ * resolves so callers skip matching entirely.
+ */
+export function indexRouteAmendments(
+  amendments:
+    | readonly {
+      from: string;
+      to: string;
+      waypoints: readonly { x: number; y: number }[];
+    }[]
+    | undefined,
+  roomNumbersByLayoutId: ReadonlyMap<string, number>,
+): ReadonlyMap<string, ResolvedRouteAmendment> | undefined {
+  if (!amendments || amendments.length === 0) return undefined;
+  const result = new Map<string, ResolvedRouteAmendment>();
+  for (const amendment of amendments) {
+    const fromRoomNumber = roomNumbersByLayoutId.get(amendment.from);
+    const toRoomNumber = roomNumbersByLayoutId.get(amendment.to);
+    if (fromRoomNumber === undefined || toRoomNumber === undefined ||
+      fromRoomNumber === toRoomNumber || amendment.waypoints.length === 0) continue;
+    const key = amendmentPairKey(fromRoomNumber, toRoomNumber);
+    if (result.has(key)) continue;
+    result.set(key, {
+      fromRoomNumber,
+      toRoomNumber,
+      waypoints: amendment.waypoints.map((point) => ({ x: point.x, y: point.y })),
+    });
+  }
+  return result.size > 0 ? result : undefined;
+}
+
+/**
+ * The amendment waypoints for the connection joining two rooms, oriented to
+ * run from `fromRoomNumber` toward `toRoomNumber`; undefined when no
+ * amendment names that pair.
+ */
+export function amendmentWaypointsBetween(
+  index: ReadonlyMap<string, ResolvedRouteAmendment> | undefined,
+  fromRoomNumber: number,
+  toRoomNumber: number,
+): { x: number; y: number }[] | undefined {
+  const amendment = index?.get(amendmentPairKey(fromRoomNumber, toRoomNumber));
+  if (!amendment) return undefined;
+  const oriented = amendment.fromRoomNumber === fromRoomNumber
+    ? [...amendment.waypoints]
+    : [...amendment.waypoints].reverse();
+  return oriented.map((point) => ({ x: point.x, y: point.y }));
+}
+
+/** The wall a possibly multi-cell axis-aligned segment leaves through. */
+function segmentSide(dx: number, dy: number): RouteSide | undefined {
+  if (dx === 0 && dy < 0) return "North";
+  if (dx > 0 && dy === 0) return "East";
+  if (dx === 0 && dy > 0) return "South";
+  if (dx < 0 && dy === 0) return "West";
+  return undefined;
+}
+
+/**
+ * Build the stored route for an engine amendment. The drawn centerline runs
+ * `from` → each waypoint → `to`, so the endpoint walls follow the first and
+ * last drawn segments when those are axis-aligned and keep the semantic
+ * preference otherwise. Amendment routes persist as `Automatic` exactly like
+ * every other generated route; `Manual` remains the user-ownership marker.
+ */
+export function amendedConnectionRoute(
+  from: GridPosition,
+  to: GridPosition,
+  waypoints: readonly { x: number; y: number }[],
+  preferredStart: RouteSide,
+  preferredEnd: RouteSide,
+): PlannedConnectionRoute {
+  const first = waypoints[0];
+  const last = waypoints[waypoints.length - 1];
+  return {
+    startSide: first
+      ? segmentSide(first.x - Math.round(from.x), first.y - Math.round(from.y)) ?? preferredStart
+      : preferredStart,
+    endSide: last
+      ? segmentSide(last.x - Math.round(to.x), last.y - Math.round(to.y)) ?? preferredEnd
+      : preferredEnd,
+    routing: "Automatic",
+    segmentShape: "Direct",
+    corner: "Rounded",
+    routePoints: waypoints.map((point) => ({ x: point.x, y: point.y })),
+  };
+}
+
 /**
  * Prefer a Manhattan route around occupied rooms without requiring stored
  * segments to remain perfectly axis-aligned. The renderer still follows the
@@ -310,6 +417,9 @@ export function planConnectionRoute(
       };
     }
   }
+  // Falling back to automatic geometry is preferable to persisting a manual
+  // route on the wrong room walls. The layout quality reports the blocked
+  // ports and gives the quiet reflow a chance to move the offending rooms.
   return {
     startSide: preferredStart,
     endSide: preferredEnd,

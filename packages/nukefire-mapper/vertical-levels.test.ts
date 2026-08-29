@@ -121,7 +121,7 @@ test("never rewrites an established room from a vertical observation", () => {
   assert.deepEqual(relative(result, "beside"), at(1, 0));
 });
 
-test("leaves rooms without vertical traversals at their observed z", () => {
+test("ignores raw z noise across an ordinary chart edge", () => {
   const result = stackVerticalTraversals(
     [node("center", 0, 0), node("hill", 1, 0, 3)],
     [edge("center", "hill", "East")],
@@ -129,7 +129,36 @@ test("leaves rooms without vertical traversals at their observed z", () => {
     "center",
   );
 
-  assert.deepEqual(relative(result, "hill"), at(1, 0, 3));
+  assert.deepEqual(relative(result, "hill"), at(1, 0));
+});
+
+test("only Up and Down split ordinary, diagonal, and special chart planes", () => {
+  const result = stackVerticalTraversals(
+    [
+      node("center", 0, 0),
+      node("east", 1, 0, 8),
+      node("northeast", 2, -1, -4),
+      node("portal", 3, -1, 12),
+      node("above", 4, -1, -7),
+      node("above-east", 5, -1, 20),
+    ],
+    [
+      edge("center", "east", "East"),
+      edge("east", "northeast", "Northeast"),
+      edge("northeast", "portal", "Special"),
+      edge("portal", "above", "Up"),
+      edge("above", "above-east", "East"),
+    ],
+    new Map(),
+    "center",
+  );
+
+  assert.deepEqual(relative(result, "center"), at(0, 0));
+  assert.deepEqual(relative(result, "east"), at(1, 0));
+  assert.deepEqual(relative(result, "northeast"), at(2, -1));
+  assert.deepEqual(relative(result, "portal"), at(3, -1));
+  assert.deepEqual(relative(result, "above"), at(4, -1, 1));
+  assert.deepEqual(relative(result, "above-east"), at(5, -1, 1));
 });
 
 test("abandons a stack that would make two new rooms share a chart cell", () => {
