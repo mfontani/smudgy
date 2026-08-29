@@ -255,9 +255,9 @@ server-details-missing = Відомості про сервер не знайд�
 
 # Спостережені метадані сервера (MSSP) на екрані підключення
 observed-players = { $players ->
-    [one] 1 гравець під час останнього з'єднання · { $ago }
-    [few] { $players } гравці під час останнього з'єднання · { $ago }
-   *[other] { $players } гравців під час останнього з'єднання · { $ago }
+    [one] 1 гравець
+    [few] { $players } гравці
+   *[other] { $players } гравців
 }
 observed-last-connected = Останнє з'єднання { $ago }
 observed-uptime = { $days ->

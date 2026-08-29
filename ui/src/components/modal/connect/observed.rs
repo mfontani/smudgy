@@ -166,9 +166,9 @@ pub(super) fn game_name_subtitle<'a>(
     Some(text(name).size(13).style(builtins::text::muted).into())
 }
 
-/// The metadata band under the address line: point-in-time facts each carrying
-/// their age, then a chip row of badges and link actions. `None` when there is
-/// nothing to show — the pane then renders exactly as it always has.
+/// The metadata band under the address line: observed facts, then a chip row
+/// of badges and link actions. `None` when there is nothing to show — the pane
+/// then renders exactly as it always has.
 pub(super) fn metadata_band<'a>(
     state: &'a State,
     server: &'a Server,
@@ -177,15 +177,8 @@ pub(super) fn metadata_band<'a>(
     let now = Utc::now();
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
-    // The player count is point-in-time, so it renders WITH its age, never
-    // as if live — and only when the merge timestamp exists to date it.
-    if let (Some(players), Some(received_at)) = (players_count(observed), observed.mssp_received_at)
-    {
-        lines.push(muted_line(t!(
-            "observed-players",
-            "players" => players,
-            "ago" => relative_ago(received_at, now)
-        )));
+    if let (Some(players), Some(_)) = (players_count(observed), observed.mssp_received_at) {
+        lines.push(muted_line(t!("observed-players", "players" => players)));
     }
     if let Some(last_connected_at) = observed.last_connected_at {
         lines.push(muted_line(t!(

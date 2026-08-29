@@ -248,7 +248,7 @@ server-edit-short = 編輯
 server-details-missing = 找不到伺服器詳細資料。
 
 # 連線畫面上觀察到的伺服器中繼資料（MSSP 側車檔）
-observed-players = 上次連線時有 { $players } 位玩家 · { $ago }
+observed-players = { $players } 位玩家
 observed-last-connected = 上次連線於 { $ago }
 observed-uptime = 已運行 { $days } 天
 observed-tls-available = 可用 TLS

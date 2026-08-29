@@ -253,8 +253,8 @@ server-details-missing = Server details not found.
 
 # Observed server metadata (MSSP sidecar) on the connect screen
 observed-players = { $players ->
-    [one] 1 player when last connected · { $ago }
-   *[other] { $players } players when last connected · { $ago }
+    [one] 1 player
+   *[other] { $players } players
 }
 observed-last-connected = Last connected { $ago }
 observed-uptime = { $days ->
