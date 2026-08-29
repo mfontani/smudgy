@@ -1997,6 +1997,15 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::PaneScroll { key, request } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneScroll { key, request },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
             RuntimeAction::PaneRelocate {
                 key,
                 reference,

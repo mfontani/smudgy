@@ -37,7 +37,7 @@ use smudgy_core::models::shared_packages;
 use smudgy_core::session::SessionParams;
 use smudgy_core::session::runtime::input::{InputOp, InputSnapshot};
 use smudgy_core::session::runtime::pane::{
-    MAIN_PANE_KEY, MAIN_PANE_NAME_ID, PaneDef, PaneKey, PaneKind, TitleBarPolicy,
+    MAIN_PANE_KEY, MAIN_PANE_NAME_ID, PaneDef, PaneKey, PaneKind, PaneScrollRequest, TitleBarPolicy,
 };
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
 use smudgy_core::session::styled_line::{
@@ -1897,6 +1897,33 @@ impl ManagedSession {
         }
     }
 
+    /// Send one scroll request to a terminal pane. A hidden pane keeps the
+    /// request until the UI renders that pane again.
+    pub fn scroll_pane(&self, key: PaneKey, request: PaneScrollRequest) -> bool {
+        let view = if key == MAIN_PANE_KEY {
+            Some(&self.terminal_view)
+        } else {
+            self.panes
+                .get(&key)
+                .filter(|pane| pane.buffer.is_some())
+                .map(|pane| &pane.terminal_view)
+        };
+        let Some(view) = view else {
+            return false;
+        };
+        let request = match request {
+            PaneScrollRequest::Start => split_terminal_pane::ScrollRequest::Home,
+            PaneScrollRequest::End => split_terminal_pane::ScrollRequest::End,
+            PaneScrollRequest::Line(line) => split_terminal_pane::ScrollRequest::RevealLine(
+                usize::try_from(line).unwrap_or(usize::MAX),
+            ),
+            PaneScrollRequest::Pages(pages) => split_terminal_pane::ScrollRequest::Pages(pages),
+            PaneScrollRequest::Lines(lines) => split_terminal_pane::ScrollRequest::Lines(lines),
+        };
+        view.scroll.request(request);
+        true
+    }
+
     /// The body of a script pane: the widget entries targeting it, stacked
     /// over the scrollback terminal on a terminal pane and standing alone on
     /// a widgets-only pane. Targets match by the interned pane name id, so a
@@ -2746,6 +2773,12 @@ impl ManagedSession {
                             self.main_font_size = def.font_size;
                         } else if let Some(pane) = self.panes.get_mut(&def.key) {
                             pane.def = def;
+                        }
+                        Task::none()
+                    }
+                    SessionEvent::PaneScroll { key, request } => {
+                        if !self.scroll_pane(key, request) {
+                            log::warn!("Dropping scroll request for terminal pane {key}");
                         }
                         Task::none()
                     }

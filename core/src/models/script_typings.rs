@@ -1777,6 +1777,52 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
+    /// Pane scroll deltas accept exactly one unit.
+    #[test]
+    fn pane_scroll_delta_accepts_exactly_one_unit() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+
+        let good = "import { session } from \"smudgy:core\";\n\
+             import type { PaneScrollDelta } from \"smudgy:core\";\n\
+             const pages: PaneScrollDelta = { pages: -1 };\n\
+             const lines: PaneScrollDelta = { lines: 3 };\n\
+             session.mainPane.scrollTo(42);\n\
+             session.mainPane.scrollTo(\"end\");\n\
+             session.mainPane.scrollBy(pages);\n\
+             session.mainPane.scrollBy(lines);\n";
+        let mut sources = BTreeMap::new();
+        sources.insert("consumer.ts".to_string(), good.to_string());
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("generate the pane-scroll consumer");
+        assert!(
+            out.diagnostics.is_empty(),
+            "valid pane-scroll calls must compile: {:?}",
+            out.diagnostics
+        );
+
+        for bad in [
+            "session.mainPane.scrollBy({ pages: 1, lines: 1 });",
+            "session.mainPane.scrollBy({});",
+        ] {
+            let source = format!("import {{ session }} from \"smudgy:core\";\n{bad}\n");
+            let mut sources = BTreeMap::new();
+            sources.insert("consumer.ts".to_string(), source);
+            let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+                .expect("the generator must handle an invalid pane-scroll delta");
+            assert!(
+                !out.diagnostics.is_empty(),
+                "an invalid pane-scroll delta compiled: {bad}"
+            );
+        }
+    }
+
     /// Compile a real `.tsx` widget module against the shipped widgets typings through the
     /// (jsx-aware) publish-time generator. A clean compile proves the `smudgy:widgets` module
     /// surface, the `smudgy:widgets/jsx-runtime` automatic runtime, and the `JSX` namespace are

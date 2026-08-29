@@ -1097,6 +1097,14 @@ declare module "smudgy:core" {
       ? { width?: number; height?: never }
       : { height?: number; width?: never });
 
+  /** An absolute position in a terminal pane's retained scrollback. */
+  export type PaneScrollTarget = "start" | "end" | number;
+
+  /** A relative move in pages or logical terminal lines. */
+  export type PaneScrollDelta =
+    | { pages: number; lines?: never }
+    | { lines: number; pages?: never };
+
   /** The spec for {@link Pane.addTab}. */
   export type TabPaneSpec = PaneSpecBase & {
     selected?: boolean;
@@ -1155,6 +1163,29 @@ declare module "smudgy:core" {
     echo(text: TemplateStringsArray, ...values: unknown[]): void;
     /** Clear this pane's terminal scrollback (works on main). Throws on widgets-only panes. */
     clear(): void;
+    /**
+     * Scrolls this terminal pane to an absolute scrollback position.
+     *
+     * - `"start"` scrolls to the oldest retained line.
+     * - `"end"` scrolls to the newest line and follows new output.
+     * - A positive number reveals the pane-local line with that 1-based number.
+     *
+     * On the main pane, a number matches `line.number` only when the main pane
+     * displays that line. If the target is outside retained scrollback, the
+     * viewport moves to the nearest retained line. This method does not show,
+     * select, or focus the pane.
+     */
+    scrollTo(target: PaneScrollTarget): void;
+    /**
+     * Scrolls this terminal pane by a page or line delta.
+     *
+     * Positive values scroll toward newer output. Negative values scroll
+     * toward older output. A page delta acts like repeated Page Up or Page
+     * Down key presses. A line delta counts logical terminal lines, not
+     * wrapped display rows. The viewport stops at the retained scrollback
+     * limits. This method does not show, select, or focus the pane.
+     */
+    scrollBy(delta: PaneScrollDelta): void;
     /** Close this pane. Throws on the main pane; safe to repeat otherwise. */
     close(): void;
     /** This pane's own input line, or `undefined` for panes created without

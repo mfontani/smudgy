@@ -85,6 +85,8 @@ const {
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
     op_smudgy_pane_clear,
+    op_smudgy_pane_scroll_to,
+    op_smudgy_pane_scroll_by,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
     op_smudgy_layout_save,
@@ -1528,6 +1530,14 @@ function __line_fg(options: ColorOptions): Color | null {
 /** Which side of the reference pane a split places the new pane on. */
 type SplitDirection = "left" | "right" | "top" | "bottom";
 
+/** An absolute position in a terminal pane's retained scrollback. */
+type PaneScrollTarget = "start" | "end" | number;
+
+/** A relative move in pages or logical terminal lines. */
+type PaneScrollDelta =
+    | { pages: number; lines?: never }
+    | { lines: number; pages?: never };
+
 /** When a pane's title bar (header/drag handle) shows: 'normal' follows the
  *  global hide-unless-toolbar rule; 'always-show' pins the header on. */
 type TitleBarSpec = "normal" | "always-show";
@@ -1670,6 +1680,42 @@ class Pane {
     /** Clear this pane's terminal scrollback (works on main; throws on widgets-only panes). */
     clear(): void {
         op_smudgy_pane_clear(this._sessionId, this._name);
+    }
+
+    /** Scrolls this terminal pane to an absolute scrollback position. */
+    scrollTo(target: PaneScrollTarget): void {
+        if (target === "start" || target === "end") {
+            op_smudgy_pane_scroll_to(this._sessionId, this._name, target, 0);
+            return;
+        }
+        if (
+            typeof target !== "number" || !Number.isInteger(target) ||
+            target < 1 || target > 0xffffffff
+        ) {
+            throw new TypeError('scrollTo() expects "start", "end", or a positive 32-bit line number');
+        }
+        op_smudgy_pane_scroll_to(this._sessionId, this._name, "line", target);
+    }
+
+    /** Scrolls this terminal pane by pages or logical terminal lines. */
+    scrollBy(delta: PaneScrollDelta): void {
+        if (typeof delta !== "object" || delta === null || Array.isArray(delta)) {
+            throw new TypeError("scrollBy() expects { pages } or { lines }");
+        }
+        const hasPages = Object.prototype.hasOwnProperty.call(delta, "pages");
+        const hasLines = Object.prototype.hasOwnProperty.call(delta, "lines");
+        if (hasPages === hasLines) {
+            throw new TypeError("scrollBy() expects exactly one of { pages } or { lines }");
+        }
+        const unit = hasPages ? "pages" : "lines";
+        const amount = hasPages ? delta.pages : delta.lines;
+        if (
+            typeof amount !== "number" || !Number.isInteger(amount) ||
+            amount < -0x80000000 || amount > 0x7fffffff
+        ) {
+            throw new TypeError(`scrollBy() ${unit} must be a signed 32-bit integer`);
+        }
+        op_smudgy_pane_scroll_by(this._sessionId, this._name, unit, amount);
     }
 
     /** Close this pane (throws on the main pane; idempotent otherwise). */

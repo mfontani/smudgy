@@ -95,6 +95,18 @@ pub enum PaneKind {
     Widgets,
 }
 
+/// A script request that changes one terminal pane's vertical viewport.
+/// Positive deltas move toward newer output. Negative deltas move toward
+/// older output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneScrollRequest {
+    Start,
+    End,
+    Line(u32),
+    Pages(i32),
+    Lines(i32),
+}
+
 /// When a pane's title bar (its header/drag handle) is shown. `Normal` panes
 /// follow the global distraction-free rule — headers show only while the
 /// hosting window's toolbar is expanded (or when the global hide setting is

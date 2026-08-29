@@ -20,7 +20,9 @@ use futures::{Stream, channel::mpsc};
 
 use super::{
     SessionId,
-    runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition},
+    runtime::pane::{
+        PaneDef, PaneKey, PanePlacement, PaneScrollRequest, SplitDirection, TabPosition,
+    },
 };
 
 /// One command in the UI daemon's canonical receive order.
@@ -41,7 +43,7 @@ pub enum UiCommand {
     Pane(PaneCommand),
 }
 
-/// Pane-layout mutations applied by the UI daemon.
+/// Pane UI commands that the UI daemon applies.
 ///
 /// Pane output deliberately does not travel here. It stays on the owning
 /// session's backpressured event stream, where `PaneOpened` still orders pane
@@ -64,6 +66,11 @@ pub enum PaneCommand {
         key: PaneKey,
         width: Option<f32>,
         height: Option<f32>,
+    },
+    Scroll {
+        session_id: SessionId,
+        key: PaneKey,
+        request: PaneScrollRequest,
     },
     Relocate {
         session_id: SessionId,
