@@ -2,7 +2,7 @@
 // contributes the human-readable current-area name and vertical topology.
 // Mapping is shared client state, so only the oldest live session may mutate it.
 
-import { getSessions, mapper, session, type EventSubscription } from "smudgy:core";
+import { createState, getSessions, mapper, session, type EventSubscription } from "smudgy:core";
 import { created, destroyed } from "smudgy:events/sessions";
 import { get } from "smudgy:params";
 import { nukefire, watchMessage } from "smudgy://kapusniak/nukefire-gmcp";
@@ -11,6 +11,14 @@ import { externalRoomId, isUsableVnum } from "./model.ts";
 import { NukeFireMapper } from "./mapper.ts";
 import { resolveFollowedLocation } from "./location-follow.ts";
 import { ownsSharedMapping } from "./ownership.ts";
+import {
+  layoutPlannerState,
+  type LayoutPlannerSnapshot,
+} from "smudgy://kapusniak/map-layout";
+import {
+  LAYOUT_STATE_PUBLISH_INTERVAL_MS,
+  ThrottledMirror,
+} from "./state-mirror.ts";
 
 export * from "./model.ts";
 export * from "./layout.ts";
@@ -24,8 +32,20 @@ export * from "./ownership.ts";
 export * from "./reflow-policy.ts";
 export * from "./mapper.ts";
 
+/** Cross-isolate layout telemetry consumed by optional NukeFire UI panels. */
+export const layoutState = createState<LayoutPlannerSnapshot>("layoutState");
+// A long search emits planner snapshots far faster than a human-read panel
+// benefits from. The throttle republishes latest-wins with a trailing edge,
+// so the mirror never exceeds the interval yet always ends on the final state.
+const layoutStateMirror = new ThrottledMirror<LayoutPlannerSnapshot>(
+  (snapshot) => layoutState.set(snapshot),
+  LAYOUT_STATE_PUBLISH_INTERVAL_MS,
+);
+layoutPlannerState.subscribe((snapshot) => layoutStateMirror.set(snapshot));
+
 export const nukefireMapper = new NukeFireMapper({
   storage: "local",
+  searchForPerfectLayouts: get("searchForPerfectLayouts") !== false,
   decisionLogFile: get("debugMappingDecisions") === true
     ? DEFAULT_DECISION_LOG_FILE
     : false,

@@ -10,16 +10,20 @@ use std::{
 };
 
 use futures::StreamExt;
+use smudgy_cloud::mutation::AreaMutation;
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapStorage, Mapper,
-    MapperBackend, PackageApiClient,
+    CloudMapper, CompositeBackend, Credential, CredentialSource, ExitArgs, ExitDirection,
+    LocalBackend, MapDestination, MapStorage, Mapper, MapperBackend, PackageApiClient, PortMode,
+    RoomNumber, RoomSide, RoomUpdates,
 };
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
 use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
+use smudgy_core::session::{
+    BufferUpdate, SessionEvent, SessionId, SessionParams, TaggedSessionEvent, spawn,
+};
 
-const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const MAP_WAIT: Duration = Duration::from_secs(15);
 const SERVER: &str = "tdome.nukefire.org";
 const MAPPER_SPEC: &str = "smudgy://local/nukefire-mapper";
 
@@ -125,7 +129,81 @@ fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
     }
 }
 
+async fn wait_for_map_state<S, F>(events: &mut S, lines: &mut Vec<String>, ready: F) -> bool
+where
+    S: futures::Stream<Item = TaggedSessionEvent> + Unpin,
+    F: Fn() -> bool,
+{
+    let deadline = tokio::time::Instant::now() + MAP_WAIT;
+    loop {
+        if ready() {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining.min(Duration::from_millis(100)), events.next()).await {
+            Ok(Some(event)) => {
+                if let SessionEvent::UpdateBuffer(updates) = event.event {
+                    collect(&updates, lines);
+                }
+            }
+            Ok(None) => return ready(),
+            Err(_) => {}
+        }
+    }
+}
+
+fn target_port_layout(
+    mapper: &Mapper,
+    external_id: &str,
+    side: RoomSide,
+) -> Option<Vec<(usize, f32, PortMode)>> {
+    let atlas = mapper.get_current_atlas();
+    let (room_key, target) = atlas.find_room_by_external_id(external_id)?;
+    let area = atlas.get_area(&room_key.area_id)?;
+    let target_number = target.get_room_number();
+    let mut ports: Vec<_> = area
+        .get_connections()
+        .iter()
+        .filter_map(|connection| {
+            let endpoint = if connection.endpoint_a.room_number == target_number {
+                Some(connection.endpoint_a)
+            } else {
+                connection
+                    .endpoint_b
+                    .filter(|endpoint| endpoint.room_number == target_number)
+            }?;
+            if endpoint.side != side {
+                return None;
+            }
+            let member_count = area
+                .get_rooms()
+                .iter()
+                .flat_map(|room| room.get_exits())
+                .filter(|exit| exit.connection_id == connection.id)
+                .count();
+            Some((member_count, endpoint.port_offset, endpoint.port_mode))
+        })
+        .collect();
+    ports.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    Some(ports)
+}
+
+fn area_property_for_room(mapper: &Mapper, external_id: &str, property: &str) -> Option<String> {
+    let atlas = mapper.get_current_atlas();
+    let (room_key, _) = atlas.find_room_by_external_id(external_id)?;
+    atlas
+        .get_area(&room_key.area_id)
+        .and_then(|area| area.get_property(property).map(str::to_string))
+}
+
 #[tokio::test]
+// Keep the authored-package smoke test as one chronological session: splitting
+// it would hide which GMCP messages and durable mapper state share a runtime.
+#[allow(clippy::too_many_lines)]
 async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -157,6 +235,102 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     let backend: Arc<dyn MapperBackend + Send + Sync> =
         Arc::new(CompositeBackend::new(local, cloud));
     let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    // Stand in for a map created by an older package version: every port still
+    // occupies its semantic midpoint, and an otherwise identical Map.Local
+    // snapshot must migrate it without waiting for unrelated topology edits.
+    let existing_port_area = mapper
+        .create_area_at(
+            "Port Existing Test".to_string(),
+            MapDestination::loose(MapStorage::Local),
+        )
+        .await
+        .expect("create existing port area");
+    let room = |title: &str, external_id: &str, x: f32, y: f32| RoomUpdates {
+        title: Some(title.to_string()),
+        external_id: Some(Some(external_id.to_string())),
+        x: Some(x),
+        y: Some(y),
+        level: Some(0),
+        ..RoomUpdates::default()
+    };
+    let exit = |direction, to, to_direction, command: Option<&str>| ExitArgs {
+        from_direction: direction,
+        to_area_id: Some(existing_port_area),
+        to_room_number: Some(RoomNumber(to)),
+        to_direction,
+        weight: 1.0,
+        command: command.map(str::to_string),
+        ..ExitArgs::default()
+    };
+    let seeded = mapper
+        .mutate_area(
+            existing_port_area,
+            vec![
+                AreaMutation::UpsertAreaProperty {
+                    name: "nukefire.zone".to_string(),
+                    value: "33".to_string(),
+                    is_secret: None,
+                },
+                // Simulate an earlier quiet reflow which was interrupted. The
+                // package must retry it passively on this area's first entry.
+                AreaMutation::UpsertAreaProperty {
+                    name: "nukefire.layout.polish-pending".to_string(),
+                    value: "true".to_string(),
+                    is_secret: None,
+                },
+                AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(1),
+                    body: room("Existing Port Target", "500", 0.0, 0.0),
+                },
+                AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(2),
+                    body: room("Existing Reciprocal Source", "501", -3.0, 0.0),
+                },
+                AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(3),
+                    body: room("Existing Northwest Source", "502", -3.0, -1.0),
+                },
+                AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(4),
+                    body: room("Existing Southwest Source", "503", -3.0, 1.0),
+                },
+                AreaMutation::CreateExit {
+                    room_number: RoomNumber(2),
+                    body: exit(ExitDirection::East, 1, Some(ExitDirection::West), None),
+                },
+                AreaMutation::CreateExit {
+                    room_number: RoomNumber(1),
+                    body: exit(ExitDirection::West, 2, Some(ExitDirection::East), None),
+                },
+                AreaMutation::CreateExit {
+                    room_number: RoomNumber(3),
+                    body: exit(
+                        ExitDirection::Special,
+                        1,
+                        None,
+                        Some("existing-northwest-arrival"),
+                    ),
+                },
+                AreaMutation::CreateExit {
+                    room_number: RoomNumber(4),
+                    body: exit(
+                        ExitDirection::Special,
+                        1,
+                        None,
+                        Some("existing-southwest-arrival"),
+                    ),
+                },
+            ],
+            "Seed existing centered ports",
+        )
+        .expect("seed existing centered ports");
+    if let Some(operation_id) = seeded.operation_id() {
+        mapper
+            .wait_for_mutation(operation_id)
+            .await
+            .expect("existing centered ports acknowledged");
+    }
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(9360_u32),
         server_name: Arc::new(SERVER.to_string()),
@@ -212,11 +386,16 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     tx.send(gmcp("NukeFire.Map.Local", snapshot)).unwrap();
     tx.send(gmcp("NukeFire.Map.Local", snapshot)).unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            mapper
+                .get_current_atlas()
+                .find_room_by_external_id("100")
+                .is_some()
+        })
+        .await,
+        "timed out waiting for room 100"
+    );
     let transcript = lines.join("\n");
     assert!(
         !transcript.contains("[nukefire-mapper] failed")
@@ -287,11 +466,15 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     }"#;
     tx.send(gmcp("NukeFire.Map.Local", lower_snapshot)).unwrap();
 
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
-        if let SessionEvent::UpdateBuffer(updates) = event.event {
-            collect(&updates, &mut lines);
-        }
-    }
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            let atlas = mapper.get_current_atlas();
+            atlas.find_room_by_external_id("200").is_some()
+                && atlas.find_room_by_external_id("201").is_some()
+        })
+        .await,
+        "timed out waiting for lower-level rooms"
+    );
     let transcript = lines.join("\n");
     assert!(
         !transcript.contains("[nukefire-mapper] failed")
@@ -318,6 +501,253 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     assert!((room201.get_x() - room200.get_x() - 1.0).abs() < f32::EPSILON);
     assert!((room201.get_y() - room200.get_y()).abs() < f32::EPSILON);
 
+    // Seed a deliberately stretched but otherwise valid corridor. The prompt
+    // topology lane preserves Map.Local's x=4 placement; after the quiet
+    // period, the full reflow must publish and durably apply its adjacent
+    // best-so-far layout before exhaustive repair returns.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{
+          "num": 300, "name": "Progress West", "area": "Progressive Test",
+          "zone": 31, "terrain": "city", "exits": { "e": 301 },
+          "coords": { "x": 0, "y": 0, "z": 0 }
+        }"#,
+    ))
+    .unwrap();
+    let gapped_snapshot = r#"{
+      "version": 1, "source": "bigmap+gps", "center": 300,
+      "zone": 31, "plane": 0,
+      "rooms": [
+        {
+          "vnum": 300, "name": "Progress West", "zone": 31,
+          "terrain": "city", "x": 0, "y": 0, "z": 0,
+          "current": true, "route": false, "destination": false
+        },
+        {
+          "vnum": 301, "name": "Progress East", "zone": 31,
+          "terrain": "city", "x": 4, "y": 0, "z": 0,
+          "current": false, "route": false, "destination": false
+        }
+      ],
+      "links": [{
+        "from": 300, "to": 301, "direction": "east",
+        "bidirectional": true, "closed": false, "locked": false, "route": false
+      }],
+      "gps": {
+        "active": false, "type": "none", "target": -1,
+        "description": "", "steps": 0, "route_raw": ""
+      },
+      "truncated": false
+    }"#;
+    tx.send(gmcp("NukeFire.Map.Local", gapped_snapshot))
+        .unwrap();
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            let atlas = mapper.get_current_atlas();
+            let Some((_, room300)) = atlas.find_room_by_external_id("300") else {
+                return false;
+            };
+            let Some((_, room301)) = atlas.find_room_by_external_id("301") else {
+                return false;
+            };
+            (room301.get_x() - room300.get_x() - 1.0).abs() < f32::EPSILON
+        })
+        .await,
+        "timed out waiting for progressive corridor reflow"
+    );
+    let atlas = mapper.get_current_atlas();
+    let (_, room300) = atlas.find_room_by_external_id("300").expect("room 300");
+    let (_, room301) = atlas.find_room_by_external_id("301").expect("room 301");
+    assert!(
+        (room301.get_x() - room300.get_x() - 1.0).abs() < f32::EPSILON,
+        "progressive reflow compacted the stretched corridor"
+    );
+    // The coordinate mutation becomes host-visible just before the package
+    // appends its decision record. Do not supersede that callback with the next
+    // synthetic area in the narrow post-commit interval this test observes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A reciprocal west-wall connection keeps its semantic midpoint while
+    // two one-way arrivals fan into the neighboring canonical port lanes.
+    // This runs through the authored package and script-visible
+    // Exit.connection_id, not merely the pure TypeScript allocator.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{
+          "num": 400, "name": "Port Target", "area": "Port Test",
+          "zone": 32, "terrain": "city", "exits": {},
+          "coords": { "x": 0, "y": 0, "z": 0 }
+        }"#,
+    ))
+    .unwrap();
+    let port_snapshot = r#"{
+      "version": 1, "source": "bigmap+gps", "center": 400,
+      "zone": 32, "plane": 0,
+      "rooms": [
+        {
+          "vnum": 400, "name": "Port Target", "zone": 32,
+          "terrain": "city", "x": 0, "y": 0, "z": 0,
+          "current": true, "route": false, "destination": false
+        },
+        {
+          "vnum": 401, "name": "Reciprocal Source", "zone": 32,
+          "terrain": "city", "x": -3, "y": 0, "z": 0,
+          "current": false, "route": false, "destination": false
+        },
+        {
+          "vnum": 402, "name": "Northwest Source", "zone": 32,
+          "terrain": "city", "x": -3, "y": -1, "z": 0,
+          "current": false, "route": false, "destination": false
+        },
+        {
+          "vnum": 403, "name": "Southwest Source", "zone": 32,
+          "terrain": "city", "x": -3, "y": 1, "z": 0,
+          "current": false, "route": false, "destination": false
+        }
+      ],
+      "links": [
+        {
+          "from": 401, "to": 400, "direction": "east",
+          "bidirectional": true, "closed": false, "locked": false, "route": false
+        },
+        {
+          "from": 402, "to": 400, "direction": "northwest-arrival",
+          "bidirectional": false, "closed": false, "locked": false, "route": false
+        },
+        {
+          "from": 403, "to": 400, "direction": "southwest-arrival",
+          "bidirectional": false, "closed": false, "locked": false, "route": false
+        }
+      ],
+      "gps": {
+        "active": false, "type": "none", "target": -1,
+        "description": "", "steps": 0, "route_raw": ""
+      },
+      "truncated": false
+    }"#;
+    tx.send(gmcp("NukeFire.Map.Local", port_snapshot)).unwrap();
+    tx.send(gmcp("NukeFire.Map.Local", port_snapshot)).unwrap();
+    let expected_ports = vec![
+        (1, 0.2, PortMode::AutoPinned),
+        (1, 0.8, PortMode::AutoPinned),
+        (2, 0.5, PortMode::AutoPinned),
+    ];
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            target_port_layout(&mapper, "400", RoomSide::West).as_ref() == Some(&expected_ports)
+        })
+        .await,
+        "timed out waiting for one-way port disambiguation"
+    );
+    let transcript = lines.join("\n");
+    assert!(
+        !transcript.contains("[nukefire-mapper] failed")
+            && !transcript.contains("[nukefire-mapper] smudgy:"),
+        "mapper reported an error during port disambiguation:\n{transcript}"
+    );
+    assert_eq!(
+        target_port_layout(&mapper, "400", RoomSide::West),
+        Some(expected_ports.clone()),
+        "one-way arrivals use distinct target-wall lanes"
+    );
+
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{
+          "num": 500, "name": "Existing Port Target", "area": "Port Existing Test",
+          "zone": 33, "terrain": "city", "exits": {},
+          "coords": { "x": 0, "y": 0, "z": 0 }
+        }"#,
+    ))
+    .unwrap();
+    let existing_port_snapshot = r#"{
+      "version": 1, "source": "bigmap+gps", "center": 500,
+      "zone": 33, "plane": 0,
+      "rooms": [
+        {
+          "vnum": 500, "name": "Existing Port Target", "zone": 33,
+          "terrain": "city", "x": 0, "y": 0, "z": 0,
+          "current": true, "route": false, "destination": false
+        },
+        {
+          "vnum": 501, "name": "Existing Reciprocal Source", "zone": 33,
+          "terrain": "city", "x": -3, "y": 0, "z": 0,
+          "current": false, "route": false, "destination": false
+        },
+        {
+          "vnum": 502, "name": "Existing Northwest Source", "zone": 33,
+          "terrain": "city", "x": -3, "y": -1, "z": 0,
+          "current": false, "route": false, "destination": false
+        },
+        {
+          "vnum": 503, "name": "Existing Southwest Source", "zone": 33,
+          "terrain": "city", "x": -3, "y": 1, "z": 0,
+          "current": false, "route": false, "destination": false
+        }
+      ],
+      "links": [
+        {
+          "from": 501, "to": 500, "direction": "east",
+          "bidirectional": true, "closed": false, "locked": false, "route": false
+        },
+        {
+          "from": 502, "to": 500, "direction": "existing-northwest-arrival",
+          "bidirectional": false, "closed": false, "locked": false, "route": false
+        },
+        {
+          "from": 503, "to": 500, "direction": "existing-southwest-arrival",
+          "bidirectional": false, "closed": false, "locked": false, "route": false
+        }
+      ],
+      "gps": {
+        "active": false, "type": "none", "target": -1,
+        "description": "", "steps": 0, "route_raw": ""
+      },
+      "truncated": false
+    }"#;
+    tx.send(gmcp("NukeFire.Map.Local", existing_port_snapshot))
+        .unwrap();
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            target_port_layout(&mapper, "500", RoomSide::West).as_ref() == Some(&expected_ports)
+        })
+        .await,
+        "timed out waiting for existing port migration"
+    );
+    assert_eq!(
+        target_port_layout(&mapper, "500", RoomSide::West),
+        Some(expected_ports),
+        "a settled area is reconciled on its first authoritative snapshot"
+    );
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            area_property_for_room(
+                &mapper,
+                "500",
+                "nukefire.layout.polish-exhausted-fingerprint",
+            )
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .is_some_and(|memo| {
+                memo["v"] == 2
+                    && memo["g"]
+                        .as_str()
+                        .is_some_and(|geometry| !geometry.is_empty())
+                    && memo["c"].as_array().is_some_and(|contexts| {
+                        contexts.len() == 1
+                            && contexts[0].as_str().is_some_and(|key| {
+                                key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                    })
+            })
+        })
+        .await,
+        "timed out waiting for passive layout polish to memoize this fixed-point context"
+    );
+    assert_eq!(
+        area_property_for_room(&mapper, "500", "nukefire.layout.polish-pending").as_deref(),
+        Some("true"),
+        "a context-relative fixed point must preserve area-wide polish eligibility"
+    );
     let decision_log = find_file(&smudgy_home.join(SERVER), "mapping-decisions.jsonl")
         .expect("debug decision log was created");
     let records: Vec<serde_json::Value> = std::fs::read_to_string(decision_log)
@@ -325,6 +755,13 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid decision record"))
         .collect();
+    assert!(
+        !records.iter().any(|record| {
+            record["kind"] == "mutation-error"
+                && record.to_string().contains("endpoint_room_immutable")
+        }),
+        "newly created links must be mirrored in canonical endpoint order"
+    );
     let mutation_id = records
         .iter()
         .find(|record| record["kind"] == "mutation-start" && record["api"] == "mutateArea")
@@ -352,6 +789,11 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
             .iter()
             .any(|record| record["kind"] == "current-location")
     );
+    assert!(records.iter().any(|record| {
+        record["kind"] == "layout-progress-applied"
+            && record["area"]["name"] == "Progressive Test"
+            && record["movedRooms"].as_u64().is_some_and(|count| count > 0)
+    }));
 
     tx.send(RuntimeAction::Shutdown).ok();
 }

@@ -42,7 +42,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::channel::oneshot;
+use futures::channel::{mpsc as futures_mpsc, oneshot};
 use kira::{
     AudioManager, AudioManagerSettings, Capacities, Decibels, Frame as KiraFrame, Tween,
     backend::{Backend, Renderer},
@@ -331,6 +331,8 @@ pub trait MixerInput: Send + 'static {
 pub enum MixerOutputFailure {
     /// The physical driver stopped or reported a device/backend error.
     BackendFailure,
+    /// Render callbacks stopped advancing beyond the resume grace period.
+    CallbackStalled,
     /// The physical callback supplied invalid channel or buffer geometry.
     InvalidCallbackGeometry,
     /// The Kira render boundary unwound and was silenced.
@@ -338,6 +340,12 @@ pub enum MixerOutputFailure {
     /// The sole mixer command owner unwound.
     OwnerPanicked,
 }
+
+/// One bounded, change-driven stream of terminal process-output failures.
+///
+/// The sole mixer owner publishes at most one item. Recoverable endpoint
+/// interruptions are deliberately not observable through this stream.
+pub type MixerOutputFailureReceiver = futures_mpsc::Receiver<MixerOutputFailure>;
 
 /// Receives one off-render process-output failure notification for an input.
 pub trait MixerFailureObserver: Send + Sync + 'static {
@@ -399,6 +407,7 @@ const fn slot_failure_cause(failure: MixerOutputFailure) -> u64 {
         MixerOutputFailure::InvalidCallbackGeometry => 2,
         MixerOutputFailure::RendererPanicked => 3,
         MixerOutputFailure::OwnerPanicked => 4,
+        MixerOutputFailure::CallbackStalled => 5,
     };
     cause << SLOT_CAUSE_SHIFT
 }
@@ -409,6 +418,7 @@ fn decode_slot_failure(word: u64) -> Option<MixerOutputFailure> {
         2 => Some(MixerOutputFailure::InvalidCallbackGeometry),
         3 => Some(MixerOutputFailure::RendererPanicked),
         4 => Some(MixerOutputFailure::OwnerPanicked),
+        5 => Some(MixerOutputFailure::CallbackStalled),
         _ => None,
     }
 }
@@ -1127,6 +1137,7 @@ const fn driver_cause(failure: MixerOutputFailure) -> u64 {
         MixerOutputFailure::InvalidCallbackGeometry => 2,
         MixerOutputFailure::RendererPanicked => 3,
         MixerOutputFailure::OwnerPanicked => 4,
+        MixerOutputFailure::CallbackStalled => 5,
     };
     cause << DRIVER_CAUSE_SHIFT
 }
@@ -1148,12 +1159,14 @@ fn decode_driver_cause(word: u64) -> Option<MixerOutputFailure> {
         2 => Some(MixerOutputFailure::InvalidCallbackGeometry),
         3 => Some(MixerOutputFailure::RendererPanicked),
         4 => Some(MixerOutputFailure::OwnerPanicked),
+        5 => Some(MixerOutputFailure::CallbackStalled),
         _ => None,
     }
 }
 
 struct DriverStatus {
     word: AtomicU64,
+    callback_epoch: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
     panic_owner: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -1190,6 +1203,7 @@ impl DriverStatus {
     fn new() -> Self {
         Self {
             word: AtomicU64::new(DriverPhase::Provisional as u64),
+            callback_epoch: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
             panic_owner: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -1244,6 +1258,14 @@ impl DriverStatus {
                 return true;
             }
         }
+    }
+
+    fn record_render_callback(&self) {
+        self.callback_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn callback_epoch(&self) -> u64 {
+        self.callback_epoch.load(Ordering::Acquire)
     }
 
     fn begin_close(&self) -> bool {
@@ -1362,12 +1384,24 @@ impl DriverFailureSignal {
     fn report(&self, failure: MixerOutputFailure) -> bool {
         self.0.upgrade().is_some_and(|status| status.fail(failure))
     }
+
+    #[cfg(feature = "physical-output")]
+    fn callback_epoch(&self) -> Option<u64> {
+        self.0.upgrade().map(|status| status.callback_epoch())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriverRenderError {
     InvalidGeometry,
     RendererPanicked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "physical-output"), allow(dead_code))]
+enum DriverMaintenance {
+    Continue,
+    Terminal(MixerOutputFailure),
 }
 
 struct JoinedRenderer {
@@ -1378,6 +1412,7 @@ struct JoinedRenderer {
 impl JoinedRenderer {
     fn render(&mut self, output: &mut [f32], channels: usize) -> Result<(), DriverRenderError> {
         output.fill(0.0);
+        self.status.record_render_callback();
         if !self.status.is_live() {
             return Ok(());
         }
@@ -1407,14 +1442,24 @@ impl JoinedRenderer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackStallPolicy {
+    /// The mixer terminalizes a stalled callback after its own grace period.
+    MixerManaged,
+    /// The driver detects callback stalls and recovers or terminalizes itself.
+    DriverManaged,
+    /// Callbacks advance only when explicitly driven, so elapsed wall time is
+    /// not evidence that output stalled.
+    Manual,
+}
+
 trait JoinedOutputDriver: Sized {
     type Settings;
     type Error;
 
-    /// Whether render callbacks advance independently of test code. Manual
-    /// probes intentionally return `false`; a pause between explicit renders
-    /// is not evidence that their synthetic device stalled.
-    const CALLBACKS_RUN_AUTONOMOUSLY: bool = true;
+    /// Selects exactly one owner for callback-stall detection. Future physical
+    /// drivers default to the mixer's fail-closed retirement watchdog.
+    const CALLBACK_STALL_POLICY: CallbackStallPolicy = CallbackStallPolicy::MixerManaged;
 
     fn setup(
         settings: Self::Settings,
@@ -1423,6 +1468,9 @@ trait JoinedOutputDriver: Sized {
     ) -> Result<(Self, PhysicalOutputFormat), Self::Error>;
     fn start(&mut self, renderer: JoinedRenderer) -> Result<(), Self::Error>;
     fn play(&mut self) -> Result<(), Self::Error>;
+    fn maintain(&mut self, _now: Instant) -> DriverMaintenance {
+        DriverMaintenance::Continue
+    }
     fn close_and_join(&mut self) -> bool;
 }
 
@@ -1495,6 +1543,12 @@ impl<D: JoinedOutputDriver> Backend for MonitoredBackend<D> {
     }
 }
 
+impl<D: JoinedOutputDriver> MonitoredBackend<D> {
+    fn maintain(&mut self, now: Instant) -> DriverMaintenance {
+        self.driver.maintain(now)
+    }
+}
+
 impl<D: JoinedOutputDriver> Drop for MonitoredBackend<D> {
     fn drop(&mut self) {
         self.status.begin_close();
@@ -1559,6 +1613,12 @@ struct SessionRetirementState {
     inputs_closed: bool,
     tracks_dropped: bool,
     tracks_dropped_at: Option<Instant>,
+    callback_stall: Option<CallbackStallObservation>,
+}
+
+struct CallbackStallObservation {
+    epoch: u64,
+    observed_at: Instant,
 }
 
 struct SessionTracks {
@@ -1615,6 +1675,13 @@ struct MixerCore<D: JoinedOutputDriver> {
 }
 
 impl<D: JoinedOutputDriver> MixerCore<D> {
+    fn maintain_output(&mut self, now: Instant) -> DriverMaintenance {
+        self.manager.as_mut().map_or(
+            DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure),
+            |manager| manager.backend_mut().maintain(now),
+        )
+    }
+
     fn with_limits(
         backend_settings: D::Settings,
         driver_status: Arc<DriverStatus>,
@@ -1622,8 +1689,8 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         max_sessions: usize,
         inputs_per_bus: usize,
     ) -> Result<(Self, PhysicalOutputFormat), MixerStartError<D::Error>> {
-        let negotiated = Arc::new(Mutex::new(None));
         let retirement_status = Arc::clone(&driver_status);
+        let negotiated = Arc::new(Mutex::new(None));
         let manager = AudioManager::new(AudioManagerSettings {
             capacities: Capacities {
                 sub_track_capacity: max_sessions,
@@ -1656,11 +1723,10 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             };
             startup_error(cause, retirement_status.is_uncertain())
         })?;
-        let negotiated = lock_recover(&negotiated)
-            .take()
-            .ok_or(MixerStartError::DriverFailed(
-                MixerOutputFailure::BackendFailure,
-            ))?;
+        let negotiated = *lock_recover(&negotiated);
+        let negotiated = negotiated.ok_or(MixerStartError::DriverFailed(
+            MixerOutputFailure::BackendFailure,
+        ))?;
         Ok((
             Self {
                 manager: Some(manager),
@@ -1899,6 +1965,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
             inputs_closed: false,
             tracks_dropped: false,
             tracks_dropped_at: None,
+            callback_stall: None,
         });
         Ok(())
     }
@@ -2024,6 +2091,27 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 .as_mut()
                 .expect("filtered retiring session")
                 .tracks_dropped_at = Some(Instant::now());
+            session
+                .retirement
+                .as_mut()
+                .expect("filtered retiring session")
+                .callback_stall = None;
+        }
+    }
+
+    fn rendered_session_retirement_timeout(
+        #[cfg(test)] configured_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        if D::CALLBACK_STALL_POLICY == CallbackStallPolicy::DriverManaged {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(timeout) = configured_timeout {
+            return Some(timeout);
+        }
+        match D::CALLBACK_STALL_POLICY {
+            CallbackStallPolicy::MixerManaged => Some(SESSION_TRACK_RETIREMENT_TIMEOUT),
+            CallbackStallPolicy::DriverManaged | CallbackStallPolicy::Manual => None,
         }
     }
 
@@ -2044,23 +2132,41 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
         let reported_track_count = manager.num_sub_tracks();
         if reported_track_count > active_track_count {
             let now = Instant::now();
-            #[cfg(test)]
-            let retirement_timeout = self.session_track_retirement_timeout.or_else(|| {
-                D::CALLBACKS_RUN_AUTONOMOUSLY.then_some(SESSION_TRACK_RETIREMENT_TIMEOUT)
-            });
-            #[cfg(not(test))]
-            let retirement_timeout =
-                D::CALLBACKS_RUN_AUTONOMOUSLY.then_some(SESSION_TRACK_RETIREMENT_TIMEOUT);
-            let callback_stalled = self.sessions.values().any(|session| {
-                session
-                    .retirement
-                    .as_ref()
-                    .and_then(|retirement| retirement.tracks_dropped_at)
-                    .is_some_and(|dropped| {
-                        retirement_timeout.is_some_and(|timeout| {
-                            now.saturating_duration_since(dropped) >= timeout
-                        })
-                    })
+            let retirement_timeout = Self::rendered_session_retirement_timeout(
+                #[cfg(test)]
+                self.session_track_retirement_timeout,
+            );
+            let callback_epoch = driver_status.callback_epoch();
+            let callback_stalled = self.sessions.values_mut().any(|session| {
+                let Some(retirement) = session.retirement.as_mut() else {
+                    return false;
+                };
+                let Some(dropped_at) = retirement.tracks_dropped_at else {
+                    return false;
+                };
+                let Some(timeout) = retirement_timeout else {
+                    return false;
+                };
+                if now.saturating_duration_since(dropped_at) < timeout {
+                    return false;
+                }
+                let Some(observation) = retirement.callback_stall.as_mut() else {
+                    // The owner and device callback can both be paused across
+                    // sleep/resume. Begin a fresh grace period after the owner
+                    // wakes instead of treating the old wall-clock gap as
+                    // immediate proof that the stream died.
+                    retirement.callback_stall = Some(CallbackStallObservation {
+                        epoch: callback_epoch,
+                        observed_at: now,
+                    });
+                    return false;
+                };
+                if observation.epoch != callback_epoch {
+                    observation.epoch = callback_epoch;
+                    observation.observed_at = now;
+                    return false;
+                }
+                now.saturating_duration_since(observation.observed_at) >= timeout
             });
             if callback_stalled {
                 // Kira removes dropped tracks only while its renderer advances.
@@ -2068,7 +2174,7 @@ impl<D: JoinedOutputDriver> MixerCore<D> {
                 // terminalize the shared output instead of leaving this
                 // session's retirement future pending forever.
                 self.cleanup_clean = false;
-                driver_status.fail(MixerOutputFailure::BackendFailure);
+                driver_status.fail(MixerOutputFailure::CallbackStalled);
                 return false;
             }
             return true;
@@ -3359,6 +3465,12 @@ impl MixerMasterGainAuthority {
     }
 
     /// Atomically set the remembered linear gain and independent mute state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerControlError::InvalidGain`] before enqueueing for a
+    /// non-finite or out-of-range value, or a typed bounded-control/stopped
+    /// service error if the update cannot be applied.
     pub fn set_state(&self, linear: f32, muted: bool) -> Result<MixerGainState, MixerControlError> {
         self.update(MixerGainUpdate::State(MixerGainState {
             linear: validate_control_gain(linear)?,
@@ -3839,8 +3951,8 @@ pub struct MixerService {
     owner: Option<JoinHandle<()>>,
     owner_status: Arc<OwnerStatus>,
     driver_status: Arc<DriverStatus>,
+    output_failure_events: Option<MixerOutputFailureReceiver>,
     format: MixerFormat,
-    physical_format: PhysicalOutputFormat,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -3905,6 +4017,7 @@ impl MixerService {
             driver_status: Arc::clone(&driver_status),
         });
         let owner_status = Arc::new(OwnerStatus::new());
+        let (output_failure_sender, output_failure_receiver) = futures_mpsc::channel(1);
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
         let control_weak = Arc::downgrade(&control);
         let owner_status_thread = Arc::clone(&owner_status);
@@ -3912,6 +4025,7 @@ impl MixerService {
         let owner = thread::Builder::new()
             .name("smudgy-audio-owner".into())
             .spawn(move || {
+                let mut output_failure_sender = Some(output_failure_sender);
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     run_owner::<D>(
                         backend_settings,
@@ -3925,10 +4039,15 @@ impl MixerService {
                         &control_weak,
                         &owner_status_thread,
                         &driver_status_thread,
+                        &mut output_failure_sender,
                     );
                 }));
                 if outcome.is_err() {
                     driver_status_thread.fail(MixerOutputFailure::OwnerPanicked);
+                    let failure = driver_status_thread
+                        .failure()
+                        .unwrap_or(MixerOutputFailure::OwnerPanicked);
+                    publish_output_failure(&mut output_failure_sender, failure);
                     if let Some(control) = control_weak.upgrade() {
                         let _ = control.seal_production();
                     }
@@ -3939,13 +4058,13 @@ impl MixerService {
             })
             .map_err(MixerStartError::Thread)?;
         match started_receiver.recv() {
-            Ok(Ok(physical_format)) => Ok(Self {
+            Ok(Ok(_)) => Ok(Self {
                 control: Some(control),
                 owner: Some(owner),
                 owner_status,
                 driver_status,
+                output_failure_events: Some(output_failure_receiver),
                 format,
-                physical_format,
                 _thread_affinity: PhantomData,
             }),
             Ok(Err(error)) => {
@@ -3967,10 +4086,13 @@ impl MixerService {
         self.format
     }
 
-    /// Exact format accepted from the physical output driver at startup.
-    #[must_use]
-    pub fn physical_output_format(&self) -> PhysicalOutputFormat {
-        self.physical_format
+    /// Takes the unique terminal-output event receiver.
+    ///
+    /// A terminal failure that happened before this call remains buffered.
+    /// Clean shutdown or ordinary service drop closes the receiver without an
+    /// item. Subsequent calls return `None`.
+    pub fn take_output_failure_events(&mut self) -> Option<MixerOutputFailureReceiver> {
+        self.output_failure_events.take()
     }
 
     /// Returns a weak, cloneable session-registration authority.
@@ -4128,6 +4250,7 @@ fn run_owner<D>(
     control: &Weak<ControlInner>,
     status: &OwnerStatus,
     driver_status: &Arc<DriverStatus>,
+    output_failure_sender: &mut Option<futures_mpsc::Sender<MixerOutputFailure>>,
 ) where
     D: JoinedOutputDriver,
 {
@@ -4192,10 +4315,15 @@ fn run_owner<D>(
                 control,
                 &mut pending,
                 driver_status,
+                output_failure_sender,
             );
         }));
         if active.is_err() {
             driver_status.fail(MixerOutputFailure::OwnerPanicked);
+            let failure = driver_status
+                .failure()
+                .unwrap_or(MixerOutputFailure::OwnerPanicked);
+            publish_output_failure(output_failure_sender, failure);
         }
         forget_panic(active);
     }
@@ -4214,7 +4342,33 @@ fn run_owner<D>(
     status.retired.store(true, Ordering::Release);
 }
 
-#[allow(clippy::too_many_arguments)]
+fn publish_output_failure(
+    sender: &mut Option<futures_mpsc::Sender<MixerOutputFailure>>,
+    failure: MixerOutputFailure,
+) {
+    if let Some(mut sender) = sender.take() {
+        let _ = sender.try_send(failure);
+    }
+}
+
+fn handle_driver_failure<D: JoinedOutputDriver>(
+    mixer: &mut MixerCore<D>,
+    control: &Weak<ControlInner>,
+    cleanup_sender: &SyncSender<CleanupTask>,
+    output_failure_sender: &mut Option<futures_mpsc::Sender<MixerOutputFailure>>,
+    failure: MixerOutputFailure,
+) {
+    publish_output_failure(output_failure_sender, failure);
+    log::error!("physical audio output failed: {failure:?}");
+    if let Some(control) = control.upgrade()
+        && control.seal_production().is_err()
+    {
+        mixer.cleanup_clean = false;
+    }
+    notify_failed_inputs(mixer, failure, cleanup_sender);
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_active_owner<D: JoinedOutputDriver>(
     mixer: &mut MixerCore<D>,
     commands: &Receiver<OwnerCommand>,
@@ -4225,6 +4379,7 @@ fn run_active_owner<D: JoinedOutputDriver>(
     control: &Weak<ControlInner>,
     pending: &mut Vec<RetirementRequest>,
     driver_status: &DriverStatus,
+    output_failure_sender: &mut Option<futures_mpsc::Sender<MixerOutputFailure>>,
 ) {
     loop {
         #[cfg(any(test, feature = "test-support"))]
@@ -4233,13 +4388,20 @@ fn run_active_owner<D: JoinedOutputDriver>(
             "injected mixer owner panic"
         );
         drain_cleanup_results(mixer, cleanup_results);
-        if let Some(failure) = driver_status.failure() {
-            if let Some(control) = control.upgrade()
-                && control.seal_production().is_err()
-            {
-                mixer.cleanup_clean = false;
+        match mixer.maintain_output(Instant::now()) {
+            DriverMaintenance::Continue => {}
+            DriverMaintenance::Terminal(failure) => {
+                driver_status.fail(failure);
             }
-            notify_failed_inputs(mixer, failure, cleanup_sender);
+        }
+        if let Some(failure) = driver_status.failure() {
+            handle_driver_failure(
+                mixer,
+                control,
+                cleanup_sender,
+                output_failure_sender,
+                failure,
+            );
             break;
         }
         drain_retirements(retirements, pending);
@@ -4256,6 +4418,21 @@ fn run_active_owner<D: JoinedOutputDriver>(
         #[cfg(test)]
         driver_status.pause_before_session_forced_cleanup();
         if !progress_session_retirements(mixer, cleanup_sender, pending, driver_status) {
+            // Retirement progression can be the operation that discovers a
+            // mixer-managed callback stall. Route that newly latched failure
+            // through the same single terminal publication path used by the
+            // maintenance scan before leaving the active loop. Structural
+            // retirement failures do not latch driver status and still exit
+            // without inventing an output failure.
+            if let Some(failure) = driver_status.failure() {
+                handle_driver_failure(
+                    mixer,
+                    control,
+                    cleanup_sender,
+                    output_failure_sender,
+                    failure,
+                );
+            }
             break;
         }
         let mut shutting_down = false;

@@ -9,7 +9,10 @@ import {
   type LayoutQuality,
   type LayoutResident,
   type LayoutTraceEvent,
+  type LayoutWorkerControlOptions,
+  type RouteAmendment,
 } from "./layout.ts";
+import { planLayoutModelInWorker } from "./worker-client.ts";
 
 export type LayoutRoomKey = string | number;
 export type ElevationPreference = "auto" | "levels" | "projected";
@@ -61,6 +64,12 @@ export interface PlanLayoutOptions {
   defaultElevation?: Exclude<ElevationPreference, "auto">;
   /** `thorough` runs a bounded multi-anchor, fixed-point tournament for reflows. */
   effort?: LayoutSearchEffort;
+  /**
+   * Aggregate integral-planner pass ceiling for one thorough reflow. Values
+   * below one still permit the mandatory baseline pass; omitted is the
+   * ordinary complete tournament.
+   */
+  maxPlanningPasses?: number;
   trace?: (event: LayoutTraceEvent) => void;
 }
 
@@ -87,9 +96,17 @@ export interface PlannedLayout {
   patch: LayoutPatch;
   positions: ReadonlyMap<string, GridPosition>;
   quality: Readonly<LayoutQuality>;
+  /**
+   * Advisory detours for defects every participating room's immovability made
+   * permanent. Presentation-layer only: `quality` still scores the straight
+   * segments. See map-layout's RouteAmendment.
+   */
+  routeAmendments?: readonly RouteAmendment[];
   /** Present when an opt-in thorough reflow tournament was run. */
   search?: Readonly<{
     effort: "thorough";
+    /** True only when every selected anchor completed its bounded fixed-point pass. */
+    completed: boolean;
     anchorsTried: readonly (string | null)[];
     planningPasses: number;
     selectedAnchor: string | null;
@@ -131,6 +148,14 @@ const OPPOSITE: Partial<Record<LayoutDirection, LayoutDirection>> = {
 
 function key(value: LayoutRoomKey): string {
   return String(value);
+}
+
+/**
+ * Code-unit string ordering. Layout selection must be identical across
+ * installs, so no internal ordering may depend on the host ICU locale.
+ */
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function position(value: GridPosition): GridPosition {
@@ -313,7 +338,7 @@ export function resolveElevationGeometry(input: LayoutModel): LayoutModel {
   for (let index = 0; index < edges.length; index += 1) {
     const edge = edges[index];
     if (edge.from === edge.to || !isElevationDirection(edge.direction)) continue;
-    const pair = edge.from.localeCompare(edge.to) <= 0
+    const pair = edge.from <= edge.to
       ? `${edge.from}|${edge.to}`
       : `${edge.to}|${edge.from}`;
     const indexes = byLink.get(pair) ?? [];
@@ -396,6 +421,50 @@ function edgesForDirectionalConnection(
     });
   }
   return { edges, relative };
+}
+
+/**
+ * Materialize the `before`/`after` models implied by a planned change and its
+ * patch. Worker responses carry only the patch; the requesting realm rebuilds
+ * both models from its own inputs, reproducing exactly what synchronous
+ * planning constructs: `before` is the normalized input snapshot and `after`
+ * applies the patch plus any edges the change introduces.
+ */
+export function materializePlannedLayoutModels(
+  input: LayoutModel,
+  change: LayoutChange,
+  options: Pick<PlanLayoutOptions, "defaultElevation">,
+  patch: LayoutPatch,
+): { before: LayoutModel; after: LayoutModel } {
+  const before = createLayoutModel(input);
+  const moves = new Map(patch.moves.map((move) => [move.id, move.to]));
+  const rooms: LayoutModelRoom[] = before.rooms.map((room) => {
+    const to = moves.get(room.id);
+    return to ? { ...room, position: to } : room;
+  });
+  for (const placement of patch.placements) {
+    rooms.push({ id: placement.id, position: placement.position, movable: true });
+  }
+  let edges: LayoutEdge[] = [...before.edges];
+  if (change.type === "add-room") {
+    edges = edgesForDirectionalConnection(
+      before,
+      change,
+      key(change.from),
+      change.temporaryId ?? "$new",
+      options,
+    ).edges;
+  } else if (change.type === "connect-rooms") {
+    edges = edgesForDirectionalConnection(
+      before,
+      change,
+      key(change.from),
+      key(change.to),
+      options,
+    ).edges;
+  }
+  const after = createLayoutModel({ areaId: before.areaId, rooms, edges });
+  return { before, after };
 }
 
 /** Run the existing deterministic planner once. */
@@ -483,6 +552,7 @@ function planLayoutModelOnce(
     patch: { moves, placements },
     positions: plan.positions,
     quality: plan.quality,
+    ...(plan.routeAmendments ? { routeAmendments: plan.routeAmendments } : {}),
   };
 }
 
@@ -531,6 +601,9 @@ function rebaseReflowPlan(original: LayoutModel, plan: PlannedLayout): PlannedLa
     patch: { moves, placements: [] },
     positions: new Map(after.rooms.map((room) => [room.id, room.position])),
     quality: plan.quality,
+    // Amendments describe links between rooms the plan could not move, so a
+    // rebase over identical final positions keeps them valid verbatim.
+    ...(plan.routeAmendments ? { routeAmendments: plan.routeAmendments } : {}),
   };
 }
 
@@ -573,7 +646,7 @@ function thoroughReflowAnchors(
       b.direct - a.direct ||
       b.nearby - a.nearby ||
       b.degree - a.degree ||
-      a.id.localeCompare(b.id)
+      compareStrings(a.id, b.id)
   );
 
   const result: (string | undefined)[] = [];
@@ -606,25 +679,38 @@ function reflowToFixedPoint(
   original: LayoutModel,
   anchor: string | undefined,
   options: PlanLayoutOptions,
-): { plan: PlannedLayout; passes: number; initialQuality: Readonly<LayoutQuality> } {
+  maximumPasses: number,
+): {
+  plan: PlannedLayout;
+  passes: number;
+  completed: boolean;
+  initialQuality: Readonly<LayoutQuality>;
+} {
   const change: ReflowLayoutChange = { type: "reflow", anchor };
   let current = planLayoutModelOnce(original, change, options);
   const initialQuality = { ...current.quality };
   let best = rebaseReflowPlan(original, current);
   let passes = 1;
+  let completed = false;
 
-  for (let pass = 1; pass < THOROUGH_FIXED_POINT_PASSES; pass += 1) {
+  for (let pass = 1;
+    pass < THOROUGH_FIXED_POINT_PASSES && passes < maximumPasses;
+    pass += 1) {
     const next = planLayoutModelOnce(current.after, change, options);
     passes += 1;
     // The unchanged layout is always a candidate, so a strict geometry gain
     // is the only useful reason to continue. This also prevents equal-quality
     // coordinate drift and makes the bounded search deterministic.
-    if (compareLayoutQuality(next.quality, current.quality) <= 0) break;
+    if (compareLayoutQuality(next.quality, current.quality) <= 0) {
+      completed = true;
+      break;
+    }
     current = next;
     const rebased = rebaseReflowPlan(original, current);
     if (comparePlannedLayouts(rebased, best, original) > 0) best = rebased;
   }
-  return { plan: best, passes, initialQuality };
+  if (passes >= THOROUGH_FIXED_POINT_PASSES) completed = true;
+  return { plan: best, passes, completed, initialQuality };
 }
 
 function planThoroughReflow(
@@ -638,26 +724,48 @@ function planThoroughReflow(
     throw new Error(`layout anchor room ${requestedAnchor} does not exist`);
   }
 
-  const baseline = reflowToFixedPoint(original, requestedAnchor, options);
+  const requestedPasses = Math.floor(options.maxPlanningPasses ?? Number.POSITIVE_INFINITY);
+  const maximumPasses = Number.isFinite(requestedPasses)
+    ? Math.max(1, requestedPasses)
+    : requestedPasses === Number.POSITIVE_INFINITY
+    ? Number.POSITIVE_INFINITY
+    : requestedPasses === Number.NEGATIVE_INFINITY
+    ? 1
+    : THOROUGH_ANCHOR_LIMIT * THOROUGH_FIXED_POINT_PASSES;
+  const baseline = reflowToFixedPoint(original, requestedAnchor, options, maximumPasses);
   const anchors = thoroughReflowAnchors(original, requestedAnchor, baseline.plan, options);
   let winner = baseline.plan;
   let selectedAnchor = requestedAnchor;
   let planningPasses = baseline.passes;
+  let completed = baseline.completed;
+  const anchorsTried: (string | null)[] = [requestedAnchor ?? null];
 
   for (const anchor of anchors.slice(1)) {
-    const candidate = reflowToFixedPoint(original, anchor, options);
+    if (!completed || planningPasses >= maximumPasses) {
+      completed = false;
+      break;
+    }
+    const candidate = reflowToFixedPoint(
+      original,
+      anchor,
+      options,
+      maximumPasses - planningPasses,
+    );
     planningPasses += candidate.passes;
+    anchorsTried.push(anchor ?? null);
     if (comparePlannedLayouts(candidate.plan, winner, original) > 0) {
       winner = candidate.plan;
       selectedAnchor = anchor;
     }
+    completed = candidate.completed;
   }
 
   return {
     ...winner,
     search: {
       effort: "thorough",
-      anchorsTried: anchors.map((anchor) => anchor ?? null),
+      completed,
+      anchorsTried,
       planningPasses,
       selectedAnchor: selectedAnchor ?? null,
       baselineQuality: baseline.initialQuality,
@@ -678,10 +786,21 @@ export function planLayoutModel(
   return planLayoutModelOnce(input, change, options);
 }
 
+/** Plan one change in map-layout's shared background Worker. */
+export function planLayoutModelAsync(
+  input: LayoutModel,
+  change: LayoutChange,
+  options: PlanLayoutOptions = {},
+  control: LayoutWorkerControlOptions = {},
+): Promise<PlannedLayout> {
+  return planLayoutModelInWorker(input, change, options, control);
+}
+
 /** Optional retained-snapshot API for consumers which map continuously. */
 export class LayoutWorkspace {
   #model: LayoutModel;
   #pending = new WeakSet<PlannedLayout>();
+  #generation = 0;
 
   constructor(model: LayoutModel) {
     this.#model = createLayoutModel(model);
@@ -697,12 +816,27 @@ export class LayoutWorkspace {
     return result;
   }
 
+  async planAsync(
+    change: LayoutChange,
+    options?: PlanLayoutOptions,
+    control?: LayoutWorkerControlOptions,
+  ): Promise<PlannedLayout> {
+    const generation = this.#generation;
+    const result = await planLayoutModelAsync(this.#model, change, options, control);
+    if (generation !== this.#generation) {
+      throw new Error("layout workspace changed while Worker planning was in progress");
+    }
+    this.#pending.add(result);
+    return result;
+  }
+
   accept(result: PlannedLayout): void {
     if (!this.#pending.has(result)) {
       throw new Error("cannot accept a layout planned from a different snapshot");
     }
     this.#model = result.after;
     this.#pending = new WeakSet();
+    this.#generation += 1;
   }
 }
 

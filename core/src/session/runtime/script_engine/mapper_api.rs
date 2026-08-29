@@ -995,6 +995,7 @@ fn op_smudgy_mapper_has_tag(#[cppgc] room_wrapper: &JSRoom, #[string] tag: Strin
 #[derive(Debug, Serialize)]
 struct JSExit {
     id: (u64, u64),
+    connection_id: (u64, u64),
     from_direction: String,
     from_area_id: (u64, u64),
     from_room_number: i32,
@@ -1100,6 +1101,7 @@ fn op_smudgy_mapper_get_room_exits(#[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit
         .iter()
         .map(|exit| JSExit {
             id: exit.id.0.as_u64_pair(),
+            connection_id: exit.connection_id.0.as_u64_pair(),
             from_direction: exit.from_direction.to_string(),
             from_area_id: room_wrapper.1.0.as_u64_pair(),
             from_room_number: room_wrapper.0.get_room_number().0,
@@ -1812,8 +1814,18 @@ struct JSLinkCreateParams {
 #[derive(Debug, Deserialize)]
 struct JSLinkTraversalParams {
     room_number: i32,
+    /// Kept outside the flattened exit so `serde_v8` can decode `BigInt`-carried
+    /// `u64` halves through the tuple's typed deserializer.
+    to_area_id: Option<(u64, u64)>,
     #[serde(flatten)]
     exit: JSExitCreateParams,
+}
+
+impl JSLinkTraversalParams {
+    fn into_parts(mut self) -> (i32, JSExitCreateParams) {
+        self.exit.to_area_id = self.to_area_id;
+        (self.room_number, self.exit)
+    }
 }
 
 /// One author-facing operation recorded by `mapper.mutateArea`. These are
@@ -2002,9 +2014,10 @@ impl JSAreaBatchOperation {
                     body: script_connection_args(connection_id, &mut body),
                 });
                 operations.extend(body.traversals.into_iter().map(|traversal| {
+                    let (room_number, exit) = traversal.into_parts();
                     AreaMutation::CreateExit {
-                        room_number: RoomNumber(traversal.room_number),
-                        body: script_exit_args(traversal.exit, ExitId::new(), Some(connection_id)),
+                        room_number: RoomNumber(room_number),
+                        body: script_exit_args(exit, ExitId::new(), Some(connection_id)),
                     }
                 }));
                 operations
@@ -2171,24 +2184,24 @@ async fn op_smudgy_mapper_create_link(
         },
     });
     for traversal in params.traversals {
+        let (room_number, exit) = traversal.into_parts();
         operations.push(AreaMutation::CreateExit {
-            room_number: RoomNumber(traversal.room_number),
+            room_number: RoomNumber(room_number),
             body: ExitArgs {
                 id: Some(ExitId::new()),
                 connection_id: Some(connection_id),
                 new_connection_id: None,
-                from_direction: traversal.exit.from_direction,
-                to_direction: traversal.exit.to_direction,
-                to_area_id: traversal
-                    .exit
+                from_direction: exit.from_direction,
+                to_direction: exit.to_direction,
+                to_area_id: exit
                     .to_area_id
                     .map(|id| AreaId(Uuid::from_u64_pair(id.0, id.1))),
-                to_room_number: traversal.exit.to_room_number.map(RoomNumber),
-                is_hidden: traversal.exit.is_hidden.unwrap_or(false),
-                is_closed: traversal.exit.is_closed.unwrap_or(false),
-                is_locked: traversal.exit.is_locked.unwrap_or(false),
-                weight: traversal.exit.weight.unwrap_or(1.0),
-                command: traversal.exit.command,
+                to_room_number: exit.to_room_number.map(RoomNumber),
+                is_hidden: exit.is_hidden.unwrap_or(false),
+                is_closed: exit.is_closed.unwrap_or(false),
+                is_locked: exit.is_locked.unwrap_or(false),
+                weight: exit.weight.unwrap_or(1.0),
+                command: exit.command,
                 path: None,
                 is_secret: None,
             },
@@ -3106,5 +3119,49 @@ mod compatibility_tests {
         let chunks = pack_area_batch_operations(operations).expect("batch packs");
         assert_eq!(chunks.len(), 1);
         assert!(matches!(chunks[0][0], AreaMutation::CreateExit { .. }));
+    }
+
+    #[test]
+    fn externally_tagged_create_link_decodes_v8_bigint_traversal_area_id() {
+        let mut runtime = JsRuntime::new(RuntimeOptions::default());
+        let value = runtime
+            .execute_script(
+                "<mapper-create-link-bigint>",
+                FastString::from_static(
+                    r#"[{ create_link: {
+                        connection_id: [18446744073709551615n, 9223372036854775808n],
+                        body: {
+                            endpoint_a: {
+                                room_number: 1,
+                                side: "East",
+                                port_offset: 0.5,
+                                port_mode: "AutoPinned"
+                            },
+                            traversals: [{
+                                room_number: 1,
+                                from_direction: "East",
+                                to_area_id: [18446744073709551614n, 9223372036854775809n],
+                                to_room_number: 2
+                            }]
+                        }
+                    } }]"#,
+                ),
+            )
+            .expect("evaluate create-link bigint payload");
+        deno_core::scope!(scope, &mut runtime);
+        let local = deno_core::v8::Local::new(scope, value);
+        let operations: Vec<JSAreaBatchOperation> = deno_core::serde_v8::from_v8(scope, local)
+            .expect("decode create-link bigint traversal area id");
+
+        let chunks = pack_area_batch_operations(operations).expect("batch packs");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 2);
+        let AreaMutation::CreateExit { body, .. } = &chunks[0][1] else {
+            panic!("expected linked exit after connection");
+        };
+        assert_eq!(
+            body.to_area_id.map(|area_id| area_id.0.as_u64_pair()),
+            Some((18_446_744_073_709_551_614, 9_223_372_036_854_775_809))
+        );
     }
 }

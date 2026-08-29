@@ -15,8 +15,8 @@ use std::thread::{self, JoinHandle};
 use futures::executor::block_on;
 use smudgy_audio::{
     AudioSessionId, MixerControlError, MixerGainState, MixerMasterGainAuthority,
-    MixerOutputFailure, MixerSessionRegistrar, MixerSessionRetirementError, MixerShutdown,
-    SystemMixerService, SystemMixerUnavailable,
+    MixerOutputFailure, MixerOutputFailureReceiver, MixerSessionRegistrar,
+    MixerSessionRetirementError, MixerShutdown, SystemMixerService, SystemMixerUnavailable,
 };
 use smudgy_audio_web::{
     ApplicationAudioOwner, ApplicationAudioRegistrar, AudioHostLimits, PackageAudioControlError,
@@ -77,16 +77,6 @@ pub enum SessionAudioUnavailable {
     PhysicalCapacity,
     Infrastructure(Arc<str>),
     Policy(Arc<str>),
-}
-
-impl SessionAudioUnavailable {
-    #[must_use]
-    pub fn system(&self) -> Option<&SystemMixerUnavailable> {
-        match self {
-            Self::System(cause) => Some(cause),
-            Self::PhysicalCapacity | Self::Infrastructure(_) | Self::Policy(_) => None,
-        }
-    }
 }
 
 impl fmt::Display for SessionAudioUnavailable {
@@ -2170,12 +2160,16 @@ fn run_coordinator(
 }
 
 pub(crate) trait ProcessMixer: Sized {
+    fn take_output_failure_events(&mut self) -> Option<MixerOutputFailureReceiver>;
     fn session_registrar(&self) -> MixerSessionRegistrar;
     fn master_gain_authority(&self) -> MixerMasterGainAuthority;
     fn shutdown(self) -> MixerShutdown;
 }
 
 impl ProcessMixer for SystemMixerService {
+    fn take_output_failure_events(&mut self) -> Option<MixerOutputFailureReceiver> {
+        SystemMixerService::take_output_failure_events(self)
+    }
     fn session_registrar(&self) -> MixerSessionRegistrar {
         self.session_registrar()
     }
@@ -2189,6 +2183,9 @@ impl ProcessMixer for SystemMixerService {
 
 #[cfg(test)]
 impl ProcessMixer for smudgy_audio::MixerService {
+    fn take_output_failure_events(&mut self) -> Option<MixerOutputFailureReceiver> {
+        smudgy_audio::MixerService::take_output_failure_events(self)
+    }
     fn session_registrar(&self) -> MixerSessionRegistrar {
         self.session_registrar()
     }
@@ -2212,6 +2209,7 @@ pub enum ApplicationAudioAvailability {
 /// Unique outer application authority, retained on `run`'s stack beyond iced.
 pub struct ApplicationAudio<S = SystemMixerService> {
     service: Option<S>,
+    output_failure_events: Option<MixerOutputFailureReceiver>,
     availability: ApplicationAudioAvailability,
     unavailable_output: Option<SystemMixerUnavailable>,
     owner: Option<ApplicationAudioOwner>,
@@ -2274,19 +2272,21 @@ impl ApplicationAudio<SystemMixerService> {
 
 impl<S: ProcessMixer> ApplicationAudio<S> {
     fn with_service_and_runtime(
-        service: S,
+        mut service: S,
         limits: AudioHostLimits,
         runtime_shutdown: RuntimeShutdown,
         runtime_join: RuntimeJoin,
         runtime_join_all: RuntimeJoinAll,
         io_quiesce: IoQuiesce,
     ) -> Result<Self, (std::io::Error, S)> {
+        let output_failure_events = service.take_output_failure_events();
         let source = SessionRegistrationSource::Physical {
             sessions: service.session_registrar(),
             master: service.master_gain_authority(),
         };
         Self::with_source_and_runtime(
             Some(service),
+            output_failure_events,
             source,
             ApplicationAudioAvailability::Physical,
             limits,
@@ -2314,6 +2314,7 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
     ) -> Result<Self, std::io::Error> {
         Self::with_source_and_runtime(
             None,
+            None,
             SessionRegistrationSource::Unavailable(cause.clone()),
             ApplicationAudioAvailability::Unavailable(cause),
             limits,
@@ -2332,6 +2333,7 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
     #[allow(clippy::too_many_arguments)]
     fn with_source_and_runtime(
         service: Option<S>,
+        output_failure_events: Option<MixerOutputFailureReceiver>,
         source: SessionRegistrationSource,
         mut availability: ApplicationAudioAvailability,
         limits: AudioHostLimits,
@@ -2451,6 +2453,7 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
         let lifecycle_worker_expected = lifecycle_worker.is_some();
         Ok(Self {
             service,
+            output_failure_events,
             availability,
             unavailable_output,
             owner: Some(owner),
@@ -2480,6 +2483,14 @@ impl<S: ProcessMixer> ApplicationAudio<S> {
     #[must_use]
     pub fn controller(&self) -> ApplicationAudioController {
         self.controller.clone()
+    }
+
+    /// Takes the unique stream of terminal physical-output failures.
+    ///
+    /// Recoverable endpoint interruptions remain internal to the mixer. A
+    /// terminal failure that happened before this call remains buffered.
+    pub fn take_output_failure_events(&mut self) -> Option<MixerOutputFailureReceiver> {
+        self.output_failure_events.take()
     }
 
     #[must_use]
@@ -2687,6 +2698,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use futures::StreamExt;
     use smudgy_audio::test_support::{TestDriverConfig, TestDriverProbe, start_test_mixer};
     use smudgy_audio::{MixerOutputFailure, MixerService, MixerStartError, SystemOutputError};
 
@@ -2747,14 +2759,16 @@ mod tests {
         worker_mode: WorkerStartMode,
         runtime_join: RuntimeJoin,
     ) -> ApplicationAudio<MixerService> {
-        let (service, _probe) =
+        let (mut service, _probe) =
             start_test_mixer(PHYSICAL_SAMPLE_RATE, TestDriverConfig::default()).unwrap();
+        let output_failure_events = service.take_output_failure_events();
         let source = SessionRegistrationSource::Physical {
             sessions: service.session_registrar(),
             master: service.master_gain_authority(),
         };
         ApplicationAudio::with_source_and_runtime(
             Some(service),
+            output_failure_events,
             source,
             ApplicationAudioAvailability::Physical,
             production_limits(),
@@ -2953,19 +2967,21 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(ApplicationAudioControlError::NotApplicable(ref retained))
-                    if retained.system().is_some_and(|cause| matches!(
-                        cause.error(),
-                        MixerStartError::InvalidSampleRate
-                    ))
+                    if matches!(
+                        retained,
+                        SessionAudioUnavailable::System(cause)
+                            if matches!(cause.error(), MixerStartError::InvalidSampleRate)
+                    )
             ));
         }
         assert!(matches!(
             session.package("sandbox", "earcon"),
             Err(ApplicationAudioControlError::NotApplicable(ref retained))
-                if retained.system().is_some_and(|cause| matches!(
-                    cause.error(),
-                    MixerStartError::InvalidSampleRate
-                ))
+                if matches!(
+                    retained,
+                    SessionAudioUnavailable::System(cause)
+                        if matches!(cause.error(), MixerStartError::InvalidSampleRate)
+                )
         ));
 
         let report = application.shutdown();
@@ -3207,6 +3223,32 @@ mod tests {
         assert!(matches!(
             map_gain_error(MixerControlError::OwnerStopped, None),
             ApplicationAudioControlError::MixerWorkerStopped
+        ));
+    }
+
+    #[test]
+    fn terminal_output_failure_receiver_is_owned_and_taken_exactly_once() {
+        let (mut application, probe) = test_application(Arc::new(Mutex::new(Vec::new())));
+        let mut failures = application
+            .take_output_failure_events()
+            .expect("a physical application owns one terminal-failure receiver");
+        assert!(application.take_output_failure_events().is_none());
+
+        assert!(probe.fail_output());
+        assert_eq!(
+            block_on(failures.next()),
+            Some(MixerOutputFailure::BackendFailure)
+        );
+        assert_eq!(block_on(failures.next()), None);
+
+        let report = application.shutdown();
+        assert!(report.is_clean());
+        assert!(matches!(
+            report.output,
+            ApplicationAudioOutputShutdown::Physical(MixerShutdown {
+                clean: true,
+                failure: Some(MixerOutputFailure::BackendFailure),
+            })
         ));
     }
 

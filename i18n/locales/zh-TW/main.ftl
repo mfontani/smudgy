@@ -250,7 +250,7 @@ server-edit-short = 編輯
 server-details-missing = 找不到伺服器詳細資料。
 
 # 連線畫面上觀察到的伺服器中繼資料（MSSP 側車檔）
-observed-players = 上次連線時有 { $players } 位玩家 · { $ago }
+observed-players = { $players } 位玩家
 observed-last-connected = 上次連線於 { $ago }
 observed-uptime = 已運行 { $days } 天
 observed-tls-available = 可用 TLS
@@ -346,7 +346,6 @@ layouts-apply = 套用版面配置
 shell-no-sessions = 尚無連線
 shell-connect-help = 選擇伺服器與設定檔以建立連線。
 audio-output-unavailable = 實體音訊輸出無法使用（{ $cause }）。終端機仍可正常使用；Web Audio 預設輸出與 sinkId "none" 都會以靜音模擬執行。已儲存的控制偏好會在之後的實體音訊啟動時套用。
-audio-output-failed = 本次啟動的音訊輸出失敗（{ $cause }）。終端機仍可使用；重新啟動前無法套用或儲存控制設定。
 audio-settings-title = 音訊
 audio-panel-keyboard-help = 使用 Tab/Shift+Tab 在控制項間移動；方向鍵每次調整 5%；Home/End 設為極限；空白鍵切換靜音。
 audio-master-label = 主音量
@@ -363,7 +362,7 @@ audio-trusted-row = { $label }：由工作階段控制（受信任的 Main；不
 audio-notice-target-closed = 音訊目標已關閉；未套用或儲存任何變更。
 audio-notice-applied-save-failed = 音訊已在本次啟動中變更，但無法儲存：{ $error }
 audio-notice-failed = 音訊變更失敗；未儲存任何內容：{ $error }
-audio-notice-output-dead = 音訊輸出已失敗；未套用或儲存任何內容。請重新啟動以重試。
+audio-notice-output-dead = 音訊輸出已停止。請重新啟動 Smudgy 以恢復聲音。
 audio-notice-preference-saved = 偏好已儲存，但本次啟動尚未套用；請重新啟動以重試音訊。
 audio-notice-preference-save-failed = 無法儲存音訊偏好：{ $error }
 audio-announcement-applied-save-failed = 音訊已在本次啟動中變更，但無法儲存。

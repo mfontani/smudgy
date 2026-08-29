@@ -20,7 +20,9 @@ use crate::session::{HotkeyId, SessionId};
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
-use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection, TabPosition};
+use super::pane::{
+    PaneDef, PaneKey, PaneNamespace, PanePlacement, PaneScrollRequest, SplitDirection, TabPosition,
+};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
@@ -465,6 +467,11 @@ pub enum RuntimeAction {
         key: PaneKey,
         width: Option<f32>,
         height: Option<f32>,
+    },
+    /// Send a terminal viewport request to the UI.
+    PaneScroll {
+        key: PaneKey,
+        request: PaneScrollRequest,
     },
     /// Forward `pane.relocate` to the UI as `SessionEvent::PaneRelocate`.
     /// Both keys were resolved synchronously by the op on the target session.

@@ -26,6 +26,12 @@ gives the central session a Wide vitals header and each right-column session a
 Compact header. Both styles sit directly on the terminal-theme background
 without an extra panel tint.
 
+Enable **Show live layout planner state below the map** to add a compact status
+block beneath `MapView`. It shows the active phase and elapsed time, candidate
+layouts/restarts/feasibility checks, and current-versus-best counts for ray,
+reciprocal, route, room-obstruction, exit-port, reciprocal-port, and crossing
+violations.
+
 F1–F4 select and focus a session. Ctrl+F1–F4 magnifies stacked sessions or
 selects the corresponding shared tab.
 

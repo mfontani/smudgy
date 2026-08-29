@@ -238,6 +238,12 @@ impl MapView {
                     return Update::none();
                 }
 
+                // The latest location still names the active area, so any
+                // pending transition away from it is stale. This matters when
+                // updates arrive B -> A -> B within one fade: active_area_id
+                // remains B until the fade-out completes, and without this
+                // cancellation the pending A would win after the newer B.
+                self.cancel_pending_area_change();
                 self.level = 0;
 
                 if let Some(room_number) = room_number {
@@ -346,6 +352,20 @@ impl MapView {
         if self.pending_area_change.is_some() {
             self.fade_phase = FadePhase::FadingOut;
             self.area_opacity.set_target(0.0);
+        }
+    }
+
+    fn cancel_pending_area_change(&mut self) {
+        if self.pending_area_change.take().is_none() {
+            return;
+        }
+
+        if (1.0 - *self.area_opacity.value()).abs() <= FADE_EPSILON {
+            self.area_opacity.settle_at(1.0);
+            self.fade_phase = FadePhase::Idle;
+        } else {
+            self.area_opacity.set_target(1.0);
+            self.fade_phase = FadePhase::FadingIn;
         }
     }
 
@@ -981,7 +1001,7 @@ impl canvas::Program<Message, Theme> for SharedMapView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_cloud::{LocalBackend, Uuid};
+    use smudgy_cloud::{LocalBackend, RoomUpdates, Uuid};
     use std::rc::Weak;
     use std::sync::Arc;
 
@@ -1016,6 +1036,121 @@ mod tests {
             weak.upgrade().is_none(),
             "dropping the element must free the view"
         );
+    }
+
+    async fn map_view_with_active_room(tag: &str) -> (MapView, AreaId, AreaId, RoomKey) {
+        let cache_dir = std::env::temp_dir()
+            .join("smudgy-map-widget-test")
+            .join(format!("{tag}-{}", Uuid::new_v4()));
+        let mapper = Mapper::new(
+            Arc::new(LocalBackend::new(cache_dir.join("local"))),
+            cache_dir,
+        );
+        mapper.load_all_areas().await.expect("load empty map");
+        let active = mapper
+            .create_area("Active".to_string())
+            .await
+            .expect("create active area");
+        let room = RoomKey::new(active, RoomNumber(7));
+        let submission = mapper
+            .upsert_room(
+                room.clone(),
+                RoomUpdates {
+                    level: Some(4),
+                    x: Some(3.0),
+                    y: Some(-2.0),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("create active room");
+        if let Some(operation_id) = submission.operation_id() {
+            mapper
+                .wait_for_mutation(operation_id)
+                .await
+                .expect("persist active room");
+        }
+        let other = AreaId(Uuid::new_v4());
+        (MapView::new(mapper, active), active, other, room)
+    }
+
+    #[tokio::test]
+    async fn newest_active_area_cancels_pending_foreign_area_before_fade() {
+        let (mut view, active, other, room) = map_view_with_active_room("cancel-pending").await;
+
+        let _ = view.update(Message::SetPlayerLocation(other, None));
+        assert_eq!(view.fade_phase, FadePhase::FadingOut);
+        assert_eq!(
+            view.pending_area_change
+                .as_ref()
+                .map(|pending| pending.area_id),
+            Some(other)
+        );
+
+        let _ = view.update(Message::SetPlayerLocation(active, Some(room.room_number.0)));
+
+        assert_eq!(view.active_area_id, active);
+        assert_eq!(view.player_location, Some(room));
+        assert!(view.pending_area_change.is_none());
+        assert_eq!(view.fade_phase, FadePhase::Idle);
+        assert_eq!(*view.area_opacity.value(), 1.0);
+        assert_eq!(*view.area_opacity.target(), 1.0);
+        assert_eq!(view.level, 4);
+        assert_eq!(
+            *view.translation.value(),
+            Vector::new(
+                -3.0 * view.resolved.room_spacing,
+                2.0 * view.resolved.room_spacing
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_active_area_reverses_a_partial_fade_out() {
+        let (mut view, active, other, room) = map_view_with_active_room("reverse-fade").await;
+
+        let _ = view.update(Message::SetPlayerLocation(other, None));
+        view.area_opacity.settle_at(0.4);
+        let _ = view.update(Message::SetPlayerLocation(active, Some(room.room_number.0)));
+
+        assert_eq!(view.active_area_id, active);
+        assert_eq!(view.player_location, Some(room));
+        assert!(view.pending_area_change.is_none());
+        assert_eq!(view.fade_phase, FadePhase::FadingIn);
+        assert_eq!(*view.area_opacity.value(), 0.4);
+        assert_eq!(*view.area_opacity.target(), 1.0);
+
+        view.area_opacity.settle_at(1.0);
+        view.handle_fade_progress();
+        assert_eq!(view.fade_phase, FadePhase::Idle);
+        assert_eq!(view.active_area_id, active);
+    }
+
+    #[tokio::test]
+    async fn corrective_area_transition_survives_the_stale_areas_fade_in() {
+        let (mut view, active, other, room) = map_view_with_active_room("fade-in-correction").await;
+
+        let _ = view.update(Message::SetPlayerLocation(other, None));
+        view.area_opacity.settle_at(0.0);
+        view.handle_fade_progress();
+        assert_eq!(view.active_area_id, other);
+        assert_eq!(view.fade_phase, FadePhase::FadingIn);
+
+        view.area_opacity.settle_at(0.4);
+        let _ = view.update(Message::SetPlayerLocation(active, Some(room.room_number.0)));
+        assert_eq!(view.fade_phase, FadePhase::FadingOut);
+        assert_eq!(
+            view.pending_area_change
+                .as_ref()
+                .map(|pending| pending.area_id),
+            Some(active)
+        );
+
+        view.area_opacity.settle_at(0.0);
+        view.handle_fade_progress();
+        assert_eq!(view.active_area_id, active);
+        assert_eq!(view.player_location, Some(room));
+        assert!(view.pending_area_change.is_none());
+        assert_eq!(view.fade_phase, FadePhase::FadingIn);
     }
 
     fn exit(room: i32, direction: ExitDirection) -> MapExitRef {

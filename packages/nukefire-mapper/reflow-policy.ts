@@ -4,7 +4,7 @@ export interface ReflowPolicy {
   deferExistingReflow: boolean;
 }
 
-/** Decide how a queued snapshot may affect an area's existing coordinates. */
+/** Decide how one latency lane may affect an area's existing coordinates. */
 export function reflowPolicy(
   topologyGrowth: boolean,
   deferredReflow: boolean,

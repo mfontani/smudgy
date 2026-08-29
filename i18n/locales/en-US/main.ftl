@@ -255,8 +255,8 @@ server-details-missing = Server details not found.
 
 # Observed server metadata (MSSP sidecar) on the connect screen
 observed-players = { $players ->
-    [one] 1 player when last connected · { $ago }
-   *[other] { $players } players when last connected · { $ago }
+    [one] 1 player
+   *[other] { $players } players
 }
 observed-last-connected = Last connected { $ago }
 observed-uptime = { $days ->
@@ -352,8 +352,7 @@ layouts-close-chosen = ✓ Close
 layouts-apply = Apply layout
 shell-no-sessions = No active sessions
 shell-connect-help = Choose a server and profile to connect.
-audio-output-unavailable = Physical audio output is unavailable ({ $cause }). The terminal remains usable; default Web Audio output and sinkId "none" both run silently. Saved controls apply on a later physical start.
-audio-output-failed = Audio output failed for this launch ({ $cause }). The terminal remains usable; controls cannot be applied or saved until restart.
+audio-output-unavailable = Physical audio output is unavailable ({ $cause }). The terminal remains usable; default Web Audio output and sinkId "none" both run silently.
 audio-settings-title = Audio
 audio-panel-keyboard-help = Tab/Shift+Tab moves between controls; arrows adjust 5%; Home/End set limits; Space mutes.
 audio-master-label = Master
@@ -370,7 +369,7 @@ audio-trusted-row = { $label }: controlled by session (trusted Main; no per-pack
 audio-notice-target-closed = Audio target closed; nothing was applied or saved.
 audio-notice-applied-save-failed = Audio changed for this launch but could not be saved: { $error }
 audio-notice-failed = Audio change failed; nothing was saved: { $error }
-audio-notice-output-dead = Audio output has failed; nothing was applied or saved. Restart to retry.
+audio-notice-output-dead = Audio output stopped. Restart Smudgy to restore sound.
 audio-notice-preference-saved = Saved preference, not applied this launch; restart to retry audio.
 audio-notice-preference-save-failed = Audio preference was not saved: { $error }
 audio-announcement-applied-save-failed = Audio changed for this launch but could not be saved.

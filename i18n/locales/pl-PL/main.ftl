@@ -30,8 +30,8 @@ action-send = Wyślij
 action-sign-in = Zaloguj
 action-sign-out = Wyloguj
 action-update = Aktualizuj
-state-disabled = Wyłącz
-state-enabled = Włącz
+state-disabled = Wyłączone
+state-enabled = Włączone
 state-loading = Ładowanie…
 state-none = Brak
 
@@ -72,7 +72,7 @@ account-recheck = Sprawdź ponownie
 account-sign-out-everywhere = wyloguj wszędzie (na wszystkich urządzeniach)
 account-choose-nickname = Wybierz swój pseudonim
 account-nickname-description = To Twoja publiczna nazwa użytkownika. Twój email pozostaje prywatny.
-account-nickname-placeholder = pseudonim (3-24 znaki: litery, cyfry, - lub _)
+account-nickname-placeholder = pseudonim (3-24 znaków: litery, cyfry, - lub _)
 account-claim-handle = Zarezerwuj nazwę
 account-nickname-change-warning = Zmiana pseudonimu zmienia sposób, w jaki znajdują Cię inni użytkownicy.
 account-change-nickname = Zmień pseudonim
@@ -118,7 +118,7 @@ preferences-wrap-window = zawijaj do okna
 preferences-line-length-help = Maksymalna liczba znaków w wierszu przed zawinięciem; puste pole zawija do szerokości okna. Naciśnij Enter, aby zastosować.
 preferences-theme = Motyw
 preferences-theme-extended-colors = Dopasuj kody TrueColor i 256-kolorowe do odcieni motywu.
-preferences-theme-extended-colors-help = Gdy ta opcja jest wyłączona, kody 256-kolorowe i TrueColor są precyzyjnie renderowane, co może utrudniać odczyt ciemniejszego tekstu w motywach jeśli nie masz czarnego tła.
+preferences-theme-extended-colors-help = Gdy ta opcja jest wyłączona, kody 256-kolorowe i TrueColor są precyzyjnie renderowane, co może utrudniać odczyt ciemniejszego tekstu w motywach, jeśli nie masz czarnego tła.
 preferences-scrollback = Historia sesji
 preferences-scrollback-help = Liczba wierszy zachowywanych na sesję. Naciśnij Enter, aby zastosować.
 preferences-link-tooltip-delay = Opóźnienie podpowiedzi odnośnika (ms)
@@ -186,7 +186,7 @@ security-revoke-current-warning = Unieważnienie sesji, z której obecnie korzys
 
 # Friends and licenses
 friends-title = Znajomi
-friends-verify-email = Zweryfikuj adres e-mail aby odnaleźć znajomych i dzielić się z nimi mapami
+friends-verify-email = Zweryfikuj adres e-mail, aby odnaleźć znajomych i dzielić się z nimi mapami
 friends-go-account = Przejdź do konta
 
 # Client validation labels
@@ -257,8 +257,8 @@ server-details-missing = Nie znaleziono szczegółów serwera.
 
 # Zaobserwowane metadane serwera (MSSP) na ekranie połączenia
 observed-players = { $players ->
-    [one] 1 gracz podczas ostatniego połączenia · { $ago }
-   *[other] { $players } graczy podczas ostatniego połączenia · { $ago }
+    [one] 1 gracz
+   *[other] { $players } graczy
 }
 observed-last-connected = Ostatnie połączenie { $ago }
 observed-uptime = { $days ->
@@ -273,7 +273,10 @@ observed-link-contact = Kontakt
 ago-just-now = przed chwilą
 ago-minutes = { $minutes } min temu
 ago-hours = { $hours } godz. temu
-ago-days = { $days } dni temu
+ago-days = ago-days = { $days ->
+    [one] { $days } dzień temu
+   *[other] { $days } dni temu
+}
 
 # Propozycja przejścia na TLS w sesji
 tls-offer-body = Ten serwer oferuje szyfrowane połączenie na porcie { $port }.
@@ -354,8 +357,7 @@ layouts-close-chosen = ✓ Zamknij
 layouts-apply = Zastosuj układ
 shell-no-sessions = Brak aktywnych sesji
 shell-connect-help = Wybierz serwer i profil, aby się połączyć.
-audio-output-unavailable = Fizyczne wyjście dźwięku jest niedostępne ({ $cause }). Terminal nadal działa; domyślne wyjście Web Audio i sinkId "none" działają bezgłośnie. Zapisane ustawienia zostaną użyte przy następnym fizycznym uruchomieniu.
-audio-output-failed = Wyjście dźwięku uległo awarii w tym uruchomieniu ({ $cause }). Terminal nadal działa; do ponownego uruchomienia nie można stosować ani zapisywać ustawień dźwięku.
+audio-output-unavailable = Fizyczne wyjście dźwięku jest niedostępne ({ $cause }). Terminal nadal działa; domyślne wyjście Web Audio i sinkId "none" działają bezgłośnie.
 audio-settings-title = Dźwięk
 audio-panel-keyboard-help = Tab/Shift+Tab przełącza kontrolki; strzałki zmieniają o 5%; Home/End ustawia skrajne wartości; Spacja wycisza.
 audio-master-label = Głośność główna
@@ -369,14 +371,14 @@ audio-control-row-status = { $row } — { $status }
 audio-action-mute = Wycisz
 audio-action-unmute = Włącz dźwięk
 audio-trusted-row = { $label }: sterowanie przez sesję (zaufany Main; bez deklaracji sterowania pakietem)
-audio-notice-target-closed = Cel dźwięku został zamknięty; niczego nie zastosowano ani nie zapisano.
+audio-notice-target-closed = Urządzenie audio zostało zamknięte; niczego nie zastosowano ani nie zapisano.
 audio-notice-applied-save-failed = Dźwięk zmieniono w tym uruchomieniu, ale nie udało się zapisać: { $error }
-audio-notice-failed = Zmiana dźwięku nie powiodła się; niczego nie zapisano: { $error }
-audio-notice-output-dead = Wyjście dźwięku uległo awarii; niczego nie zastosowano ani nie zapisano. Uruchom ponownie, aby spróbować jeszcze raz.
-audio-notice-preference-saved = Ustawienie zapisano, ale nie zastosowano w tym uruchomieniu; uruchom ponownie, aby spróbować dźwięku.
+audio-notice-failed = Zmiana dźwięku nie powiodła się: { $error }
+audio-notice-output-dead = Wyjście dźwięku zostało zatrzymane. Uruchom ponownie Smudgy, aby przywrócić dźwięk.
+audio-notice-preference-saved = Ustawienie zapisano, ale nie zastosowano w tym uruchomieniu; uruchom ponownie.
 audio-notice-preference-save-failed = Nie zapisano ustawienia dźwięku: { $error }
 audio-announcement-applied-save-failed = Dźwięk zmieniono w tym uruchomieniu, ale nie udało się zapisać.
-audio-announcement-failed = Zmiana dźwięku nie powiodła się; niczego nie zapisano.
+audio-announcement-failed = Zmiana dźwięku nie powiodła się.
 audio-announcement-preference-save-failed = Nie zapisano ustawienia dźwięku.
 shell-connect-action = Połącz z serwerem
 shell-verify-email = Zweryfikuj swój adres e-mail, aby korzystać z funkcji w chmurze (znajomi, udostępnianie, synchronizacja).
@@ -406,7 +408,7 @@ package-update-modal-title = Aktualizacja pakietu
 package-update-versions = { $current } → { $latest }
 package-update-version-new = Nowa wersja { $latest }
 package-update-asks = Ta aktualizacja wymaga dodatkowych uprawnień:
-package-update-needs-smudgy = Ta aktualizacja wymaga smudgy { $version } lub nowszego. Najpierw zaktualizuj smudgy.
+package-update-needs-smudgy = Ta aktualizacja wymaga smudgy { $version } lub nowszej wersji. Zaktualizuj smudgy.
 package-update-grant = Udziel zgody i zaktualizuj
 package-update-pin = Przypnij bieżącą wersję
 package-update-not-now = Nie teraz
@@ -560,7 +562,7 @@ mapper-folder-maps-move =
 mapper-loose-maps = Nieskatalogowane mapy
 mapper-move-area-to = Przenieś „{ $name }" do:
 mapper-move-to-folder = Przenieś do folderu
-mapper-relocation-duplicate-notice = { $error } — „{ $name }" mapa została w całości skopiowana do miejsca docelowego, a oryginał pozostał w folderze. Usuń jedną z dwóch kopii zamiast ponawiać przenoszenie.
+mapper-relocation-duplicate-notice = { $error } — mapa „{ $name }" została w całości skopiowana do miejsca docelowego, a oryginał pozostał w folderze. Usuń jedną z dwóch kopii zamiast ponawiać przenoszenie.
 mapper-share-folder-title = Udostępnij folder „{ $name }"
 mapper-loading = Ładowanie…
 mapper-no-secrets = Brak sekretów w tym obszarze.
@@ -1551,7 +1553,13 @@ package-manage = Zarządzaj
 package-view = Wyświetl
 package-install = Zainstaluj
 package-installed = Zainstalowano
-package-search-meta = { $owner } · v{ $version } · { $count } instalacji ·
+package-search-meta =
+    { $owner } v{ $version } { $count ->
+        [one] { $count } instalacja
+        [few] { $count } instalacje
+        [many] { $count } instalacji
+       *[other] { $count } instalacji
+    }
 package-you = Ty
 package-back = ‹ Wstecz
 package-comments = Komentarze
