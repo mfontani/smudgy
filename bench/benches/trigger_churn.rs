@@ -38,6 +38,13 @@
 //!   should sit on the floor (no dirty flag).
 //! - `create_delete20`: the mode line creates 20 triggers (next pass deletes
 //!   them, alternating) — the floor plus the rebuild stall.
+//! - `register_plain20` / `register_styled20`: the same bounded alternating
+//!   create/delete workload with plaintext bodies, through the public JS API.
+//!   Their delta prices style decoration + descriptor serde/native
+//!   preparation without append-only function-registry growth.
+//!   Function-body registration needs a fresh-session-per-sample harness to
+//!   bound that append-only registry and is intentionally not folded into this
+//!   reused-session group.
 //! - `create_delete20_x4pkg` (own session): the same 20 mutations split
 //!   across 4 sandboxed package isolates (5 each) — adds per-isolate
 //!   dispatch entry to the same shared-Manager rebuild.
@@ -51,6 +58,11 @@
 //! (truncate-only); `SMUDGY_BENCH_SKIP_SANITY=1` skips the checks that
 //! disabled triggers don't fire (and enabled ones do), and that the mode
 //! handler's create/delete really take effect through live dispatch.
+//!
+//! Every Criterion iteration is a pair of identical packets. Alternating
+//! create/delete and toggle handlers therefore end each iteration in their
+//! starting state regardless of Criterion's requested iteration count; sample
+//! parity cannot produce a bimodal distribution.
 
 use std::{
     env,
@@ -104,6 +116,7 @@ fn push_one_trigger(
         patterns: &patterns,
         raw_patterns: &empty,
         anti_patterns: &empty,
+        matchers: None,
         action,
         prompt: false,
         enabled,
@@ -266,6 +279,9 @@ const RESIDENT_TRIGGERS: usize = 1_000;
 const PACKET_LINES: usize = 50;
 /// Combat triggers the mode handler mutates per packet.
 const COMBAT_TRIGGERS: usize = 20;
+/// Every stateful handler is a two-state transition. Pairing packets makes one
+/// Criterion iteration state-neutral and keeps samples comparable.
+const PACKETS_PER_ITERATION: usize = 2;
 
 const PACKET_DONE: &str = "ZZPKTDONE";
 
@@ -273,12 +289,12 @@ const PACKET_DONE: &str = "ZZPKTDONE";
 const FILLER: &str =
     "the caravan rolls slowly across the tundra under a pale sun xxxxxxxxxxxxxxxxxxx";
 
-/// The main-session module: residents + barrier + the two mode handlers
-/// (toggle / create-delete) + the combat sanity probe.
+/// The main-session module: residents + barrier + toggle/create-delete and
+/// plain/styled registration handlers + the combat sanity probe.
 fn packet_main_script(residents: usize, combat: usize) -> String {
     format!(
         r#"
-import {{ echo, createTrigger }} from "smudgy:core";
+import {{ echo, createTrigger, style }} from "smudgy:core";
 
 // The resident population: distinct never-matching literal patterns.
 for (let i = 0; i < {residents}; i++) {{
@@ -316,6 +332,55 @@ createTrigger(/^ZZMODE$/, () => {{
     }}
 }}, {{ name: "mode_churn" }});
 
+// Registration-through-serde comparison. Both branches use plaintext bodies
+// so repeated create/delete passes do not append V8 function handles forever;
+// the only intentional difference is the styled pattern descriptor.
+let plainRegistration = null;
+let plainRegistrationSanity = true;
+createTrigger(/^ZZREGPLAIN$/, () => {{
+    if (plainRegistration === null) {{
+        plainRegistration = [];
+        for (let i = 0; i < {combat}; i++) {{
+            plainRegistration.push(createTrigger(
+                new RegExp("^zzregplain_" + i + " never$"),
+                "look",
+                {{ name: "regplain_" + i }},
+            ));
+        }}
+        if (plainRegistrationSanity) echo("ZZREGPLAIN_CREATED");
+    }} else {{
+        for (const t of plainRegistration) t.delete();
+        plainRegistration = null;
+        if (plainRegistrationSanity) {{
+            echo("ZZREGPLAIN_DELETED");
+            plainRegistrationSanity = false;
+        }}
+    }}
+}}, {{ name: "register_plain" }});
+
+let styledRegistration = null;
+let styledRegistrationSanity = true;
+createTrigger(/^ZZREGSTYLE$/, () => {{
+    if (styledRegistration === null) {{
+        styledRegistration = [];
+        for (let i = 0; i < {combat}; i++) {{
+            styledRegistration.push(createTrigger(
+                style.red(new RegExp("^zzregstyle_" + i + " never$")),
+                "look",
+                {{ name: "regstyle_" + i }},
+            ));
+        }}
+        if (styledRegistrationSanity) echo("ZZREGSTYLE_CREATED");
+    }} else {{
+        for (const t of styledRegistration) t.delete();
+        styledRegistration = null;
+        if (styledRegistrationSanity) {{
+            echo("ZZREGSTYLE_DELETED");
+            styledRegistrationSanity = false;
+        }}
+    }}
+}}, {{ name: "register_styled" }});
+
 createTrigger(/^ZZPKTSYNC$/, () => {{ echo("{PACKET_DONE}"); }}, {{ name: "pkt_sync" }});
 echo("PACKET_READY");
 "#
@@ -349,7 +414,9 @@ struct PacketCell {
     lines: Vec<Arc<StyledLine>>,
 }
 
-/// Feed one packet shape per pass and drain to the barrier echo.
+/// Feed a create/delete (or off/on) packet pair per logical iteration and
+/// drain each packet to its barrier. Timing the pair makes the workload
+/// independent of whether Criterion requests an odd or even `iters` count.
 fn packet_pass(
     rt: &tokio::runtime::Runtime,
     session: &mut BenchSession,
@@ -361,10 +428,12 @@ fn packet_pass(
         for _ in 0..iters {
             session.drain_stragglers();
             let start = Instant::now();
-            for line in lines {
-                session.feed(line);
+            for _ in 0..PACKETS_PER_ITERATION {
+                for line in lines {
+                    session.feed(line);
+                }
+                session.drain_until(PACKET_DONE).await;
             }
-            session.drain_until(PACKET_DONE).await;
             total += start.elapsed();
         }
         total
@@ -411,6 +480,42 @@ fn packet_warmup(rt: &tokio::runtime::Runtime, session: &mut BenchSession, id: &
             let mut t = Vec::new();
             assert!(session.drain_collect_until(PACKET_DONE, &mut t).await, "{id}: warmup barrier");
         }
+
+        // Exercise one complete registration pair outside Criterion. These
+        // one-shot echoes occur only during setup, so a synchronous
+        // regex/style/serde failure cannot silently turn a timed cell into a
+        // no-op, and both handle arrays begin measurement empty.
+        for (command, created, deleted) in [
+            (
+                "ZZREGPLAIN",
+                "ZZREGPLAIN_CREATED",
+                "ZZREGPLAIN_DELETED",
+            ),
+            (
+                "ZZREGSTYLE",
+                "ZZREGSTYLE_CREATED",
+                "ZZREGSTYLE_DELETED",
+            ),
+        ] {
+            for marker in [created, deleted] {
+                for line in [styled(command), styled("ZZPKTSYNC")] {
+                    session.feed(&line);
+                }
+                let mut registration_transcript = Vec::new();
+                assert!(
+                    session
+                        .drain_collect_until(PACKET_DONE, &mut registration_transcript)
+                        .await,
+                    "{id}: {command} registration sanity barrier"
+                );
+                if sanity {
+                    assert!(
+                        registration_transcript.iter().any(|line| line == marker),
+                        "{id}: {command} did not reach {marker}; transcript:\n{registration_transcript:#?}"
+                    );
+                }
+            }
+        }
     });
     session.drain_stragglers();
 }
@@ -418,7 +523,7 @@ fn packet_warmup(rt: &tokio::runtime::Runtime, session: &mut BenchSession, id: &
 fn churn_packet(c: &mut Criterion) {
     let sanity = env::var("SMUDGY_BENCH_SKIP_SANITY").is_err();
     eprintln!(
-        "churn_packet: {PACKET_LINES}-line packets against {RESIDENT_TRIGGERS} resident \
+        "churn_packet: paired {PACKET_LINES}-line packets against {RESIDENT_TRIGGERS} resident \
          triggers; mode line mutates {COMBAT_TRIGGERS} combat triggers; sanity checks {}",
         if sanity { "on" } else { "off" }
     );
@@ -494,12 +599,24 @@ fn churn_packet(c: &mut Criterion) {
             id: "create_delete20",
             lines: packet(Some("ZZMODE")),
         },
+        PacketCell {
+            id: "register_plain20",
+            lines: packet(Some("ZZREGPLAIN")),
+        },
+        PacketCell {
+            id: "register_styled20",
+            lines: packet(Some("ZZREGSTYLE")),
+        },
     ];
 
     let mut group = c.benchmark_group("churn_packet");
     group.sample_size(10);
     group.sampling_mode(SamplingMode::Flat);
-    group.throughput(Throughput::Elements(PACKET_LINES as u64));
+    // Throughput counts payload/filler lines, as before, but a logical
+    // iteration now processes a state-neutral pair of packets.
+    group.throughput(Throughput::Elements(
+        (PACKET_LINES * PACKETS_PER_ITERATION) as u64,
+    ));
     for cell in &main_cells {
         group.bench_function(cell.id, |b| {
             b.iter_custom(|iters| packet_pass(&rt, &mut main_session, &cell.lines, iters));
