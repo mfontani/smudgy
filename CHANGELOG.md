@@ -5,6 +5,18 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Triggers can match terminal colors and text attributes directly.** Each saved
+  Match or Anti-match row can require foreground, background, positive attributes,
+  or an RGB-backed color range, so color conditions no longer need regexes over raw
+  escape codes. Script triggers use `style.red(/Warning:/)` when the match must begin
+  in bright ANSI red, or bare `style.red` for any bright-red run;
+  `style.fg.range(...)` adds directed color ranges to the same composition used by
+  `createTrigger()` and `createTriggers()`.
+
 ## [0.5.5] - 2026-08-28
 
 ### Added
