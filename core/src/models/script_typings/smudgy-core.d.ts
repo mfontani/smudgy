@@ -921,8 +921,8 @@ declare module "smudgy:core" {
   export interface SavedTrigger {
     /** Regexes matched against each incoming line's displayed text. */
     patterns?: string[];
-    /** Regexes matched against the raw incoming line, before ANSI color codes
-     *  are stripped. Use these to match on colors. */
+    /** Regexes matched against exact raw escape/control input. Saved semantic
+     * color matching is authored in the Automations editor. */
     rawPatterns?: string[];
     /** Vetoes: if any of these match, the trigger does not fire. */
     antiPatterns?: string[];
@@ -1561,8 +1561,124 @@ declare module "smudgy:core" {
   }
 
   /**
+   * Qualifies a trigger {@link Pattern} using the terminal colors and
+   * attributes at the pattern's first displayed character. A style chain
+   * creates this immutable value; regex occurrences are tried from left to
+   * right, and captures come from the first occurrence whose style qualifies.
+   *
+   * Strings are regex source, just as they are elsewhere in the trigger API:
+   *
+   * ```ts
+   * import { style } from "smudgy:core";
+   *
+   * style.red`Danger`    // StyledText for output
+   * style.red(/Danger/)  // StyleMatch for an incoming trigger
+   * style.red("Danger")  // also StyleMatch; the string is regex source
+   * style.red("")        // style-only StyleMatch
+   * style.red(new RegExp("")) // ordinary zero-width StyleMatch
+   * style.red``          // empty StyledText, still output
+   * ```
+   *
+   * A parenthesized empty string on a constrained chain is the explicit
+   * style-only sentinel.
+   * `style.red("")` scans nonempty style runs, or the final cursor style on an
+   * empty line, just like passing bare `style.red` to {@link createTrigger}.
+   * The handler's `matches[0]` is `""`; `$0` in a plaintext body also expands
+   * to the empty string. By contrast, `new RegExp("").source` is `"(?:)"`, so
+   * `style.red(new RegExp(""))` retains ordinary zero-width regex behavior and
+   * can qualify only at a position with a displayed character. With no
+   * surviving color or positive attribute, `style("")` remains an inert empty
+   * pattern rather than becoming match-all.
+   */
+  export interface StyleMatch {
+    /** Opaque runtime brand; style chains create these values. */
+    readonly __smudgyStyleMatch: true;
+  }
+
+  /**
+   * A trigger-only style chain. Calling `style.fg.range(...)` or
+   * `style.bg.range(...)` creates this builder. It can keep
+   * composing exact colors, ranges, and positive attributes, then qualify one
+   * {@link Pattern}; passed bare to {@link createTrigger}, it means “any run
+   * with this style.” Foreground, background, and attributes are ANDed.
+   *
+   * A chain stays trigger-only after it has used a range, even if a later
+   * exact setter replaces that range. Start a new exact {@link StyleBuilder}
+   * for output. Final theme roles (`default`, `echo`, `output`, `warn`) and
+   * negative attribute requirements are rejected when converted to a trigger.
+   */
+  export interface StyleMatchBuilder {
+    /** Qualify a regex source or `RegExp` with this style. */
+    (pattern: Pattern): StyleMatch;
+    /** Refine this chain; its range history remains trigger-only. */
+    (options: LineColorOptions): StyleMatchBuilder;
+    readonly fg: {
+      /** Replace the foreground constraint with one exact color. */
+      (color: Color): StyleMatchBuilder;
+      /**
+       * Match RGB-backed foreground colors in the inclusive HSV region from
+       * `from` to `to`. Hue travels forward and wraps through 0° when needed;
+       * saturation/value use unordered inclusive bounds. This is not an RGB
+       * gradient or shortest-arc calculation: 350°→10° selects the narrow red
+       * region around 0°, while 10°→350° selects nearly the whole hue circle.
+       * Equal hues select only that hue. An achromatic incoming RGB color
+       * ignores hue but must still satisfy saturation/value; equal endpoints
+       * remain an HSV point-region rather than exact RGB. Only truecolor and
+       * xterm slots 16 through 255 participate. ANSI slots 0 through 15 are
+       * not resolved through the theme and do not match.
+       */
+      range(from: RgbColor, to: RgbColor): StyleMatchBuilder;
+    };
+    readonly bg: {
+      /** Replace the background constraint with one exact color. */
+      (color: Color): StyleMatchBuilder;
+      /**
+       * Match RGB-backed background colors in the inclusive HSV region from
+       * `from` to `to`. Hue travels forward and wraps through 0° when needed;
+       * saturation/value use unordered inclusive bounds. This is not an RGB
+       * gradient or shortest-arc calculation: 350°→10° selects the narrow red
+       * region around 0°, while 10°→350° selects nearly the whole hue circle.
+       * Equal hues select only that hue. An achromatic incoming RGB color
+       * ignores hue but must still satisfy saturation/value; equal endpoints
+       * remain an HSV point-region rather than exact RGB. Only truecolor and
+       * xterm slots 16 through 255 participate. ANSI slots 0 through 15 are
+       * not resolved through the theme and do not match.
+       */
+      range(from: RgbColor, to: RgbColor): StyleMatchBuilder;
+    };
+    readonly black: StyleMatchBuilder;
+    readonly red: StyleMatchBuilder;
+    readonly green: StyleMatchBuilder;
+    readonly yellow: StyleMatchBuilder;
+    readonly blue: StyleMatchBuilder;
+    readonly magenta: StyleMatchBuilder;
+    readonly cyan: StyleMatchBuilder;
+    readonly white: StyleMatchBuilder;
+    readonly default: StyleMatchBuilder;
+    readonly echo: StyleMatchBuilder;
+    readonly output: StyleMatchBuilder;
+    readonly warn: StyleMatchBuilder;
+    readonly bgBlack: StyleMatchBuilder;
+    readonly bgRed: StyleMatchBuilder;
+    readonly bgGreen: StyleMatchBuilder;
+    readonly bgYellow: StyleMatchBuilder;
+    readonly bgBlue: StyleMatchBuilder;
+    readonly bgMagenta: StyleMatchBuilder;
+    readonly bgCyan: StyleMatchBuilder;
+    readonly bgWhite: StyleMatchBuilder;
+    /** Require the terminal bold attribute. */
+    readonly bold: StyleMatchBuilder;
+    readonly faint: StyleMatchBuilder;
+    readonly italic: StyleMatchBuilder;
+    readonly underline: StyleMatchBuilder;
+    readonly doubleUnderline: StyleMatchBuilder;
+    readonly crossedOut: StyleMatchBuilder;
+    readonly reverse: StyleMatchBuilder;
+  }
+
+  /**
    * Builds styled text. Use it as a template tag, optionally picking colors
-   * and attributes first. Each step is itself a tag, so all of these work:
+   * and attributes first. Each exact step is itself a tag, so all of these work:
    *
    * ```ts
    * import { echo, style } from "smudgy:core";
@@ -1588,14 +1704,67 @@ declare module "smudgy:core" {
    * A chain also works directly AS the options of a line write —
    * `line.highlight("goblin", style.red.bgWhite)` — where it applies exactly
    * what it set and leaves everything else untouched.
+   *
+   * A chain can also describe the terminal style an incoming trigger must
+   * see. Call it with a string or `RegExp` to make a {@link StyleMatch}, or
+   * pass a constrained chain directly to {@link createTrigger} for a
+   * style-only condition: `createTrigger(style.red, "flee")`.
    */
   export interface StyleBuilder extends StyleTag {
+    /** Qualify a trigger pattern with the colors/attributes in this chain. */
+    (pattern: Pattern): StyleMatch;
     /** Colors and/or text attributes, in the same shape `highlight` takes.
      *  `attributes` may be any subset: it refines what the chain has set so
      *  far, and fields no step sets inherit at delivery like unset colors. */
     (options: LineColorOptions): StyleBuilder;
-    fg(color: Color): StyleBuilder;
-    bg(color: Color): StyleBuilder;
+    readonly fg: {
+      /** Set one exact foreground color. */
+      (color: Color): StyleBuilder;
+      /**
+       * Match RGB-backed foreground colors in the inclusive HSV region from
+       * `from` to `to`. Hue travels forward and wraps through 0° when needed;
+       * saturation/value use unordered inclusive bounds. This is not an RGB
+       * gradient or shortest-arc calculation: 350°→10° selects the narrow red
+       * region around 0°, while 10°→350° selects nearly the whole hue circle.
+       * Equal hues select only that hue. An achromatic incoming RGB color
+       * ignores hue but must still satisfy saturation/value; equal endpoints
+       * remain an HSV point-region rather than exact RGB. Only truecolor and
+       * xterm slots 16 through 255 participate. ANSI slots 0 through 15 are
+       * not resolved through the theme and do not match. The returned chain
+       * is trigger-only.
+       *
+       * ```ts
+       * import { createTrigger, pattern, style } from "smudgy:core";
+       *
+       * createTrigger(
+       *   style.fg.range(
+       *     { r: 220, g: 20, b: 60 },
+       *     { r: 255, g: 165, b: 0 },
+       *   )(pattern.contains`Warning: {message}`),
+       *   "look",
+       * );
+       * ```
+       */
+      range(from: RgbColor, to: RgbColor): StyleMatchBuilder;
+    };
+    readonly bg: {
+      /** Set one exact background color. */
+      (color: Color): StyleBuilder;
+      /**
+       * Match RGB-backed background colors in the inclusive HSV region from
+       * `from` to `to`. Hue travels forward and wraps through 0° when needed;
+       * saturation/value use unordered inclusive bounds. This is not an RGB
+       * gradient or shortest-arc calculation: 350°→10° selects the narrow red
+       * region around 0°, while 10°→350° selects nearly the whole hue circle.
+       * Equal hues select only that hue. An achromatic incoming RGB color
+       * ignores hue but must still satisfy saturation/value; equal endpoints
+       * remain an HSV point-region rather than exact RGB. Only truecolor and
+       * xterm slots 16 through 255 participate. ANSI slots 0 through 15 are
+       * not resolved through the theme and do not match. The returned chain
+       * is trigger-only.
+       */
+      range(from: RgbColor, to: RgbColor): StyleMatchBuilder;
+    };
     readonly black: StyleBuilder;
     readonly red: StyleBuilder;
     readonly green: StyleBuilder;
@@ -1627,8 +1796,8 @@ declare module "smudgy:core" {
     readonly reverse: StyleBuilder;
   }
 
-  /** Builds {@link StyledText} for `echo` and the line-editing methods (see
-   *  {@link StyleBuilder}). */
+  /** Builds {@link StyledText} for output and {@link StyleMatch} values for
+   * incoming triggers (see {@link StyleBuilder}). */
   export const style: StyleBuilder;
 
   /** Modifier keys held when a link was clicked. */
@@ -1887,16 +2056,32 @@ declare module "smudgy:core" {
     (strings: TemplateStringsArray, ...values: unknown[]): Command;
   }
 
-  /** The three pattern lists a trigger can match with. Most triggers set only
-   *  `patterns`. */
+  /**
+   * One displayed-text condition accepted by a trigger: a regex source,
+   * `RegExp`, immutable {@link StyleMatch}, or a constrained style chain used
+   * bare as a color/attribute-only condition. A decorated `""` is the same
+   * style-only sentinel; a decorated `new RegExp("")` remains an ordinary
+   * zero-width regex. Separate leaves are alternatives.
+   */
+  export type TriggerPattern = Pattern | StyleMatch | StyleBuilder | StyleMatchBuilder;
+
+  /**
+   * The three pattern lists a trigger can match with. Most triggers set only
+   * `patterns`. Displayed `patterns` and `rawPatterns` are alternatives; the
+   * raw pass runs first and a trigger fires at most once per line.
+   */
   export type TriggerPatterns = {
-    /** Regexes tested against each incoming line's displayed text. */
-    patterns?: Pattern[];
-    /** Regexes tested against the raw incoming line, before ANSI color codes
-     *  are stripped. Use these to match on colors. */
-    rawPatterns?: Pattern[];
-    /** Vetoes: if any of these match the line, the trigger does not fire. */
-    antiPatterns?: Pattern[];
+    /** Alternatives tested against each incoming line's displayed text. A
+     * styled leaf checks the terminal style at its match's first displayed
+     * character; a bare constrained chain matches any qualifying run. */
+    patterns?: readonly TriggerPattern[];
+    /** Regexes tested against exact raw escape/control input. Raw leaves
+     * cannot carry style predicates; use styled `patterns`/`antiPatterns` for
+     * terminal colors and attributes. */
+    rawPatterns?: readonly Pattern[];
+    /** Vetoes. Styled vetoes require both the regex occurrence and its starting
+     * terminal style to qualify; bare chains veto on any qualifying run. */
+    antiPatterns?: readonly TriggerPattern[];
   };
 
   /** Options for {@link createAlias}. */
@@ -2190,17 +2375,21 @@ declare module "smudgy:core" {
   ): Alias;
   /**
    * Create a trigger: it watches every line **arriving from the MUD** and runs
-   * a script on a match. `patterns` is one regex, or a {@link TriggerPatterns}
-   * object for raw/anti patterns; `script` is a command template string, or a
-   * function that receives the {@link Matches}.
+   * a script on a match. `patterns` is one {@link TriggerPattern}, or a
+   * {@link TriggerPatterns} object for alternatives/raw/veto patterns;
+   * `script` is a command template string, or a function that receives the
+   * {@link Matches}. A style chain can qualify one regex occurrence, or stand
+   * alone to match any incoming run with that terminal style.
    *
    * ```ts
-   * import { createTrigger, send } from "smudgy:core";
-   * // Congratulate, reusing the captured name.
-   * createTrigger("^(\\w+) has advanced a level", "say Grats, $1!");
-   * // A function body can decide what to do; named groups arrive by name.
-   * createTrigger(/^(?<hp>\d+)H /, ({ hp }) => {
-   *   if (parseInt(hp) < 100) send("flee");
+   * import { createTrigger, send, style } from "smudgy:core";
+   *
+   * createTrigger(style.red(/^Danger:/), () => send("flee"));
+   * createTrigger({
+   *   patterns: [style.yellow(/^Warning:/), style.red(/^Danger:/)],
+   *   antiPatterns: [style.faint(/harmless/)],
+   * }, ({ 0: warning }) => {
+   *   send(`say I saw: ${warning}`);
    * });
    * ```
    *
@@ -2210,7 +2399,7 @@ declare module "smudgy:core" {
    * fire limits, and more. Returns a {@link Trigger} handle.
    */
   export function createTrigger(
-    patterns: Pattern | TriggerPatterns,
+    patterns: TriggerPattern | TriggerPatterns,
     script: AutomationScript,
     options?: TriggerOptions,
   ): Trigger;
@@ -2218,7 +2407,23 @@ declare module "smudgy:core" {
    *  to its {@link TriggerDef}; get back the same names mapped to their
    *  {@link Trigger} handles. The keys make this the natural form for a
    *  staged chain (`chain.row.enabled = true`) and give multi-pattern
-   *  triggers a readable name in the automations window. */
+   *  triggers a readable name in the automations window.
+   *
+   * ```ts
+   * import { createTriggers, style } from "smudgy:core";
+   *
+   * createTriggers({
+   *   warning: {
+   *     patterns: [style.yellow(/^Warning:/), style.red(/^Danger:/)],
+   *     script: "look",
+   *   },
+   *   recovery: {
+   *     patterns: [style.green(/^You recover/)],
+   *     script: "score",
+   *   },
+   * });
+   * ```
+   */
   export function createTriggers(triggers: Record<string, TriggerDef>): Record<string, Trigger>;
   /**
    * Create a timer that runs `callback` after `intervalMs` milliseconds:
@@ -2278,6 +2483,14 @@ declare module "smudgy:core" {
 
   // ---- Line / buffer / capture --------------------------------------------
 
+  /** An RGB color with numeric components on 0…255. Values are rounded and
+   * clamped when used; `NaN` and either infinity normalize to 0. */
+  export interface RgbColor {
+    r: number;
+    g: number;
+    b: number;
+  }
+
   /**
    * A color accepted by the line-styling APIs. One of:
    * - an ANSI color name (`"black"`, `"red"`, `"green"`, `"yellow"`, `"blue"`,
@@ -2292,7 +2505,7 @@ declare module "smudgy:core" {
    */
   export type Color =
     | string
-    | { r: number; g: number; b: number }
+    | RgbColor
     | {
         color: string;
         /** The palette slot: `true` bright, `false` normal. Omitted means what

@@ -29,6 +29,12 @@
 //!   literal substitution triggers plus the shared `REGEX_TRIGGERS` regex
 //!   set — the same engine shape `benches/trigger_engine.rs` times (the run
 //!   header prints the exact counts).
+//! - `styled_normal_*` / `styled_anti_*`: focused styled-trigger qualification
+//!   cells. Normal text/style misses queue nothing; a normal hit exposes the
+//!   capture/action allocation boundary. For styled anti patterns, prefilter
+//!   and color misses let the positive trigger fire, while a color hit vetoes
+//!   it; that outcome naming makes the candidate-bitset allocation visible
+//!   without pretending `Noop` actions disappear before dispatch.
 //!
 //! Env vars: `SMUDGY_BENCH_LINES=n` truncates the corpus (shared loaders);
 //! `SMUDGY_BENCH_SKIP_SANITY=1` skips the sanity checks that pin each
@@ -46,13 +52,16 @@ use std::{
 };
 
 use smudgy_bench::{REGEX_TRIGGERS, load_item_names_10k, log_corpora, wire};
+use smudgy_core::models::matchers::{
+    MatcherColor, MatcherColorMatch, MatcherRole, MatcherSyntax, TriggerMatcherSource,
+};
 use smudgy_core::session::{
     connection::{
         feed_inbound,
         responders::{DEFAULT_DIMS, ProtocolState},
         telnet::TelnetParser,
         transcode::Transcode,
-        vt_processor::VtProcessor,
+        vt_processor::{AnsiColor, VtProcessor},
     },
     runtime::{
         BenchActionQueue, IsolateId, Manager, Origin, PushTriggerParams, RuntimeAction,
@@ -157,10 +166,10 @@ const PROBE_REGEX: &str = r"^__ALLOC_STATS_PROBE_REGEX__ (\d+)$";
 /// action queue so passes can drain it. Duplicated from
 /// `benches/trigger_engine.rs` (cargo targets cannot import from one another;
 /// only the corpora live in the crate lib), with one addition: a `SendRaw`
-/// probe trigger per matcher tier. `Noop` triggers enqueue nothing when they
-/// fire (`Trigger::run` maps them to `Ok(None)`), so engine liveness is only
-/// observable through an action-carrying trigger; the probes' markers match
-/// no corpus line, keeping the measured passes identical to the engine bench.
+/// probe trigger per matcher tier. Every fire, including `Noop`, first queues a
+/// `RunAutomation`; `Noop` becomes no work only when that action is dispatched.
+/// The probes use a distinctive action and markers that match no corpus line,
+/// keeping the measured passes identical to the engine bench.
 fn build_manager(names: &[String], regexes: &[&str]) -> (Manager, Queue) {
     let registry = SharedAutomationRegistry::default();
     let (mut mgr, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
@@ -178,6 +187,7 @@ fn build_manager(names: &[String], regexes: &[&str]) -> (Manager, Queue) {
             patterns: &patterns,
             raw_patterns: &empty,
             anti_patterns: &empty,
+            matchers: None,
             action,
             prompt: false,
             enabled: true,
@@ -223,6 +233,112 @@ fn build_manager(names: &[String], regexes: &[&str]) -> (Manager, Queue) {
     (mgr, queue)
 }
 
+/// One focused exact-color positive trigger. The persisted matcher sidecar is
+/// used here because this target exercises the native engine directly rather
+/// than the JS registration bridge.
+fn build_styled_normal_manager() -> (Manager, Queue) {
+    let registry = SharedAutomationRegistry::default();
+    let (mut manager, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
+    let name = Arc::new(String::from("styled_normal"));
+    let patterns = Arc::new(vec![String::from("target")]);
+    let empty = Arc::new(Vec::<String>::new());
+    let matchers = [TriggerMatcherSource {
+        role: MatcherRole::Match,
+        syntax: MatcherSyntax::Regex,
+        source: String::from("target"),
+        anchor_start: true,
+        anchor_end: true,
+        color: Some(MatcherColorMatch {
+            foreground: Some(MatcherColor::Ansi { index: 1 }),
+            ..Default::default()
+        }),
+    }];
+    manager
+        .push_trigger(PushTriggerParams {
+            isolate: IsolateId::Main,
+            origin: Origin::User,
+            name: &name,
+            patterns: &patterns,
+            raw_patterns: &empty,
+            anti_patterns: &empty,
+            matchers: Some(&matchers),
+            action: ScriptAction::Noop,
+            prompt: false,
+            enabled: true,
+            priority: 0,
+            fallthrough: false,
+            fire_limit: None,
+            line_limit: None,
+            source: None,
+        })
+        .expect("styled normal trigger");
+    (manager, queue)
+}
+
+/// One plain positive plus one exact-color anti-pattern. This isolates the
+/// colored anti `RegexSet`'s no-hit and candidate-bitset paths.
+fn build_styled_anti_manager() -> (Manager, Queue) {
+    let registry = SharedAutomationRegistry::default();
+    let (mut manager, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
+    let name = Arc::new(String::from("styled_anti"));
+    let patterns = Arc::new(vec![String::from("target")]);
+    let raw_patterns = Arc::new(Vec::<String>::new());
+    let anti_patterns = Arc::new(vec![String::from("block")]);
+    let matchers = [
+        TriggerMatcherSource {
+            role: MatcherRole::Match,
+            syntax: MatcherSyntax::Regex,
+            source: String::from("target"),
+            anchor_start: true,
+            anchor_end: true,
+            color: None,
+        },
+        TriggerMatcherSource {
+            role: MatcherRole::Anti,
+            syntax: MatcherSyntax::Regex,
+            source: String::from("block"),
+            anchor_start: true,
+            anchor_end: true,
+            color: Some(MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 1 }),
+                ..Default::default()
+            }),
+        },
+    ];
+    manager
+        .push_trigger(PushTriggerParams {
+            isolate: IsolateId::Main,
+            origin: Origin::User,
+            name: &name,
+            patterns: &patterns,
+            raw_patterns: &raw_patterns,
+            anti_patterns: &anti_patterns,
+            matchers: Some(&matchers),
+            action: ScriptAction::Noop,
+            prompt: false,
+            enabled: true,
+            priority: 0,
+            fallthrough: false,
+            fire_limit: None,
+            line_limit: None,
+            source: None,
+        })
+        .expect("styled anti trigger");
+    (manager, queue)
+}
+
+fn repeated_styled_line(text: &str, style: Style, count: usize) -> Vec<Arc<StyledLine>> {
+    let line = Arc::new(StyledLine::new(
+        text,
+        vec![VtSpan {
+            style,
+            begin_pos: 0,
+            end_pos: text.len(),
+        }],
+    ));
+    vec![line; count]
+}
+
 /// Runs the dressed wire bytes through the inbound pipeline as one oversized
 /// "read" and gathers what came out: the complete lines the `VtProcessor`
 /// committed, and the count of partial-line flushes (prompt commits). A
@@ -253,8 +369,8 @@ fn collect_ingest(wire_bytes: &[u8]) -> (Vec<Arc<StyledLine>>, usize) {
     let mut partials = 0_usize;
     while let Ok(action) = rx.try_recv() {
         match action {
-            RuntimeAction::HandleIncomingLine(line) => complete.push(line),
-            RuntimeAction::HandleIncomingFragmentedLine { line, .. } => complete.push(line),
+            RuntimeAction::HandleIncomingLine(line)
+            | RuntimeAction::HandleIncomingFragmentedLine { line, .. } => complete.push(line),
             RuntimeAction::HandleIncomingPartialLine(_) => partials += 1,
             _ => {}
         }
@@ -381,11 +497,12 @@ fn frag4_pass(fragged: &[Vec<Arc<StyledLine>>]) -> (u64, u64) {
     })
 }
 
-/// One measured trigger scan over the corpus, draining the action queue at
-/// the end of the pass (empty in practice: the corpus set is all `Noop`, and
-/// the probe markers never occur in a log). `clear` keeps the deque's
-/// capacity and the engine's regex caches stay warm from the warmup pass, so
-/// pass-to-pass counts are steady-state and comparable.
+/// One measured trigger scan over the corpus, draining the action queue at the
+/// end of the pass. A matching `Noop` trigger still contributes one deferred
+/// `RunAutomation`; dispatch (which this native engine target intentionally
+/// omits) is where it becomes no work. `clear` keeps the deque's capacity and
+/// the engine's regex caches stay warm from the warmup pass, so pass-to-pass
+/// counts are steady-state and comparable.
 fn trigger_pass(mgr: &mut Manager, queue: &Queue, styled: &[Arc<StyledLine>]) -> (u64, u64) {
     measure(|| {
         for line in styled {
@@ -481,8 +598,9 @@ fn sanity_ingest(styled: &[Arc<StyledLine>], partials: usize, lines: &[String]) 
 
 /// Pins the trigger workload to a live engine: the `SendRaw` probe trigger on
 /// each matcher tier (literal / regex-filtered) must enqueue an action when
-/// its marker line arrives. `Noop` triggers are unobservable by design, so
-/// the probes are the proof that `process_incoming_line` really matches.
+/// its marker line arrives. The queue observes `RunAutomation` before dispatch,
+/// including for `Noop`; dedicated probe markers make each tier's liveness
+/// check independent of incidental corpus-pattern matches.
 fn sanity_trigger(mgr: &mut Manager, queue: &Queue) {
     let literal_probe = Arc::new(StyledLine::new(
         &format!("loot: {PROBE_LITERAL} acquired"),
@@ -512,6 +630,30 @@ fn sanity_trigger(mgr: &mut Manager, queue: &Queue) {
     eprintln!(
         "sanity: trigger engine fired on both tiers ({literal_fired} literal / {regex_fired} regex action(s))"
     );
+}
+
+/// Pins the focused styled rows to their intended control flow. Allocation
+/// comparisons are meaningless if a supposed miss accidentally fires, or if
+/// an anti hit fails to veto and changes capture/action work.
+fn sanity_styled_outcomes(
+    family: &str,
+    manager: &mut Manager,
+    queue: &Queue,
+    cases: &[(&str, &Arc<StyledLine>, usize)],
+) {
+    for (case, line, expected_actions) in cases {
+        assert!(queue.is_empty(), "{family}/{case}: dirty action queue");
+        manager
+            .process_incoming_line(line)
+            .expect("styled trigger sanity line");
+        let actual_actions = queue.len();
+        queue.clear();
+        assert_eq!(
+            actual_actions, *expected_actions,
+            "{family}/{case}: unexpected queued RunAutomation count"
+        );
+    }
+    eprintln!("sanity: {family} text/color miss and hit outcomes are correct");
 }
 
 /// Pins the terminal-buffer workloads to real scrollback behavior: line
@@ -601,6 +743,7 @@ fn print_table(rows: &[Row]) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let skip_sanity = std::env::var("SMUDGY_BENCH_SKIP_SANITY").is_ok();
     // First log in `bench/logs/` (name-sorted, so deterministic), matching
@@ -668,6 +811,53 @@ fn main() {
         .map(|l| Arc::new(StyledLine::new(l, Vec::new())))
         .collect();
 
+    let default_style = Style::default();
+    let red_style = Style {
+        fg: Color::Ansi {
+            color: AnsiColor::Red,
+            bold: false,
+        },
+        ..Style::default()
+    };
+    let styled_text_miss = repeated_styled_line("clear", default_style, lines.len());
+    let styled_color_miss = repeated_styled_line("target", default_style, lines.len());
+    let styled_color_hit = repeated_styled_line("target", red_style, lines.len());
+    let anti_text_miss = repeated_styled_line("target clear", default_style, lines.len());
+    let anti_color_miss = repeated_styled_line("target block", default_style, lines.len());
+    let anti_color_hit = repeated_styled_line("target block", red_style, lines.len());
+    let (mut styled_normal, styled_normal_queue) = build_styled_normal_manager();
+    let (mut styled_anti, styled_anti_queue) = build_styled_anti_manager();
+    styled_normal
+        .process_incoming_line(&styled_text_miss[0])
+        .expect("styled normal warmup");
+    styled_anti
+        .process_incoming_line(&anti_text_miss[0])
+        .expect("styled anti warmup");
+    styled_normal_queue.clear();
+    styled_anti_queue.clear();
+    if !skip_sanity {
+        sanity_styled_outcomes(
+            "styled normal",
+            &mut styled_normal,
+            &styled_normal_queue,
+            &[
+                ("text miss", &styled_text_miss[0], 0),
+                ("color miss", &styled_color_miss[0], 0),
+                ("color hit", &styled_color_hit[0], 1),
+            ],
+        );
+        sanity_styled_outcomes(
+            "styled anti",
+            &mut styled_anti,
+            &styled_anti_queue,
+            &[
+                ("prefilter miss / positive fires", &anti_text_miss[0], 1),
+                ("color miss / positive fires", &anti_color_miss[0], 1),
+                ("color hit / veto", &anti_color_hit[0], 0),
+            ],
+        );
+    }
+
     let rows = vec![
         run_workload("ingest", lines.len(), || ingest_pass(&chunks)),
         run_workload("styled_line", lines.len(), || styled_line_pass(&lines)),
@@ -679,6 +869,26 @@ fn main() {
         }),
         run_workload("trigger_scan", lines.len(), || {
             trigger_pass(&mut mgr, &queue, &styled_plain)
+        }),
+        run_workload("styled_normal_text_miss", lines.len(), || {
+            trigger_pass(&mut styled_normal, &styled_normal_queue, &styled_text_miss)
+        }),
+        run_workload("styled_normal_color_miss", lines.len(), || {
+            trigger_pass(&mut styled_normal, &styled_normal_queue, &styled_color_miss)
+        }),
+        run_workload("styled_normal_color_hit", lines.len(), || {
+            trigger_pass(&mut styled_normal, &styled_normal_queue, &styled_color_hit)
+        }),
+        run_workload(
+            "styled_anti_prefilter_miss_positive_fires",
+            lines.len(),
+            || trigger_pass(&mut styled_anti, &styled_anti_queue, &anti_text_miss),
+        ),
+        run_workload("styled_anti_color_miss_positive_fires", lines.len(), || {
+            trigger_pass(&mut styled_anti, &styled_anti_queue, &anti_color_miss)
+        }),
+        run_workload("styled_anti_color_hit_veto", lines.len(), || {
+            trigger_pass(&mut styled_anti, &styled_anti_queue, &anti_color_hit)
         }),
     ];
 

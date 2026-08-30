@@ -43,6 +43,7 @@ pub(crate) mod common;
 mod dashboard;
 mod editors;
 mod highlight;
+mod keyboard_control;
 mod manifest;
 pub(crate) mod model;
 mod packages;
@@ -65,6 +66,68 @@ use packages::{
 fn tab_traversal(modifiers: keyboard::Modifiers, status: Status) -> Option<bool> {
     (status == Status::Ignored && !modifiers.control() && !modifiers.alt() && !modifiers.logo())
         .then_some(modifiers.shift())
+}
+
+fn matcher_truecolor_range(
+    color: smudgy_core::models::matchers::MatcherColor,
+) -> Option<smudgy_core::models::matchers::MatcherHsvRange> {
+    use smudgy_core::models::matchers::{MatcherColor, MatcherHsvRange};
+    let MatcherColor::Truecolor { r, g, b, range } = color else {
+        return None;
+    };
+    let point = smudgy_core::models::matchers::MatcherHsv::from_rgb(r, g, b);
+    let range = range
+        .unwrap_or_else(|| MatcherHsvRange::from_to(point, point))
+        .rgb_canonicalized();
+    let (from, to) = range.directed_endpoints();
+    Some(MatcherHsvRange::from_to(from, to))
+}
+
+fn matcher_hsv_to_picker(
+    hsv: smudgy_core::models::matchers::MatcherHsv,
+) -> crate::components::color_picker::Hsv {
+    crate::components::color_picker::Hsv {
+        hue: f32::from(hsv.hue % 360),
+        saturation: f32::from(hsv.saturation) / 255.0,
+        value: f32::from(hsv.value) / 255.0,
+    }
+}
+
+fn picker_hsv_to_matcher(
+    hsv: crate::components::color_picker::Hsv,
+) -> smudgy_core::models::matchers::MatcherHsv {
+    let hsv = hsv.normalized();
+    let quantized = smudgy_core::models::matchers::MatcherHsv {
+        hue: (hsv.hue.round() as u16) % 360,
+        saturation: (hsv.saturation * 255.0).round() as u8,
+        value: (hsv.value * 255.0).round() as u8,
+    };
+    // Store the HSV value that the displayed 8-bit RGB swatch represents.
+    // Without this canonical value, HSV-to-RGB-to-HSV quantization can make a
+    // single-color or narrow range reject its selected color. Keep the
+    // specified hue as a range boundary for an achromatic endpoint. Matching
+    // does not compare hue when the input color is achromatic.
+    quantized.rgb_canonicalized()
+}
+
+fn matcher_truecolor_from_range(
+    range: smudgy_core::models::matchers::MatcherHsvRange,
+) -> smudgy_core::models::matchers::MatcherColor {
+    let from = range.first.rgb_canonicalized();
+    let to = range.second.rgb_canonicalized();
+    let range = smudgy_core::models::matchers::MatcherHsvRange::from_to(from, to);
+    let (r, g, b) = range.first.to_rgb();
+    smudgy_core::models::matchers::MatcherColor::Truecolor {
+        r,
+        g,
+        b,
+        range: Some(range),
+    }
+}
+
+fn matcher_hsv_hex(hsv: smudgy_core::models::matchers::MatcherHsv) -> String {
+    let (r, g, b) = hsv.to_rgb();
+    format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 /// Convenience alias for this window's themed elements.
@@ -339,6 +402,25 @@ pub enum Message {
     SetRowSyntax(usize, smudgy_core::models::matchers::MatcherSyntax),
     ToggleRowAnchorStart(usize),
     ToggleRowAnchorEnd(usize),
+    /// Adds or removes the color filter for a normal or exception matcher row.
+    ToggleRowColor(usize, bool),
+    SelectRowColorChannel(usize, smudgy_core::models::matchers::MatcherColorChannel),
+    SelectRowColorKind(usize, model::MatcherColorKind),
+    SetRowAnsiColor(usize, u8),
+    SetRowXtermColor(usize, u8),
+    SetRowColorRange(
+        usize,
+        model::ColorRangeEndpoint,
+        crate::components::color_picker::Message,
+    ),
+    SetRowColorRangeHex(usize, model::ColorRangeEndpoint, String),
+    SetRowExactTruecolorHex(usize, String),
+    SetRowExactTruecolorRgb(usize, model::TruecolorComponent, String),
+    ToggleRowColorAttribute(
+        usize,
+        smudgy_core::models::matchers::MatcherTextAttribute,
+        bool,
+    ),
 
     // ---- save bar ----------------------------------------------------------
     Save,
@@ -551,6 +633,8 @@ pub enum Message {
     PaletteRunItem(usize),
 
     // ---- keyboard focus traversal -----------------------------------------
+    /// Focus one feature-local composite color control after a pointer press.
+    FocusColorControl(iced::widget::Id),
     FocusNext(window::Id),
     FocusPrevious(window::Id),
 
@@ -1166,6 +1250,7 @@ impl AutomationsWindow {
             }
 
             // -------- keyboard focus traversal ----------------------------
+            Message::FocusColorControl(id) => Update::with_task(operation::focus(id)),
             Message::FocusNext(event_window) if event_window == self.window_id => {
                 Update::with_task(operation::focus_next())
             }
@@ -1503,6 +1588,9 @@ impl AutomationsWindow {
                             if let Some(row) = rows.get_mut(index) {
                                 row.syntax = syntax;
                                 row.role = role;
+                                if role == PatternKind::Raw {
+                                    row.color = None;
+                                }
                             }
                         }
                         // The cards are not shown at two or more matchers.
@@ -1584,6 +1672,283 @@ impl AutomationsWindow {
                     && let Some(row) = rows.get_mut(i)
                 {
                     row.anchor_end = !row.anchor_end;
+                }
+                Update::none()
+            }
+            Message::ToggleRowColor(i, enabled) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                    && row.role != PatternKind::Raw
+                {
+                    row.set_color_enabled(enabled);
+                }
+                Update::none()
+            }
+            Message::SelectRowColorChannel(i, channel) => {
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    row.color_channel = channel;
+                }
+                Update::none()
+            }
+            Message::SelectRowColorKind(i, kind) => {
+                use smudgy_core::models::matchers::{MatcherColor, MatcherColorChannel};
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    let channel = row.color_channel;
+                    let draft = row.color_draft(channel);
+                    let [r, g, b] = draft.exact_truecolor.last_valid;
+                    let range = draft.color_range_last_valid;
+                    if let Some(filter) = row.color.as_mut() {
+                        let slot = match channel {
+                            MatcherColorChannel::Foreground => &mut filter.foreground,
+                            MatcherColorChannel::Background => &mut filter.background,
+                        };
+                        if model::MatcherColorKind::of(*slot) != kind {
+                            *slot = match kind {
+                                model::MatcherColorKind::Any => None,
+                                model::MatcherColorKind::Ansi => {
+                                    Some(MatcherColor::Ansi { index: 7 })
+                                }
+                                model::MatcherColorKind::Xterm => {
+                                    Some(MatcherColor::Xterm { index: 7 })
+                                }
+                                model::MatcherColorKind::Truecolor => {
+                                    Some(MatcherColor::Truecolor {
+                                        r,
+                                        g,
+                                        b,
+                                        range: None,
+                                    })
+                                }
+                                model::MatcherColorKind::ColorRange => {
+                                    Some(matcher_truecolor_from_range(range))
+                                }
+                            };
+                        }
+                    }
+                }
+                Update::none()
+            }
+            Message::SetRowAnsiColor(i, index) => {
+                self.set_row_matcher_color(
+                    i,
+                    smudgy_core::models::matchers::MatcherColor::Ansi {
+                        index: index.min(15),
+                    },
+                );
+                Update::none()
+            }
+            Message::SetRowXtermColor(i, index) => {
+                self.set_row_matcher_color(
+                    i,
+                    smudgy_core::models::matchers::MatcherColor::Xterm { index },
+                );
+                Update::none()
+            }
+            Message::SetRowColorRange(i, endpoint, message) => {
+                let mut range = self
+                    .trigger_row(i)
+                    .map(|row| row.color_draft(row.color_channel).color_range_last_valid)
+                    .unwrap_or_else(|| {
+                        let point =
+                            smudgy_core::models::matchers::MatcherHsv::from_rgb(255, 255, 255);
+                        smudgy_core::models::matchers::MatcherHsvRange::from_to(point, point)
+                    });
+                let (mut from, mut to) = range.directed_endpoints();
+                let initial = match endpoint {
+                    model::ColorRangeEndpoint::First => from,
+                    model::ColorRangeEndpoint::Second => to,
+                };
+                let mut picker = crate::components::color_picker::ColorPicker::from_hsv(
+                    matcher_hsv_to_picker(initial),
+                );
+                let _ = picker.update(message);
+                let hsv = picker_hsv_to_matcher(picker.hsv());
+                match endpoint {
+                    model::ColorRangeEndpoint::First => from = hsv,
+                    model::ColorRangeEndpoint::Second => to = hsv,
+                }
+                range = smudgy_core::models::matchers::MatcherHsvRange::from_to(from, to);
+                let color = matcher_truecolor_from_range(range);
+                range = matcher_truecolor_range(color).unwrap_or(range);
+                self.set_row_matcher_color(i, color);
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    let channel = row.color_channel;
+                    let draft = row.color_draft_mut(channel);
+                    draft.color_range_last_valid = range;
+                    let (from, to) = range.directed_endpoints();
+                    draft.color_range_hex[endpoint.index()] = matcher_hsv_hex(match endpoint {
+                        model::ColorRangeEndpoint::First => from,
+                        model::ColorRangeEndpoint::Second => to,
+                    });
+                }
+                Update::none()
+            }
+            Message::SetRowColorRangeHex(i, endpoint, value) => {
+                let parsed = model::parse_matcher_hex(&value);
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    let channel = row.color_channel;
+                    row.color_draft_mut(channel).color_range_hex[endpoint.index()] = value;
+                }
+                if let Some((r, g, b)) = parsed {
+                    let mut range = self
+                        .trigger_row(i)
+                        .map(|row| row.color_draft(row.color_channel).color_range_last_valid)
+                        .unwrap_or_else(|| {
+                            let point =
+                                smudgy_core::models::matchers::MatcherHsv::from_rgb(255, 255, 255);
+                            smudgy_core::models::matchers::MatcherHsvRange::from_to(point, point)
+                        });
+                    let (mut from, mut to) = range.directed_endpoints();
+                    let old_hue = match endpoint {
+                        model::ColorRangeEndpoint::First => from.hue,
+                        model::ColorRangeEndpoint::Second => to.hue,
+                    };
+                    let mut hsv = smudgy_core::models::matchers::MatcherHsv::from_rgb(r, g, b);
+                    if hsv.saturation == 0 {
+                        hsv.hue = old_hue;
+                    }
+                    match endpoint {
+                        model::ColorRangeEndpoint::First => from = hsv,
+                        model::ColorRangeEndpoint::Second => to = hsv,
+                    }
+                    range = smudgy_core::models::matchers::MatcherHsvRange::from_to(from, to);
+                    let color = matcher_truecolor_from_range(range);
+                    range = matcher_truecolor_range(color).unwrap_or(range);
+                    self.set_row_matcher_color(i, color);
+                    if let Pane::Editor(EditorState {
+                        node: EditNode::Trigger { rows, .. },
+                        ..
+                    }) = &mut self.pane
+                        && let Some(row) = rows.get_mut(i)
+                    {
+                        let channel = row.color_channel;
+                        row.color_draft_mut(channel).color_range_last_valid = range;
+                    }
+                }
+                Update::none()
+            }
+            Message::SetRowExactTruecolorHex(i, value) => {
+                let parsed = model::parse_matcher_hex(&value);
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    let channel = row.color_channel;
+                    let draft = &mut row.color_draft_mut(channel).exact_truecolor;
+                    draft.hex = value;
+                    if let Some((r, g, b)) = parsed {
+                        draft.rgb = [r.to_string(), g.to_string(), b.to_string()];
+                        draft.last_valid = [r, g, b];
+                    }
+                }
+                if let Some((r, g, b)) = parsed {
+                    self.set_row_matcher_color(
+                        i,
+                        smudgy_core::models::matchers::MatcherColor::Truecolor {
+                            r,
+                            g,
+                            b,
+                            range: None,
+                        },
+                    );
+                }
+                Update::none()
+            }
+            Message::SetRowExactTruecolorRgb(i, component, value) => {
+                let parsed = if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(row) = rows.get_mut(i)
+                {
+                    let channel = row.color_channel;
+                    let draft = &mut row.color_draft_mut(channel).exact_truecolor;
+                    draft.rgb[component.index()] = value;
+                    let [red, green, blue] = &draft.rgb;
+                    let parsed = red
+                        .parse::<u8>()
+                        .ok()
+                        .zip(green.parse::<u8>().ok())
+                        .zip(blue.parse::<u8>().ok())
+                        .map(|((r, g), b)| (r, g, b));
+                    if let Some((r, g, b)) = parsed {
+                        draft.hex = format!("#{r:02x}{g:02x}{b:02x}");
+                        draft.last_valid = [r, g, b];
+                    }
+                    parsed
+                } else {
+                    None
+                };
+                if let Some((r, g, b)) = parsed {
+                    self.set_row_matcher_color(
+                        i,
+                        smudgy_core::models::matchers::MatcherColor::Truecolor {
+                            r,
+                            g,
+                            b,
+                            range: None,
+                        },
+                    );
+                }
+                Update::none()
+            }
+            Message::ToggleRowColorAttribute(i, attribute, selected) => {
+                use smudgy_core::models::matchers::MatcherTextAttribute;
+                if let Pane::Editor(EditorState {
+                    node: EditNode::Trigger { rows, .. },
+                    ..
+                }) = &mut self.pane
+                    && let Some(filter) = rows.get_mut(i).and_then(|row| row.color.as_mut())
+                {
+                    filter.attributes.retain(|current| *current != attribute);
+                    if selected {
+                        let incompatible = match attribute {
+                            MatcherTextAttribute::Bold => Some(MatcherTextAttribute::Faint),
+                            MatcherTextAttribute::Faint => Some(MatcherTextAttribute::Bold),
+                            MatcherTextAttribute::Underline => {
+                                Some(MatcherTextAttribute::DoubleUnderline)
+                            }
+                            MatcherTextAttribute::DoubleUnderline => {
+                                Some(MatcherTextAttribute::Underline)
+                            }
+                            MatcherTextAttribute::SlowBlink => {
+                                Some(MatcherTextAttribute::FastBlink)
+                            }
+                            MatcherTextAttribute::FastBlink => {
+                                Some(MatcherTextAttribute::SlowBlink)
+                            }
+                            _ => None,
+                        };
+                        if let Some(incompatible) = incompatible {
+                            filter.attributes.retain(|current| *current != incompatible);
+                        }
+                        filter.attributes.push(attribute);
+                    }
                 }
                 Update::none()
             }
@@ -2048,6 +2413,15 @@ impl AutomationsWindow {
             | Message::SetRowSyntax(_, _)
             | Message::ToggleRowAnchorStart(_)
             | Message::ToggleRowAnchorEnd(_)
+            | Message::ToggleRowColor(_, _)
+            | Message::SelectRowColorKind(_, _)
+            | Message::SetRowAnsiColor(_, _)
+            | Message::SetRowXtermColor(_, _)
+            | Message::SetRowColorRange(_, _, _)
+            | Message::SetRowColorRangeHex(_, _, _)
+            | Message::SetRowExactTruecolorHex(_, _)
+            | Message::SetRowExactTruecolorRgb(_, _, _)
+            | Message::ToggleRowColorAttribute(_, _, _)
             | Message::InsertReference(_)
             | Message::MarkHotkeyState(_) => true,
             _ => false,
@@ -2139,6 +2513,42 @@ impl AutomationsWindow {
                     self.trigger_row_contents.swap(i, j);
                 }
             }
+        }
+    }
+
+    fn trigger_row(&self, index: usize) -> Option<&model::TriggerRow> {
+        let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &self.pane
+        else {
+            return None;
+        };
+        rows.get(index)
+    }
+
+    fn set_row_matcher_color(
+        &mut self,
+        index: usize,
+        color: smudgy_core::models::matchers::MatcherColor,
+    ) {
+        use smudgy_core::models::matchers::MatcherColorChannel;
+        let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &mut self.pane
+        else {
+            return;
+        };
+        let Some(row) = rows.get_mut(index) else {
+            return;
+        };
+        let Some(filter) = row.color.as_mut() else {
+            return;
+        };
+        match row.color_channel {
+            MatcherColorChannel::Foreground => filter.foreground = Some(color),
+            MatcherColorChannel::Background => filter.background = Some(color),
         }
     }
 
@@ -2304,6 +2714,66 @@ impl AutomationsWindow {
 mod tab_traversal_tests {
     use super::*;
 
+    fn window_with_foreground(
+        color: smudgy_core::models::matchers::MatcherColor,
+    ) -> AutomationsWindow {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "truecolor-editor-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.pane = Pane::Editor(EditorState {
+            mode: EditorMode::Create,
+            original_name: None,
+            name: "color".to_string(),
+            node: EditNode::Trigger {
+                enabled: true,
+                language: ScriptLang::Plaintext,
+                prompt: false,
+                priority: 0,
+                fallthrough: false,
+                package: None,
+                rows: vec![model::TriggerRow {
+                    color: Some(smudgy_core::models::matchers::MatcherColorMatch {
+                        foreground: Some(color),
+                        ..Default::default()
+                    }),
+                    ..model::TriggerRow::new(PatternKind::Match)
+                }],
+            },
+            error: None,
+        });
+        window
+    }
+
+    fn first_row(window: &AutomationsWindow) -> &model::TriggerRow {
+        let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &window.pane
+        else {
+            panic!("test window must contain a trigger editor");
+        };
+        &rows[0]
+    }
+
+    fn foreground(window: &AutomationsWindow) -> smudgy_core::models::matchers::MatcherColor {
+        first_row(window)
+            .color
+            .as_ref()
+            .and_then(|filter| filter.foreground)
+            .expect("test row must have a foreground filter")
+    }
+
+    fn background(window: &AutomationsWindow) -> smudgy_core::models::matchers::MatcherColor {
+        first_row(window)
+            .color
+            .as_ref()
+            .and_then(|filter| filter.background)
+            .expect("test row must have a background filter")
+    }
+
     #[test]
     fn publish_completion_updates_the_open_pane_immediately() {
         let mut window = AutomationsWindow::new(
@@ -2368,5 +2838,438 @@ mod tab_traversal_tests {
         ] {
             assert_eq!(tab_traversal(modifier, Status::Ignored), None);
         }
+    }
+
+    #[test]
+    fn color_focus_and_channel_navigation_do_not_mark_the_editor_dirty() {
+        use smudgy_core::models::matchers::{MatcherColor, MatcherColorChannel};
+
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        assert!(!window.dirty);
+
+        let _ = window.update(Message::FocusColorControl(iced::widget::Id::from(
+            "automation-trigger-color-row-0-channel".to_string(),
+        )));
+        assert!(!window.dirty);
+
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Background,
+        ));
+        assert!(!window.dirty);
+
+        let _ = window.update(Message::SetRowAnsiColor(0, 3));
+        assert!(window.dirty);
+    }
+
+    #[test]
+    fn exact_truecolor_inputs_synchronize_only_after_valid_edits() {
+        use model::{MatcherColorKind, TruecolorComponent};
+        use smudgy_core::models::matchers::MatcherColor;
+
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        assert_eq!(model::parse_matcher_hex("aéabc"), None);
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        assert_eq!(
+            foreground(&window),
+            MatcherColor::Truecolor {
+                r: 255,
+                g: 255,
+                b: 255,
+                range: None,
+            }
+        );
+
+        let _ = window.update(Message::SetRowExactTruecolorHex(0, "#0a80ff".to_string()));
+        assert_eq!(
+            first_row(&window)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground)
+                .exact_truecolor
+                .rgb,
+            ["10", "128", "255"]
+        );
+        assert_eq!(
+            foreground(&window),
+            MatcherColor::Truecolor {
+                r: 10,
+                g: 128,
+                b: 255,
+                range: None,
+            }
+        );
+
+        let valid_color = foreground(&window);
+        let _ = window.update(Message::SetRowExactTruecolorHex(0, "#0a80f".to_string()));
+        assert_eq!(
+            first_row(&window)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground)
+                .exact_truecolor
+                .hex,
+            "#0a80f"
+        );
+        assert_eq!(foreground(&window), valid_color);
+
+        let _ = window.update(Message::SetRowExactTruecolorRgb(
+            0,
+            TruecolorComponent::Green,
+            "300".to_string(),
+        ));
+        let _ = window.update(Message::SetRowExactTruecolorRgb(
+            0,
+            TruecolorComponent::Red,
+            "17".to_string(),
+        ));
+        assert_eq!(foreground(&window), valid_color);
+        assert_eq!(
+            first_row(&window)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground)
+                .exact_truecolor
+                .rgb,
+            ["17", "300", "255"]
+        );
+
+        let _ = window.update(Message::SetRowExactTruecolorRgb(
+            0,
+            TruecolorComponent::Green,
+            "42".to_string(),
+        ));
+        assert_eq!(
+            first_row(&window)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground)
+                .exact_truecolor
+                .hex,
+            "#112aff"
+        );
+        assert_eq!(
+            foreground(&window),
+            MatcherColor::Truecolor {
+                r: 17,
+                g: 42,
+                b: 255,
+                range: None,
+            }
+        );
+    }
+
+    #[test]
+    fn channel_switches_preserve_partial_color_drafts() {
+        use model::{ColorRangeEndpoint, MatcherColorKind};
+        use smudgy_core::models::matchers::{MatcherColor, MatcherColorChannel};
+
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        let _ = window.update(Message::SetRowExactTruecolorHex(0, "#12".to_string()));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Ansi));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Background,
+        ));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            "#34".to_string(),
+        ));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Ansi));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Foreground,
+        ));
+        assert_eq!(
+            first_row(&window)
+                .color_draft(MatcherColorChannel::Foreground)
+                .exact_truecolor
+                .hex,
+            "#12"
+        );
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Background,
+        ));
+        assert_eq!(
+            first_row(&window)
+                .color_draft(MatcherColorChannel::Background)
+                .color_range_hex[0],
+            "#34"
+        );
+    }
+
+    #[test]
+    fn color_toggle_message_restores_foreground_background_and_attributes() {
+        use smudgy_core::models::matchers::{
+            MatcherColor, MatcherColorMatch, MatcherTextAttribute,
+        };
+
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        let filter = MatcherColorMatch {
+            foreground: Some(MatcherColor::Ansi { index: 2 }),
+            background: Some(MatcherColor::Xterm { index: 196 }),
+            attributes: vec![MatcherTextAttribute::Bold, MatcherTextAttribute::Italic],
+        };
+        let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &mut window.pane
+        else {
+            panic!("test window must contain a trigger editor");
+        };
+        rows[0].color = Some(filter.clone());
+
+        let _ = window.update(Message::ToggleRowColor(0, false));
+        assert!(first_row(&window).color.is_none());
+
+        let _ = window.update(Message::ToggleRowColor(0, true));
+        assert_eq!(first_row(&window).color.as_ref(), Some(&filter));
+    }
+
+    #[test]
+    fn color_kind_tabs_restore_each_channel_dormant_values() {
+        use model::{ColorRangeEndpoint, MatcherColorKind};
+        use smudgy_core::models::matchers::{MatcherColor, MatcherColorChannel, MatcherHsv};
+
+        let hex = |hsv: MatcherHsv| {
+            let (r, g, b) = hsv.to_rgb();
+            format!("#{r:02x}{g:02x}{b:02x}")
+        };
+        let vivid = |hue| MatcherHsv {
+            hue,
+            saturation: 255,
+            value: 255,
+        };
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        let _ = window.update(Message::SetRowExactTruecolorHex(0, "#0a80ff".to_string()));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            hex(vivid(350)),
+        ));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            hex(vivid(10)),
+        ));
+        let foreground_range = matcher_truecolor_range(foreground(&window)).unwrap();
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Ansi));
+
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Background,
+        ));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        let _ = window.update(Message::SetRowExactTruecolorHex(0, "#112233".to_string()));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            hex(vivid(120)),
+        ));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            hex(vivid(240)),
+        ));
+        let background_range = matcher_truecolor_range(background(&window)).unwrap();
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Ansi));
+
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Foreground,
+        ));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        assert_eq!(
+            foreground(&window),
+            MatcherColor::Truecolor {
+                r: 10,
+                g: 128,
+                b: 255,
+                range: None,
+            }
+        );
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        assert_eq!(
+            matcher_truecolor_range(foreground(&window)),
+            Some(foreground_range)
+        );
+
+        let _ = window.update(Message::SelectRowColorChannel(
+            0,
+            MatcherColorChannel::Background,
+        ));
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        assert_eq!(
+            background(&window),
+            MatcherColor::Truecolor {
+                r: 17,
+                g: 34,
+                b: 51,
+                range: None,
+            }
+        );
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        assert_eq!(
+            matcher_truecolor_range(background(&window)),
+            Some(background_range)
+        );
+    }
+
+    #[test]
+    fn invalid_color_text_blocks_save_and_remains_dirty() {
+        use model::{ColorRangeEndpoint, MatcherColorKind};
+        use smudgy_core::models::matchers::MatcherColor;
+
+        let mut exact = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        let _ = exact.update(Message::SelectRowColorKind(0, MatcherColorKind::Truecolor));
+        let _ = exact.update(Message::SetRowExactTruecolorHex(0, "#123".to_string()));
+        let _ = exact.update(Message::Save);
+        assert!(exact.dirty);
+        let Pane::Editor(state) = &exact.pane else {
+            panic!("save must keep the editor open");
+        };
+        assert!(state.error.is_some());
+        assert_eq!(
+            first_row(&exact)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground,)
+                .exact_truecolor
+                .hex,
+            "#123"
+        );
+
+        let mut range = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        let _ = range.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        let _ = range.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            "#abcd".to_string(),
+        ));
+        let _ = range.update(Message::Save);
+        assert!(range.dirty);
+        let Pane::Editor(state) = &range.pane else {
+            panic!("save must keep the editor open");
+        };
+        assert!(state.error.is_some());
+        assert_eq!(
+            first_row(&range)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground,)
+                .color_range_hex[1],
+            "#abcd"
+        );
+    }
+
+    #[test]
+    fn color_range_derives_the_directed_hue_interval() {
+        use model::{ColorRangeEndpoint, MatcherColorKind};
+        use smudgy_core::models::matchers::{MatcherColor, MatcherHsv};
+
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        let hex = |hsv: MatcherHsv| {
+            let (r, g, b) = hsv.to_rgb();
+            format!("#{r:02x}{g:02x}{b:02x}")
+        };
+        let vivid = |hue| MatcherHsv {
+            hue,
+            saturation: 255,
+            value: 255,
+        };
+
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            hex(vivid(350)),
+        ));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            hex(vivid(10)),
+        ));
+        let narrow = matcher_truecolor_range(foreground(&window)).unwrap();
+        assert_eq!(narrow.directed_endpoints(), (vivid(350), vivid(10)));
+        assert!(narrow.wrap_hue);
+
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            hex(vivid(10)),
+        ));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            hex(vivid(350)),
+        ));
+        let broad = matcher_truecolor_range(foreground(&window)).unwrap();
+        assert_eq!(broad.directed_endpoints(), (vivid(10), vivid(350)));
+        assert!(!broad.wrap_hue);
+    }
+
+    #[test]
+    fn achromatic_range_hex_preserves_each_endpoint_hue() {
+        use model::{ColorRangeEndpoint, MatcherColorKind};
+        use smudgy_core::models::matchers::{MatcherColor, MatcherHsv};
+
+        let mut window = window_with_foreground(MatcherColor::Ansi { index: 7 });
+        let _ = window.update(Message::SelectRowColorKind(0, MatcherColorKind::ColorRange));
+        let hex = |hsv: MatcherHsv| {
+            let (r, g, b) = hsv.to_rgb();
+            format!("#{r:02x}{g:02x}{b:02x}")
+        };
+        let vivid = |hue| MatcherHsv {
+            hue,
+            saturation: 255,
+            value: 255,
+        };
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            hex(vivid(350)),
+        ));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            hex(vivid(10)),
+        ));
+
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::First,
+            "#808080".to_string(),
+        ));
+        let _ = window.update(Message::SetRowColorRangeHex(
+            0,
+            ColorRangeEndpoint::Second,
+            "#ffffff".to_string(),
+        ));
+
+        let range = matcher_truecolor_range(foreground(&window)).unwrap();
+        let (from, to) = range.directed_endpoints();
+        assert_eq!(
+            from,
+            MatcherHsv {
+                hue: 350,
+                saturation: 0,
+                value: 128,
+            }
+        );
+        assert_eq!(
+            to,
+            MatcherHsv {
+                hue: 10,
+                saturation: 0,
+                value: 255,
+            }
+        );
+        assert!(range.wrap_hue);
+        assert_eq!(
+            first_row(&window)
+                .color_draft(smudgy_core::models::matchers::MatcherColorChannel::Foreground)
+                .color_range_last_valid,
+            range
+        );
     }
 }

@@ -1577,11 +1577,12 @@ impl Runtime {
             let settings = load_settings();
             let command_separator = Arc::new(settings.command_separator);
 
-            let trigger_manager = Manager::new(
+            let mut trigger_manager = Manager::new(
                 spawned_actions.clone(),
                 command_separator.clone(),
                 automation_registry,
             );
+            trigger_manager.set_bold_is_bright(settings.terminal_bold_mode.uses_bright_palette());
 
             let mut inner = Inner {
                 log_file: None,
@@ -1940,6 +1941,8 @@ impl Runtime {
                     command_separator.clone(),
                     automation_registry,
                 );
+                new_trigger_manager
+                    .set_bold_is_bright(settings.terminal_bold_mode.uses_bright_palette());
                 new_trigger_manager.adopt_raw_wanted_flag(old_raw_wanted);
 
                 // Replace with the new inner struct

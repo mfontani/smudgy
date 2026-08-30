@@ -39,8 +39,9 @@ pub struct TriggerDefinition {
     /// Whether matching continues to later triggers after this one runs. Defaults to true.
     pub fallthrough: bool,
     /// Authoring intent behind the three pattern vectors, as the editor's row
-    /// list in author order. Editor-only: the runtime never reads it, and the
-    /// vectors are derived from it on every save
+    /// list in author order. The runtime reads this sidecar only when it exactly
+    /// reproduces the stored vectors. It then uses metadata such as color
+    /// filters. The vectors are derived from it on every save
     /// ([`super::matchers::trigger_patterns`]). Absent means every row is a
     /// hand-written regex shown verbatim — the pre-sidecar behavior.
     pub matchers: Option<Vec<super::matchers::TriggerMatcherSource>>,
@@ -562,6 +563,7 @@ mod tests {
                 source: "You are {state}.".to_string(),
                 anchor_start: true,
                 anchor_end: true,
+                color: None,
             }]),
             ..Default::default()
         };

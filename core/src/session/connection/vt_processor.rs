@@ -133,6 +133,14 @@ impl TooltipAnsiActor {
             spans: spans.into(),
         })
     }
+
+    fn finish_fragment(mut self) -> StyledLine {
+        if self.pending_cr {
+            self.text.push('\n');
+        }
+        self.close_span();
+        StyledLine::new(&self.text, self.spans)
+    }
 }
 
 impl VTActor for TooltipAnsiActor {
@@ -199,6 +207,20 @@ pub fn parse_link_tooltip_text(text: &str) -> Option<LinkTooltipText> {
         parser.parse_byte(byte, &mut actor);
     }
     actor.finish()
+}
+
+/// Parses an editor or tester fragment as terminal text with SGR styles.
+///
+/// This function does not connect the fragment to a session. Trigger previews
+/// with color filters use the same style representation as live socket input.
+#[must_use]
+pub fn parse_ansi_fragment(text: &str) -> StyledLine {
+    let mut parser = VTParser::new();
+    let mut actor = TooltipAnsiActor::default();
+    for &byte in text.as_bytes() {
+        parser.parse_byte(byte, &mut actor);
+    }
+    actor.finish_fragment()
 }
 
 /// Map an OSC 8 URI to its click action. The scheme allowlist is the trust
@@ -975,9 +997,17 @@ impl VtProcessor {
     /// mid-batch on the socket runtime, and the connection task then exits via its
     /// disconnect signal.
     pub fn notify_end_of_buffer(&mut self) {
+        // A batch can carry terminal state without displayable characters
+        // (for example, an SGR-only prompt). Preserve that cursor-style line
+        // for prompt/color-only matching. A truly empty batch stays silent.
+        let has_pending_line = !self.buf.is_empty()
+            || !self.span_info.is_empty()
+            || (self.capture_raw && !self.buf_raw.is_empty());
         let pending_line = Arc::new(self.consume_into_pending_line());
-        if !self.buf.is_empty() {
-            self.packet_has_displayable_text = true;
+        if has_pending_line {
+            if !self.buf.is_empty() {
+                self.packet_has_displayable_text = true;
+            }
             self.open_logical_line.push(pending_line.clone());
             self.session_runtime_tx
                 .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
@@ -1030,14 +1060,20 @@ impl VtProcessor {
     /// Driven by the telnet layer when it decodes a prompt boundary (`IAC GA` / `IAC EOR`) — a
     /// precise, server-sent signal, unlike the partial-line-at-end-of-buffer heuristic in
     /// [`notify_end_of_buffer`](Self::notify_end_of_buffer). Clearing the buffers here is what stops
-    /// that heuristic from re-emitting the same prompt at end of read. A no-op when nothing is
-    /// pending (e.g. a bare `IAC GA` with no preceding text). The send is best-effort, like
-    /// [`notify_end_of_buffer`](Self::notify_end_of_buffer)'s.
+    /// that heuristic from re-emitting the same prompt at end of read. A bare
+    /// boundary still emits one empty styled partial so a
+    /// color-only prompt trigger can inspect the inherited cursor style. If a
+    /// prior read-batch flush already emitted the prompt and no new terminal
+    /// state arrived, only the boundary marker is sent. Sends are best-effort,
+    /// like [`notify_end_of_buffer`](Self::notify_end_of_buffer)'s.
     pub fn commit_prompt(&mut self) {
         // A prompt boundary finalizes the line; a `\r` just before it must
         // not overwrite what follows.
         self.pending_cr = None;
-        if self.buf.is_empty() {
+        let has_new_pending_line = !self.buf.is_empty()
+            || !self.span_info.is_empty()
+            || (self.capture_raw && !self.buf_raw.is_empty());
+        if !has_new_pending_line && self.open_logical_line.has_fragments() {
             self.open_logical_line.clear();
             self.session_runtime_tx
                 .send(RuntimeAction::PromptBoundary)
@@ -1045,7 +1081,9 @@ impl VtProcessor {
             return;
         }
         let pending_line = Arc::new(self.consume_into_pending_line());
-        self.packet_has_displayable_text = true;
+        if !self.buf.is_empty() {
+            self.packet_has_displayable_text = true;
+        }
         self.session_runtime_tx
             .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
             .ok();
@@ -1400,6 +1438,65 @@ mod tests {
                 has_displayable_text: true,
             }
         )));
+    }
+
+    #[test]
+    fn sgr_only_batch_emits_one_empty_styled_partial() {
+        let mut h = harness();
+        h.feed(b"\x1b[31m");
+        h.processor.notify_end_of_buffer();
+        let actions = h.actions();
+        let partial = actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::HandleIncomingPartialLine(line) => Some(line),
+                _ => None,
+            })
+            .expect("SGR-only terminal state must reach prompt triggers");
+        assert!(partial.text.is_empty());
+        assert!(matches!(
+            partial.spans.last().map(|span| span.style.fg),
+            Some(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false
+            })
+        ));
+
+        h.processor.notify_end_of_buffer();
+        assert!(
+            !h.actions()
+                .iter()
+                .any(|action| matches!(action, RuntimeAction::HandleIncomingPartialLine(_))),
+            "an actually empty follow-up batch must not duplicate the partial"
+        );
+    }
+
+    #[test]
+    fn bare_prompt_boundary_emits_the_inherited_cursor_style() {
+        let mut h = harness();
+        h.feed(b"\x1b[31m");
+        h.processor.commit_prompt();
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:"]);
+        let partial = actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::HandleIncomingPartialLine(line) => Some(line),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            partial.spans.last().map(|span| span.style.fg),
+            Some(Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false
+            })
+        ));
+
+        // A later bare GA/EOR is another explicit empty prompt under the
+        // cursor style that survived the previous boundary.
+        h.processor.commit_prompt();
+        assert_eq!(transcript(&h.actions()), ["partial:"]);
     }
 
     #[test]

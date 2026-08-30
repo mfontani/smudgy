@@ -33,6 +33,7 @@ fn apply_settings(log_enabled: bool) -> RuntimeAction {
         command_separator: Arc::new(settings.command_separator.clone()),
         raw_line_prefix: Arc::new(settings.raw_line_prefix.clone()),
         log_enabled,
+        bold_is_bright: settings.terminal_bold_mode.uses_bright_palette(),
         script_settings: Box::new(ScriptSettings::from(&settings)),
     }
 }

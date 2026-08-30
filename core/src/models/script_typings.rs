@@ -2087,6 +2087,174 @@ export function make() { return createEvent('dynamic'); }
         }
     }
 
+    /// The trigger-specific style surface deliberately reuses the callable style builder
+    /// without widening the shared `Pattern` type used by aliases. Compile every supported
+    /// builder/decorator form as a consumer so an overload cannot silently drift away from the
+    /// runtime implementation.
+    #[test]
+    fn styled_trigger_surface_compiles() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "styled-triggers.ts".to_string(),
+            r#"import {
+  createTrigger,
+  createTriggers,
+  pattern,
+  style,
+  type RgbColor,
+  type StyleMatch,
+  type StyleMatchBuilder,
+  type TriggerPattern,
+  type TriggerPatterns,
+} from "smudgy:core";
+
+const crimson: RgbColor = { r: 220, g: 20, b: 60 };
+const orange: RgbColor = { r: 255, g: 165, b: 0 };
+
+export const styledOutput = style.red`Danger`;
+export const fromString: StyleMatch = style.red("^Danger:");
+export const fromRegExp: StyleMatch = style.red(/^Danger:/is);
+export const fromFriendlyPattern: StyleMatch = style.red(pattern.contains`Danger: {message}`);
+export const refined: StyleMatch = style.red({ bg: "black" }).bold(/^Danger:/);
+export const noOp: StyleMatch = style({})(/^ordinary$/);
+
+export const ranged: StyleMatchBuilder = style.fg.range(crimson, orange);
+export const overwrittenRange: StyleMatchBuilder = ranged.fg("red");
+export const combinedRange = ranged.bg.range(orange, crimson).bold.underline;
+export const leaves: readonly TriggerPattern[] = [
+  style.italic,
+  fromString,
+  combinedRange(pattern.contains`Warning: {message}`),
+];
+export const grouped: TriggerPatterns = {
+  patterns: leaves,
+  rawPatterns: [/\x1b\[/],
+  antiPatterns: [style.faint(/harmless/), style.red],
+};
+
+createTrigger(fromString, "flee");
+createTrigger(style.italic, "look");
+createTrigger(combinedRange, "score");
+createTrigger(grouped, "look");
+createTrigger(overwrittenRange(/^Danger:/), "flee");
+
+createTriggers({
+  warning: {
+    patterns: [style.yellow(/^Warning:/), style.red(/^Danger:/)],
+    antiPatterns: [style.faint(/harmless/)],
+    script: "look",
+  },
+  recovery: {
+    patterns: [style.green(pattern.startsWith`You recover`)],
+    script: ({ 0: text }) => text,
+  },
+});
+"#
+            .to_string(),
+        );
+
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("compile a consumer of every styled-trigger overload");
+        assert!(
+            out.diagnostics.is_empty(),
+            "the supported styled-trigger surface must compile:\n{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// Matcher-only builders and decorated leaves must not leak into the older output, alias,
+    /// raw-pattern, or persisted-trigger surfaces. Each source is compiled independently so one
+    /// expected diagnostic cannot mask a missing exclusion elsewhere.
+    #[test]
+    fn styled_trigger_exclusions_fail_to_compile() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+
+        for (name, source) in [
+            (
+                "styled-alias.ts",
+                r#"import { createAlias, style } from "smudgy:core";
+createAlias(style.red(/danger/), "flee");
+"#,
+            ),
+            (
+                "styled-raw.ts",
+                r#"import { createTrigger, style } from "smudgy:core";
+createTrigger({ rawPatterns: [style.red(/danger/)] }, "flee");
+"#,
+            ),
+            (
+                "range-output.ts",
+                r#"import { style } from "smudgy:core";
+const a = { r: 0, g: 0, b: 0 };
+style.fg.range(a, a)`not output`;
+"#,
+            ),
+            (
+                "range-echo.ts",
+                r#"import { echo, style } from "smudgy:core";
+const a = { r: 0, g: 0, b: 0 };
+echo(style.fg.range(a, a));
+"#,
+            ),
+            (
+                "range-line-option.ts",
+                r#"import { line, style } from "smudgy:core";
+const a = { r: 0, g: 0, b: 0 };
+line.highlight("danger", style.fg.range(a, a));
+"#,
+            ),
+            (
+                "whole-pattern-object.ts",
+                r#"import { style } from "smudgy:core";
+style.red({ patterns: [/danger/] });
+"#,
+            ),
+            (
+                "nested-style-match.ts",
+                r#"import { style } from "smudgy:core";
+style.red(style.blue(/danger/));
+"#,
+            ),
+            (
+                "missing-trigger-body.ts",
+                r#"import { createTrigger, style } from "smudgy:core";
+createTrigger(style.red(/danger/));
+"#,
+            ),
+            (
+                "persisted-style-match.ts",
+                r#"import { style, userAutomations } from "smudgy:core";
+userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
+"#,
+            ),
+        ] {
+            let mut sources = BTreeMap::new();
+            sources.insert(name.to_string(), source.to_string());
+            let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+                .expect("the generator itself must not crash on a type error");
+            assert!(
+                !out.diagnostics.is_empty(),
+                "{name} must fail the styled-trigger type boundary"
+            );
+        }
+    }
+
     /// The runtime implementation in `js/smudgy.ts`, type-checked against the contract here.
     /// deno's extension transpiler only type-STRIPS this file at runtime, so this is the only
     /// place its TypeScript is actually checked.

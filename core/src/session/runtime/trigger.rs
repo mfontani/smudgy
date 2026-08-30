@@ -9,8 +9,13 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use regex::{Regex, RegexSet};
+
+use crate::models::matchers::{
+    MatcherColor, MatcherColorMatch, MatcherHsv, MatcherHsvRange, MatcherRole,
+    MatcherTextAttribute, TriggerMatcherSource,
+};
 
 use super::{
     ActionQueue, ScriptAction,
@@ -70,7 +75,7 @@ use crate::session::{
         RuntimeAction,
         script_engine::{FunctionId, ScriptId},
     },
-    styled_line::StyledLine,
+    styled_line::{Blink, Color, Style, StyledLine, Underline},
 };
 
 // The bools are independent dirty/recording gates, not an encodable state machine.
@@ -111,6 +116,11 @@ pub struct Manager {
     trigger_regex_set_dirty: bool,
     alias_regex_set_dirty: bool,
     command_separator: Arc<String>,
+    /// Controls whether SGR bold promotes a normal ANSI foreground color to
+    /// its bright variant during matching with a color filter. The
+    /// session thread caches this setting here. The unfiltered trigger path
+    /// does not read it.
+    bold_is_bright: bool,
     /// While ≥1 window is subscribed (the runtime sets this from the automation broadcast's
     /// receiver count, so it covers any number of windows), each add/enable on a
     /// script-created (non-`User`) automation records an [`AutomationDelta`] here; the
@@ -288,6 +298,450 @@ enum TriggerMatchType {
     Raw,
 }
 
+enum ColorQualification {
+    Unfiltered,
+    Matched(usize),
+}
+
+const ATTR_BOLD: u16 = 1 << 0;
+const ATTR_FAINT: u16 = 1 << 1;
+const ATTR_ITALIC: u16 = 1 << 2;
+const ATTR_UNDERLINE: u16 = 1 << 3;
+const ATTR_DOUBLE_UNDERLINE: u16 = 1 << 4;
+const ATTR_SLOW_BLINK: u16 = 1 << 5;
+const ATTR_FAST_BLINK: u16 = 1 << 6;
+const ATTR_CROSSED_OUT: u16 = 1 << 7;
+const ATTR_REVERSE: u16 = 1 << 8;
+
+#[derive(Debug, Clone, Copy)]
+struct CompiledHsvRange {
+    hue_from: u16,
+    hue_to: u16,
+    saturation_min: u8,
+    saturation_max: u8,
+    value_min: u8,
+    value_max: u8,
+}
+
+impl From<MatcherHsvRange> for CompiledHsvRange {
+    fn from(range: MatcherHsvRange) -> Self {
+        let range = range.rgb_canonicalized();
+        let (hue_from, hue_to) = range.directed_hue_bounds();
+        let (saturation_min, saturation_max) = range.saturation_bounds();
+        let (value_min, value_max) = range.value_bounds();
+        Self {
+            hue_from,
+            hue_to,
+            saturation_min,
+            saturation_max,
+            value_min,
+            value_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompiledMatcherColor {
+    Exact(Color),
+    HsvRange(CompiledHsvRange),
+}
+
+impl CompiledMatcherColor {
+    fn compile(color: MatcherColor) -> Self {
+        match color {
+            MatcherColor::Truecolor {
+                range: Some(range), ..
+            } => Self::HsvRange(range.into()),
+            _ => Self::Exact(matcher_terminal_color(color)),
+        }
+    }
+
+    #[inline]
+    fn matches(self, actual: Color) -> bool {
+        match self {
+            Self::Exact(expected) => actual == expected,
+            Self::HsvRange(range) => {
+                let Color::Rgb { r, g, b } = actual else {
+                    return false;
+                };
+                let hsv = MatcherHsv::from_rgb(r, g, b);
+                let hue_matches = if hsv.saturation == 0 {
+                    // Colors with zero saturation have no defined hue.
+                    // Saturation and value must still match their separate
+                    // bounds.
+                    true
+                } else {
+                    let hue = if hsv.hue < range.hue_from {
+                        hsv.hue + MatcherHsv::HUE_PERIOD
+                    } else {
+                        hsv.hue
+                    };
+                    (range.hue_from..=range.hue_to).contains(&hue)
+                };
+                hue_matches
+                    && (range.saturation_min..=range.saturation_max).contains(&hsv.saturation)
+                    && (range.value_min..=range.value_max).contains(&hsv.value)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompiledColorMatch {
+    foreground: Option<CompiledMatcherColor>,
+    background: Option<CompiledMatcherColor>,
+    required_attributes: u16,
+}
+
+/// One displayed-text row supplied by the scripting facade. Unlike the
+/// persisted matcher sidecar, the source and its style predicate cannot drift
+/// apart: they cross the native boundary as one value.
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptTriggerPattern {
+    pub(crate) source: String,
+    pub(crate) style: Option<MatcherColorMatch>,
+}
+
+/// Trigger-local regexes and style predicates compiled before a script create
+/// op reserves a singleton identity or stores a V8 function. Dispatch can
+/// therefore install this value without another fallible compilation step.
+#[derive(Debug, Clone)]
+pub struct PreparedScriptTriggerPatterns {
+    patterns: Vec<Regex>,
+    pattern_colors: Vec<Option<CompiledColorMatch>>,
+    raw_patterns: Vec<Regex>,
+    anti_patterns: RegexSet,
+    colored_anti_pattern_set: Option<RegexSet>,
+    colored_anti_patterns: Vec<(Regex, CompiledColorMatch)>,
+}
+
+impl CompiledColorMatch {
+    fn compile(matcher: &MatcherColorMatch) -> Self {
+        let mut required_attributes = 0;
+        for attribute in &matcher.attributes {
+            required_attributes |= matcher_attribute_bit(*attribute);
+        }
+        Self {
+            foreground: matcher.foreground.map(CompiledMatcherColor::compile),
+            background: matcher.background.map(CompiledMatcherColor::compile),
+            required_attributes,
+        }
+    }
+
+    const fn is_unconstrained(self) -> bool {
+        self.foreground.is_none() && self.background.is_none() && self.required_attributes == 0
+    }
+}
+
+const fn matcher_attribute_bit(attribute: MatcherTextAttribute) -> u16 {
+    match attribute {
+        MatcherTextAttribute::Bold => ATTR_BOLD,
+        MatcherTextAttribute::Faint => ATTR_FAINT,
+        MatcherTextAttribute::Italic => ATTR_ITALIC,
+        MatcherTextAttribute::Underline => ATTR_UNDERLINE,
+        MatcherTextAttribute::DoubleUnderline => ATTR_DOUBLE_UNDERLINE,
+        MatcherTextAttribute::SlowBlink => ATTR_SLOW_BLINK,
+        MatcherTextAttribute::FastBlink => ATTR_FAST_BLINK,
+        MatcherTextAttribute::CrossedOut => ATTR_CROSSED_OUT,
+        MatcherTextAttribute::Reverse => ATTR_REVERSE,
+    }
+}
+
+/// Validate the persisted and script paths at their shared compilation point.
+/// `MatcherColor::Ansi` is an external-data shape, so do not let a forged
+/// index reach `ansi_color` and silently alias through its modulo conversion.
+fn validate_color_match(matcher: &MatcherColorMatch, path: &str) -> Result<()> {
+    for (channel, color) in [
+        ("foreground", matcher.foreground),
+        ("background", matcher.background),
+    ] {
+        if let Some(MatcherColor::Ansi { index }) = color
+            && index > 15
+        {
+            bail!("{path}.{channel} ANSI index must be between 0 and 15");
+        }
+    }
+
+    let mut seen = 0_u16;
+    for attribute in &matcher.attributes {
+        let bit = matcher_attribute_bit(*attribute);
+        if seen & bit != 0 {
+            bail!("{path}.attributes contains duplicate {attribute:?}");
+        }
+        seen |= bit;
+    }
+    if seen & (ATTR_UNDERLINE | ATTR_DOUBLE_UNDERLINE) == ATTR_UNDERLINE | ATTR_DOUBLE_UNDERLINE {
+        bail!("{path}.attributes cannot require both single and double underline");
+    }
+    if seen & (ATTR_SLOW_BLINK | ATTR_FAST_BLINK) == ATTR_SLOW_BLINK | ATTR_FAST_BLINK {
+        bail!("{path}.attributes cannot require both slow and fast blink");
+    }
+    Ok(())
+}
+
+const fn ansi_color(index: u8) -> crate::session::connection::vt_processor::AnsiColor {
+    use crate::session::connection::vt_processor::AnsiColor;
+    match index % 8 {
+        0 => AnsiColor::Black,
+        1 => AnsiColor::Red,
+        2 => AnsiColor::Green,
+        3 => AnsiColor::Yellow,
+        4 => AnsiColor::Blue,
+        5 => AnsiColor::Magenta,
+        6 => AnsiColor::Cyan,
+        _ => AnsiColor::White,
+    }
+}
+
+/// Converts a persisted matcher color to the representation used by
+/// [`StyledLine`]. It preserves ANSI slots and xterm indices 0 through 15. It
+/// converts other xterm colors and truecolor values to RGB.
+fn matcher_terminal_color(color: MatcherColor) -> Color {
+    match color {
+        MatcherColor::Ansi { index } => Color::Ansi {
+            color: ansi_color(index),
+            bold: index >= 8,
+        },
+        MatcherColor::Xterm { index } if index < 16 => Color::Ansi {
+            color: ansi_color(index),
+            bold: index >= 8,
+        },
+        MatcherColor::Xterm { index } if index < 232 => {
+            let n = index - 16;
+            let component = |level: u8| if level == 0 { 0 } else { 55 + 40 * level };
+            Color::Rgb {
+                r: component(n / 36),
+                g: component((n % 36) / 6),
+                b: component(n % 6),
+            }
+        }
+        MatcherColor::Xterm { index } => {
+            let value = 8 + 10 * (index - 232);
+            Color::Rgb {
+                r: value,
+                g: value,
+                b: value,
+            }
+        }
+        MatcherColor::Truecolor { r, g, b, .. } => Color::Rgb { r, g, b },
+    }
+}
+
+#[inline]
+const fn effective_foreground(style: Style, bold_is_bright: bool) -> Color {
+    if !bold_is_bright || !style.attributes.bold {
+        return style.fg;
+    }
+    match style.fg {
+        Color::Ansi { color, bold: false } => Color::Ansi { color, bold: true },
+        Color::DefaultForeground { bold: false } => Color::DefaultForeground { bold: true },
+        foreground => foreground,
+    }
+}
+
+#[inline]
+fn style_matches(style: Style, matcher: CompiledColorMatch, bold_is_bright: bool) -> bool {
+    if matcher
+        .foreground
+        .is_some_and(|color| !color.matches(effective_foreground(style, bold_is_bright)))
+        || matcher
+            .background
+            .is_some_and(|color| !color.matches(style.bg))
+    {
+        return false;
+    }
+
+    let required = matcher.required_attributes;
+    required == 0
+        || (required & ATTR_BOLD == 0 || style.attributes.bold)
+            && (required & ATTR_FAINT == 0 || style.attributes.faint)
+            && (required & ATTR_ITALIC == 0 || style.attributes.italic)
+            && (required & ATTR_UNDERLINE == 0 || style.attributes.underline == Underline::Single)
+            && (required & ATTR_DOUBLE_UNDERLINE == 0
+                || style.attributes.underline == Underline::Double)
+            && (required & ATTR_SLOW_BLINK == 0 || style.attributes.blink == Blink::Slow)
+            && (required & ATTR_FAST_BLINK == 0 || style.attributes.blink == Blink::Fast)
+            && (required & ATTR_CROSSED_OUT == 0 || style.attributes.crossed_out)
+            && (required & ATTR_REVERSE == 0 || style.attributes.reverse)
+}
+
+/// Returns the start byte of the first regex match whose style at that byte
+/// satisfies the filter. Regex matches and VT spans have the same order. A
+/// single monotonic span cursor keeps the search at O(matches + spans). An
+/// empty regex defines a color-only matcher. It scans spans directly and
+/// avoids a regex match at each character boundary.
+fn color_matched_start(
+    regex: &Regex,
+    subject: &str,
+    line: &StyledLine,
+    matcher: CompiledColorMatch,
+    bold_is_bright: bool,
+) -> Option<usize> {
+    // An empty regex requires no text search. Scan the spans directly in
+    // O(spans). This avoids a regex match at each character boundary.
+    if regex.as_str().is_empty() {
+        if subject.is_empty() {
+            // The VT processor records the empty line's cursor style in the
+            // final zero-width span. Earlier zero-width spans record
+            // superseded transitions at the same position.
+            return line
+                .spans
+                .last()
+                .filter(|span| style_matches(span.style, matcher, bold_is_bright))
+                .map(|_| 0);
+        }
+        return line
+            .spans
+            .iter()
+            // The VT processor records a zero-width span when one style
+            // transition replaces another before more text arrives. The span
+            // preserves cursor history but contains no text. Ignore it so a
+            // color-only matcher checks only styles that apply to text.
+            .find(|span| {
+                span.begin_pos < span.end_pos && style_matches(span.style, matcher, bold_is_bright)
+            })
+            .map(|span| span.begin_pos.min(subject.len()));
+    }
+
+    let mut span_index = 0;
+    let mut cached_span_index = usize::MAX;
+    let mut cached_style_matches = false;
+    regex.find_iter(subject).find_map(|matched| {
+        let start = matched.start();
+        while line
+            .spans
+            .get(span_index)
+            .is_some_and(|span| span.end_pos <= start)
+        {
+            span_index += 1;
+        }
+        let span = line.spans.get(span_index)?;
+        if span.begin_pos > start || start >= span.end_pos {
+            return None;
+        }
+        if cached_span_index != span_index {
+            cached_span_index = span_index;
+            cached_style_matches = style_matches(span.style, matcher, bold_is_bright);
+        }
+        cached_style_matches.then_some(start)
+    })
+}
+
+impl PreparedScriptTriggerPatterns {
+    /// Validates and compiles a script-created trigger before the op mutates
+    /// singleton or function registries. Empty predicates first normalize to
+    /// an unfiltered row, then empty unfiltered rows are discarded.
+    pub(crate) fn prepare(
+        patterns: Vec<ScriptTriggerPattern>,
+        raw_patterns: Vec<String>,
+        anti_patterns: Vec<ScriptTriggerPattern>,
+    ) -> Result<Self> {
+        // Historically, an explicitly supplied empty normal/raw pattern was
+        // accepted as an inert trigger. Preserve that registration contract;
+        // it is distinct from supplying no positive leaves at all.
+        let has_inert_plain_positive = patterns
+            .iter()
+            .any(|row| row.source.is_empty() && row.style.is_none())
+            || raw_patterns.iter().any(String::is_empty);
+        let prepared = Self::compile(patterns, raw_patterns, anti_patterns)?;
+        if prepared.patterns.is_empty()
+            && prepared.raw_patterns.is_empty()
+            && !has_inert_plain_positive
+        {
+            bail!("a trigger requires at least one normal or raw positive pattern");
+        }
+        Ok(prepared)
+    }
+
+    /// Shared compiler for persisted rows and script-created paired rows.
+    fn compile(
+        pattern_rows: Vec<ScriptTriggerPattern>,
+        raw_pattern_sources: Vec<String>,
+        anti_rows: Vec<ScriptTriggerPattern>,
+    ) -> Result<Self> {
+        let mut patterns = Vec::with_capacity(pattern_rows.len());
+        let mut pattern_colors = Vec::with_capacity(pattern_rows.len());
+        for (index, row) in pattern_rows.into_iter().enumerate() {
+            let color = match row.style.as_ref() {
+                Some(style) => {
+                    validate_color_match(style, &format!("normal[{index}].style"))?;
+                    let compiled = CompiledColorMatch::compile(style);
+                    (!compiled.is_unconstrained()).then_some(compiled)
+                }
+                None => None,
+            };
+
+            // Empty unfiltered rows are inert. Normalize the predicate first:
+            // otherwise `style: {}` would retain an empty regex and silently
+            // become a match-all trigger.
+            if row.source.is_empty() && color.is_none() {
+                continue;
+            }
+            let regex = Regex::new(&row.source)
+                .with_context(|| format!("normal[{index}] contains an invalid regex"))?;
+            patterns.push(regex);
+            pattern_colors.push(color);
+        }
+        if pattern_colors.iter().all(Option::is_none) {
+            pattern_colors.clear();
+        }
+
+        let raw_patterns = raw_pattern_sources
+            .into_iter()
+            .enumerate()
+            .filter(|(_, source)| !source.is_empty())
+            .map(|(index, source)| {
+                Regex::new(&source)
+                    .with_context(|| format!("raw[{index}] contains an invalid regex"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut plain_anti_patterns = Vec::new();
+        let mut colored_anti_patterns = Vec::new();
+        for (index, row) in anti_rows.into_iter().enumerate() {
+            let color = match row.style.as_ref() {
+                Some(style) => {
+                    validate_color_match(style, &format!("anti[{index}].style"))?;
+                    let compiled = CompiledColorMatch::compile(style);
+                    (!compiled.is_unconstrained()).then_some(compiled)
+                }
+                None => None,
+            };
+            if row.source.is_empty() && color.is_none() {
+                continue;
+            }
+            let regex = Regex::new(&row.source)
+                .with_context(|| format!("anti[{index}] contains an invalid regex"))?;
+            if let Some(color) = color {
+                colored_anti_patterns.push((regex, color));
+            } else {
+                plain_anti_patterns.push(regex.as_str().to_string());
+            }
+        }
+        let anti_patterns = RegexSet::new(plain_anti_patterns)
+            .context("plain anti-pattern set contains an invalid regex")?;
+        let colored_anti_pattern_set = (!colored_anti_patterns.is_empty())
+            .then(|| {
+                RegexSet::new(
+                    colored_anti_patterns
+                        .iter()
+                        .map(|(regex, _)| regex.as_str()),
+                )
+            })
+            .transpose()
+            .context("styled anti-pattern set contains an invalid regex")?;
+
+        Ok(Self {
+            patterns,
+            pattern_colors,
+            raw_patterns,
+            anti_patterns,
+            colored_anti_pattern_set,
+            colored_anti_patterns,
+        })
+    }
+}
+
 pub struct PushTriggerParams<'a> {
     pub isolate: IsolateId,
     pub origin: Origin,
@@ -295,6 +749,10 @@ pub struct PushTriggerParams<'a> {
     pub patterns: &'a Arc<Vec<String>>,
     pub raw_patterns: &'a Arc<Vec<String>>,
     pub anti_patterns: &'a Arc<Vec<String>>,
+    /// Matcher rows from the editor. The stored regex vectors are authoritative.
+    /// The runtime uses these color filters only if compiling the rows
+    /// reproduces every stored vector exactly.
+    pub matchers: Option<&'a [TriggerMatcherSource]>,
     pub action: ScriptAction,
     pub prompt: bool,
     pub enabled: bool,
@@ -349,6 +807,8 @@ impl Manager {
             trigger_regex_set_dirty: true,
             alias_regex_set_dirty: true,
             command_separator,
+            bold_is_bright: crate::models::settings::TerminalBoldMode::default()
+                .uses_bright_palette(),
             recording: false,
             automation_deltas: Vec::new(),
             automation_registry,
@@ -511,6 +971,13 @@ impl Manager {
     /// into commands. Used by the `ApplySettings` handler for live updates.
     pub fn set_command_separator(&mut self, separator: Arc<String>) {
         self.command_separator = separator;
+    }
+
+    /// Sets the effective ANSI foreground brightness policy for SGR bold.
+    /// Matching with a color filter reads this cached value. This avoids a
+    /// settings load in the trigger hot path.
+    pub fn set_bold_is_bright(&mut self, bold_is_bright: bool) {
+        self.bold_is_bright = bold_is_bright;
     }
 
     /// The pattern source the JS `.pattern` handle reads back: the first pattern's regex
@@ -698,6 +1165,7 @@ impl Manager {
                 params.patterns.iter(),
                 params.raw_patterns.iter(),
                 params.anti_patterns.iter(),
+                params.matchers,
                 params.action,
                 params.prompt,
                 params.enabled,
@@ -709,6 +1177,42 @@ impl Manager {
             .with_source(params.source),
         );
         Ok(())
+    }
+
+    /// Installs a script trigger whose trigger-local regexes and predicates
+    /// were prepared synchronously by the registration op.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_script_trigger(
+        &mut self,
+        isolate: IsolateId,
+        origin: Origin,
+        name: String,
+        prepared: PreparedScriptTriggerPatterns,
+        action: ScriptAction,
+        prompt: bool,
+        enabled: bool,
+        priority: i32,
+        fallthrough: bool,
+        fire_limit: Option<u32>,
+        line_limit: Option<u32>,
+        source: Option<Arc<str>>,
+    ) {
+        self.add_or_update_trigger(
+            Trigger::from_prepared(
+                isolate,
+                origin,
+                name,
+                prepared,
+                action,
+                prompt,
+                enabled,
+                priority,
+                fallthrough,
+                fire_limit,
+                line_limit,
+            )
+            .with_source(source),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1138,6 +1642,7 @@ impl Manager {
     fn process_line_inner(
         &self,
         line: &str,
+        styled_line: Option<&StyledLine>,
         depth: u32,
         sender: Option<&AliasSender>,
         pattern_set: &PatternSet,
@@ -1174,16 +1679,48 @@ impl Manager {
                 regex_set_to_triggers_map.get(*a).unwrap()
                     == regex_set_to_triggers_map.get(*b).unwrap()
             }) {
-                let match_idx = match_indices[0];
-                let trigger_idx = *regex_set_to_triggers_map.get(match_idx).unwrap();
+                let first_match_idx = match_indices[0];
+                let trigger_idx = *regex_set_to_triggers_map.get(first_match_idx).unwrap();
                 let trigger = triggers.get(trigger_idx).unwrap();
 
                 if !trigger.enabled
                     || fired.contains(&trigger_idx)
-                    || trigger.anti_patterns.is_match(line)
+                    || trigger.anti_matches(line, styled_line, self.bold_is_bright)
                 {
                     continue;
                 }
+
+                // Preserve the fast path for unfiltered triggers. It reads only
+                // the first RegexSet match index. A candidate with a color
+                // filter can inspect later regex matches and their styled spans.
+                let qualified_match = if matches!(match_type, TriggerMatchType::Raw)
+                    || trigger.pattern_colors.is_empty()
+                {
+                    regex_set_to_patterns_map
+                        .get(first_match_idx)
+                        .copied()
+                        .map(|pattern_idx| (first_match_idx, pattern_idx, None))
+                } else {
+                    match_indices.iter().find_map(|&match_idx| {
+                        let pattern_idx = *regex_set_to_patterns_map.get(match_idx)?;
+                        trigger
+                            .pattern_color_match_start(
+                                line,
+                                styled_line,
+                                pattern_idx,
+                                self.bold_is_bright,
+                            )
+                            .map(|qualification| match qualification {
+                                ColorQualification::Unfiltered => (match_idx, pattern_idx, None),
+                                ColorQualification::Matched(start) => {
+                                    (match_idx, pattern_idx, Some(start))
+                                }
+                            })
+                    })
+                };
+                let Some((match_idx, pattern_idx, match_start)) = qualified_match else {
+                    continue;
+                };
 
                 // An alias's own sent text does not re-match it unless it opts
                 // in: the direct self-recursion loop never starts, instead of
@@ -1205,7 +1742,6 @@ impl Manager {
                     pattern_set.patterns().get(match_idx).unwrap()
                 );
 
-                let pattern_idx = *regex_set_to_patterns_map.get(match_idx).unwrap();
                 let stopped = fallthrough_scopes
                     .entry((trigger.isolate.clone(), trigger.origin.clone()))
                     .or_insert_with(|| Arc::new(AtomicBool::new(false)))
@@ -1214,6 +1750,7 @@ impl Manager {
                     line,
                     match_type,
                     pattern_idx,
+                    match_start,
                     &is_captured,
                     stopped,
                     &self.spawned_actions,
@@ -1303,6 +1840,7 @@ impl Manager {
 
         self.process_line_inner(
             line,
+            None,
             depth,
             sender,
             &self.alias_regex_set,
@@ -1396,10 +1934,11 @@ impl Manager {
         // Shared across the raw and normal passes (the same per-line lifetime as
         // `fallthrough_scopes`): a trigger matching in both fires once, on the raw pass.
         let mut fired = Vec::new();
-        if let Some(line) = line.raw() {
-            debug!("Processing raw line: {line:?}");
+        if let Some(raw) = line.raw() {
+            debug!("Processing raw line: {raw:?}");
             self.process_line_inner(
-                line,
+                raw,
+                Some(line),
                 0,
                 None,
                 &self.raw_trigger_regex_set,
@@ -1415,6 +1954,7 @@ impl Manager {
 
         self.process_line_inner(
             line,
+            Some(line),
             0,
             None,
             &self.trigger_regex_set,
@@ -1441,8 +1981,16 @@ impl Manager {
         Ok(())
     }
 
-    pub fn process_partial_line(&self, line: Arc<StyledLine>) -> Result<()> {
+    pub fn process_partial_line(&mut self, line: Arc<StyledLine>) -> Result<()> {
         trace!("Processing incoming partial line: {line:?}");
+
+        // A prompt can be the first server output after scripts register (or
+        // reload). Do not require an unrelated complete line to rebuild the
+        // prompt PatternSets first.
+        if self.trigger_regex_set_dirty {
+            self.rebuild_trigger_regex_set();
+            self.trigger_regex_set_dirty = false;
+        }
 
         // Zero-cost unless debug logging is compiled in; see `process_line_inner`.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
@@ -1452,9 +2000,10 @@ impl Manager {
         // the same one-fire-per-line treatment. Each call owns its list, so a partial
         // line and its later completed line count as different lines.
         let mut fired = Vec::new();
-        if let Some(line) = line.raw() {
+        if let Some(raw) = line.raw() {
             self.process_line_inner(
-                line,
+                raw,
+                Some(&line),
                 0,
                 None,
                 &self.prompt_raw_trigger_regex_set,
@@ -1470,6 +2019,7 @@ impl Manager {
 
         self.process_line_inner(
             &line,
+            Some(&line),
             0,
             None,
             &self.prompt_trigger_regex_set,
@@ -1506,8 +2056,11 @@ struct Trigger {
     origin: Origin,
     name: String,
     patterns: Vec<Regex>,
+    pattern_colors: Vec<Option<CompiledColorMatch>>,
     raw_patterns: Vec<Regex>,
     anti_patterns: RegexSet,
+    colored_anti_pattern_set: Option<RegexSet>,
+    colored_anti_patterns: Vec<(Regex, CompiledColorMatch)>,
     script: ScriptAction,
     prompt: bool,
     enabled: bool,
@@ -1547,6 +2100,69 @@ struct Trigger {
 }
 
 impl Trigger {
+    fn anti_matches(
+        &self,
+        subject: &str,
+        styled_line: Option<&StyledLine>,
+        bold_is_bright: bool,
+    ) -> bool {
+        if self.anti_patterns.is_match(subject) {
+            return true;
+        }
+        let Some(colored_anti_pattern_set) = &self.colored_anti_pattern_set else {
+            return false;
+        };
+        let Some(styled_line) = styled_line else {
+            return false;
+        };
+        // Keep the common text-miss path allocation-free. `matches()` builds
+        // a candidate bitset, so pay for it only after the cheaper boolean
+        // prefilter says at least one colored anti regex matched.
+        if !colored_anti_pattern_set.is_match(&styled_line.text) {
+            return false;
+        }
+        colored_anti_pattern_set
+            .matches(&styled_line.text)
+            .iter()
+            .any(|index| {
+                let (regex, color) = &self.colored_anti_patterns[index];
+                color_matched_start(
+                    regex,
+                    &styled_line.text,
+                    styled_line,
+                    *color,
+                    bold_is_bright,
+                )
+                .is_some()
+            })
+    }
+
+    /// Returns `Some(Unfiltered)` for an unfiltered candidate. Returns
+    /// `Some(Matched(start))` for the first text match that satisfies the color
+    /// filter. Returns `None` when the filter rejects the candidate.
+    fn pattern_color_match_start(
+        &self,
+        subject: &str,
+        styled_line: Option<&StyledLine>,
+        pattern_index: usize,
+        bold_is_bright: bool,
+    ) -> Option<ColorQualification> {
+        let Some(color) = self
+            .pattern_colors
+            .get(pattern_index)
+            .and_then(Option::as_ref)
+        else {
+            return Some(ColorQualification::Unfiltered);
+        };
+        let styled_line = styled_line?;
+        self.patterns
+            .get(pattern_index)
+            .and_then(|regex| {
+                color_matched_start(regex, subject, styled_line, *color, bold_is_bright)
+            })
+            .map(ColorQualification::Matched)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         TIterPattern,
@@ -1562,6 +2178,7 @@ impl Trigger {
         patterns: TIterPattern,
         raw_patterns: TIterRawPattern,
         anti_patterns: TIterAntiPattern,
+        matchers: Option<&[TriggerMatcherSource]>,
         script: ScriptAction,
         prompt: bool,
         enabled: bool,
@@ -1578,30 +2195,99 @@ impl Trigger {
         TIterRawPattern: Iterator<Item = TRawPatternStr>,
         TIterAntiPattern: Iterator<Item = TAntiPatternStr>,
     {
-        // An empty pattern compiles to a regex that matches EVERY subject —
-        // never what a definition saved without a pattern means. Empty sources
-        // are dropped from all three lists, so an empty match/raw pattern
-        // matches nothing and an empty exception blocks nothing. A deliberate
-        // match-everything automation is still expressible as a non-empty
-        // regex (`.*`) or a `{...rest}` simple pattern.
-        let patterns: Vec<_> = patterns
-            .filter(|pattern| !pattern.as_ref().is_empty())
-            .map(|pattern| Regex::new(pattern.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let raw_patterns: Vec<_> = raw_patterns
-            .filter(|pattern| !pattern.as_ref().is_empty())
-            .map(|pattern| Regex::new(pattern.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let anti_patterns =
-            RegexSet::new(anti_patterns.filter(|pattern| !pattern.as_ref().is_empty()))?;
+        let pattern_sources: Vec<_> = patterns.map(|p| p.as_ref().to_string()).collect();
+        let raw_pattern_sources: Vec<_> = raw_patterns.map(|p| p.as_ref().to_string()).collect();
+        let anti_pattern_sources: Vec<_> = anti_patterns.map(|p| p.as_ref().to_string()).collect();
 
-        Ok(Self {
+        let fresh_colors = matchers.and_then(|matchers| {
+            let derived = crate::models::matchers::trigger_patterns(matchers).ok()?;
+            let same = derived.patterns == pattern_sources
+                && derived.raw_patterns == raw_pattern_sources
+                && derived.anti_patterns == anti_pattern_sources;
+            same.then_some(matchers)
+        });
+        let source_pattern_colors = fresh_colors.map_or_else(
+            || vec![None; pattern_sources.len()],
+            |matchers| {
+                matchers
+                    .iter()
+                    .filter(|matcher| matcher.role == MatcherRole::Match)
+                    .map(|matcher| matcher.color.clone())
+                    .collect()
+            },
+        );
+        let anti_colors: Vec<_> = fresh_colors.map_or_else(
+            || vec![None; anti_pattern_sources.len()],
+            |matchers| {
+                matchers
+                    .iter()
+                    .filter(|matcher| matcher.role == MatcherRole::Anti)
+                    .map(|matcher| matcher.color.clone())
+                    .collect()
+            },
+        );
+
+        let pattern_rows = pattern_sources
+            .into_iter()
+            .zip(source_pattern_colors)
+            .map(|(source, style)| ScriptTriggerPattern { source, style })
+            .collect();
+        let anti_rows = anti_pattern_sources
+            .into_iter()
+            .zip(anti_colors)
+            .map(|(source, style)| ScriptTriggerPattern { source, style })
+            .collect();
+        let prepared =
+            PreparedScriptTriggerPatterns::compile(pattern_rows, raw_pattern_sources, anti_rows)?;
+
+        Ok(Self::from_prepared(
+            isolate,
+            origin,
+            name,
+            prepared,
+            script,
+            prompt,
+            enabled,
+            priority,
+            fallthrough,
+            fire_limit,
+            line_limit,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared(
+        isolate: IsolateId,
+        origin: Origin,
+        name: String,
+        prepared: PreparedScriptTriggerPatterns,
+        script: ScriptAction,
+        prompt: bool,
+        enabled: bool,
+        priority: i32,
+        fallthrough: bool,
+        fire_limit: Option<u32>,
+        line_limit: Option<u32>,
+    ) -> Self {
+        let PreparedScriptTriggerPatterns {
+            patterns,
+            pattern_colors,
+            raw_patterns,
+            anti_patterns,
+            colored_anti_pattern_set,
+            colored_anti_patterns,
+        } = prepared;
+
+        Self {
             isolate,
             origin,
             name,
             patterns,
+            pattern_colors,
             raw_patterns,
             anti_patterns,
+            colored_anti_pattern_set,
+            colored_anti_patterns,
             script,
             prompt,
             enabled,
@@ -1615,7 +2301,7 @@ impl Trigger {
             lines_tested: Cell::new(0),
             source: None,
             command: None,
-        })
+        }
     }
 
     pub fn new_alias<TIterPattern, TPatternStr>(
@@ -1639,6 +2325,7 @@ impl Trigger {
             patterns,
             std::iter::empty::<&str>(),
             std::iter::empty::<&str>(),
+            None,
             script,
             false,
             true,
@@ -1681,6 +2368,7 @@ impl Trigger {
         line: &str,
         match_type: TriggerMatchType,
         pattern_idx: usize,
+        match_start: Option<usize>,
         is_captured: &Option<Arc<AtomicBool>>,
         stopped: Arc<AtomicBool>,
         spawned_actions: &ActionQueue,
@@ -1699,10 +2387,22 @@ impl Trigger {
         // Ordered captures: position is the group number (index 0 = whole match), `name` set
         // only for named groups. The list is shared by the JS handlers (numeric/named
         // `matches` object) and the inline `SendSimple` template expansion.
+        let captures = match_start.map_or_else(
+            || pattern.captures(line),
+            |start| {
+                pattern
+                    .captures_at(line, start)
+                    .filter(|captures| captures.get(0).is_some_and(|whole| whole.start() == start))
+            },
+        );
         let captures: Arc<Vec<MatchCapture>> = Arc::new(
             pattern
                 .capture_names()
-                .zip(pattern.captures(line).unwrap().iter())
+                .zip(
+                    captures
+                        .expect("a selected trigger match must still capture")
+                        .iter(),
+                )
                 .map(|(name, value)| MatchCapture {
                     name: name.map(|n| std::borrow::Cow::Owned(n.to_string())),
                     value: value.map_or_else(String::new, |m| m.as_str().to_string()),
@@ -1804,6 +2504,1282 @@ impl Trigger {
 mod tests {
     use super::{MatchCapture, expand_template, split_commands};
 
+    mod color_matching {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use regex::Regex;
+
+        use super::super::{
+            CompiledColorMatch, CompiledMatcherColor, Manager, PreparedScriptTriggerPatterns,
+            PushTriggerParams, ScriptAction, ScriptTriggerPattern, Trigger,
+            color_matched_start as compiled_color_matched_start, effective_foreground,
+        };
+        use crate::models::matchers::{
+            MatcherColor, MatcherColorMatch, MatcherHsv, MatcherHsvRange, MatcherRole,
+            MatcherSyntax, MatcherTextAttribute, TriggerMatcherSource,
+        };
+        use crate::session::connection::vt_processor::{
+            AnsiColor, VtProcessor, parse_ansi_fragment,
+        };
+        use crate::session::runtime::origin::{IsolateId, Origin};
+        use crate::session::runtime::{ActionQueue, RuntimeAction};
+        use crate::session::styled_line::{Color, Style, StyledLine, TextAttributes, VtSpan};
+        use tokio::sync::mpsc::unbounded_channel;
+        use vtparse::VTParser;
+
+        const RED: Color = Color::Ansi {
+            color: AnsiColor::Red,
+            bold: false,
+        };
+        const BLUE: Color = Color::Ansi {
+            color: AnsiColor::Blue,
+            bold: false,
+        };
+        const CYAN: Color = Color::Ansi {
+            color: AnsiColor::Cyan,
+            bold: false,
+        };
+        const BRIGHT_CYAN: Color = Color::Ansi {
+            color: AnsiColor::Cyan,
+            bold: true,
+        };
+
+        fn color_matched_start(
+            regex: &Regex,
+            subject: &str,
+            line: &StyledLine,
+            matcher: &MatcherColorMatch,
+            bold_is_bright: bool,
+        ) -> Option<usize> {
+            compiled_color_matched_start(
+                regex,
+                subject,
+                line,
+                CompiledColorMatch::compile(matcher),
+                bold_is_bright,
+            )
+        }
+
+        fn line() -> StyledLine {
+            StyledLine::new(
+                "red red",
+                vec![
+                    VtSpan {
+                        style: Style::default(),
+                        begin_pos: 0,
+                        end_pos: 4,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: RED,
+                            bg: BLUE,
+                            attributes: TextAttributes {
+                                bold: true,
+                                ..TextAttributes::default()
+                            },
+                        },
+                        begin_pos: 4,
+                        end_pos: 7,
+                    },
+                ],
+            )
+        }
+
+        fn red_bold_on_blue() -> MatcherColorMatch {
+            MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 1 }),
+                background: Some(MatcherColor::Ansi { index: 4 }),
+                attributes: vec![MatcherTextAttribute::Bold],
+            }
+        }
+
+        #[test]
+        fn iterates_matches_until_a_start_style_fits() {
+            let line = line();
+            assert_eq!(
+                color_matched_start(
+                    &Regex::new("red").unwrap(),
+                    &line.text,
+                    &line,
+                    &red_bold_on_blue(),
+                    false,
+                ),
+                Some(4),
+            );
+            assert!(
+                color_matched_start(
+                    &Regex::new("^red").unwrap(),
+                    &line.text,
+                    &line,
+                    &red_bold_on_blue(),
+                    false,
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn empty_pattern_becomes_a_color_only_scan() {
+            let line = line();
+            assert_eq!(
+                color_matched_start(
+                    &Regex::new("").unwrap(),
+                    &line.text,
+                    &line,
+                    &red_bold_on_blue(),
+                    false,
+                ),
+                Some(4),
+            );
+        }
+
+        #[test]
+        fn color_only_scan_ignores_zero_width_vt_style_transitions() {
+            let bold = TextAttributes {
+                bold: true,
+                ..TextAttributes::default()
+            };
+            let line = StyledLine::new(
+                "cyan",
+                vec![
+                    // A live VtProcessor emits these spans when the cursor
+                    // inherits dim cyan and receives SGR 1 before text.
+                    VtSpan {
+                        style: Style {
+                            fg: CYAN,
+                            ..Style::default()
+                        },
+                        begin_pos: 0,
+                        end_pos: 0,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: CYAN,
+                            attributes: bold,
+                            ..Style::default()
+                        },
+                        begin_pos: 0,
+                        end_pos: 4,
+                    },
+                ],
+            );
+            let dim = MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 6 }),
+                ..Default::default()
+            };
+            let bright = MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 14 }),
+                ..Default::default()
+            };
+            let empty = Regex::new("").unwrap();
+
+            assert!(color_matched_start(&empty, &line.text, &line, &dim, true).is_none());
+            assert_eq!(
+                color_matched_start(&empty, &line.text, &line, &bright, true),
+                Some(0),
+            );
+
+            let empty_line = StyledLine::new(
+                "",
+                vec![
+                    VtSpan {
+                        style: Style {
+                            fg: CYAN,
+                            ..Style::default()
+                        },
+                        begin_pos: 0,
+                        end_pos: 0,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: CYAN,
+                            attributes: bold,
+                            ..Style::default()
+                        },
+                        begin_pos: 0,
+                        end_pos: 0,
+                    },
+                ],
+            );
+            assert!(
+                color_matched_start(&empty, &empty_line.text, &empty_line, &dim, true).is_none()
+            );
+            assert_eq!(
+                color_matched_start(&empty, &empty_line.text, &empty_line, &bright, true),
+                Some(0),
+            );
+        }
+
+        #[test]
+        fn any_channel_does_not_constrain_that_channel() {
+            let line = line();
+            let filter = MatcherColorMatch {
+                foreground: None,
+                background: Some(MatcherColor::Ansi { index: 4 }),
+                attributes: Vec::new(),
+            };
+            assert!(
+                color_matched_start(
+                    &Regex::new("red").unwrap(),
+                    &line.text,
+                    &line,
+                    &filter,
+                    false,
+                )
+                .is_some()
+            );
+        }
+
+        #[test]
+        fn xterm_and_truecolor_compare_by_terminal_rgb() {
+            let regex = Regex::new("target").unwrap();
+            let rgb = Color::Rgb {
+                r: 95,
+                g: 135,
+                b: 175,
+            };
+            let line = StyledLine::new(
+                "target",
+                vec![VtSpan {
+                    style: Style {
+                        fg: rgb,
+                        ..Style::default()
+                    },
+                    begin_pos: 0,
+                    end_pos: 6,
+                }],
+            );
+            for foreground in [
+                MatcherColor::Xterm { index: 67 },
+                MatcherColor::Truecolor {
+                    r: 95,
+                    g: 135,
+                    b: 175,
+                    range: None,
+                },
+            ] {
+                let filter = MatcherColorMatch {
+                    foreground: Some(foreground),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    color_matched_start(&regex, &line.text, &line, &filter, false,),
+                    Some(0),
+                );
+            }
+        }
+
+        #[test]
+        fn truecolor_range_requires_all_hsv_components_inside_the_box() {
+            let range = MatcherHsvRange {
+                first: MatcherHsv {
+                    hue: 100,
+                    saturation: 100,
+                    value: 100,
+                },
+                second: MatcherHsv {
+                    hue: 140,
+                    saturation: 200,
+                    value: 200,
+                },
+                wrap_hue: false,
+            };
+            let matcher = CompiledMatcherColor::compile(MatcherColor::Truecolor {
+                r: 0,
+                g: 0,
+                b: 0,
+                range: Some(range),
+            });
+            let rgb = |hsv: MatcherHsv| {
+                let (r, g, b) = hsv.to_rgb();
+                Color::Rgb { r, g, b }
+            };
+
+            assert!(matcher.matches(rgb(MatcherHsv {
+                hue: 120,
+                saturation: 150,
+                value: 150,
+            })));
+            assert!(!matcher.matches(rgb(MatcherHsv {
+                hue: 160,
+                saturation: 150,
+                value: 150,
+            })));
+            assert!(!matcher.matches(rgb(MatcherHsv {
+                hue: 120,
+                saturation: 220,
+                value: 150,
+            })));
+            assert!(!matcher.matches(rgb(MatcherHsv {
+                hue: 120,
+                saturation: 150,
+                value: 220,
+            })));
+            assert!(!matcher.matches(CYAN));
+
+            let gray = MatcherHsv {
+                hue: 217,
+                saturation: 0,
+                value: 128,
+            };
+            let gray_matcher = CompiledMatcherColor::compile(MatcherColor::Truecolor {
+                r: 128,
+                g: 128,
+                b: 128,
+                range: Some(MatcherHsvRange {
+                    first: gray,
+                    second: gray,
+                    wrap_hue: false,
+                }),
+            });
+            assert!(gray_matcher.matches(Color::Rgb {
+                r: 128,
+                g: 128,
+                b: 128,
+            }));
+
+            let wrapped = CompiledMatcherColor::compile(MatcherColor::Truecolor {
+                r: 255,
+                g: 0,
+                b: 42,
+                range: Some(MatcherHsvRange {
+                    first: MatcherHsv {
+                        hue: 350,
+                        saturation: 255,
+                        value: 255,
+                    },
+                    second: MatcherHsv {
+                        hue: 10,
+                        saturation: 255,
+                        value: 255,
+                    },
+                    wrap_hue: true,
+                }),
+            });
+            assert!(wrapped.matches(rgb(MatcherHsv {
+                hue: 355,
+                saturation: 255,
+                value: 255,
+            })));
+            assert!(wrapped.matches(rgb(MatcherHsv {
+                hue: 5,
+                saturation: 255,
+                value: 255,
+            })));
+            assert!(!wrapped.matches(rgb(MatcherHsv {
+                hue: 180,
+                saturation: 255,
+                value: 255,
+            })));
+        }
+
+        #[test]
+        fn compiled_hue_range_supports_broad_and_equal_directed_arcs() {
+            let endpoint = |hue| MatcherHsv {
+                hue,
+                saturation: 255,
+                value: 255,
+            };
+            let compile = |from, to| {
+                CompiledMatcherColor::compile(MatcherColor::Truecolor {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    range: Some(MatcherHsvRange::from_to(from, to)),
+                })
+            };
+            let rgb = |hsv: MatcherHsv| {
+                let (r, g, b) = hsv.to_rgb();
+                Color::Rgb { r, g, b }
+            };
+
+            let broad = compile(endpoint(10), endpoint(350));
+            assert!(broad.matches(rgb(endpoint(10))));
+            assert!(broad.matches(rgb(endpoint(180))));
+            assert!(broad.matches(rgb(endpoint(350))));
+            assert!(!broad.matches(rgb(endpoint(5))));
+            assert!(!broad.matches(rgb(endpoint(355))));
+
+            let equal = compile(endpoint(45), endpoint(45));
+            assert!(equal.matches(rgb(endpoint(45))));
+            assert!(!equal.matches(rgb(endpoint(44))));
+            assert!(!equal.matches(rgb(endpoint(46))));
+        }
+
+        #[test]
+        fn compiled_hue_range_preserves_direction_when_quantization_crosses_zero() {
+            let from = MatcherHsv {
+                hue: 359,
+                saturation: 10,
+                value: 30,
+            };
+            let to = MatcherHsv {
+                hue: 1,
+                saturation: 255,
+                value: 255,
+            };
+            let matcher = CompiledMatcherColor::compile(MatcherColor::Truecolor {
+                r: 0,
+                g: 0,
+                b: 0,
+                range: Some(MatcherHsvRange::from_to(from, to)),
+            });
+            let CompiledMatcherColor::HsvRange(compiled) = matcher else {
+                panic!("expected a compiled HSV range");
+            };
+            assert_eq!((compiled.hue_from, compiled.hue_to), (0, 1));
+
+            let rgb = |hsv: MatcherHsv| {
+                let (r, g, b) = hsv.to_rgb();
+                Color::Rgb { r, g, b }
+            };
+            assert!(matcher.matches(rgb(from)));
+            assert!(matcher.matches(rgb(to)));
+            assert!(!matcher.matches(rgb(MatcherHsv {
+                hue: 180,
+                saturation: 255,
+                value: 255,
+            })));
+        }
+
+        #[test]
+        fn bold_brightness_promotes_only_normal_ansi_foregrounds() {
+            let bold = TextAttributes {
+                bold: true,
+                ..TextAttributes::default()
+            };
+            assert_eq!(
+                effective_foreground(
+                    Style {
+                        fg: CYAN,
+                        bg: CYAN,
+                        attributes: bold,
+                    },
+                    true,
+                ),
+                BRIGHT_CYAN,
+            );
+            assert_eq!(
+                effective_foreground(
+                    Style {
+                        fg: CYAN,
+                        attributes: bold,
+                        ..Style::default()
+                    },
+                    false,
+                ),
+                CYAN,
+            );
+            assert_eq!(
+                effective_foreground(
+                    Style {
+                        fg: BRIGHT_CYAN,
+                        ..Style::default()
+                    },
+                    true,
+                ),
+                BRIGHT_CYAN,
+            );
+            assert_eq!(
+                effective_foreground(
+                    Style {
+                        fg: Color::DefaultForeground { bold: false },
+                        attributes: bold,
+                        ..Style::default()
+                    },
+                    true,
+                ),
+                Color::DefaultForeground { bold: true },
+            );
+            let rgb = Color::Rgb { r: 1, g: 2, b: 3 };
+            assert_eq!(
+                effective_foreground(
+                    Style {
+                        fg: rgb,
+                        attributes: bold,
+                        ..Style::default()
+                    },
+                    true,
+                ),
+                rgb,
+            );
+        }
+
+        #[test]
+        fn bold_is_bright_distinguishes_effective_dim_and_bright_cyan() {
+            let line = parse_ansi_fragment("\u{1b}[1;36;46mcyan");
+            let regex = Regex::new("cyan").unwrap();
+            let dim = MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 6 }),
+                ..Default::default()
+            };
+            let bright = MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 14 }),
+                ..Default::default()
+            };
+            let bright_and_bold = MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 14 }),
+                attributes: vec![MatcherTextAttribute::Bold],
+                ..Default::default()
+            };
+            let bright_background = MatcherColorMatch {
+                background: Some(MatcherColor::Ansi { index: 8 + 6 }),
+                ..Default::default()
+            };
+            let dim_background = MatcherColorMatch {
+                background: Some(MatcherColor::Ansi { index: 6 }),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                color_matched_start(&regex, &line.text, &line, &dim, false),
+                Some(0),
+            );
+            assert!(color_matched_start(&regex, &line.text, &line, &bright, false).is_none());
+            assert!(color_matched_start(&regex, &line.text, &line, &dim, true).is_none());
+            assert_eq!(
+                color_matched_start(&regex, &line.text, &line, &bright, true),
+                Some(0),
+            );
+            assert_eq!(
+                color_matched_start(&regex, &line.text, &line, &bright_and_bold, true),
+                Some(0),
+            );
+            assert!(
+                color_matched_start(&regex, &line.text, &line, &bright_background, true).is_none()
+            );
+            assert_eq!(
+                color_matched_start(&regex, &line.text, &line, &dim_background, true),
+                Some(0),
+            );
+        }
+
+        #[test]
+        fn manager_uses_live_bold_brightness_policy() {
+            let queue: ActionQueue = Rc::default();
+            let mut manager = Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default());
+            let name = Arc::new("bright cyan".to_string());
+            let patterns = Arc::new(vec!["cyan".to_string()]);
+            let empty = Arc::new(Vec::<String>::new());
+            let matchers = [TriggerMatcherSource {
+                role: MatcherRole::Match,
+                syntax: MatcherSyntax::Regex,
+                source: "cyan".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+                color: Some(MatcherColorMatch {
+                    foreground: Some(MatcherColor::Ansi { index: 14 }),
+                    ..Default::default()
+                }),
+            }];
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin: Origin::User,
+                    name: &name,
+                    patterns: &patterns,
+                    raw_patterns: &empty,
+                    anti_patterns: &empty,
+                    matchers: Some(&matchers),
+                    action: ScriptAction::Noop,
+                    prompt: false,
+                    enabled: true,
+                    priority: 0,
+                    fallthrough: true,
+                    fire_limit: None,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+            let line = Arc::new(parse_ansi_fragment("\u{1b}[1;36mcyan"));
+
+            manager.set_bold_is_bright(true);
+            manager.process_incoming_line(&line).unwrap();
+            assert!(
+                queue
+                    .borrow_mut()
+                    .drain(..)
+                    .any(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+            );
+
+            manager.set_bold_is_bright(false);
+            manager.process_incoming_line(&line).unwrap();
+            assert!(
+                !queue
+                    .borrow_mut()
+                    .drain(..)
+                    .any(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+            );
+        }
+
+        #[test]
+        fn manager_ansi_cyan_matrix_respects_bold_brightness_policy() {
+            fn fires_line(manager: &mut Manager, queue: &ActionQueue, line: StyledLine) -> bool {
+                let line = Arc::new(line);
+                manager.process_incoming_line(&line).unwrap();
+                queue
+                    .borrow_mut()
+                    .drain(..)
+                    .any(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+            }
+
+            fn fires(manager: &mut Manager, queue: &ActionQueue, sgr: &str) -> bool {
+                fires_line(manager, queue, parse_ansi_fragment(sgr))
+            }
+
+            fn live_lines(bytes: &[u8]) -> Vec<Arc<StyledLine>> {
+                let (tx, mut rx) = unbounded_channel();
+                let mut processor = VtProcessor::new(tx);
+                let mut parser = VTParser::new();
+                for &byte in bytes {
+                    if byte != b'\r' && byte != b'\n' {
+                        processor.push_raw_incoming_byte(byte);
+                    }
+                    parser.parse_byte(byte, &mut processor);
+                }
+                let mut lines = Vec::new();
+                while let Ok(action) = rx.try_recv() {
+                    if let RuntimeAction::HandleIncomingLine(line) = action {
+                        lines.push(line);
+                    }
+                }
+                lines
+            }
+
+            fn manager_for(index: u8) -> (Manager, ActionQueue) {
+                let queue: ActionQueue = Rc::default();
+                let mut manager =
+                    Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default());
+                let name = Arc::new(format!("ansi {index}"));
+                // Use the color-only form that the editor persists. Its text
+                // pattern is empty. The color filter is its only condition.
+                let patterns = Arc::new(vec![String::new()]);
+                let empty = Arc::new(Vec::<String>::new());
+                let matchers = [TriggerMatcherSource {
+                    role: MatcherRole::Match,
+                    syntax: MatcherSyntax::Regex,
+                    source: String::new(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index }),
+                        ..Default::default()
+                    }),
+                }];
+                manager
+                    .push_trigger(PushTriggerParams {
+                        isolate: IsolateId::Main,
+                        origin: Origin::User,
+                        name: &name,
+                        patterns: &patterns,
+                        raw_patterns: &empty,
+                        anti_patterns: &empty,
+                        matchers: Some(&matchers),
+                        action: ScriptAction::Noop,
+                        prompt: false,
+                        enabled: true,
+                        priority: 0,
+                        fallthrough: true,
+                        fire_limit: None,
+                        line_limit: None,
+                        source: None,
+                    })
+                    .unwrap();
+                (manager, queue)
+            }
+
+            let (mut dim, dim_queue) = manager_for(6);
+            dim.set_bold_is_bright(false);
+            assert!(fires(&mut dim, &dim_queue, "\u{1b}[36mcyan"));
+            assert!(fires(&mut dim, &dim_queue, "\u{1b}[1;36mcyan"));
+            assert!(!fires(&mut dim, &dim_queue, "\u{1b}[96mcyan"));
+            dim.set_bold_is_bright(true);
+            assert!(fires(&mut dim, &dim_queue, "\u{1b}[36mcyan"));
+            assert!(!fires(&mut dim, &dim_queue, "\u{1b}[1;36mcyan"));
+            assert!(!fires(&mut dim, &dim_queue, "\u{1b}[96mcyan"));
+            let lines = live_lines(b"\x1b[36mheader\r\n\x1b[1m\x1b[36mcyan\r\n");
+            assert_eq!(lines.len(), 2);
+            assert!(!fires_line(&mut dim, &dim_queue, (*lines[1]).clone()));
+
+            let (mut bright, bright_queue) = manager_for(14);
+            bright.set_bold_is_bright(false);
+            assert!(!fires(&mut bright, &bright_queue, "\u{1b}[36mcyan"));
+            assert!(!fires(&mut bright, &bright_queue, "\u{1b}[1;36mcyan"));
+            assert!(fires(&mut bright, &bright_queue, "\u{1b}[96mcyan"));
+            bright.set_bold_is_bright(true);
+            assert!(!fires(&mut bright, &bright_queue, "\u{1b}[36mcyan"));
+            assert!(fires(&mut bright, &bright_queue, "\u{1b}[1;36mcyan"));
+            assert!(fires(&mut bright, &bright_queue, "\u{1b}[96mcyan"));
+        }
+
+        #[test]
+        fn blank_colored_anti_pattern_scans_for_a_qualifying_style() {
+            let matchers = [
+                TriggerMatcherSource {
+                    role: MatcherRole::Match,
+                    syntax: MatcherSyntax::Regex,
+                    source: "go".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: None,
+                },
+                TriggerMatcherSource {
+                    role: MatcherRole::Anti,
+                    syntax: MatcherSyntax::Regex,
+                    source: String::new(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 1 }),
+                        ..Default::default()
+                    }),
+                },
+            ];
+            let trigger = Trigger::new(
+                IsolateId::Main,
+                Origin::User,
+                "colored anti".to_string(),
+                ["go"].into_iter(),
+                std::iter::empty::<&str>(),
+                [""].into_iter(),
+                Some(&matchers),
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let line = StyledLine::new(
+                "go red",
+                vec![
+                    VtSpan {
+                        style: Style::default(),
+                        begin_pos: 0,
+                        end_pos: 3,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: RED,
+                            ..Style::default()
+                        },
+                        begin_pos: 3,
+                        end_pos: 6,
+                    },
+                ],
+            );
+            assert!(trigger.anti_matches(&line.text, Some(&line), false));
+        }
+
+        #[test]
+        fn colored_anti_prefilter_uses_plain_styled_text() {
+            let matchers = [
+                TriggerMatcherSource {
+                    role: MatcherRole::Match,
+                    syntax: MatcherSyntax::Regex,
+                    source: "go".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: None,
+                },
+                TriggerMatcherSource {
+                    role: MatcherRole::Anti,
+                    syntax: MatcherSyntax::Regex,
+                    source: "^red$".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 1 }),
+                        ..Default::default()
+                    }),
+                },
+            ];
+            let trigger = Trigger::new(
+                IsolateId::Main,
+                Origin::User,
+                "colored anti".to_string(),
+                ["go"].into_iter(),
+                std::iter::empty::<&str>(),
+                ["^red$"].into_iter(),
+                Some(&matchers),
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let raw = "\u{1b}[31mred";
+            let line = parse_ansi_fragment(raw);
+
+            assert!(trigger.anti_matches(raw, Some(&line), false));
+        }
+
+        #[test]
+        fn colored_anti_text_miss_does_not_qualify_a_matching_style() {
+            let matchers = [
+                TriggerMatcherSource {
+                    role: MatcherRole::Match,
+                    syntax: MatcherSyntax::Regex,
+                    source: "go".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: None,
+                },
+                TriggerMatcherSource {
+                    role: MatcherRole::Anti,
+                    syntax: MatcherSyntax::Regex,
+                    source: "stop".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 1 }),
+                        ..Default::default()
+                    }),
+                },
+            ];
+            let trigger = Trigger::new(
+                IsolateId::Main,
+                Origin::User,
+                "colored anti miss".to_string(),
+                ["go"].into_iter(),
+                std::iter::empty::<&str>(),
+                ["stop"].into_iter(),
+                Some(&matchers),
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let line = StyledLine::new(
+                "go",
+                vec![VtSpan {
+                    style: Style {
+                        fg: RED,
+                        ..Style::default()
+                    },
+                    begin_pos: 0,
+                    end_pos: 2,
+                }],
+            );
+
+            assert!(!trigger.anti_matches(&line.text, Some(&line), false));
+        }
+
+        #[test]
+        fn colored_anti_checks_each_pattern_after_the_prefilter_matches() {
+            let matchers = [
+                TriggerMatcherSource {
+                    role: MatcherRole::Match,
+                    syntax: MatcherSyntax::Regex,
+                    source: "go".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: None,
+                },
+                TriggerMatcherSource {
+                    role: MatcherRole::Anti,
+                    syntax: MatcherSyntax::Regex,
+                    source: "stop".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 1 }),
+                        ..Default::default()
+                    }),
+                },
+                TriggerMatcherSource {
+                    role: MatcherRole::Anti,
+                    syntax: MatcherSyntax::Regex,
+                    source: "stop".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 4 }),
+                        ..Default::default()
+                    }),
+                },
+            ];
+            let trigger = Trigger::new(
+                IsolateId::Main,
+                Origin::User,
+                "colored anti".to_string(),
+                ["go"].into_iter(),
+                std::iter::empty::<&str>(),
+                ["stop", "stop"].into_iter(),
+                Some(&matchers),
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let blue_line = StyledLine::new(
+                "go stop",
+                vec![
+                    VtSpan {
+                        style: Style::default(),
+                        begin_pos: 0,
+                        end_pos: 3,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: BLUE,
+                            ..Style::default()
+                        },
+                        begin_pos: 3,
+                        end_pos: 7,
+                    },
+                ],
+            );
+            let plain_line = StyledLine::new(
+                "go stop",
+                vec![VtSpan {
+                    style: Style::default(),
+                    begin_pos: 0,
+                    end_pos: 7,
+                }],
+            );
+
+            assert!(trigger.anti_matches(&blue_line.text, Some(&blue_line), false));
+            assert!(!trigger.anti_matches(&plain_line.text, Some(&plain_line), false));
+        }
+
+        #[test]
+        fn uncolored_trigger_omits_the_colored_anti_prefilter() {
+            let trigger = Trigger::new(
+                IsolateId::Main,
+                Origin::User,
+                "plain anti".to_string(),
+                ["go"].into_iter(),
+                std::iter::empty::<&str>(),
+                ["stop"].into_iter(),
+                None,
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert!(trigger.colored_anti_pattern_set.is_none());
+            assert!(trigger.anti_matches("go stop", None, false));
+        }
+
+        #[test]
+        fn unconstrained_persisted_filter_does_not_turn_blank_pattern_into_match_all() {
+            let matchers = [TriggerMatcherSource {
+                role: MatcherRole::Match,
+                syntax: MatcherSyntax::Regex,
+                source: String::new(),
+                anchor_start: true,
+                anchor_end: true,
+                color: Some(MatcherColorMatch::default()),
+            }];
+            let trigger = Trigger::new(
+                IsolateId::Main,
+                Origin::User,
+                "any style".to_string(),
+                [""].into_iter(),
+                std::iter::empty::<&str>(),
+                std::iter::empty::<&str>(),
+                Some(&matchers),
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert!(trigger.patterns.is_empty());
+            assert!(trigger.pattern_colors.is_empty());
+        }
+
+        #[test]
+        fn script_preparation_normalizes_empty_style_before_filtering_empty_rows() {
+            let empty_style = MatcherColorMatch::default();
+            let prepared = PreparedScriptTriggerPatterns::prepare(
+                vec![ScriptTriggerPattern {
+                    source: "go".to_string(),
+                    style: Some(empty_style.clone()),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(prepared.patterns[0].as_str(), "go");
+            assert!(prepared.pattern_colors.is_empty());
+
+            let error = PreparedScriptTriggerPatterns::prepare(
+                vec![ScriptTriggerPattern {
+                    source: String::new(),
+                    style: Some(empty_style),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("at least one normal or raw"));
+
+            let prepared = PreparedScriptTriggerPatterns::prepare(
+                vec![ScriptTriggerPattern {
+                    source: String::new(),
+                    style: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(prepared.patterns.is_empty());
+
+            let prepared =
+                PreparedScriptTriggerPatterns::prepare(Vec::new(), vec![String::new()], Vec::new())
+                    .unwrap();
+            assert!(prepared.raw_patterns.is_empty());
+
+            let error = PreparedScriptTriggerPatterns::prepare(
+                Vec::new(),
+                Vec::new(),
+                vec![ScriptTriggerPattern {
+                    source: "stop".to_string(),
+                    style: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 1 }),
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("at least one normal or raw"));
+        }
+
+        #[test]
+        fn persisted_rows_reject_ansi_aliasing_and_conflicting_attributes() {
+            let invalid_match = |color: MatcherColorMatch| {
+                let matchers = [TriggerMatcherSource {
+                    role: MatcherRole::Match,
+                    syntax: MatcherSyntax::Regex,
+                    source: "go".to_string(),
+                    anchor_start: true,
+                    anchor_end: true,
+                    color: Some(color),
+                }];
+                Trigger::new(
+                    IsolateId::Main,
+                    Origin::User,
+                    "invalid persisted color".to_string(),
+                    ["go"].into_iter(),
+                    std::iter::empty::<&str>(),
+                    std::iter::empty::<&str>(),
+                    Some(&matchers),
+                    ScriptAction::Noop,
+                    false,
+                    true,
+                    0,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap_err()
+                .to_string()
+            };
+
+            let error = invalid_match(MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 16 }),
+                ..Default::default()
+            });
+            assert!(error.contains("between 0 and 15"), "{error}");
+
+            let error = invalid_match(MatcherColorMatch {
+                attributes: vec![
+                    MatcherTextAttribute::Underline,
+                    MatcherTextAttribute::DoubleUnderline,
+                ],
+                ..Default::default()
+            });
+            assert!(error.contains("single and double underline"), "{error}");
+        }
+
+        #[test]
+        fn script_preparation_validates_all_regexes_before_installation() {
+            for (normal, raw, anti, expected) in [
+                (
+                    vec![ScriptTriggerPattern {
+                        source: "[".to_string(),
+                        style: None,
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                    "normal[0]",
+                ),
+                (Vec::new(), vec!["[".to_string()], Vec::new(), "raw[0]"),
+                (
+                    vec![ScriptTriggerPattern {
+                        source: "go".to_string(),
+                        style: None,
+                    }],
+                    Vec::new(),
+                    vec![ScriptTriggerPattern {
+                        source: "[".to_string(),
+                        style: None,
+                    }],
+                    "anti[0]",
+                ),
+            ] {
+                let error = PreparedScriptTriggerPatterns::prepare(normal, raw, anti).unwrap_err();
+                assert!(error.to_string().contains(expected), "{error:#}");
+            }
+        }
+
+        #[test]
+        fn captures_come_from_the_first_color_fitting_match() {
+            let queue: ActionQueue = Rc::default();
+            let mut manager = Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default());
+            let name = Arc::new("colored".to_string());
+            let patterns = Arc::new(vec![r"(?<number>red\d)".to_string()]);
+            let empty = Arc::new(Vec::<String>::new());
+            let matchers = [TriggerMatcherSource {
+                role: MatcherRole::Match,
+                syntax: MatcherSyntax::Regex,
+                source: r"(?<number>red\d)".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+                color: Some(MatcherColorMatch {
+                    foreground: Some(MatcherColor::Ansi { index: 1 }),
+                    ..Default::default()
+                }),
+            }];
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin: Origin::User,
+                    name: &name,
+                    patterns: &patterns,
+                    raw_patterns: &empty,
+                    anti_patterns: &empty,
+                    matchers: Some(&matchers),
+                    action: ScriptAction::Noop,
+                    prompt: false,
+                    enabled: true,
+                    priority: 0,
+                    fallthrough: true,
+                    fire_limit: None,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+            let line = Arc::new(StyledLine::new(
+                "red1 red2",
+                vec![
+                    VtSpan {
+                        style: Style::default(),
+                        begin_pos: 0,
+                        end_pos: 5,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: RED,
+                            ..Style::default()
+                        },
+                        begin_pos: 5,
+                        end_pos: 9,
+                    },
+                ],
+            ));
+            manager.process_incoming_line(&line).unwrap();
+
+            let captures = queue
+                .borrow_mut()
+                .drain(..)
+                .find_map(|action| match action {
+                    RuntimeAction::RunAutomation { matches, .. } => Some(matches),
+                    _ => None,
+                })
+                .expect("colored trigger should fire");
+            assert_eq!(captures[0].value, "red2");
+            assert_eq!(captures[1].value, "red2");
+        }
+
+        #[test]
+        fn prepared_color_only_trigger_captures_an_empty_whole_match() {
+            let queue: ActionQueue = Rc::default();
+            let mut manager = Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default());
+            let prepared = PreparedScriptTriggerPatterns::prepare(
+                vec![ScriptTriggerPattern {
+                    source: String::new(),
+                    style: Some(MatcherColorMatch {
+                        foreground: Some(MatcherColor::Ansi { index: 1 }),
+                        ..Default::default()
+                    }),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            manager.push_script_trigger(
+                IsolateId::Main,
+                Origin::User,
+                "red run".to_string(),
+                prepared,
+                ScriptAction::Noop,
+                false,
+                true,
+                0,
+                true,
+                None,
+                None,
+                None,
+            );
+            let line = Arc::new(StyledLine::new(
+                "plain red",
+                vec![
+                    VtSpan {
+                        style: Style::default(),
+                        begin_pos: 0,
+                        end_pos: 6,
+                    },
+                    VtSpan {
+                        style: Style {
+                            fg: RED,
+                            ..Style::default()
+                        },
+                        begin_pos: 6,
+                        end_pos: 9,
+                    },
+                ],
+            ));
+
+            manager.process_incoming_line(&line).unwrap();
+            let captures = queue
+                .borrow_mut()
+                .drain(..)
+                .find_map(|action| match action {
+                    RuntimeAction::RunAutomation { matches, .. } => Some(matches),
+                    _ => None,
+                })
+                .expect("color-only trigger should fire");
+            assert_eq!(captures.len(), 1);
+            assert_eq!(captures[0].value, "");
+        }
+    }
+
     mod raw_wanted {
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
@@ -1828,6 +3804,7 @@ mod tests {
                     patterns: &Arc::new(vec!["plain".to_string()]),
                     raw_patterns: &Arc::new(raw_patterns),
                     anti_patterns: &Arc::new(Vec::new()),
+                    matchers: None,
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
                     prompt: false,
                     enabled: true,
@@ -1922,6 +3899,7 @@ mod tests {
                     patterns: &Arc::new(patterns),
                     raw_patterns: &Arc::new(raw_patterns),
                     anti_patterns: &Arc::new(Vec::new()),
+                    matchers: None,
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
                     prompt,
                     enabled: true,
@@ -2038,7 +4016,7 @@ mod tests {
         }
 
         #[test]
-        fn prompt_path_fires_once_across_its_passes() {
+        fn first_prompt_after_registration_rebuilds_and_fires_once_across_its_passes() {
             let (mut manager, queue) = manager();
             push(
                 &mut manager,
@@ -2047,13 +4025,6 @@ mod tests {
                 vec![r"\x1b\[31m(?<hp>\d+)hp".to_string()],
                 true,
             );
-
-            // The prompt PatternSets rebuild at the complete-line dirty check; run a
-            // non-matching complete line through first, as a live session would.
-            manager
-                .process_incoming_line(&line_with_raw("nothing here", "nothing here"))
-                .unwrap();
-            queue.borrow_mut().drain(..).for_each(drop);
 
             manager
                 .process_partial_line(line_with_raw("42hp", "\x1b[31m42hp"))
@@ -2470,6 +4441,7 @@ mod tests {
                     patterns: &Arc::new(patterns),
                     raw_patterns: &Arc::new(raw_patterns),
                     anti_patterns: &Arc::new(anti_patterns),
+                    matchers: None,
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
                     prompt: false,
                     enabled: true,

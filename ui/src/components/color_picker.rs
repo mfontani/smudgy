@@ -26,12 +26,23 @@ pub struct Hsv {
 }
 
 impl Hsv {
+    /// Clamps saturation and value. Normalizes hue to the canonical interval.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            hue: self.hue.rem_euclid(360.0),
+            saturation: self.saturation.clamp(0.0, 1.0),
+            value: self.value.clamp(0.0, 1.0),
+        }
+    }
+
     #[must_use]
     pub fn to_color(self) -> Color {
-        let h = (self.hue.rem_euclid(360.0)) / 60.0;
-        let c = self.value * self.saturation;
+        let hsv = self.normalized();
+        let h = hsv.hue / 60.0;
+        let c = hsv.value * hsv.saturation;
         let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
-        let m = self.value - c;
+        let m = hsv.value - c;
 
         let (r, g, b) = match h {
             h if h < 1.0 => (c, x, 0.0),
@@ -106,14 +117,28 @@ pub struct ColorPicker {
 impl ColorPicker {
     #[must_use]
     pub fn from_color(color: Color) -> Self {
+        Self::from_hsv(Hsv::from_color(color))
+    }
+
+    /// Constructs a picker directly from HSV without an RGB conversion. This
+    /// preserves the specified hue of an achromatic color. Its RGB value does
+    /// not contain hue information.
+    #[must_use]
+    pub fn from_hsv(hsv: Hsv) -> Self {
         Self {
-            hsv: Hsv::from_color(color),
+            hsv: hsv.normalized(),
         }
     }
 
     #[must_use]
     pub fn color(&self) -> Color {
         self.hsv.to_color()
+    }
+
+    /// Returns the picker's HSV state, including a specified achromatic hue.
+    #[must_use]
+    pub const fn hsv(&self) -> Hsv {
+        self.hsv
     }
 
     pub fn update(&mut self, message: Message) -> Event {
@@ -123,12 +148,12 @@ impl ColorPicker {
                 value,
                 commit,
             } => {
-                self.hsv.saturation = saturation;
-                self.hsv.value = value;
+                self.hsv.saturation = saturation.clamp(0.0, 1.0);
+                self.hsv.value = value.clamp(0.0, 1.0);
                 commit
             }
             Message::HueChanged { hue, commit } => {
-                self.hsv.hue = hue;
+                self.hsv.hue = hue.rem_euclid(360.0);
                 commit
             }
         };
@@ -141,11 +166,18 @@ impl ColorPicker {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        Self::view_for_hsv(self.hsv)
+    }
+
+    /// Builds an owned picker view directly from HSV. This preserves the
+    /// specified hue of an achromatic endpoint.
+    pub fn view_for_hsv(hsv: Hsv) -> Element<'static, Message> {
+        let hsv = hsv.normalized();
         iced::widget::column![
-            Canvas::new(SvSquare { hsv: self.hsv })
+            Canvas::new(SvSquare { hsv })
                 .width(Length::Fill)
                 .height(SQUARE_HEIGHT),
-            Canvas::new(HueStrip { hsv: self.hsv })
+            Canvas::new(HueStrip { hsv })
                 .width(Length::Fill)
                 .height(STRIP_HEIGHT),
         ]
@@ -376,7 +408,7 @@ impl canvas::Program<Message, Theme> for HueStrip {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hsv, to_hex};
+    use super::{ColorPicker, Hsv, Message, to_hex};
 
     #[test]
     fn hsv_round_trips_through_rgb() {
@@ -409,6 +441,41 @@ mod tests {
         let back = gray.to_color().into_rgba8();
         assert_eq!(back[0], back[1]);
         assert_eq!(back[1], back[2]);
+    }
+
+    #[test]
+    fn direct_hsv_picker_preserves_achromatic_hue() {
+        let hsv = Hsv {
+            hue: 217.0,
+            saturation: 0.0,
+            value: 0.5,
+        };
+        let mut picker = ColorPicker::from_hsv(hsv);
+        assert_eq!(picker.hsv(), hsv);
+
+        picker.update(Message::SvChanged {
+            saturation: 0.25,
+            value: 0.5,
+            commit: false,
+        });
+        assert_eq!(picker.hsv().hue, 217.0);
+    }
+
+    #[test]
+    fn direct_hsv_picker_normalizes_external_values() {
+        let picker = ColorPicker::from_hsv(Hsv {
+            hue: 725.0,
+            saturation: 2.0,
+            value: -1.0,
+        });
+        assert_eq!(
+            picker.hsv(),
+            Hsv {
+                hue: 5.0,
+                saturation: 1.0,
+                value: 0.0,
+            }
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! ops receive the interned id.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -143,29 +143,50 @@ pub struct SingletonKey {
     pub name: Arc<str>,
 }
 
-/// Session-global reservation set for `singleton` automations, shared (the same `Rc`) into
+/// Session-global reservations for `singleton` automations, shared (the same `Rc`) into
 /// every isolate's ops — legal because all isolates live on the one session thread
 /// (see `PACKAGE-ISOLATES.md`). A fresh set is built per [`ScriptEngine`](super::script_engine),
 /// so a session reload clears every reservation.
 ///
-/// **Known gaps (insert-only registry).** Reservations are only ever inserted,
-/// never removed, leaving two edges — both benign while every lifecycle change
-/// (install/uninstall/trust/update) is a full session reload that rebuilds this set from
-/// scratch:
-/// 1. **No release on delete/teardown** — deleting a `singleton` automation or tearing down
-///    its isolate does not free its key, so re-creating that singleton within the same
-///    session no-ops.
-/// 2. **Stranding on late registration failure** — the create op reserves the key (and
-///    reports `created == true`) *before* pattern→regex compilation, which happens later in
-///    the deferred `Add*` action ([`Manager`](super::trigger), `Regex::new(..)?`). The op's
-///    only up-front validation is parsing the v8 pattern arrays into strings, **not**
-///    compiling them, so an invalid regex in a `singleton` trigger fails registration *after*
-///    the reserve — stranding the key (the name is dead session-wide) while JS was told it
-///    was created.
-/// Both want the same `.remove()` release path the create ops + dispatch can call, landing
-/// with live (non-reload) isolate teardown (`PACKAGE-ISOLATES-LIFECYCLE.md`); gap 2 can also
-/// be fixed standalone by compiling the patterns in the op before reserving.
-pub type SingletonRegistry = Rc<RefCell<HashSet<SingletonKey>>>;
+/// The winning isolate is retained so a sandbox discarded after `load_modules` returns an
+/// error can release exactly the seats it acquired while its queued registrations are purged.
+/// It must not release a seat an earlier successful isolate won under the same
+/// version-independent key. Top-level errors reported later by the event-loop pump do not
+/// discard the isolate and therefore do not use this cleanup.
+///
+/// **Known gap (normal delete/teardown).** Deleting a successfully registered singleton or
+/// tearing down its live isolate does not free its key, so re-creating it within the same
+/// engine generation still no-ops. Current install/uninstall/trust/update lifecycle changes
+/// rebuild the engine and therefore the registry.
+#[derive(Debug, Default)]
+pub struct SingletonReservations {
+    owners: HashMap<SingletonKey, IsolateId>,
+}
+
+impl SingletonReservations {
+    /// First-writer-wins reservation. Records the winner for failed-load cleanup.
+    pub(crate) fn reserve(&mut self, key: SingletonKey, isolate: IsolateId) -> bool {
+        match self.owners.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(isolate);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn contains(&self, key: &SingletonKey) -> bool {
+        self.owners.contains_key(key)
+    }
+
+    /// Release only reservations actually won by a failed isolate.
+    pub(crate) fn release_isolate(&mut self, isolate: &IsolateId) {
+        self.owners.retain(|_, owner| owner != isolate);
+    }
+}
+
+pub type SingletonRegistry = Rc<RefCell<SingletonReservations>>;
 
 /// A script-created automation's provenance + display state, sent to the UI so it can be
 /// shown nested under its creating module/package. Carries only what the tree needs.
@@ -317,7 +338,10 @@ fn module_subpath(referrer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{IsolateId, NO_ISOLATE_INSTANCE, Origin};
+    use super::{
+        AutomationKind, IsolateId, NO_ISOLATE_INSTANCE, Origin, SingletonKey, SingletonOrigin,
+        SingletonReservations,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -386,5 +410,38 @@ mod tests {
         );
         // Malformed JSON is a loud error — attribution is semantics, never guessed.
         assert!(Origin::try_from_creator_json("not json").is_err());
+    }
+
+    #[test]
+    fn failed_isolate_cleanup_releases_only_its_singleton_wins() {
+        let winner = IsolateId::Package {
+            owner: Arc::from("wbk"),
+            name: Arc::from("winner"),
+            version: Arc::from("1.0.0"),
+        };
+        let loser = IsolateId::Package {
+            owner: Arc::from("wbk"),
+            name: Arc::from("loser"),
+            version: Arc::from("1.0.0"),
+        };
+        let key = SingletonKey {
+            origin: SingletonOrigin::Package {
+                owner: "wbk".to_string(),
+                name: "shared".to_string(),
+            },
+            kind: AutomationKind::Trigger,
+            name: Arc::from("ready"),
+        };
+        let mut reservations = SingletonReservations::default();
+        assert!(reservations.reserve(key.clone(), winner.clone()));
+        assert!(!reservations.reserve(key.clone(), loser.clone()));
+
+        reservations.release_isolate(&loser);
+        assert!(
+            reservations.contains(&key),
+            "a loser owns no seat to release"
+        );
+        reservations.release_isolate(&winner);
+        assert!(!reservations.contains(&key));
     }
 }

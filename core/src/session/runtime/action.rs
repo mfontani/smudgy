@@ -26,7 +26,7 @@ use super::pane::{
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
-use super::trigger::{AliasSender, MatchCapture};
+use super::trigger::{AliasSender, MatchCapture, PreparedScriptTriggerPatterns};
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
@@ -338,14 +338,15 @@ pub enum RuntimeAction {
         fire_limit: Option<u32>,
         line_limit: Option<u32>,
     },
-    AddJavascriptFunctionTrigger {
+    /// A script-created trigger whose regexes and style predicates were
+    /// validated before the registration op performed singleton/function
+    /// side effects. Shared by plaintext and function bodies.
+    AddScriptTrigger {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        patterns: Arc<Vec<String>>,
-        raw_patterns: Arc<Vec<String>>,
-        anti_patterns: Arc<Vec<String>>,
-        function_id: FunctionId,
+        prepared: Arc<PreparedScriptTriggerPatterns>,
+        script: ScriptAction,
         prompt: bool,
         enabled: bool,
         priority: i32,
@@ -648,6 +649,10 @@ pub enum RuntimeAction {
         command_separator: Arc<String>,
         raw_line_prefix: Arc<String>,
         log_enabled: bool,
+        /// Specifies whether SGR bold promotes normal ANSI foreground colors
+        /// to bright variants during matching with a color filter. The runtime
+        /// caches this value in [`super::trigger::Manager`].
+        bold_is_bright: bool,
         script_settings: Box<crate::models::settings::ScriptSettings>,
     },
     RequestRepaint,
@@ -791,6 +796,7 @@ impl RuntimeAction {
                 | Self::CallJavascriptFunction { .. }
                 | Self::RunAutomation { .. }
                 | Self::ExecuteJavascriptFunction { .. }
+                | Self::AddScriptTrigger { .. }
         )
     }
 
@@ -810,7 +816,7 @@ impl RuntimeAction {
             | Self::AddAlias { isolate, .. }
             | Self::AddJavascriptFunctionAlias { isolate, .. }
             | Self::AddTrigger { isolate, .. }
-            | Self::AddJavascriptFunctionTrigger { isolate, .. }
+            | Self::AddScriptTrigger { isolate, .. }
             | Self::RemoveHotkey(isolate, ..)
             | Self::EnableAlias(isolate, ..)
             | Self::EnableTrigger(isolate, ..)
@@ -938,6 +944,7 @@ pub(crate) enum RunAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::runtime::trigger::ScriptTriggerPattern;
 
     #[test]
     fn ordinary_large_send_bursts_fit_the_script_turn_budget() {
@@ -969,5 +976,34 @@ mod tests {
         actions.reserve_script_send(SCRIPT_SEND_BYTE_LIMIT).unwrap();
         actions.drain(..).for_each(drop);
         actions.reserve_script_send(SCRIPT_SEND_BYTE_LIMIT).unwrap();
+    }
+
+    #[test]
+    fn script_trigger_registration_is_owned_by_its_engine_generation() {
+        let prepared = PreparedScriptTriggerPatterns::prepare(
+            vec![ScriptTriggerPattern {
+                source: "ready".to_string(),
+                style: None,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let action = RuntimeAction::AddScriptTrigger {
+            isolate: IsolateId::Main,
+            origin: Origin::User,
+            name: Arc::new("ready".to_string()),
+            prepared: Arc::new(prepared),
+            script: ScriptAction::Noop,
+            prompt: false,
+            enabled: true,
+            priority: 0,
+            fallthrough: true,
+            fire_limit: None,
+            line_limit: None,
+            script_source: None,
+        };
+
+        assert!(action.references_engine_state());
     }
 }

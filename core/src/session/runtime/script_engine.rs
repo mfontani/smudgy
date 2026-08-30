@@ -58,6 +58,20 @@ pub use ops::layout_fold;
 
 use package_provider::build_package_provider;
 
+/// Roll back synchronous registrations owned by a sandbox whose graph/module
+/// load returned an error. Top-level errors reported later by the event loop
+/// are not loader failures and deliberately do not use this path.
+fn purge_failed_isolate_registrations(
+    spawned_actions: &super::ActionQueue,
+    singleton_registry: &SingletonRegistry,
+    isolate_id: &IsolateId,
+) {
+    spawned_actions
+        .borrow_mut()
+        .retain(|action| action.target_isolate() != Some(isolate_id));
+    singleton_registry.borrow_mut().release_isolate(isolate_id);
+}
+
 /// Bind a v8 inspector in dev builds, or whenever `SMUDGY_SCRIPT_INSPECTOR` is set,
 /// so the bundled `smudgy_inspector` helper (or any CDP client) can attach. The
 /// inspector can only be created at runtime construction; it merely listens until a
@@ -1036,8 +1050,7 @@ impl<'a> ScriptEngine<'a> {
         // isolate's ops below so `createAlias(.., {singleton:true})` dedupes session-wide
         // regardless of which isolate the copy runs in (`PACKAGE-ISOLATES.md`). A reload
         // rebuilds the whole engine, so this set — and thus every reservation — resets with it.
-        let singleton_registry: SingletonRegistry =
-            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let singleton_registry: SingletonRegistry = Rc::new(RefCell::default());
         // The session-global event bus, shared (same `Rc`) into every isolate's ops like
         // `singleton_registry`, so `emit` reaches subscribers across isolates (`PACKAGE-EVENTS.md`).
         let event_registry: ops::EventRegistry =
@@ -1860,17 +1873,21 @@ impl<'a> ScriptEngine<'a> {
                             &params.emitted_line_count,
                             &format!("[package] {} failed to load \u{2014} {e:#}", spec.name),
                         );
-                        // Partial evaluation before the throw can have queued automation/script
-                        // actions (a top-level `createTrigger`, or a code-imported dependency's
-                        // registrations) into the shared spawned-action queue, all stamped with
-                        // this isolate's id. Since the isolate is discarded below, those actions
-                        // would register triggers keyed to a dead isolate — every later fire then
-                        // trips dispatch's liveness `debug_assert` (a panic in debug, an
-                        // `Isolate not found` echo per matching line in release). Drop them here so
-                        // the failed load leaves nothing behind; the reload re-runs modules cleanly.
-                        spawned_actions
-                            .borrow_mut()
-                            .retain(|action| action.target_isolate() != Some(&isolate_id));
+                        // Roll back any isolate-owned registrations/actions present when
+                        // `load_modules` returns `Err`. Static graph resolution currently finishes
+                        // before module evaluation, and a top-level error reported later by the
+                        // event-loop pump does not enter this branch. Keeping this rollback
+                        // ownership-exact still protects against any loader/evaluation error that
+                        // is returned after a host op has queued work: the isolate is discarded
+                        // below, so such an action would otherwise target a dead isolate. Release
+                        // only singleton seats this isolate actually won; a collapsed key owned by
+                        // an earlier successful isolate must survive. The reload re-runs modules
+                        // cleanly.
+                        purge_failed_isolate_registrations(
+                            &spawned_actions,
+                            &singleton_registry,
+                            &isolate_id,
+                        );
                         // An input-bearing pane of this package would survive as a
                         // live-looking input whose submissions vanish silently: the
                         // handler-required design leaves nothing to deliver to, and
@@ -3474,6 +3491,96 @@ fn build_restricted_container(
 /// denies the kind entirely; a non-empty list scopes the grant to exactly those entries.
 fn to_allow_list(entries: Vec<String>) -> Option<Vec<String>> {
     (!entries.is_empty()).then_some(entries)
+}
+
+#[cfg(test)]
+mod failed_isolate_registration_cleanup_tests {
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    use super::purge_failed_isolate_registrations;
+    use crate::session::runtime::origin::SingletonReservations;
+    use crate::session::runtime::{
+        ActionQueue, AutomationKind, IsolateId, Origin, RuntimeAction, SingletonKey,
+        SingletonOrigin, SingletonRegistry,
+    };
+
+    fn isolate(name: &str) -> IsolateId {
+        IsolateId::Package {
+            owner: Arc::from("wbk"),
+            name: Arc::from(name),
+            version: Arc::from("1.0.0"),
+        }
+    }
+
+    fn trigger_key(name: &str) -> SingletonKey {
+        SingletonKey {
+            origin: SingletonOrigin::Package {
+                owner: "wbk".to_string(),
+                name: "shared".to_string(),
+            },
+            kind: AutomationKind::Trigger,
+            name: Arc::from(name),
+        }
+    }
+
+    /// This invokes the exact rollback helper used when `load_modules` returns
+    /// `Err`. Static graph failures currently happen before JS evaluation, so
+    /// an external package fixture cannot acquire a reservation and then enter
+    /// this path; model the synchronous registrations directly instead.
+    #[test]
+    fn loader_failure_cleanup_preserves_another_winner_and_allows_retry() {
+        let healthy = isolate("healthy");
+        let failed = isolate("failed");
+        let retry = isolate("retry");
+        let keep = trigger_key("keep");
+        let retryable = trigger_key("retryable");
+        let registry: SingletonRegistry = Rc::new(RefCell::new(SingletonReservations::default()));
+        {
+            let mut reservations = registry.borrow_mut();
+            assert!(reservations.reserve(keep.clone(), healthy.clone()));
+            assert!(reservations.reserve(retryable.clone(), failed.clone()));
+        }
+
+        let actions: ActionQueue = Rc::default();
+        actions.borrow_mut().extend([
+            RuntimeAction::RemoveTrigger(
+                failed.clone(),
+                Origin::User,
+                Arc::new("failed action".to_string()),
+            ),
+            RuntimeAction::RemoveTrigger(
+                healthy.clone(),
+                Origin::User,
+                Arc::new("healthy action".to_string()),
+            ),
+            RuntimeAction::RequestRepaint,
+        ]);
+
+        purge_failed_isolate_registrations(&actions, &registry, &failed);
+
+        let actions: Vec<_> = actions.borrow_mut().drain(..).collect();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].target_isolate(), Some(&healthy));
+        assert!(matches!(&actions[1], RuntimeAction::RequestRepaint));
+
+        let mut reservations = registry.borrow_mut();
+        assert!(
+            reservations.contains(&keep),
+            "a reservation won by a different isolate must survive"
+        );
+        assert!(
+            !reservations.contains(&retryable),
+            "the failed isolate's own reservation must be released"
+        );
+        assert!(
+            reservations.reserve(retryable, retry.clone()),
+            "a later isolate must be able to retry the released identity"
+        );
+        assert!(
+            !reservations.reserve(keep, retry),
+            "the later isolate must not steal the surviving identity"
+        );
+    }
 }
 
 #[cfg(test)]
