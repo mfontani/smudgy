@@ -2,7 +2,8 @@ use crate::models::ScriptLang;
 use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
 use crate::models::matchers::{
-    AliasMatcherSource, ArgSpec, CmdMode, CommandSpec, ParseMode, command_prefilter,
+    AliasMatcherSource, ArgSpec, CmdMode, CommandSpec, MatcherColor, MatcherColorMatch, MatcherHsv,
+    MatcherHsvRange, MatcherTextAttribute, ParseMode, command_prefilter,
 };
 use crate::models::triggers::TriggerDefinition;
 use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
@@ -10,12 +11,13 @@ use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceR
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
-use crate::session::runtime::trigger::AliasSender;
-use crate::session::runtime::trigger::MatchCapture;
-use crate::session::runtime::trigger::SharedAutomationRegistry;
+use crate::session::runtime::trigger::{
+    AliasSender, MatchCapture, PreparedScriptTriggerPatterns, ScriptTriggerPattern,
+    SharedAutomationRegistry,
+};
 use crate::session::runtime::{
-    ActionQueue, AutomationKind, IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction, SingletonKey,
-    SingletonRegistry,
+    ActionQueue, AutomationKind, IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction, ScriptAction,
+    SingletonKey, SingletonRegistry,
 };
 use crate::session::styled_line::{
     Blink, Color, LinkAction, LinkMenu, LinkMenuItem, LinkMenuTitle, LinkToken, LinkTooltip,
@@ -2678,7 +2680,33 @@ fn reserve_singleton(
         kind,
         name: Arc::from(name),
     };
-    state.borrow::<SingletonRegistry>().borrow_mut().insert(key)
+    let isolate = current_isolate(state);
+    state
+        .borrow::<SingletonRegistry>()
+        .borrow_mut()
+        .reserve(key, isolate)
+}
+
+/// Read-only half of singleton registration. Trigger creation uses this after
+/// structural descriptor validation but before regex compilation so an
+/// already-won identity discards an unused replacement without changing the
+/// registry or rejecting its regex syntax.
+fn singleton_is_reserved(
+    state: &OpState,
+    singleton: bool,
+    origin: &Origin,
+    kind: AutomationKind,
+    name: &str,
+) -> bool {
+    if !singleton {
+        return false;
+    }
+    let key = SingletonKey {
+        origin: origin.singleton_origin(),
+        kind,
+        name: Arc::from(name),
+    };
+    state.borrow::<SingletonRegistry>().borrow().contains(&key)
 }
 
 /// Route a session-targeted action: the current session's actions join the
@@ -4419,6 +4447,214 @@ fn parse_command_spec(raw: &str) -> Result<Option<WireCommandSpec>, ()> {
         .map_err(|_| ())
 }
 
+/// Script-only trigger descriptor. It deliberately does not reuse the
+/// persisted matcher sidecar: raw script regexes stay on their direct path,
+/// while every displayed source remains paired with its style predicate.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptTriggerPatternsWire {
+    normal: Vec<ScriptTriggerPatternWire>,
+    raw: Vec<String>,
+    anti: Vec<ScriptTriggerPatternWire>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptTriggerPatternWire {
+    source: String,
+    #[serde(default)]
+    style: Option<ScriptStyleMatchWire>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptStyleMatchWire {
+    #[serde(default)]
+    foreground: Option<ScriptMatcherColorWire>,
+    #[serde(default)]
+    background: Option<ScriptMatcherColorWire>,
+    #[serde(default)]
+    attributes: Vec<MatcherTextAttribute>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptRgbWire {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+/// Matching ranges carry their authored RGB endpoints across the bridge. Rust
+/// owns the canonical RGB-to-HSV conversion; JS does not duplicate it.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum ScriptMatcherColorWire {
+    Ansi {
+        index: u8,
+    },
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
+    HsvRange {
+        from: ScriptRgbWire,
+        to: ScriptRgbWire,
+    },
+}
+
+impl ScriptMatcherColorWire {
+    fn into_matcher(self, path: &str) -> Result<MatcherColor, String> {
+        match self {
+            Self::Ansi { index } => {
+                if index > 15 {
+                    return Err(format!("{path}.index must be between 0 and 15"));
+                }
+                Ok(MatcherColor::Ansi { index })
+            }
+            Self::Rgb { r, g, b } => Ok(MatcherColor::Truecolor {
+                r,
+                g,
+                b,
+                range: None,
+            }),
+            Self::HsvRange { from, to } => {
+                let from_hsv = MatcherHsv::from_rgb(from.r, from.g, from.b);
+                let to_hsv = MatcherHsv::from_rgb(to.r, to.g, to.b);
+                Ok(MatcherColor::Truecolor {
+                    // The persisted model requires one preview RGB alongside
+                    // a range. Runtime compilation ignores it when `range` is
+                    // present; retaining `from` is deterministic.
+                    r: from.r,
+                    g: from.g,
+                    b: from.b,
+                    range: Some(MatcherHsvRange::from_to(from_hsv, to_hsv)),
+                })
+            }
+        }
+    }
+}
+
+fn matcher_attribute_order(attribute: MatcherTextAttribute) -> u8 {
+    match attribute {
+        MatcherTextAttribute::Bold => 0,
+        MatcherTextAttribute::Faint => 1,
+        MatcherTextAttribute::Italic => 2,
+        MatcherTextAttribute::Underline => 3,
+        MatcherTextAttribute::DoubleUnderline => 4,
+        MatcherTextAttribute::SlowBlink => 5,
+        MatcherTextAttribute::FastBlink => 6,
+        MatcherTextAttribute::CrossedOut => 7,
+        MatcherTextAttribute::Reverse => 8,
+    }
+}
+
+impl ScriptStyleMatchWire {
+    fn into_matcher(mut self, path: &str) -> Result<Option<MatcherColorMatch>, String> {
+        let mut seen = 0_u16;
+        for &attribute in &self.attributes {
+            let bit = 1_u16 << matcher_attribute_order(attribute);
+            if seen & bit != 0 {
+                return Err(format!(
+                    "{path}.attributes contains duplicate {attribute:?}"
+                ));
+            }
+            seen |= bit;
+        }
+        let underline = (1_u16 << matcher_attribute_order(MatcherTextAttribute::Underline))
+            | (1_u16 << matcher_attribute_order(MatcherTextAttribute::DoubleUnderline));
+        if seen & underline == underline {
+            return Err(format!(
+                "{path}.attributes cannot require both single and double underline"
+            ));
+        }
+        let blink = (1_u16 << matcher_attribute_order(MatcherTextAttribute::SlowBlink))
+            | (1_u16 << matcher_attribute_order(MatcherTextAttribute::FastBlink));
+        if seen & blink == blink {
+            return Err(format!(
+                "{path}.attributes cannot require both slow and fast blink"
+            ));
+        }
+        self.attributes
+            .sort_by_key(|attribute| matcher_attribute_order(*attribute));
+
+        let foreground = self
+            .foreground
+            .map(|color| color.into_matcher(&format!("{path}.foreground")))
+            .transpose()?;
+        let background = self
+            .background
+            .map(|color| color.into_matcher(&format!("{path}.background")))
+            .transpose()?;
+        if foreground.is_none() && background.is_none() && self.attributes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(MatcherColorMatch {
+            foreground,
+            background,
+            attributes: self.attributes,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct NormalizedScriptTriggerPatterns {
+    normal: Vec<ScriptTriggerPattern>,
+    raw: Vec<String>,
+    anti: Vec<ScriptTriggerPattern>,
+}
+
+impl ScriptTriggerPatternsWire {
+    /// Validate and canonicalize style predicates without compiling regexes.
+    /// This phase deliberately precedes the singleton read-only check.
+    fn normalize(self) -> Result<NormalizedScriptTriggerPatterns, String> {
+        let convert_rows = |role: &str,
+                            rows: Vec<ScriptTriggerPatternWire>|
+         -> Result<Vec<ScriptTriggerPattern>, String> {
+            rows.into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let supplied_style = row.style.is_some();
+                    let style = row
+                        .style
+                        .map(|style| style.into_matcher(&format!("{role}[{index}].style")))
+                        .transpose()?
+                        .flatten();
+                    if supplied_style && style.is_none() {
+                        return Err(format!(
+                            "{role}[{index}].style must constrain a color or positive attribute"
+                        ));
+                    }
+                    Ok(ScriptTriggerPattern {
+                        source: row.source,
+                        style,
+                    })
+                })
+                .collect()
+        };
+        let normal = convert_rows("normal", self.normal)?;
+        let anti = convert_rows("anti", self.anti)?;
+        if normal.is_empty() && self.raw.is_empty() {
+            return Err(
+                "a trigger requires at least one normal or raw positive pattern".to_string(),
+            );
+        }
+        Ok(NormalizedScriptTriggerPatterns {
+            normal,
+            raw: self.raw,
+            anti,
+        })
+    }
+}
+
+impl NormalizedScriptTriggerPatterns {
+    fn prepare(self) -> Result<PreparedScriptTriggerPatterns, String> {
+        PreparedScriptTriggerPatterns::prepare(self.normal, self.raw, self.anti)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Errors an automation op can throw: the capability denial, or an interop identity lookup
 /// failure (an unknown/forged creator id — the host-minted ids the facade carries are
 /// always valid, and a malformed creator descriptor already failed loudly at
@@ -4431,6 +4667,9 @@ pub enum AutomationOpError {
     #[class(inherit)]
     #[error(transparent)]
     Identity(#[from] StoreOpError),
+    #[class(generic)]
+    #[error("smudgy: invalid trigger descriptor: {0}")]
+    InvalidTrigger(String),
 }
 
 /// Returns whether the alias was created (`true`) or skipped because an equal singleton
@@ -4512,15 +4751,12 @@ fn op_smudgy_create_simple_alias(
 /// Returns whether the trigger was created (`true`) or skipped because an equal singleton
 /// identity was already reserved (`false`); a non-singleton create always returns `true`.
 #[allow(clippy::too_many_arguments)]
-#[op2(fast)]
+#[op2]
 fn op_smudgy_create_simple_trigger(
-    scope: &mut v8::PinScope,
     state: &mut OpState,
     creator_id: u32,
     #[string] name: String,
-    patterns: &v8::Array,
-    raw_patterns: &v8::Array,
-    anti_patterns: &v8::Array,
+    #[serde] descriptor: ScriptTriggerPatternsWire,
     #[string] script: String,
     prompt: bool,
     enabled: bool,
@@ -4531,71 +4767,40 @@ fn op_smudgy_create_simple_trigger(
     line_limit: u32,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_triggers, "triggers")?;
-    // Convert all pattern arrays to Vec<String>
-    let patterns_vec = match v8_array_to_vec_str(scope, patterns) {
-        Ok(patterns) => {
-            if patterns.is_empty() {
-                None
-            } else {
-                Some(patterns)
-            }
-        }
-        Err(_) => return Ok(false), // Silently fail on error
-    };
-
-    let raw_patterns_vec = match v8_array_to_vec_str(scope, raw_patterns) {
-        Ok(patterns) => {
-            if patterns.is_empty() {
-                None
-            } else {
-                Some(patterns)
-            }
-        }
-        Err(_) => return Ok(false), // Silently fail on error
-    };
-
-    let anti_patterns_vec = match v8_array_to_vec_str(scope, anti_patterns) {
-        Ok(patterns) => {
-            if patterns.is_empty() {
-                None
-            } else {
-                Some(patterns)
-            }
-        }
-        Err(_) => return Ok(false), // Silently fail on error
-    };
+    let normalized = descriptor
+        .normalize()
+        .map_err(AutomationOpError::InvalidTrigger)?;
 
     let origin = creator_origin(state, creator_id)?;
-    // First-writer-wins: a singleton whose identity is already reserved no-ops here.
+    // Preserve first-writer-wins without compiling an unused replacement.
+    if singleton_is_reserved(state, singleton, &origin, AutomationKind::Trigger, &name) {
+        return Ok(false);
+    }
+    // New registrations compile before their first mutation, so malformed
+    // regexes cannot strand a singleton identity or replace an old trigger.
+    let prepared = normalized
+        .prepare()
+        .map_err(AutomationOpError::InvalidTrigger)?;
     if !reserve_singleton(state, singleton, &origin, AutomationKind::Trigger, &name) {
         return Ok(false);
     }
 
-    // Create TriggerDefinition
-    let trigger_def = TriggerDefinition {
-        patterns: patterns_vec,
-        raw_patterns: raw_patterns_vec,
-        anti_patterns: anti_patterns_vec,
-        script: Some(script),
-        package: None,
-        language: ScriptLang::Plaintext,
-        enabled,
-        prompt,
-        priority,
-        fallthrough,
-        matchers: None,
-    };
-
     let isolate = current_isolate(state);
     queue_own_action(
         state,
-        RuntimeAction::AddTrigger {
+        RuntimeAction::AddScriptTrigger {
             isolate,
             origin,
             name: Arc::new(name),
-            trigger: trigger_def,
+            prepared: Arc::new(prepared),
+            script: ScriptAction::SendSimple(Arc::new(script)),
+            prompt,
+            enabled,
+            priority,
+            fallthrough,
             fire_limit: self_limit(fire_limit),
             line_limit: self_limit(line_limit),
+            script_source: None,
         },
     );
     Ok(true)
@@ -4604,15 +4809,13 @@ fn op_smudgy_create_simple_trigger(
 /// Returns whether the trigger was created (`true`) or skipped because an equal singleton
 /// identity was already reserved (`false`); a non-singleton create always returns `true`.
 #[allow(clippy::too_many_arguments)]
-#[op2(fast)]
+#[op2]
 fn op_smudgy_create_javascript_function_trigger<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     state: &mut OpState,
     creator_id: u32,
     #[string] name: String,
-    patterns: &v8::Array,
-    raw_patterns: &v8::Array,
-    anti_patterns: &v8::Array,
+    #[serde] descriptor: ScriptTriggerPatternsWire,
     f: v8::Local<'s, v8::Function>,
     prompt: bool,
     enabled: bool,
@@ -4624,23 +4827,19 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
     #[string] script_source: String,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_triggers, "triggers")?;
-    // Convert all pattern arrays to Vec<String>
-    let patterns_vec = match v8_array_to_vec_str(scope, patterns) {
-        Ok(patterns) => patterns,
-        Err(_) => return Ok(false), // Silently fail on error
-    };
-    let raw_patterns_vec = match v8_array_to_vec_str(scope, raw_patterns) {
-        Ok(patterns) => patterns,
-        Err(_) => return Ok(false), // Silently fail on error
-    };
-    let anti_patterns_vec = match v8_array_to_vec_str(scope, anti_patterns) {
-        Ok(patterns) => patterns,
-        Err(_) => return Ok(false), // Silently fail on error
-    };
+    let normalized = descriptor
+        .normalize()
+        .map_err(AutomationOpError::InvalidTrigger)?;
 
     let origin = creator_origin(state, creator_id)?;
-    // First-writer-wins: a singleton whose identity is already reserved no-ops here — and we
-    // skip registering the function so it doesn't leak into this isolate's registry.
+    // A skipped singleton performs structural validation but does not compile
+    // its unused replacement regexes or allocate a function-registry entry.
+    if singleton_is_reserved(state, singleton, &origin, AutomationKind::Trigger, &name) {
+        return Ok(false);
+    }
+    let prepared = normalized
+        .prepare()
+        .map_err(AutomationOpError::InvalidTrigger)?;
     if !reserve_singleton(state, singleton, &origin, AutomationKind::Trigger, &name) {
         return Ok(false);
     }
@@ -4659,14 +4858,12 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
     let isolate = current_isolate(state);
     queue_own_action(
         state,
-        RuntimeAction::AddJavascriptFunctionTrigger {
+        RuntimeAction::AddScriptTrigger {
             isolate,
             origin,
             name: Arc::new(name),
-            patterns: Arc::new(patterns_vec),
-            raw_patterns: Arc::new(raw_patterns_vec),
-            anti_patterns: Arc::new(anti_patterns_vec),
-            function_id,
+            prepared: Arc::new(prepared),
+            script: ScriptAction::CallJavascriptFunction(function_id),
             prompt,
             enabled,
             priority,
@@ -7838,6 +8035,112 @@ mod tests {
         Blink, LinkAction, LinkToken, TextAttributes, TextAttributesUpdate, Underline,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn script_trigger_hsv_range_uses_strict_rgb_endpoints_and_native_conversion() {
+        let color: super::ScriptMatcherColorWire = serde_json::from_value(serde_json::json!({
+            "kind": "hsvRange",
+            "from": { "r": 255, "g": 0, "b": 255 },
+            "to": { "r": 255, "g": 32, "b": 0 }
+        }))
+        .unwrap();
+        let matcher = color.into_matcher("normal[0].style.foreground").unwrap();
+        let super::MatcherColor::Truecolor {
+            r,
+            g,
+            b,
+            range: Some(range),
+        } = matcher
+        else {
+            panic!("hsvRange must compile to a ranged truecolor matcher");
+        };
+        assert_eq!((r, g, b), (255, 0, 255));
+        assert_eq!(
+            range.directed_endpoints(),
+            (
+                super::MatcherHsv::from_rgb(255, 0, 255),
+                super::MatcherHsv::from_rgb(255, 32, 0)
+            )
+        );
+
+        let error = serde_json::from_value::<super::ScriptMatcherColorWire>(serde_json::json!({
+            "kind": "hsvRange",
+            "from": { "hue": 300, "saturation": 255, "value": 255 },
+            "to": { "r": 255, "g": 32, "b": 0 }
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn script_trigger_wire_rejects_invalid_ansi_and_style_predicates() {
+        fn descriptor_with_style(
+            source: &str,
+            style: &serde_json::Value,
+        ) -> super::ScriptTriggerPatternsWire {
+            serde_json::from_value(serde_json::json!({
+                "normal": [{ "source": source, "style": style }],
+                "raw": [],
+                "anti": []
+            }))
+            .unwrap()
+        }
+
+        let error = descriptor_with_style(
+            "",
+            &serde_json::json!({
+                "foreground": { "kind": "ansi", "index": 16 }
+            }),
+        )
+        .normalize()
+        .unwrap_err();
+        assert!(error.contains("between 0 and 15"), "{error}");
+
+        for (attributes, expected) in [
+            (vec!["bold", "bold"], "duplicate"),
+            (
+                vec!["underline", "double_underline"],
+                "single and double underline",
+            ),
+            (vec!["slow_blink", "fast_blink"], "slow and fast blink"),
+        ] {
+            let error = descriptor_with_style("", &serde_json::json!({ "attributes": attributes }))
+                .normalize()
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let error = descriptor_with_style("go", &serde_json::json!({}))
+            .normalize()
+            .unwrap_err();
+        assert!(error.contains("must constrain"), "{error}");
+
+        let error = descriptor_with_style("", &serde_json::json!({}))
+            .normalize()
+            .unwrap_err();
+        assert!(error.contains("must constrain"), "{error}");
+
+        let anti_only: super::ScriptTriggerPatternsWire =
+            serde_json::from_value(serde_json::json!({
+                "normal": [],
+                "raw": [],
+                "anti": [{ "source": "stop" }]
+            }))
+            .unwrap();
+        let error = anti_only.normalize().unwrap_err();
+        assert!(error.contains("at least one normal or raw"), "{error}");
+    }
+
+    #[test]
+    fn script_trigger_wire_denies_unknown_descriptor_fields() {
+        let error = serde_json::from_value::<super::ScriptTriggerPatternsWire>(serde_json::json!({
+            "normal": [{ "source": "go", "style": null, "extra": true }],
+            "raw": [],
+            "anti": []
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
 
     // ---- Packed styled-echo payload ----------------------------------------------
 

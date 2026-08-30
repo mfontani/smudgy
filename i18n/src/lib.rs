@@ -314,6 +314,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_catalog_preserves_the_locale_neutral_palette_identifier() {
+        for catalog in available_catalogs() {
+            let translator = Translator::for_tag(catalog.tag).unwrap();
+            let rendered = crate::t!(
+                translator,
+                "editor-color-selected",
+                "color" => "xterm 196"
+            );
+            assert!(
+                rendered.contains("xterm 196"),
+                "{} selected-color label lost its palette identifier: {rendered}",
+                catalog.tag
+            );
+        }
+    }
+
     fn rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
         let mut entries: Vec<_> = std::fs::read_dir(root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))

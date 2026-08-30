@@ -1287,6 +1287,7 @@ impl Inner<'_> {
                     patterns: &Arc::new(trigger.patterns.unwrap_or_default()),
                     raw_patterns: &Arc::new(trigger.raw_patterns.unwrap_or_default()),
                     anti_patterns: &Arc::new(trigger.anti_patterns.unwrap_or_default()),
+                    matchers: trigger.matchers.as_deref(),
                     action,
                     enabled: trigger.enabled,
                     priority: trigger.priority,
@@ -1298,14 +1299,12 @@ impl Inner<'_> {
                 })?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::AddJavascriptFunctionTrigger {
+            RuntimeAction::AddScriptTrigger {
                 isolate,
                 origin,
                 name,
-                patterns,
-                raw_patterns,
-                anti_patterns,
-                function_id,
+                prepared,
+                script,
                 prompt,
                 enabled,
                 priority,
@@ -1314,22 +1313,20 @@ impl Inner<'_> {
                 line_limit,
                 script_source,
             } => {
-                self.trigger_manager.push_trigger(PushTriggerParams {
+                self.trigger_manager.push_script_trigger(
                     isolate,
                     origin,
-                    name: &name,
-                    patterns: &patterns,
-                    raw_patterns: &raw_patterns,
-                    anti_patterns: &anti_patterns,
-                    action: ScriptAction::CallJavascriptFunction(function_id),
+                    (*name).clone(),
+                    Arc::unwrap_or_clone(prepared),
+                    script,
+                    prompt,
                     enabled,
                     priority,
                     fallthrough,
-                    prompt,
                     fire_limit,
                     line_limit,
-                    source: script_source,
-                })?;
+                    script_source,
+                );
                 Ok(ActionResult::None)
             }
             RuntimeAction::EnableAlias(isolate, origin, name, enabled) => {
@@ -2446,10 +2443,12 @@ impl Inner<'_> {
                 command_separator,
                 raw_line_prefix,
                 log_enabled,
+                bold_is_bright,
                 script_settings,
             } => {
                 self.trigger_manager
                     .set_command_separator(command_separator.clone());
+                self.trigger_manager.set_bold_is_bright(bold_is_bright);
                 self.command_separator = command_separator;
                 self.raw_line_prefix = raw_line_prefix;
                 self.set_log_enabled(log_enabled);

@@ -299,10 +299,13 @@ interface Settings {
 /** A foreground/background color in the shape the write color API accepts.
  *  In the `{ color, bold? }` form an omitted `bold` means what the bare name
  *  means: the bright variant for an ANSI name, the normal slot for "default". */
-type Color =
-    | string
-    | { r: number; g: number; b: number }
-    | { color: string; bold?: boolean; paletteBright?: boolean };
+interface RgbColor {
+    r: number;
+    g: number;
+    b: number;
+}
+
+type Color = string | RgbColor | { color: string; bold?: boolean; paletteBright?: boolean };
 
 interface TextAttributes {
     bold: boolean;
@@ -597,6 +600,10 @@ function __styled_from_template(
                         run.link === null ? link : run.link,
                     );
                 }
+            } else if (__is_style_builder(value) && __style_builder_state(value).matcherOnly) {
+                throw new TypeError(
+                    "this style chain is trigger-only because it used range(); start a new exact style chain for output",
+                );
             } else {
                 // Plain-template semantics: every other value stringifies.
                 push(String(value), fg, bg, attributes, link);
@@ -606,12 +613,49 @@ function __styled_from_template(
     return new StyledTextImpl(runs);
 }
 
-/** The impl-side twin of the contract's `StyleBuilder` (see smudgy-core.d.ts). */
+/** One exact/range color encoded for the script-trigger serde boundary. */
+type ScriptMatcherColorWire =
+    | { kind: "ansi"; index: number }
+    | { kind: "rgb"; r: number; g: number; b: number }
+    | { kind: "hsvRange"; from: RgbColor; to: RgbColor };
+
+/** A positive terminal-style predicate encoded for the script-trigger serde boundary. */
+interface ScriptStyleMatchWire {
+    foreground?: ScriptMatcherColorWire;
+    background?: ScriptMatcherColorWire;
+    attributes?: string[];
+}
+
+interface StyleMatchSnapshot {
+    source: string;
+    patternSource?: string;
+    patternAnchors?: "both" | "start" | "end" | "none";
+    style: ScriptStyleMatchWire | null;
+    summary: string;
+}
+
+/** The impl-side twin of the contract's opaque `StyleMatch`. */
+interface StyleMatch {
+    readonly __smudgyStyleMatch: true;
+}
+
+interface StyleOutputColorSetter {
+    (color: Color): StyleBuilder;
+    range(from: RgbColor, to: RgbColor): StyleMatchBuilder;
+}
+
+interface StyleMatchColorSetter {
+    (color: Color): StyleMatchBuilder;
+    range(from: RgbColor, to: RgbColor): StyleMatchBuilder;
+}
+
+/** The impl-side twin of the contract's output-capable `StyleBuilder`. */
 interface StyleBuilder {
     (text: TemplateStringsArray, ...values: unknown[]): StyledTextImpl;
+    (pattern: Pattern): StyleMatch;
     (options: ColorOptions): StyleBuilder;
-    fg(color: Color): StyleBuilder;
-    bg(color: Color): StyleBuilder;
+    readonly fg: StyleOutputColorSetter;
+    readonly bg: StyleOutputColorSetter;
     readonly black: StyleBuilder;
     readonly red: StyleBuilder;
     readonly green: StyleBuilder;
@@ -641,6 +685,43 @@ interface StyleBuilder {
     readonly reverse: StyleBuilder;
 }
 
+/** A fully chainable style builder whose history makes it trigger-only. */
+interface StyleMatchBuilder {
+    (pattern: Pattern): StyleMatch;
+    (options: ColorOptions): StyleMatchBuilder;
+    readonly fg: StyleMatchColorSetter;
+    readonly bg: StyleMatchColorSetter;
+    readonly black: StyleMatchBuilder;
+    readonly red: StyleMatchBuilder;
+    readonly green: StyleMatchBuilder;
+    readonly yellow: StyleMatchBuilder;
+    readonly blue: StyleMatchBuilder;
+    readonly magenta: StyleMatchBuilder;
+    readonly cyan: StyleMatchBuilder;
+    readonly white: StyleMatchBuilder;
+    readonly default: StyleMatchBuilder;
+    readonly echo: StyleMatchBuilder;
+    readonly output: StyleMatchBuilder;
+    readonly warn: StyleMatchBuilder;
+    readonly bgBlack: StyleMatchBuilder;
+    readonly bgRed: StyleMatchBuilder;
+    readonly bgGreen: StyleMatchBuilder;
+    readonly bgYellow: StyleMatchBuilder;
+    readonly bgBlue: StyleMatchBuilder;
+    readonly bgMagenta: StyleMatchBuilder;
+    readonly bgCyan: StyleMatchBuilder;
+    readonly bgWhite: StyleMatchBuilder;
+    readonly bold: StyleMatchBuilder;
+    readonly faint: StyleMatchBuilder;
+    readonly italic: StyleMatchBuilder;
+    readonly underline: StyleMatchBuilder;
+    readonly doubleUnderline: StyleMatchBuilder;
+    readonly crossedOut: StyleMatchBuilder;
+    readonly reverse: StyleMatchBuilder;
+}
+
+type AnyStyleBuilder = StyleBuilder | StyleMatchBuilder;
+
 /** The shorthand property tables, built once: property name -> the color it sets. */
 const __STYLED_FG_PROPS: [string, Color][] =
     __STYLED_ANSI_NAMES.concat(__STYLED_ROLE_NAMES).map((name) => [name, name]);
@@ -668,15 +749,38 @@ const __STYLED_ATTRIBUTE_PROPS: [string, Partial<TextAttributes>][] = [
  *  options (`Symbol.for` for robustness across realm copies, like the styled
  *  text brand). */
 const __STYLE_BUILDER_BRAND = Symbol.for("smudgy.styleBuilder");
+const __STYLE_MATCH_BRAND = Symbol.for("smudgy.styleMatch");
 
-interface StyleBuilderState {
-    fg: Color | null;
-    bg: Color | null;
-    attributes: Partial<TextAttributes> | null;
+interface StyleHsvRange {
+    kind: "hsvRange";
+    from: RgbColor;
+    to: RgbColor;
 }
 
-function __is_style_builder(value: unknown): value is StyleBuilder {
+type StyleColorConstraint = Color | StyleHsvRange;
+
+interface StyleBuilderState {
+    fg: StyleColorConstraint | null;
+    bg: StyleColorConstraint | null;
+    attributes: Partial<TextAttributes> | null;
+    matcherOnly: boolean;
+}
+
+function __is_style_builder(value: unknown): value is AnyStyleBuilder {
     return typeof value === "function" && (value as any)[__STYLE_BUILDER_BRAND] !== undefined;
+}
+
+function __style_builder_state(value: AnyStyleBuilder): StyleBuilderState {
+    return (value as any)[__STYLE_BUILDER_BRAND] as StyleBuilderState;
+}
+
+function __is_style_match(value: unknown): value is StyleMatch {
+    return typeof value === "object" && value !== null
+        && (value as any)[__STYLE_MATCH_BRAND] !== undefined;
+}
+
+function __style_match_snapshot(value: StyleMatch): StyleMatchSnapshot {
+    return (value as any)[__STYLE_MATCH_BRAND] as StyleMatchSnapshot;
 }
 
 /** The runtime brand every link tag carries: the `LinkSpec` it would give its
@@ -715,10 +819,15 @@ function __line_options(
 ): HighlightOptions {
     if (typeof options === "function") {
         if (__is_style_builder(options)) {
-            const state = (options as any)[__STYLE_BUILDER_BRAND] as StyleBuilderState;
+            const state = __style_builder_state(options);
+            if (state.matcherOnly) {
+                throw new TypeError(
+                    "this style chain is trigger-only because it used range(); start a new exact style chain for line output",
+                );
+            }
             return {
-                ...(state.fg === null ? {} : { fg: state.fg }),
-                ...(state.bg === null ? {} : { bg: state.bg }),
+                ...(state.fg === null ? {} : { fg: state.fg as Color }),
+                ...(state.bg === null ? {} : { bg: state.bg as Color }),
                 ...(state.attributes === null ? {} : { attributes: state.attributes }),
             };
         }
@@ -768,21 +877,246 @@ function __line_options(
     return options;
 }
 
-/** Every step of the chain is a fresh immutable builder over `(fg, bg)`; each is both
- *  a template tag and (called with options) a refinement. Shorthand properties are
- *  memoizing getters: the derived builder is built on first touch and cached as a data
- *  property, so a chain echoed per incoming line pays its allocations once. */
-function __styled_make_builder(
-    fg: Color | null,
-    bg: Color | null,
+function __styled_rgb_endpoint(value: unknown, label: string): RgbColor {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new TypeError(`${label} must be an RGB object with numeric r, g, and b fields`);
+    }
+    const rgb = value as any;
+    if (typeof rgb.r !== "number" || typeof rgb.g !== "number" || typeof rgb.b !== "number") {
+        throw new TypeError(`${label} must be an RGB object with numeric r, g, and b fields`);
+    }
+    return Object.freeze({ r: __styled_u8(rgb.r), g: __styled_u8(rgb.g), b: __styled_u8(rgb.b) });
+}
+
+function __styled_hsv_range(from: unknown, to: unknown, arity: number): StyleHsvRange {
+    if (arity !== 2) {
+        throw new TypeError("range() expects exactly two { r, g, b } endpoints");
+    }
+    return Object.freeze({
+        kind: "hsvRange",
+        from: __styled_rgb_endpoint(from, "range() from"),
+        to: __styled_rgb_endpoint(to, "range() to"),
+    });
+}
+
+function __is_style_hsv_range(value: StyleColorConstraint): value is StyleHsvRange {
+    return typeof value === "object" && value !== null && (value as any).kind === "hsvRange";
+}
+
+function __style_color_wire(value: StyleColorConstraint, channel: string): ScriptMatcherColorWire {
+    if (__is_style_hsv_range(value)) {
+        return Object.freeze({ kind: "hsvRange", from: value.from, to: value.to });
+    }
+    if (typeof value === "string") {
+        if (__STYLED_ROLE_NAMES.indexOf(value) !== -1) {
+            throw new TypeError(
+                `${channel} color "${value}" is an output theme role and cannot match incoming terminal colors; use an ANSI color or RGB value`,
+            );
+        }
+        const index = __STYLED_ANSI_NAMES.indexOf(value);
+        if (index === -1) throw new TypeError(`unsupported ${channel} color "${value}"`);
+        return Object.freeze({ kind: "ansi", index: index + 8 });
+    }
+    if (typeof (value as any).r === "number") {
+        const rgb = value as RgbColor;
+        return Object.freeze({ kind: "rgb", r: rgb.r, g: rgb.g, b: rgb.b });
+    }
+    const palette = value as { color: string; bold?: boolean; paletteBright?: boolean };
+    if (palette.color === "default") {
+        throw new TypeError(
+            `${channel} color "default" cannot match incoming terminal colors; use an ANSI color or RGB value`,
+        );
+    }
+    const index = __STYLED_ANSI_NAMES.indexOf(palette.color);
+    if (index === -1) throw new TypeError(`unsupported ${channel} palette color "${palette.color}"`);
+    return Object.freeze({
+        kind: "ansi",
+        index: index + ((palette.paletteBright ?? palette.bold) ? 8 : 0),
+    });
+}
+
+const __STYLE_MATCH_ATTRIBUTE_ORDER: readonly [
+    keyof TextAttributes,
+    string,
+    string,
+][] = [
+    ["bold", "bold", "bold"],
+    ["faint", "faint", "faint"],
+    ["italic", "italic", "italic"],
+    ["underline", "underline", "underline"],
+    ["underline", "double_underline", "double-underline"],
+    ["blink", "slow_blink", "slow-blink"],
+    ["blink", "fast_blink", "fast-blink"],
+    ["crossedOut", "crossed_out", "crossed-out"],
+    ["reverse", "reverse", "reverse"],
+];
+
+function __style_attribute_wires(
     attributes: Partial<TextAttributes> | null,
-): StyleBuilder {
-    const builder = ((first: TemplateStringsArray | ColorOptions, ...values: unknown[]): any => {
+): { wire: string[]; summary: string[] } {
+    if (attributes === null) return { wire: [], summary: [] };
+    for (const name of ["bold", "faint", "italic", "crossedOut", "reverse"] as const) {
+        if (attributes[name] === false) {
+            throw new TypeError(
+                `style matching cannot require attributes.${name} to be false; only positive attribute requirements are supported`,
+            );
+        }
+    }
+    if (attributes.underline === "none") {
+        throw new TypeError(
+            'style matching cannot require attributes.underline to be "none"; require "single" or "double" instead',
+        );
+    }
+    if (attributes.blink === "none") {
+        throw new TypeError(
+            'style matching cannot require attributes.blink to be "none"; require "slow" or "fast" instead',
+        );
+    }
+
+    const wire: string[] = [];
+    const summary: string[] = [];
+    for (const [field, wireName, summaryName] of __STYLE_MATCH_ATTRIBUTE_ORDER) {
+        const expected = wireName === "double_underline"
+            ? "double"
+            : wireName === "underline"
+            ? "single"
+            : wireName === "slow_blink"
+            ? "slow"
+            : wireName === "fast_blink"
+            ? "fast"
+            : true;
+        if (attributes[field] === expected) {
+            wire.push(wireName);
+            summary.push(summaryName);
+        }
+    }
+    return { wire, summary };
+}
+
+function __style_hex(rgb: RgbColor): string {
+    return "#" + [rgb.r, rgb.g, rgb.b]
+        .map((component) => component.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+function __style_color_summary(color: ScriptMatcherColorWire): string {
+    if (color.kind === "ansi") {
+        const name = __STYLED_ANSI_NAMES[color.index % 8];
+        return `ansi:${color.index >= 8 ? "bright-" : ""}${name}`;
+    }
+    if (color.kind === "rgb") return `rgb:${__style_hex(color)}`;
+    return `hsv:${__style_hex(color.from)}->${__style_hex(color.to)}`;
+}
+
+function __style_predicate_from_state(
+    state: StyleBuilderState,
+): { wire: ScriptStyleMatchWire; summary: string } | null {
+    const foreground = state.fg === null ? undefined : __style_color_wire(state.fg, "foreground");
+    const background = state.bg === null ? undefined : __style_color_wire(state.bg, "background");
+    const attributes = __style_attribute_wires(state.attributes);
+    if (foreground === undefined && background === undefined && attributes.wire.length === 0) {
+        return null;
+    }
+
+    const wire = Object.freeze({
+        ...(foreground === undefined ? {} : { foreground }),
+        ...(background === undefined ? {} : { background }),
+        ...(attributes.wire.length === 0
+            ? {}
+            : { attributes: Object.freeze(attributes.wire) as unknown as string[] }),
+    });
+    const parts: string[] = [];
+    if (foreground !== undefined) parts.push(`fg=${__style_color_summary(foreground)}`);
+    if (background !== undefined) parts.push(`bg=${__style_color_summary(background)}`);
+    if (attributes.summary.length > 0) parts.push(`attrs=${attributes.summary.join(",")}`);
+    return { wire, summary: parts.join("; ") };
+}
+
+function __styled_make_match(pattern: Pattern, state: StyleBuilderState): StyleMatch {
+    const predicate = __style_predicate_from_state(state);
+    const candidate = pattern as any;
+    const friendlySource = pattern instanceof RegExp && typeof candidate.patternSource === "string"
+        ? candidate.patternSource
+        : undefined;
+    const friendlyAnchors = pattern instanceof RegExp
+            && (candidate.patternAnchors === "both" || candidate.patternAnchors === "start"
+                || candidate.patternAnchors === "end" || candidate.patternAnchors === "none")
+        ? candidate.patternAnchors
+        : undefined;
+    const snapshot: StyleMatchSnapshot = Object.freeze({
+        source: patternSource(pattern),
+        ...(friendlySource === undefined ? {} : { patternSource: friendlySource }),
+        ...(friendlyAnchors === undefined ? {} : { patternAnchors: friendlyAnchors }),
+        style: predicate?.wire ?? null,
+        summary: predicate?.summary ?? "",
+    });
+    const value = {} as StyleMatch;
+    Object.defineProperty(value, "__smudgyStyleMatch", { value: true });
+    Object.defineProperty(value, __STYLE_MATCH_BRAND, { value: snapshot });
+    return Object.freeze(value);
+}
+
+function __has_trigger_pattern_keys(value: object): boolean {
+    return ["patterns", "rawPatterns", "antiPatterns"].some((key) =>
+        Object.prototype.hasOwnProperty.call(value, key)
+    );
+}
+
+function __styled_rejected_argument(value: unknown): string | null {
+    if (__is_style_match(value)) {
+        return "this pattern is already style-qualified; compose the style before applying it to the pattern";
+    }
+    if (__is_style_builder(value)) {
+        return "a style chain cannot wrap another style chain; compose colors and attributes on one chain";
+    }
+    if (__is_link_tag(value)) return "a link tag is output, not a trigger pattern; pass a string or RegExp";
+    if (__is_styled_text(value)) return "styled output is not a trigger pattern; pass a string or RegExp";
+    if (isCommand(value)) return "command`...` values are alias matchers; pass a string or RegExp";
+    if (Array.isArray(value)) return "style() decorates one pattern, not an array; decorate each trigger leaf";
+    if (typeof value === "object" && value !== null && __has_trigger_pattern_keys(value)) {
+        return "style() decorates individual trigger leaves, not a TriggerPatterns object";
+    }
+    return null;
+}
+
+/** Every step of the chain is a fresh immutable builder over style state. An exact
+ * builder remains an output tag; calling either channel's `range()` makes that chain
+ * permanently trigger-only. Shorthand properties retain the existing lazy memoization. */
+function __styled_make_builder(
+    fg: StyleColorConstraint | null,
+    bg: StyleColorConstraint | null,
+    attributes: Partial<TextAttributes> | null,
+    matcherOnly = false,
+): AnyStyleBuilder {
+    const builder = ((
+        first: TemplateStringsArray | Pattern | ColorOptions,
+        ...values: unknown[]
+    ): any => {
         if (__is_template_strings(first)) {
-            return __styled_from_template(fg, bg, attributes, null, first, values);
+            if (matcherOnly) {
+                throw new TypeError(
+                    "this style chain is trigger-only because it used range(); start a new exact style chain for output",
+                );
+            }
+            return __styled_from_template(fg as Color | null, bg as Color | null, attributes, null, first, values);
+        }
+        if (typeof first === "string" || first instanceof RegExp) {
+            return __styled_make_match(first, state);
+        }
+        const rejected = __styled_rejected_argument(first);
+        if (rejected !== null) {
+            throw new TypeError(rejected);
         }
         if (typeof first !== "object" || first === null) {
-            throw new TypeError("style(...) expects { fg?, bg? }, or use it as a template tag");
+            throw new TypeError(
+                "style() expects a string/RegExp trigger pattern, color options, or tagged-template text",
+            );
+        }
+        if (
+            first.foregroundPaletteBright !== undefined
+            && typeof first.foregroundPaletteBright !== "boolean"
+        ) {
+            throw new TypeError("options.foregroundPaletteBright must be a boolean");
         }
         // `!= null` so an explicit null means unset, like the plain color options.
         // Attributes refine field-by-field: the new subset merges over what the
@@ -793,13 +1127,31 @@ function __styled_make_builder(
             first.attributes != null
                 ? __styled_merge_attributes(attributes, __styled_check_attributes(first.attributes))
                 : attributes,
+            matcherOnly,
         );
     }) as any;
-    builder.fg = (color: Color) =>
-        __styled_make_builder(__styled_check_color(color), bg, attributes);
-    builder.bg = (color: Color) =>
-        __styled_make_builder(fg, __styled_check_color(color), attributes);
-    const memoize = (prop: string, derive: () => StyleBuilder): void => {
+    const makeColorSetter = (channel: "fg" | "bg"): StyleOutputColorSetter | StyleMatchColorSetter => {
+        const setter = ((color: Color) =>
+            __styled_make_builder(
+                channel === "fg" ? __styled_check_color(color) : fg,
+                channel === "bg" ? __styled_check_color(color) : bg,
+                attributes,
+                matcherOnly,
+            )) as any;
+        setter.range = function(from: RgbColor, to: RgbColor): StyleMatchBuilder {
+            const range = __styled_hsv_range(from, to, arguments.length);
+            return __styled_make_builder(
+                channel === "fg" ? range : fg,
+                channel === "bg" ? range : bg,
+                attributes,
+                true,
+            ) as StyleMatchBuilder;
+        };
+        return setter;
+    };
+    builder.fg = makeColorSetter("fg");
+    builder.bg = makeColorSetter("bg");
+    const memoize = (prop: string, derive: () => AnyStyleBuilder): void => {
         Object.defineProperty(builder, prop, {
             configurable: true,
             get: () => {
@@ -810,14 +1162,19 @@ function __styled_make_builder(
         });
     };
     for (const [prop, color] of __STYLED_FG_PROPS) {
-        memoize(prop, () => __styled_make_builder(color, bg, attributes));
+        memoize(prop, () => __styled_make_builder(color, bg, attributes, matcherOnly));
     }
     for (const [prop, color] of __STYLED_BG_PROPS) {
-        memoize(prop, () => __styled_make_builder(fg, color, attributes));
+        memoize(prop, () => __styled_make_builder(fg, color, attributes, matcherOnly));
     }
     for (const [prop, patch] of __STYLED_ATTRIBUTE_PROPS) {
         memoize(prop, () =>
-            __styled_make_builder(fg, bg, __styled_merge_attributes(attributes, patch)));
+            __styled_make_builder(
+                fg,
+                bg,
+                __styled_merge_attributes(attributes, patch),
+                matcherOnly,
+            ));
     }
     // The whole state is frozen: it is reachable through a REGISTERED symbol,
     // and every value in it is owned (validation copies incoming objects), so
@@ -828,13 +1185,14 @@ function __styled_make_builder(
         fg: freezeValue(fg),
         bg: freezeValue(bg),
         attributes: freezeValue(attributes),
+        matcherOnly,
     });
     Object.defineProperty(builder, __STYLE_BUILDER_BRAND, { value: state });
-    return builder as StyleBuilder;
+    return builder as AnyStyleBuilder;
 }
 
 /** The root style builder (`style.red`, `style.bgBlue`, `style({ fg, bg })`, ...). */
-const style: StyleBuilder = __styled_make_builder(null, null, null);
+const style: StyleBuilder = __styled_make_builder(null, null, null) as StyleBuilder;
 
 /** The impl-side twin of the contract's `StyleTag` (see smudgy-core.d.ts). */
 interface StyleTag {
@@ -1299,6 +1657,11 @@ function __styled_echo_arg(
     if (__is_template_strings(first)) {
         return __styled_from_template(null, null, null, null, first, values);
     }
+    if (__is_style_builder(first) && __style_builder_state(first).matcherOnly) {
+        throw new TypeError(
+            "this style chain is trigger-only because it used range(); start a new exact style chain for output",
+        );
+    }
     return first as string | StyledTextImpl;
 }
 
@@ -1320,10 +1683,23 @@ type AutomationScript = InlineTemplate | AutomationHandler;
 
 type Pattern = string | RegExp;
 
+type TriggerPattern = Pattern | StyleMatch | StyleBuilder | StyleMatchBuilder;
+
 interface TriggerPatterns {
-    patterns?: Pattern[];
-    rawPatterns?: Pattern[];
-    antiPatterns?: Pattern[];
+    patterns?: readonly TriggerPattern[];
+    rawPatterns?: readonly Pattern[];
+    antiPatterns?: readonly TriggerPattern[];
+}
+
+interface ScriptTriggerPatternWire {
+    source: string;
+    style?: ScriptStyleMatchWire;
+}
+
+interface ScriptTriggerPatternsWire {
+    normal: ScriptTriggerPatternWire[];
+    raw: string[];
+    anti: ScriptTriggerPatternWire[];
 }
 
 /** The language of a persisted automation's script body. A `script` is sent as a literal
@@ -2801,6 +3177,22 @@ function createAlias(
     const priority = normalizePriority(options);
     const fallthrough = normalizeFallthrough(options);
 
+    const styledAliasValue = (value: unknown): boolean =>
+        __is_style_match(value) || __is_style_builder(value);
+    if (styledAliasValue(patterns)) {
+        throw new TypeError(
+            "style-qualified patterns are for incoming triggers; createAlias() accepts plain patterns",
+        );
+    }
+    if (Array.isArray(patterns)) {
+        const styledIndex = patterns.findIndex(styledAliasValue);
+        if (styledIndex >= 0) {
+            throw new TypeError(
+                `patterns[${styledIndex}] is style-qualified; createAlias() accepts plain patterns`,
+            );
+        }
+    }
+
     let patternList: string[];
     let commandSpec = "";
     let name: string;
@@ -2881,9 +3273,9 @@ function createTriggers(
             } = triggerDef;
 
             const validPatterns: TriggerPatterns = {
-                ...(patterns && { patterns }),
-                ...(rawPatterns && { rawPatterns }),
-                ...(antiPatterns && { antiPatterns }),
+                ...(patterns !== undefined && { patterns }),
+                ...(rawPatterns !== undefined && { rawPatterns }),
+                ...(antiPatterns !== undefined && { antiPatterns }),
             };
 
             const options: TriggerOptions = {
@@ -2908,7 +3300,7 @@ function createTriggers(
 /** Creates a new trigger. */
 function createTrigger(
     creatorId: number,
-    patterns: Pattern | TriggerPatterns,
+    patterns: TriggerPattern | TriggerPatterns,
     script: AutomationScript,
     options: TriggerOptions = {},
 ): Trigger {
@@ -2924,9 +3316,7 @@ function createTrigger(
         created = op_smudgy_create_javascript_function_trigger(
             creatorId,
             params.name,
-            params.normalizedPatterns.patterns,
-            params.normalizedPatterns.rawPatterns,
-            params.normalizedPatterns.antiPatterns,
+            params.descriptor,
             script,
             options.prompt ?? false,
             options.enabled ?? true,
@@ -2943,9 +3333,7 @@ function createTrigger(
         created = op_smudgy_create_simple_trigger(
             creatorId,
             params.name,
-            params.normalizedPatterns.patterns,
-            params.normalizedPatterns.rawPatterns,
-            params.normalizedPatterns.antiPatterns,
+            params.descriptor,
             script,
             options.prompt ?? false,
             options.enabled ?? true,
@@ -2962,21 +3350,20 @@ function createTrigger(
     return trigger;
 }
 
-interface NormalizedPatterns {
-    patterns: string[];
-    rawPatterns: string[];
-    antiPatterns: string[];
+interface NormalizedTriggerPatterns {
+    descriptor: ScriptTriggerPatternsWire;
+    derivedName: string;
 }
 
 interface NormalizedTriggerParams {
     name: string;
-    normalizedPatterns: NormalizedPatterns;
+    descriptor: ScriptTriggerPatternsWire;
     script: AutomationScript;
 }
 
 /** Validates and normalizes parameters for creating a trigger. */
 function validateCreateTriggerParams(
-    patterns: Pattern | TriggerPatterns,
+    patterns: TriggerPattern | TriggerPatterns,
     script: AutomationScript,
     options: TriggerOptions,
 ): NormalizedTriggerParams {
@@ -3012,32 +3399,21 @@ function validateCreateTriggerParams(
         throw new TypeError(`Unexpected option(s): ${unexpectedOptions.join(", ")}`);
     }
 
-    if (
-        typeof patterns !== "string" && !(patterns instanceof RegExp) &&
-        typeof patterns !== "object"
-    ) {
-        throw new TypeError(
-            "Patterns must be a string, RegExp, or an object with pattern properties",
-        );
-    }
-
     if (typeof script !== "string" && typeof script !== "function") {
         throw new TypeError("Script must be a string or function");
     }
 
     const normalizedPatterns = normalizePatterns(patterns);
     if (
-        normalizedPatterns.patterns.length === 0 &&
-        normalizedPatterns.rawPatterns.length === 0
+        normalizedPatterns.descriptor.normal.length === 0 &&
+        normalizedPatterns.descriptor.raw.length === 0
     ) {
         throw new TypeError("At least one pattern or raw pattern must be provided");
     }
 
-    const name = resolveAutomationName(options.name, () =>
-        derivePatternName([...normalizedPatterns.patterns, ...normalizedPatterns.rawPatterns]),
-    );
+    const name = resolveAutomationName(options.name, () => normalizedPatterns.derivedName);
 
-    return { name, normalizedPatterns, script };
+    return { name, descriptor: normalizedPatterns.descriptor, script };
 }
 
 /**
@@ -3469,30 +3845,196 @@ function command(strings: TemplateStringsArray, ...values: unknown[]): Command {
     return Object.freeze(value);
 }
 
-/** Normalizes the patterns for a trigger. */
-function normalizePatterns(patterns: Pattern | TriggerPatterns): {
-    patterns: string[];
-    rawPatterns: string[];
-    antiPatterns: string[];
-} {
-    if (isCommand(patterns)) {
-        throw new TypeError("command`...` values are for createAlias; a trigger matches lines with patterns");
-    }
-    const normalized = {
-        patterns: [] as string[],
-        rawPatterns: [] as string[],
-        antiPatterns: [] as string[],
-    };
+interface NormalizedTriggerLeaf {
+    source: string;
+    style: ScriptStyleMatchWire | null;
+    summary: string;
+}
 
-    if (typeof patterns === "string" || patterns instanceof RegExp) {
-        normalized.patterns = [patternSource(patterns)];
-    } else if (typeof patterns === "object") {
-        normalized.patterns = (patterns.patterns || []).map(patternSource);
-        normalized.rawPatterns = (patterns.rawPatterns || []).map(patternSource);
-        normalized.antiPatterns = (patterns.antiPatterns || []).map(patternSource);
-    }
+function __trigger_leaf_label(role: keyof TriggerPatterns, index: number): string {
+    return `${role}[${index}]`;
+}
 
+function __trigger_style_snapshot(
+    value: StyleMatch,
+    role: keyof TriggerPatterns,
+    index: number,
+): StyleMatchSnapshot {
+    const snapshot = __style_match_snapshot(value);
+    if (
+        typeof snapshot !== "object" || snapshot === null || typeof snapshot.source !== "string"
+        || typeof snapshot.summary !== "string"
+        || (snapshot.style !== null && (typeof snapshot.style !== "object" || snapshot.style === null))
+    ) {
+        throw new TypeError(`${__trigger_leaf_label(role, index)} has an invalid StyleMatch brand`);
+    }
+    return snapshot;
+}
+
+function __normalize_trigger_leaf(
+    value: unknown,
+    role: "patterns" | "antiPatterns",
+    index: number,
+): NormalizedTriggerLeaf {
+    const label = __trigger_leaf_label(role, index);
+    if (typeof value === "string" || value instanceof RegExp) {
+        return { source: patternSource(value), style: null, summary: "" };
+    }
+    if (__is_style_match(value)) {
+        const snapshot = __trigger_style_snapshot(value, role, index);
+        return { source: snapshot.source, style: snapshot.style, summary: snapshot.summary };
+    }
+    if (__is_style_builder(value)) {
+        let predicate: ReturnType<typeof __style_predicate_from_state>;
+        try {
+            predicate = __style_predicate_from_state(__style_builder_state(value));
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new TypeError(`${label}: ${message}`);
+        }
+        if (predicate === null) {
+            throw new TypeError(
+                `${label} is an unconstrained style chain; add a color or positive attribute, or supply a text pattern`,
+            );
+        }
+        return { source: "", style: predicate.wire, summary: predicate.summary };
+    }
+    if (isCommand(value)) {
+        throw new TypeError(`${label} is a command\`...\` value; command matchers are for createAlias()`);
+    }
+    if (__is_link_tag(value)) {
+        throw new TypeError(`${label} is a link tag; triggers accept strings, RegExp values, or style matches`);
+    }
+    if (__is_styled_text(value)) {
+        throw new TypeError(`${label} is styled output; apply the style chain to a string or RegExp instead`);
+    }
+    if (Array.isArray(value)) {
+        throw new TypeError(`${label} is an array; pattern-list entries must be individual leaves`);
+    }
+    throw new TypeError(
+        `${label} must be a string, RegExp, StyleMatch, or constrained style chain; received ${value === null ? "null" : typeof value}`,
+    );
+}
+
+function __normalize_raw_trigger_leaf(value: unknown, index: number): string {
+    const label = __trigger_leaf_label("rawPatterns", index);
+    if (__is_style_match(value) || __is_style_builder(value)) {
+        throw new TypeError(
+            `${label} cannot be styled; raw patterns inspect escape bytes, so decorate a displayed patterns/antiPatterns leaf instead`,
+        );
+    }
+    if (typeof value === "string" || value instanceof RegExp) return patternSource(value);
+    throw new TypeError(
+        `${label} must be a string or RegExp; received ${value === null ? "null" : typeof value}`,
+    );
+}
+
+function __normalize_trigger_array<T>(
+    value: unknown,
+    role: keyof TriggerPatterns,
+    normalize: (leaf: unknown, index: number) => T,
+): T[] {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) {
+        throw new TypeError(`${role} must be an array of trigger pattern leaves`);
+    }
+    const normalized: T[] = [];
+    for (let index = 0; index < value.length; index++) {
+        if (!Object.prototype.hasOwnProperty.call(value, index)) {
+            throw new TypeError(`${__trigger_leaf_label(role, index)} is a sparse hole; supply a pattern or remove it`);
+        }
+        normalized.push(normalize(value[index], index));
+    }
     return normalized;
+}
+
+function __trigger_escape_source(source: string): string {
+    let escaped = "";
+    for (const char of source) {
+        const code = char.charCodeAt(0);
+        if (char === "\\" || char === "|" || char === ";" || char === "[" || char === "]"
+            || char === "<" || char === ">") {
+            escaped += "\\" + char;
+        } else if (code < 0x20 || code === 0x7f) {
+            escaped += JSON.stringify(char).slice(1, -1);
+        } else {
+            escaped += char;
+        }
+    }
+    return escaped;
+}
+
+function __trigger_leaf_description(leaf: NormalizedTriggerLeaf): string {
+    const source = leaf.source === "" && leaf.style !== null
+        ? "<styled text>"
+        : __trigger_escape_source(leaf.source);
+    return leaf.style === null ? source : `${source} [${leaf.summary}]`;
+}
+
+/** Normalize every trigger leaf once, preserving source/style pairing for Rust. */
+function normalizePatterns(patterns: TriggerPattern | TriggerPatterns): NormalizedTriggerPatterns {
+    if (isCommand(patterns)) {
+        throw new TypeError("command`...` values are for createAlias(); triggers match incoming lines");
+    }
+    if (Array.isArray(patterns)) {
+        throw new TypeError("bare trigger pattern arrays are invalid; use { patterns: [...] }");
+    }
+
+    let normal: NormalizedTriggerLeaf[];
+    let raw: string[];
+    let anti: NormalizedTriggerLeaf[];
+    if (
+        typeof patterns === "string" || patterns instanceof RegExp
+        || __is_style_match(patterns) || __is_style_builder(patterns)
+    ) {
+        normal = [__normalize_trigger_leaf(patterns, "patterns", 0)];
+        raw = [];
+        anti = [];
+    } else {
+        if (typeof patterns !== "object" || patterns === null || __is_styled_text(patterns)) {
+            throw new TypeError(
+                "Patterns must be a string, RegExp, StyleMatch, constrained style chain, or TriggerPatterns object",
+            );
+        }
+        const group = patterns as TriggerPatterns;
+        normal = __normalize_trigger_array(group.patterns, "patterns", (leaf, index) =>
+            __normalize_trigger_leaf(leaf, "patterns", index));
+        raw = __normalize_trigger_array(group.rawPatterns, "rawPatterns", __normalize_raw_trigger_leaf);
+        anti = __normalize_trigger_array(group.antiPatterns, "antiPatterns", (leaf, index) =>
+            __normalize_trigger_leaf(leaf, "antiPatterns", index));
+    }
+
+    const descriptor: ScriptTriggerPatternsWire = {
+        normal: normal.map((leaf) => ({
+            source: leaf.source,
+            ...(leaf.style === null ? {} : { style: leaf.style }),
+        })),
+        raw,
+        anti: anti.map((leaf) => ({
+            source: leaf.source,
+            ...(leaf.style === null ? {} : { style: leaf.style }),
+        })),
+    };
+    const hasStyle = normal.some((leaf) => leaf.style !== null)
+        || anti.some((leaf) => leaf.style !== null);
+    if (!hasStyle) {
+        return {
+            descriptor,
+            derivedName: derivePatternName([...normal.map((leaf) => leaf.source), ...raw]),
+        };
+    }
+
+    const positives = [
+        ...normal.map(__trigger_leaf_description),
+        ...raw.map(__trigger_escape_source),
+    ].join(" | ");
+    const styledAnti = anti.filter((leaf) => leaf.style !== null).map(__trigger_leaf_description);
+    return {
+        descriptor,
+        derivedName: styledAnti.length === 0
+            ? positives
+            : `${positives} ; except ${styledAnti.join(" | ")}`,
+    };
 }
 
 /** A creator-bound introspection registry: `.get`/`.list`/`.exists` over owned names. */
@@ -4248,18 +4790,32 @@ const aliasToWire = (def: SavedAlias) => ({
     // cannot strip it (the save op validates the shape on deserialization).
     ...(def.matcher !== undefined && def.matcher !== null ? { matcher: def.matcher } : {}),
 });
-const triggerToWire = (def: SavedTrigger) => ({
-    enabled: def.enabled ?? true,
-    prompt: def.prompt ?? false,
-    priority: def.priority ?? 0,
-    fallthrough: def.fallthrough ?? true,
-    language: langToWire(def.language),
-    ...(def.patterns !== undefined ? { patterns: def.patterns } : {}),
-    ...(def.rawPatterns !== undefined ? { raw_patterns: def.rawPatterns } : {}),
-    ...(def.antiPatterns !== undefined ? { anti_patterns: def.antiPatterns } : {}),
-    ...(def.script !== undefined ? { script: String(def.script) } : {}),
-    ...(def.package !== undefined ? { package: String(def.package) } : {}),
-});
+const triggerToWire = (def: SavedTrigger) => {
+    for (const role of ["patterns", "rawPatterns", "antiPatterns"] as const) {
+        const leaves = (def as any)[role];
+        if (!Array.isArray(leaves)) continue;
+        const styledIndex = leaves.findIndex((leaf: unknown) =>
+            __is_style_match(leaf) || __is_style_builder(leaf)
+        );
+        if (styledIndex !== -1) {
+            throw new TypeError(
+                `${role}[${styledIndex}] cannot persist a script style match; create it with createTrigger() or author saved colors in the Automations editor`,
+            );
+        }
+    }
+    return {
+        enabled: def.enabled ?? true,
+        prompt: def.prompt ?? false,
+        priority: def.priority ?? 0,
+        fallthrough: def.fallthrough ?? true,
+        language: langToWire(def.language),
+        ...(def.patterns !== undefined ? { patterns: def.patterns } : {}),
+        ...(def.rawPatterns !== undefined ? { raw_patterns: def.rawPatterns } : {}),
+        ...(def.antiPatterns !== undefined ? { anti_patterns: def.antiPatterns } : {}),
+        ...(def.script !== undefined ? { script: String(def.script) } : {}),
+        ...(def.package !== undefined ? { package: String(def.package) } : {}),
+    };
+};
 const hotkeyToWire = (def: SavedHotkey) => ({
     key: String(def.key),
     modifiers: def.modifiers ?? [],
@@ -5371,7 +5927,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         // the creator id is internal provenance and never exposed to scripts.
         createAlias: (patterns: Pattern | Pattern[] | Command, script: AutomationScript, options?: AliasOptions) =>
             createAlias(creatorId, patterns, script, options),
-        createTrigger: (patterns: Pattern | TriggerPatterns, script: AutomationScript, options?: TriggerOptions) =>
+        createTrigger: (patterns: TriggerPattern | TriggerPatterns, script: AutomationScript, options?: TriggerOptions) =>
             createTrigger(creatorId, patterns, script, options),
         createTriggers: (triggers: Record<string, TriggerDef>) => createTriggers(creatorId, triggers),
         createTimer: timerHotkey.createTimer,

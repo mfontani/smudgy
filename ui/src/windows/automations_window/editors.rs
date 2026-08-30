@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iced::alignment::Vertical;
+use iced::keyboard::Key;
+use iced::widget::Id;
 use iced::widget::{
     Column, Space, button, checkbox, column, container, pick_list, radio, row, text, text_editor,
     text_input,
@@ -12,29 +14,36 @@ use iced::widget::{
 use iced::{Element, Font, Length, Padding};
 
 use smudgy_core::models::matchers::{
-    self, ArgKind, CmdMode, CommandOutcome, CommandSpec, MatcherSyntax,
+    self, ArgKind, CmdMode, CommandOutcome, CommandSpec, MatcherColor, MatcherColorChannel,
+    MatcherColorMatch, MatcherHsv, MatcherHsvRange, MatcherSyntax, MatcherTextAttribute,
 };
 use smudgy_core::models::server;
 use smudgy_core::models::{ScriptLang, aliases, hotkeys, naming, packages, triggers};
 
 use crate::assets::{bootstrap_icons, fonts};
+use crate::components::color_picker::ColorPicker;
 use crate::keymap::{self as hotkey_helpers, MaybePhysicalKey};
 use crate::theme::Theme;
 use crate::theme::builtins::button as button_style;
 use crate::update::Update;
 use crate::widgets::dropdown::Dropdown;
 use crate::widgets::hotkey_input::HotkeyInput;
+use crate::widgets::wrap_row::wrap_row;
 
 use super::common;
 use super::highlight;
+use super::keyboard_control::{
+    KeyAction, KeyboardControl, activation, grid_selection, linear_selection, publish_selection,
+};
 use super::model::{
-    AliasKind, AliasMatcherDraft, ArgKindChoice, NodeStatus, ParseModeChoice, PatternKind, Script,
-    ScriptKey, SyntaxChoice, TriggerCard, TriggerRow, pattern_error_text, rows_into_trigger,
-    trigger_rows, upsert_script_folder,
+    AliasKind, AliasMatcherDraft, ArgKindChoice, ColorRangeEndpoint, MatcherColorKind, NodeStatus,
+    ParseModeChoice, PatternKind, Script, ScriptKey, SyntaxChoice, TriggerCard, TriggerRow,
+    TruecolorComponent, parse_matcher_hex, pattern_error_text, rows_into_trigger, trigger_rows,
+    upsert_script_folder,
 };
 use super::{
     AutomationsWindow, EditNode, EditorMode, EditorState, Elem, Event, FolderState, Message,
-    ModuleMode, ModuleState, Pane, Selection,
+    ModuleMode, ModuleState, Pane, Selection, matcher_hsv_to_picker, matcher_truecolor_range,
 };
 
 const LABEL_WIDTH: f32 = 92.0;
@@ -1838,9 +1847,9 @@ impl AutomationsWindow {
             crate::i18n::ts!("automation-trigger"),
             trigger_package(state),
         );
-        let any_invalid = rows
-            .iter()
-            .any(|row| !row.source.trim().is_empty() && row.compiled().is_err());
+        let any_invalid = rows.iter().any(|row| {
+            (!row.source.trim().is_empty() || row.color.is_some()) && row.compiled().is_err()
+        });
         let status = Self::editor_status(create, enabled, any_invalid);
         let badge_label = if language == ScriptLang::Plaintext {
             crate::i18n::ts!("editor-text")
@@ -1916,6 +1925,10 @@ impl AutomationsWindow {
                 }
                 if trigger_row.syntax == MatcherSyntax::Pattern {
                     matchers = matchers.push(anchors_row(index, trigger_row));
+                }
+                if trigger_row.role != PatternKind::Raw {
+                    matchers =
+                        matchers.push(matcher_color_controls(self.window_id, index, trigger_row));
                 }
                 if trigger_row.role == PatternKind::Raw && trigger_row.source.trim().is_empty() {
                     matchers = matchers.push(raw_hint());
@@ -2120,18 +2133,28 @@ impl AutomationsWindow {
 
     /// A row's status dot value against the current test line.
     fn row_status(&self, trigger_row: &TriggerRow) -> NodeStatus {
-        if trigger_row.source.trim().is_empty() {
+        if trigger_row.source.trim().is_empty()
+            && (trigger_row.color.is_none() || trigger_row.role == PatternKind::Raw)
+        {
             return NodeStatus::Disabled;
         }
         let raw_subject = raw_of(&self.test_input);
+        let styled =
+            smudgy_core::session::connection::vt_processor::parse_ansi_fragment(&raw_subject);
         let subject = if trigger_row.role == PatternKind::Raw {
-            raw_subject.clone()
+            raw_subject
         } else {
-            plain_of(&raw_subject)
+            styled.text.clone()
         };
         match trigger_row.compiled().map(|s| regex::Regex::new(&s)) {
             Err(_) | Ok(Err(_)) => NodeStatus::Error,
-            Ok(Ok(re)) if !self.test_input.is_empty() && re.is_match(&subject) => {
+            Ok(Ok(re))
+                if !self.test_input.is_empty()
+                    && trigger_row.color.as_ref().map_or_else(
+                        || re.is_match(&subject),
+                        |color| preview_has_color_matched_start(&re, &subject, &styled, color),
+                    ) =>
+            {
                 // A matching exception is what BLOCKS the trigger.
                 if trigger_row.role == PatternKind::Anti {
                     NodeStatus::Error
@@ -2207,6 +2230,9 @@ impl AutomationsWindow {
         );
         if trigger_row.syntax == MatcherSyntax::Pattern {
             lines = lines.push(anchors_row(index, trigger_row));
+        }
+        if trigger_row.role != PatternKind::Raw {
+            lines = lines.push(matcher_color_controls(self.window_id, index, trigger_row));
         }
         if trigger_row.role == PatternKind::Raw && trigger_row.source.trim().is_empty() {
             lines = lines.push(raw_hint());
@@ -2685,7 +2711,10 @@ impl AutomationsWindow {
         let filled: Vec<(usize, &TriggerRow)> = rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| !row.source.trim().is_empty())
+            .filter(|(_, row)| {
+                !row.source.trim().is_empty()
+                    || (row.color.is_some() && row.role != PatternKind::Raw)
+            })
             .collect();
         if line.is_empty() {
             return (crate::i18n::t!("editor-enter-line"), NodeStatus::Disabled);
@@ -2698,7 +2727,9 @@ impl AutomationsWindow {
         }
 
         let raw_subject = raw_of(line);
-        let plain_subject = plain_of(&raw_subject);
+        let styled =
+            smudgy_core::session::connection::vt_processor::parse_ansi_fragment(&raw_subject);
+        let plain_subject = styled.text.as_str();
         let compile = |row: &TriggerRow| -> Result<regex::Regex, String> {
             let source = row.compiled()?;
             regex::Regex::new(&source)
@@ -2720,7 +2751,16 @@ impl AutomationsWindow {
                 .iter()
                 .filter(|(_, row)| row.role == PatternKind::Anti)
                 .enumerate()
-                .find_map(|(nth, (_, row))| compile(row).ok()?.is_match(subject).then_some(nth + 1))
+                .find_map(|(nth, (_, row))| {
+                    let regex = compile(row).ok()?;
+                    let matches = row.color.as_ref().map_or_else(
+                        || regex.is_match(subject),
+                        |filter| {
+                            preview_has_color_matched_start(&regex, plain_subject, &styled, filter)
+                        },
+                    );
+                    matches.then_some(nth + 1)
+                })
         };
 
         let mut first_block = None;
@@ -2728,7 +2768,7 @@ impl AutomationsWindow {
             let subject = if role == PatternKind::Raw {
                 raw_subject.as_str()
             } else {
-                plain_subject.as_str()
+                plain_subject
             };
             let phase: Vec<&TriggerRow> = filled
                 .iter()
@@ -2743,7 +2783,14 @@ impl AutomationsWindow {
                 continue;
             }
             for (nth, row) in phase.iter().enumerate() {
-                if compile(row).is_ok_and(|re| re.is_match(subject)) {
+                if compile(row).is_ok_and(|regex| {
+                    row.color.as_ref().map_or_else(
+                        || regex.is_match(subject),
+                        |filter| {
+                            preview_has_color_matched_start(&regex, plain_subject, &styled, filter)
+                        },
+                    )
+                }) {
                     let key = if role == PatternKind::Raw {
                         crate::i18n::t!("editor-fires-on-raw", "n" => (nth + 1).to_string())
                     } else {
@@ -3363,6 +3410,975 @@ fn anchors_row<'a>(index: usize, trigger_row: &TriggerRow) -> Elem<'a> {
     .into()
 }
 
+/// Returns the inline validation message for an unconstrained color-only row.
+fn color_filter_constraint_error(trigger_row: &TriggerRow) -> Option<&'static str> {
+    let filter = trigger_row.color.as_ref()?;
+    (trigger_row.source.is_empty()
+        && filter.foreground.is_none()
+        && filter.background.is_none()
+        && filter.attributes.is_empty())
+    .then(|| crate::i18n::ts!("editor-color-needs-constraint"))
+}
+
+const COLOR_CHANNELS: [MatcherColorChannel; 2] = [
+    MatcherColorChannel::Foreground,
+    MatcherColorChannel::Background,
+];
+
+fn color_control_id(window_id: iced::window::Id, row_index: usize, control: &str) -> Id {
+    Id::from(format!(
+        "automation-window-{window_id}-trigger-color-row-{row_index}-{control}"
+    ))
+}
+
+fn color_attribute_control_id(
+    window_id: iced::window::Id,
+    row_index: usize,
+    attribute: MatcherTextAttribute,
+) -> Id {
+    let name = match attribute {
+        MatcherTextAttribute::Bold => "attribute-bold",
+        MatcherTextAttribute::Faint => "attribute-faint",
+        MatcherTextAttribute::Italic => "attribute-italic",
+        MatcherTextAttribute::Underline => "attribute-underline",
+        MatcherTextAttribute::DoubleUnderline => "attribute-double-underline",
+        MatcherTextAttribute::SlowBlink => "attribute-slow-blink",
+        MatcherTextAttribute::FastBlink => "attribute-fast-blink",
+        MatcherTextAttribute::CrossedOut => "attribute-crossed-out",
+        MatcherTextAttribute::Reverse => "attribute-reverse",
+    };
+    color_control_id(window_id, row_index, name)
+}
+
+fn color_keyboard_control<'a>(
+    content: Elem<'a>,
+    id: Id,
+    focus_color: iced::Color,
+    on_key: impl Fn(&Key, bool) -> KeyAction<Message> + 'a,
+) -> Elem<'a> {
+    let focus_id = id.clone();
+    KeyboardControl::new(
+        content,
+        id,
+        move || Message::FocusColorControl(focus_id.clone()),
+        on_key,
+    )
+    .focus_color(focus_color)
+    .into()
+}
+
+/// Builds the color filter below a normal or exception matcher.
+///
+/// Foreground and background use independent tabs. Each channel retains its
+/// selection when the user selects the other tab. The choices are Any, ANSI,
+/// xterm, an exact truecolor, and a color range. Every selection other than
+/// Any must match.
+fn matcher_color_controls<'a>(
+    window_id: iced::window::Id,
+    index: usize,
+    trigger_row: &'a TriggerRow,
+) -> Elem<'a> {
+    let enabled = trigger_row.color.is_some();
+    let focus_color = crate::prefs::app_theme().styles.general.accent;
+    let heading_content: Elem<'a> = row![
+        checkbox(enabled)
+            .label(crate::i18n::ts!("editor-match-color"))
+            .on_toggle(move |value| Message::ToggleRowColor(index, value))
+            .size(14.0)
+            .text_size(12.0),
+    ]
+    .spacing(8.0)
+    .align_y(Vertical::Center)
+    .into();
+    let heading = color_keyboard_control(
+        heading_content,
+        color_control_id(window_id, index, "match"),
+        focus_color,
+        move |key, repeat| activation(key, repeat, Message::ToggleRowColor(index, !enabled)),
+    );
+
+    let Some(filter) = &trigger_row.color else {
+        return heading;
+    };
+
+    let channel_tab = |label: &'static str, channel: MatcherColorChannel| {
+        selector_tab(
+            label,
+            trigger_row.color_channel == channel,
+            Message::SelectRowColorChannel(index, channel),
+        )
+    };
+    let channels_content: Elem<'a> = row![
+        channel_tab(
+            crate::i18n::ts!("editor-color-foreground"),
+            MatcherColorChannel::Foreground,
+        ),
+        channel_tab(
+            crate::i18n::ts!("editor-color-background"),
+            MatcherColorChannel::Background,
+        ),
+    ]
+    .spacing(12.0)
+    .into();
+    let selected_channel = TriggerRow::color_channel_index(trigger_row.color_channel);
+    let channels = color_keyboard_control(
+        channels_content,
+        color_control_id(window_id, index, "channel"),
+        focus_color,
+        move |key, _repeat| {
+            publish_selection(
+                linear_selection(key, selected_channel, COLOR_CHANNELS.len()),
+                |selected| Message::SelectRowColorChannel(index, COLOR_CHANNELS[selected]),
+            )
+        },
+    );
+
+    let selected_color = match trigger_row.color_channel {
+        MatcherColorChannel::Foreground => filter.foreground,
+        MatcherColorChannel::Background => filter.background,
+    };
+    let selected_kind = MatcherColorKind::of(selected_color);
+    let color_draft = trigger_row.color_draft(trigger_row.color_channel);
+    let kind_label = |kind| match kind {
+        MatcherColorKind::Any => crate::i18n::ts!("editor-color-any"),
+        MatcherColorKind::Ansi => crate::i18n::ts!("editor-color-ansi"),
+        MatcherColorKind::Xterm => crate::i18n::ts!("editor-color-xterm"),
+        MatcherColorKind::Truecolor => crate::i18n::ts!("editor-color-truecolor"),
+        MatcherColorKind::ColorRange => crate::i18n::ts!("editor-color-range"),
+    };
+    let kinds_content: Elem<'a> = MatcherColorKind::ALL
+        .into_iter()
+        .fold(iced::widget::Row::new().spacing(12.0), |row, kind| {
+            row.push(selector_tab(
+                kind_label(kind),
+                selected_kind == kind,
+                Message::SelectRowColorKind(index, kind),
+            ))
+        })
+        .into();
+    let selected_kind_index = MatcherColorKind::ALL
+        .iter()
+        .position(|kind| *kind == selected_kind)
+        .unwrap_or(0);
+    let kinds = color_keyboard_control(
+        kinds_content,
+        color_control_id(window_id, index, "kind"),
+        focus_color,
+        move |key, _repeat| {
+            publish_selection(
+                linear_selection(key, selected_kind_index, MatcherColorKind::ALL.len()),
+                |selected| Message::SelectRowColorKind(index, MatcherColorKind::ALL[selected]),
+            )
+        },
+    );
+
+    let chooser: Elem<'a> = match selected_kind {
+        MatcherColorKind::Any => text(crate::i18n::ts!("editor-color-any-note"))
+            .size(12.0)
+            .style(common::muted)
+            .into(),
+        MatcherColorKind::Ansi => ansi_color_grid(window_id, index, selected_color, focus_color),
+        MatcherColorKind::Xterm => xterm_color_grid(window_id, index, selected_color, focus_color),
+        MatcherColorKind::Truecolor => exact_truecolor_editor(index, trigger_row, selected_color),
+        MatcherColorKind::ColorRange => {
+            let point = MatcherHsv::from_rgb(255, 255, 255);
+            let range = selected_color
+                .and_then(matcher_truecolor_range)
+                .unwrap_or_else(|| MatcherHsvRange::from_to(point, point));
+            column![
+                row![
+                    color_range_endpoint_editor(
+                        index,
+                        ColorRangeEndpoint::First,
+                        crate::i18n::ts!("editor-color-from"),
+                        range.first,
+                        &color_draft.color_range_hex[0],
+                    ),
+                    color_range_endpoint_editor(
+                        index,
+                        ColorRangeEndpoint::Second,
+                        crate::i18n::ts!("editor-color-to"),
+                        range.second,
+                        &color_draft.color_range_hex[1],
+                    ),
+                ]
+                .spacing(12.0),
+                row![
+                    range_color_swatches(range),
+                    text(hsv_range_name(range)).size(11.0),
+                ]
+                .spacing(10.0)
+                .align_y(Vertical::Center),
+                text(crate::i18n::ts!("editor-color-range-note"))
+                    .size(11.0)
+                    .style(common::muted),
+            ]
+            .spacing(8.0)
+            .into()
+        }
+    };
+
+    let attributes = color_attribute_controls(window_id, index, filter, focus_color);
+    let panel = container(
+        column![
+            channels,
+            kinds,
+            chooser,
+            attributes,
+            inline_error_slot(color_filter_constraint_error(trigger_row)),
+        ]
+        .spacing(8.0),
+    )
+    .padding(8.0)
+    .style(|theme: &Theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(
+            theme.styles.general.container_background,
+        )),
+        border: iced::Border {
+            color: theme.styles.general.border,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        ..Default::default()
+    });
+
+    column![heading, color_filter_summary_chip(filter), panel]
+        .spacing(6.0)
+        .into()
+}
+
+/// Keeps live validation text at a stable widget-tree position.
+fn inline_error_slot<'a>(message: Option<&'a str>) -> Elem<'a> {
+    let content: Elem<'a> = match message {
+        Some(message) => text(message).size(11.0).style(common::danger).into(),
+        None => Space::new().height(0).into(),
+    };
+    container(content).into()
+}
+
+fn exact_truecolor_editor<'a>(
+    index: usize,
+    trigger_row: &'a TriggerRow,
+    selected_color: Option<MatcherColor>,
+) -> Elem<'a> {
+    let (r, g, b) = match selected_color {
+        Some(MatcherColor::Truecolor {
+            r,
+            g,
+            b,
+            range: None,
+        }) => (r, g, b),
+        _ => (255, 255, 255),
+    };
+    let draft = &trigger_row
+        .color_draft(trigger_row.color_channel)
+        .exact_truecolor;
+    let hex_valid = parse_matcher_hex(&draft.hex).is_some();
+    let rgb_valid = draft.rgb.iter().all(|value| value.parse::<u8>().is_ok());
+    let label = |value: &'a str| {
+        text(value).size(11.0).font(Font {
+            weight: iced::font::Weight::Semibold,
+            ..fonts::GEIST_VF
+        })
+    };
+    column![
+        row![
+            column![
+                label(crate::i18n::ts!("editor-color-preview")),
+                mini_color_swatch(iced::Color::from_rgb8(r, g, b), 30.0),
+            ]
+            .spacing(5.0),
+            column![
+                label(crate::i18n::ts!("editor-color-hex")),
+                text_input("#rrggbb", &draft.hex)
+                    .on_input(move |value| Message::SetRowExactTruecolorHex(index, value))
+                    .width(Length::Fixed(120.0))
+                    .size(12.0),
+            ]
+            .spacing(5.0),
+            column![
+                label(crate::i18n::ts!("editor-color-red")),
+                text_input("0", &draft.rgb[0])
+                    .on_input(move |value| Message::SetRowExactTruecolorRgb(
+                        index,
+                        TruecolorComponent::Red,
+                        value,
+                    ))
+                    .width(Length::Fixed(64.0))
+                    .size(12.0),
+            ]
+            .spacing(5.0),
+            column![
+                label(crate::i18n::ts!("editor-color-green")),
+                text_input("0", &draft.rgb[1])
+                    .on_input(move |value| Message::SetRowExactTruecolorRgb(
+                        index,
+                        TruecolorComponent::Green,
+                        value,
+                    ))
+                    .width(Length::Fixed(64.0))
+                    .size(12.0),
+            ]
+            .spacing(5.0),
+            column![
+                label(crate::i18n::ts!("editor-color-blue")),
+                text_input("0", &draft.rgb[2])
+                    .on_input(move |value| Message::SetRowExactTruecolorRgb(
+                        index,
+                        TruecolorComponent::Blue,
+                        value,
+                    ))
+                    .width(Length::Fixed(64.0))
+                    .size(12.0),
+            ]
+            .spacing(5.0),
+        ]
+        .spacing(10.0)
+        .align_y(Vertical::Bottom),
+        inline_error_slot((!hex_valid).then_some(crate::i18n::ts!("editor-color-invalid-hex"))),
+        inline_error_slot((!rgb_valid).then_some(crate::i18n::ts!("editor-color-invalid-rgb"))),
+        text(crate::i18n::ts!("editor-color-truecolor-note"))
+            .size(11.0)
+            .style(common::muted),
+    ]
+    .spacing(5.0)
+    .into()
+}
+
+fn color_range_endpoint_editor<'a>(
+    index: usize,
+    endpoint: ColorRangeEndpoint,
+    label: &'a str,
+    hsv: MatcherHsv,
+    hex: &'a str,
+) -> Elem<'a> {
+    let picker = ColorPicker::view_for_hsv(matcher_hsv_to_picker(hsv))
+        .map(move |message| Message::SetRowColorRange(index, endpoint, message));
+    let (r, g, b) = hsv.to_rgb();
+    container(
+        column![
+            row![
+                text(label).size(11.0).font(Font {
+                    weight: iced::font::Weight::Semibold,
+                    ..fonts::GEIST_VF
+                }),
+                mini_color_swatch(iced::Color::from_rgb8(r, g, b), 14.0),
+            ]
+            .spacing(6.0)
+            .align_y(Vertical::Center),
+            picker,
+            column![
+                text(crate::i18n::ts!("editor-color-hex"))
+                    .size(11.0)
+                    .style(common::muted),
+                text_input("#rrggbb", hex)
+                    .on_input(move |value| Message::SetRowColorRangeHex(index, endpoint, value))
+                    .width(Length::Fill)
+                    .size(12.0),
+            ]
+            .spacing(4.0),
+            inline_error_slot(
+                parse_matcher_hex(hex)
+                    .is_none()
+                    .then_some(crate::i18n::ts!("editor-color-invalid-hex"))
+            ),
+        ]
+        .spacing(6.0),
+    )
+    .width(Length::FillPortion(1))
+    .padding(8.0)
+    .style(|theme: &Theme| iced::widget::container::Style {
+        background: Some(iced::Background::Color(
+            theme.styles.text.normal.scale_alpha(0.035),
+        )),
+        border: iced::Border {
+            color: theme.styles.general.border,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+fn selector_tab<'a>(label: &'a str, selected: bool, message: Message) -> Elem<'a> {
+    let mut control = button(
+        column![
+            text(label).size(12.0).style(if selected {
+                common::regular
+            } else {
+                common::muted
+            }),
+            container(Space::new())
+                .height(Length::Fixed(2.0))
+                .width(Length::Fill)
+                .style(move |theme: &Theme| iced::widget::container::Style {
+                    background: selected
+                        .then_some(iced::Background::Color(theme.styles.general.accent)),
+                    ..Default::default()
+                }),
+        ]
+        .spacing(3.0),
+    )
+    .style(|_theme: &Theme, _status| iced::widget::button::Style::default())
+    .padding(Padding {
+        top: 2.0,
+        bottom: 0.0,
+        left: 2.0,
+        right: 2.0,
+    });
+    if !selected {
+        control = control.on_press(message);
+    }
+    control.into()
+}
+
+fn ansi_color_grid<'a>(
+    window_id: iced::window::Id,
+    index: usize,
+    selected: Option<MatcherColor>,
+    focus_color: iced::Color,
+) -> Elem<'a> {
+    let selected = match selected {
+        Some(MatcherColor::Ansi { index }) => Some(index.min(15)),
+        _ => None,
+    };
+    let mut grid = Column::new().spacing(4.0);
+    for row_index in 0..2 {
+        let mut swatches = iced::widget::Row::new().spacing(4.0);
+        for column_index in 0..8 {
+            let ansi_index = row_index * 8 + column_index;
+            swatches = swatches.push(color_swatch(
+                MatcherColor::Ansi {
+                    index: ansi_index as u8,
+                },
+                selected == Some(ansi_index as u8),
+                Message::SetRowAnsiColor(index, ansi_index as u8),
+                palette_color_identifier(MatcherColor::Ansi {
+                    index: ansi_index as u8,
+                }),
+            ));
+        }
+        grid = grid.push(swatches);
+    }
+    if let Some(selected) = selected {
+        grid = grid.push(palette_selected_row(MatcherColor::Ansi { index: selected }));
+    }
+    let content: Elem<'a> = grid.into();
+    let current = usize::from(selected.unwrap_or(7));
+    color_keyboard_control(
+        content,
+        color_control_id(window_id, index, "ansi-grid"),
+        focus_color,
+        move |key, _repeat| {
+            publish_selection(grid_selection(key, current, 8, 16), |selected| {
+                Message::SetRowAnsiColor(index, selected as u8)
+            })
+        },
+    )
+}
+
+fn xterm_color_grid<'a>(
+    window_id: iced::window::Id,
+    index: usize,
+    selected: Option<MatcherColor>,
+    focus_color: iced::Color,
+) -> Elem<'a> {
+    let selected = match selected {
+        Some(MatcherColor::Xterm { index }) => Some(index),
+        _ => None,
+    };
+    let mut grid = Column::new().spacing(2.0);
+    for row_index in 0..16_u16 {
+        let mut swatches = iced::widget::Row::new().spacing(2.0);
+        for column_index in 0..16_u16 {
+            let xterm_index = (row_index * 16 + column_index) as u8;
+            swatches = swatches.push(color_swatch(
+                MatcherColor::Xterm { index: xterm_index },
+                selected == Some(xterm_index),
+                Message::SetRowXtermColor(index, xterm_index),
+                palette_color_identifier(MatcherColor::Xterm { index: xterm_index }),
+            ));
+        }
+        grid = grid.push(swatches);
+    }
+    if let Some(selected) = selected {
+        grid = grid.push(palette_selected_row(MatcherColor::Xterm {
+            index: selected,
+        }));
+    }
+    let content: Elem<'a> = grid.into();
+    let current = usize::from(selected.unwrap_or(7));
+    color_keyboard_control(
+        content,
+        color_control_id(window_id, index, "xterm-grid"),
+        focus_color,
+        move |key, _repeat| {
+            publish_selection(grid_selection(key, current, 16, 256), |selected| {
+                Message::SetRowXtermColor(index, selected as u8)
+            })
+        },
+    )
+}
+
+fn palette_color_identifier(color: MatcherColor) -> String {
+    match color {
+        MatcherColor::Ansi { index } => format!("ANSI {index}"),
+        MatcherColor::Xterm { index } => format!("xterm {index}"),
+        MatcherColor::Truecolor { .. } => matcher_color_name(color),
+    }
+}
+
+fn palette_selected_row<'a>(color: MatcherColor) -> Elem<'a> {
+    row![
+        mini_color_swatch(matcher_display_color(color), 14.0),
+        text(crate::i18n::t!(
+            "editor-color-selected",
+            "color" => palette_color_identifier(color)
+        ))
+        .size(11.0),
+    ]
+    .spacing(6.0)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn color_swatch<'a>(
+    color: MatcherColor,
+    selected: bool,
+    message: Message,
+    label: String,
+) -> Elem<'a> {
+    let display = matcher_display_color(color);
+    let size = if selected { 28.0 } else { 24.0 };
+    let control = button(Space::new())
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .padding(0.0)
+        .style(move |theme: &Theme, status| iced::widget::button::Style {
+            background: Some(iced::Background::Color(display)),
+            border: iced::Border {
+                color: if selected {
+                    theme.styles.general.accent
+                } else if status == iced::widget::button::Status::Hovered {
+                    theme.styles.text.normal
+                } else {
+                    theme.styles.general.border
+                },
+                width: if selected { 3.0 } else { 1.0 },
+                radius: 4.0.into(),
+            },
+            shadow: if selected {
+                iced::Shadow {
+                    color: iced::Color::BLACK.scale_alpha(0.45),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 5.0,
+                }
+            } else {
+                iced::Shadow::default()
+            },
+            ..Default::default()
+        })
+        .on_press(message);
+    let layer = container(control)
+        .width(Length::Fixed(28.0))
+        .height(Length::Fixed(28.0))
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(Vertical::Center);
+    let exploded: Elem<'a> = if selected {
+        let base = container(Space::new())
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(24.0))
+            .style(move |theme: &Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(display)),
+                border: iced::Border {
+                    color: theme.styles.general.border,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            });
+        iced::widget::stack![
+            container(base)
+                .width(Length::Fixed(28.0))
+                .height(Length::Fixed(28.0))
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(Vertical::Center),
+            layer,
+        ]
+        .width(Length::Fixed(28.0))
+        .height(Length::Fixed(28.0))
+        .into()
+    } else {
+        layer.into()
+    };
+    tip(exploded, label)
+}
+
+fn mini_color_swatch<'a>(color: iced::Color, size: f32) -> Elem<'a> {
+    container(Space::new())
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |theme: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(color)),
+            border: iced::Border {
+                color: theme.styles.general.border,
+                width: 1.0,
+                radius: 2.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn range_color_swatches<'a>(range: MatcherHsvRange) -> Elem<'a> {
+    let range = range.rgb_canonicalized();
+    let (from, to) = range.directed_endpoints();
+    let display = |hsv: MatcherHsv| {
+        let (r, g, b) = hsv.to_rgb();
+        iced::Color::from_rgb8(r, g, b)
+    };
+    row![
+        mini_color_swatch(display(from), 11.0),
+        mini_color_swatch(display(to), 11.0),
+    ]
+    .spacing(2.0)
+    .into()
+}
+
+fn matcher_color_swatches<'a>(color: MatcherColor) -> Elem<'a> {
+    match color {
+        MatcherColor::Truecolor {
+            range: Some(range), ..
+        } => range_color_swatches(range),
+        _ => mini_color_swatch(matcher_display_color(color), 11.0),
+    }
+}
+
+fn channel_color_summary<'a>(label: &'a str, color: Option<MatcherColor>) -> Elem<'a> {
+    let mut content = iced::widget::Row::new()
+        .spacing(4.0)
+        .align_y(Vertical::Center)
+        .push(text(label).size(11.0));
+    if let Some(color) = color {
+        content = content
+            .push(matcher_color_swatches(color))
+            .push(text(matcher_color_name(color)).size(11.0));
+    } else {
+        content = content.push(text(crate::i18n::ts!("editor-color-any-short")).size(11.0));
+    }
+    content.into()
+}
+
+fn color_filter_summary_chip<'a>(filter: &MatcherColorMatch) -> Elem<'a> {
+    let mut parts = vec![channel_color_summary(
+        crate::i18n::ts!("editor-color-foreground"),
+        filter.foreground,
+    )];
+    parts.push(
+        row![
+            text("·").size(11.0),
+            channel_color_summary(
+                crate::i18n::ts!("editor-color-background"),
+                filter.background,
+            ),
+        ]
+        .spacing(4.0)
+        .align_y(Vertical::Center)
+        .into(),
+    );
+    parts.extend(filter.attributes.iter().map(|attribute| {
+        Elem::from(
+            text(format!(
+                ", {}",
+                color_attribute_label(*attribute).to_lowercase()
+            ))
+            .size(11.0),
+        )
+    }));
+    container(wrap_row(parts).spacing(4.0, 3.0))
+        .padding(Padding {
+            top: 2.0,
+            bottom: 2.0,
+            left: 6.0,
+            right: 6.0,
+        })
+        .style(|theme: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(
+                theme.styles.text.normal.scale_alpha(0.06),
+            )),
+            border: iced::Border {
+                color: theme.styles.general.border,
+                width: 1.0,
+                radius: 9.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn color_attribute_label(attribute: MatcherTextAttribute) -> &'static str {
+    crate::i18n::translate_static(match attribute {
+        MatcherTextAttribute::Bold => "editor-color-bold",
+        MatcherTextAttribute::Faint => "editor-color-faint",
+        MatcherTextAttribute::Italic => "editor-color-italic",
+        MatcherTextAttribute::Underline => "editor-color-underline",
+        MatcherTextAttribute::DoubleUnderline => "editor-color-double-underline",
+        MatcherTextAttribute::SlowBlink => "editor-color-slow-blink",
+        MatcherTextAttribute::FastBlink => "editor-color-fast-blink",
+        MatcherTextAttribute::CrossedOut => "editor-color-crossed-out",
+        MatcherTextAttribute::Reverse => "editor-color-reverse",
+    })
+}
+
+fn color_attribute_controls<'a>(
+    window_id: iced::window::Id,
+    index: usize,
+    filter: &MatcherColorMatch,
+    focus_color: iced::Color,
+) -> Elem<'a> {
+    let choices = [
+        (MatcherTextAttribute::Bold, "editor-color-bold"),
+        (MatcherTextAttribute::Faint, "editor-color-faint"),
+        (MatcherTextAttribute::Italic, "editor-color-italic"),
+        (MatcherTextAttribute::Underline, "editor-color-underline"),
+        (
+            MatcherTextAttribute::DoubleUnderline,
+            "editor-color-double-underline",
+        ),
+        (MatcherTextAttribute::SlowBlink, "editor-color-slow-blink"),
+        (MatcherTextAttribute::FastBlink, "editor-color-fast-blink"),
+        (MatcherTextAttribute::CrossedOut, "editor-color-crossed-out"),
+        (MatcherTextAttribute::Reverse, "editor-color-reverse"),
+    ];
+    let children = choices
+        .into_iter()
+        .map(|(attribute, key)| {
+            let selected = filter.attributes.contains(&attribute);
+            let content: Elem<'a> = checkbox(selected)
+                .label(crate::i18n::translate_static(key))
+                .on_toggle(move |value| Message::ToggleRowColorAttribute(index, attribute, value))
+                .size(13.0)
+                .text_size(11.0)
+                .into();
+            color_keyboard_control(
+                content,
+                color_attribute_control_id(window_id, index, attribute),
+                focus_color,
+                move |key, repeat| {
+                    activation(
+                        key,
+                        repeat,
+                        Message::ToggleRowColorAttribute(index, attribute, !selected),
+                    )
+                },
+            )
+        })
+        .collect();
+    column![
+        text(crate::i18n::ts!("editor-color-attributes"))
+            .size(11.0)
+            .style(common::muted),
+        wrap_row(children).spacing(12.0, 5.0),
+    ]
+    .spacing(5.0)
+    .into()
+}
+
+fn matcher_color_name(color: MatcherColor) -> String {
+    match color {
+        MatcherColor::Ansi { index } => ansi_color_name(index),
+        MatcherColor::Xterm { index } => format!("xterm {index}"),
+        MatcherColor::Truecolor {
+            range: Some(range), ..
+        } => hsv_range_name(range),
+        MatcherColor::Truecolor {
+            r,
+            g,
+            b,
+            range: None,
+        } => format!("#{r:02x}{g:02x}{b:02x}"),
+    }
+}
+
+fn ansi_color_name(index: u8) -> String {
+    format!("ANSI {index}")
+}
+
+fn hsv_range_name(range: MatcherHsvRange) -> String {
+    let range = range.rgb_canonicalized();
+    let (from, to) = range.directed_endpoints();
+    let (saturation_min, saturation_max) = range.saturation_bounds();
+    let (value_min, value_max) = range.value_bounds();
+    let percent = |component: u8| (u16::from(component) * 100 + 127) / 255;
+    format!(
+        "H {}→{}°  S {}–{}%  V {}–{}%",
+        from.hue,
+        to.hue,
+        percent(saturation_min),
+        percent(saturation_max),
+        percent(value_min),
+        percent(value_max),
+    )
+}
+
+fn matcher_display_color(color: MatcherColor) -> iced::Color {
+    let prefs = crate::prefs::current();
+    prefs.resolve(matcher_vt_color(color))
+}
+
+fn matcher_vt_color(color: MatcherColor) -> smudgy_core::session::styled_line::Color {
+    use smudgy_core::session::connection::vt_processor::AnsiColor;
+    use smudgy_core::session::styled_line::Color;
+    let ansi = |index: u8| match index % 8 {
+        0 => AnsiColor::Black,
+        1 => AnsiColor::Red,
+        2 => AnsiColor::Green,
+        3 => AnsiColor::Yellow,
+        4 => AnsiColor::Blue,
+        5 => AnsiColor::Magenta,
+        6 => AnsiColor::Cyan,
+        _ => AnsiColor::White,
+    };
+    match color {
+        MatcherColor::Ansi { index } | MatcherColor::Xterm { index } if index < 16 => Color::Ansi {
+            color: ansi(index),
+            bold: index >= 8,
+        },
+        MatcherColor::Xterm { index } if index < 232 => {
+            let n = index - 16;
+            let component = |level: u8| if level == 0 { 0 } else { 55 + 40 * level };
+            Color::Rgb {
+                r: component(n / 36),
+                g: component((n % 36) / 6),
+                b: component(n % 6),
+            }
+        }
+        MatcherColor::Xterm { index } => {
+            let value = 8 + 10 * (index - 232);
+            Color::Rgb {
+                r: value,
+                g: value,
+                b: value,
+            }
+        }
+        MatcherColor::Truecolor { r, g, b, .. } => Color::Rgb { r, g, b },
+        MatcherColor::Ansi { index } => Color::Ansi {
+            color: ansi(index),
+            bold: index >= 8,
+        },
+    }
+}
+
+fn preview_has_color_matched_start(
+    regex: &regex::Regex,
+    subject: &str,
+    line: &smudgy_core::session::styled_line::StyledLine,
+    filter: &MatcherColorMatch,
+) -> bool {
+    let bold_is_bright = crate::prefs::current().bold_mode.uses_bright_palette();
+    if regex.as_str().is_empty() {
+        // Consecutive SGR changes can create zero-width transition spans.
+        // These spans contain no text. An empty pattern cannot start in them
+        // on a nonempty line. On an empty line, the final span defines the
+        // cursor style at the only match position.
+        return if subject.is_empty() {
+            line.spans
+                .last()
+                .is_some_and(|span| preview_style_matches(span.style, filter, bold_is_bright))
+        } else {
+            line.spans.iter().any(|span| {
+                span.begin_pos < span.end_pos
+                    && preview_style_matches(span.style, filter, bold_is_bright)
+            })
+        };
+    }
+    let mut span_index = 0;
+    let mut cached_span_index = usize::MAX;
+    let mut cached_style_matches = false;
+    regex.find_iter(subject).any(|matched| {
+        let start = matched.start();
+        while line
+            .spans
+            .get(span_index)
+            .is_some_and(|span| span.end_pos <= start)
+        {
+            span_index += 1;
+        }
+        let Some(span) = line.spans.get(span_index) else {
+            return false;
+        };
+        if span.begin_pos > start || start >= span.end_pos {
+            return false;
+        }
+        if cached_span_index != span_index {
+            cached_span_index = span_index;
+            cached_style_matches = preview_style_matches(span.style, filter, bold_is_bright);
+        }
+        cached_style_matches
+    })
+}
+
+fn preview_style_matches(
+    style: smudgy_core::session::styled_line::Style,
+    filter: &MatcherColorMatch,
+    bold_is_bright: bool,
+) -> bool {
+    use smudgy_core::session::styled_line::{Blink, Color, Underline};
+    let foreground = if style.attributes.bold && bold_is_bright {
+        match style.fg {
+            Color::Ansi { color, bold: false } => Color::Ansi { color, bold: true },
+            Color::DefaultForeground { bold: false } => Color::DefaultForeground { bold: true },
+            other => other,
+        }
+    } else {
+        style.fg
+    };
+    if filter
+        .foreground
+        .is_some_and(|color| !preview_color_matches(foreground, color))
+        || filter
+            .background
+            .is_some_and(|color| !preview_color_matches(style.bg, color))
+    {
+        return false;
+    }
+    filter.attributes.iter().all(|attribute| match attribute {
+        MatcherTextAttribute::Bold => style.attributes.bold,
+        MatcherTextAttribute::Faint => style.attributes.faint,
+        MatcherTextAttribute::Italic => style.attributes.italic,
+        MatcherTextAttribute::Underline => style.attributes.underline == Underline::Single,
+        MatcherTextAttribute::DoubleUnderline => style.attributes.underline == Underline::Double,
+        MatcherTextAttribute::SlowBlink => style.attributes.blink == Blink::Slow,
+        MatcherTextAttribute::FastBlink => style.attributes.blink == Blink::Fast,
+        MatcherTextAttribute::CrossedOut => style.attributes.crossed_out,
+        MatcherTextAttribute::Reverse => style.attributes.reverse,
+    })
+}
+
+fn preview_color_matches(
+    actual: smudgy_core::session::styled_line::Color,
+    matcher: MatcherColor,
+) -> bool {
+    use smudgy_core::session::styled_line::Color;
+    if let MatcherColor::Truecolor {
+        range: Some(range), ..
+    } = matcher
+    {
+        let Color::Rgb { r, g, b } = actual else {
+            return false;
+        };
+        let range = range.rgb_canonicalized();
+        let hsv = MatcherHsv::from_rgb(r, g, b);
+        let (saturation_min, saturation_max) = range.saturation_bounds();
+        let (value_min, value_max) = range.value_bounds();
+        return (hsv.saturation == 0 || range.hue_matches(hsv.hue))
+            && (saturation_min..=saturation_max).contains(&hsv.saturation)
+            && (value_min..=value_max).contains(&hsv.value);
+    }
+    actual == matcher_vt_color(matcher)
+}
+
 /// The raw kind's teaching hint, shown only while its field is blank.
 fn raw_hint<'a>() -> Elem<'a> {
     text(crate::i18n::ts!("editor-raw-hint"))
@@ -3750,13 +4766,6 @@ fn raw_of(test: &str) -> String {
     test.replace("\\e", "\x1b")
 }
 
-/// The ANSI-stripped subject normal matchers see.
-fn plain_of(raw: &str) -> String {
-    static ANSI: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new("\x1b\\[[0-9;]*[A-Za-z]").unwrap());
-    ANSI.replace_all(raw, "").into_owned()
-}
-
 fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {
     if pattern.is_empty() {
         return (
@@ -3805,6 +4814,180 @@ mod tests {
     use super::*;
 
     #[test]
+    fn color_control_ids_and_palette_labels_are_stable_and_locale_neutral() {
+        let first_window = iced::window::Id::unique();
+        let second_window = iced::window::Id::unique();
+        assert_eq!(
+            color_control_id(first_window, 4, "channel"),
+            color_control_id(first_window, 4, "channel")
+        );
+        assert_ne!(
+            color_control_id(first_window, 4, "channel"),
+            color_control_id(first_window, 5, "channel")
+        );
+        assert_ne!(
+            color_control_id(first_window, 4, "channel"),
+            color_control_id(second_window, 4, "channel")
+        );
+        assert_ne!(
+            color_attribute_control_id(first_window, 4, MatcherTextAttribute::Bold),
+            color_attribute_control_id(first_window, 4, MatcherTextAttribute::Faint)
+        );
+        assert_eq!(
+            palette_color_identifier(MatcherColor::Ansi { index: 12 }),
+            "ANSI 12"
+        );
+        assert_eq!(
+            palette_color_identifier(MatcherColor::Xterm { index: 196 }),
+            "xterm 196"
+        );
+    }
+
+    #[test]
+    fn color_only_row_reports_a_try_it_match() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "color-only-status-test".to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.test_input = "\u{1b}[31mred".to_string();
+        let row = TriggerRow {
+            color: Some(MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 1 }),
+                ..Default::default()
+            }),
+            ..TriggerRow::new(PatternKind::Match)
+        };
+
+        assert_eq!(window.row_status(&row), NodeStatus::Ok);
+        window.pane = Pane::Editor(EditorState {
+            mode: EditorMode::Create,
+            original_name: None,
+            name: "color only".to_string(),
+            node: EditNode::Trigger {
+                enabled: true,
+                language: ScriptLang::Plaintext,
+                prompt: false,
+                priority: 0,
+                fallthrough: false,
+                package: None,
+                rows: vec![row],
+            },
+            error: None,
+        });
+        assert_eq!(window.trigger_verdict().1, NodeStatus::Ok);
+    }
+
+    #[test]
+    fn all_any_color_only_row_is_invalid_but_an_attribute_constraint_matches() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "color-only-constraint-test".to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.test_input = "\u{1b}[1mbold".to_string();
+        let mut row = TriggerRow {
+            color: Some(MatcherColorMatch::default()),
+            ..TriggerRow::new(PatternKind::Match)
+        };
+
+        assert_eq!(
+            color_filter_constraint_error(&row),
+            Some(crate::i18n::ts!("editor-color-needs-constraint"))
+        );
+        assert_eq!(window.row_status(&row), NodeStatus::Error);
+        window.pane = Pane::Editor(EditorState {
+            mode: EditorMode::Create,
+            original_name: None,
+            name: "color only".to_string(),
+            node: EditNode::Trigger {
+                enabled: true,
+                language: ScriptLang::Plaintext,
+                prompt: false,
+                priority: 0,
+                fallthrough: false,
+                package: None,
+                rows: vec![row.clone()],
+            },
+            error: None,
+        });
+        assert_eq!(window.trigger_verdict().1, NodeStatus::Error);
+
+        row.color
+            .as_mut()
+            .unwrap()
+            .attributes
+            .push(MatcherTextAttribute::Bold);
+        assert_eq!(color_filter_constraint_error(&row), None);
+        assert_eq!(window.row_status(&row), NodeStatus::Ok);
+        let Pane::Editor(EditorState {
+            node: EditNode::Trigger { rows, .. },
+            ..
+        }) = &mut window.pane
+        else {
+            panic!("test window must contain a trigger editor");
+        };
+        rows[0] = row;
+        assert_eq!(window.trigger_verdict().1, NodeStatus::Ok);
+    }
+
+    #[test]
+    fn color_only_preview_ignores_zero_width_pre_sgr_style() {
+        use smudgy_core::session::connection::vt_processor::AnsiColor;
+        use smudgy_core::session::styled_line::{Color, Style, StyledLine, TextAttributes, VtSpan};
+
+        let cyan = Color::Ansi {
+            color: AnsiColor::Cyan,
+            bold: false,
+        };
+        let line = StyledLine::new(
+            "cyan",
+            vec![
+                // The cursor inherited dim cyan from the previous line. SGR
+                // bold changed the style before this line emitted any text.
+                VtSpan {
+                    style: Style {
+                        fg: cyan,
+                        ..Style::DEFAULT
+                    },
+                    begin_pos: 0,
+                    end_pos: 0,
+                },
+                VtSpan {
+                    style: Style {
+                        fg: cyan,
+                        attributes: TextAttributes {
+                            bold: true,
+                            ..TextAttributes::DEFAULT
+                        },
+                        ..Style::DEFAULT
+                    },
+                    begin_pos: 0,
+                    end_pos: 4,
+                },
+            ],
+        );
+        let empty = regex::Regex::new("").unwrap();
+        let dim = MatcherColorMatch {
+            foreground: Some(MatcherColor::Ansi { index: 6 }),
+            ..Default::default()
+        };
+        let bright = MatcherColorMatch {
+            foreground: Some(MatcherColor::Ansi { index: 14 }),
+            ..Default::default()
+        };
+
+        assert!(!preview_has_color_matched_start(
+            &empty, "cyan", &line, &dim
+        ));
+        assert!(preview_has_color_matched_start(
+            &empty, "cyan", &line, &bright
+        ));
+    }
+
+    #[test]
     fn live_error_slot_keeps_following_input_focus_state() {
         let value = String::new();
         let valid = iced::widget::column![
@@ -3822,6 +5005,33 @@ mod tests {
         let invalid = iced::widget::column![
             error_slot(Some("invalid regular expression")),
             text_input("pattern", &value).on_input(Message::SetName)
+        ];
+        tree.diff(&invalid as &dyn Widget<Message, Theme, iced::Renderer>);
+
+        let input_state = tree.children[1]
+            .state
+            .downcast_ref::<iced::widget::text_input::State<Paragraph>>();
+        assert!(input_state.is_focused());
+    }
+
+    #[test]
+    fn inline_color_error_slot_keeps_following_input_focus_state() {
+        let value = String::new();
+        let valid = iced::widget::column![
+            inline_error_slot(None),
+            text_input("#rrggbb", &value).on_input(Message::SetName)
+        ];
+        let mut tree = Tree::new(&valid as &dyn Widget<Message, Theme, iced::Renderer>);
+
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let input_state = tree.children[1]
+            .state
+            .downcast_mut::<iced::widget::text_input::State<Paragraph>>();
+        input_state.focus();
+
+        let invalid = iced::widget::column![
+            inline_error_slot(Some("Enter six hexadecimal digits.")),
+            text_input("#rrggbb", &value).on_input(Message::SetName)
         ];
         tree.diff(&invalid as &dyn Widget<Message, Theme, iced::Renderer>);
 

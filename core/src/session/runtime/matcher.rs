@@ -32,6 +32,10 @@ use regex_syntax::hir::HirKind;
 pub struct PatternSet {
     /// Original pattern strings, for diagnostics.
     patterns: Vec<String>,
+    /// Empty regexes match every subject without inspecting its bytes. Keep
+    /// their original indices out of the text engines so a color-only trigger
+    /// can proceed directly to its O(spans) style scan.
+    always_match_indices: Vec<usize>,
     /// Patterns that are pure literals, matched in one Aho-Corasick pass.
     literals: AhoCorasick,
     /// Aho-Corasick pattern id → index in `patterns`.
@@ -67,10 +71,21 @@ impl PatternSet {
             .map(|p| p.as_ref().to_owned())
             .collect();
 
+        let mut always_match_indices = Vec::new();
         let mut literal_strings = Vec::new();
         let mut literal_indices = Vec::new();
         let mut filter_candidates = Vec::new();
+        let mut unfiltered = Vec::new();
         for (idx, pattern) in patterns.iter().enumerate() {
+            // Empty regexes are used by color-only triggers. Neither an empty
+            // Aho-Corasick automaton nor an empty regex-filtered set is free to
+            // run over a long haystack, so keep this O(1) candidate separate
+            // from every text engine. The trigger's style qualifier then
+            // performs its O(spans) scan.
+            if pattern.is_empty() {
+                always_match_indices.push(idx);
+                continue;
+            }
             if let Some(literal) = as_literal(pattern) {
                 literal_strings.push(literal);
                 literal_indices.push(idx);
@@ -87,7 +102,6 @@ impl PatternSet {
         // `regex-filtered` parses with its own parser; in the unlikely event
         // it rejects a pattern the regex crate accepts, demote that pattern
         // to an individually-checked regex rather than failing the set.
-        let mut unfiltered = Vec::new();
         let (filtered, filtered_indices) = loop {
             let mut builder = Some(regex_filtered::Builder::new_atom_len(2));
             let mut rejected = None;
@@ -118,6 +132,7 @@ impl PatternSet {
 
         Ok(Self {
             patterns,
+            always_match_indices,
             literals,
             literal_indices,
             filtered,
@@ -130,22 +145,27 @@ impl PatternSet {
     /// ascending and deduplicated.
     #[must_use]
     pub fn matched_indices(&self, haystack: &str) -> Vec<usize> {
-        let mut out: Vec<usize> = self
-            .literals
-            .find_overlapping_iter(haystack)
-            .map(|m| self.literal_indices[m.pattern().as_usize()])
-            .chain(
+        let mut out = self.always_match_indices.clone();
+        if !self.literal_indices.is_empty() {
+            out.extend(
+                self.literals
+                    .find_overlapping_iter(haystack)
+                    .map(|m| self.literal_indices[m.pattern().as_usize()]),
+            );
+        }
+        if !self.filtered_indices.is_empty() {
+            out.extend(
                 self.filtered
                     .matching(haystack)
                     .map(|(id, _)| self.filtered_indices[id]),
-            )
-            .chain(
-                self.unfiltered
-                    .iter()
-                    .filter(|(_, regex)| regex.is_match(haystack))
-                    .map(|(idx, _)| *idx),
-            )
-            .collect();
+            );
+        }
+        out.extend(
+            self.unfiltered
+                .iter()
+                .filter(|(_, regex)| regex.is_match(haystack))
+                .map(|(idx, _)| *idx),
+        );
         out.sort_unstable();
         out.dedup();
         out
@@ -161,6 +181,7 @@ impl PatternSet {
 impl std::fmt::Debug for PatternSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PatternSet")
+            .field("always", &self.always_match_indices.len())
             .field("literals", &self.literal_indices.len())
             .field("filtered", &self.filtered_indices.len())
             .field("unfiltered", &self.unfiltered.len())
@@ -226,6 +247,42 @@ mod tests {
             set.matched_indices("you wear a shiny ring of power"),
             vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn empty_regex_bypasses_every_text_engine() {
+        let set = PatternSet::build([""]).unwrap();
+        assert_eq!(set.always_match_indices, [0]);
+        assert!(set.literal_indices.is_empty());
+        assert!(set.filtered_indices.is_empty());
+        assert!(set.unfiltered.is_empty());
+        assert_eq!(set.matched_indices(&"x".repeat(100_000)), vec![0]);
+    }
+
+    #[test]
+    fn mixed_always_literal_and_regex_matches_keep_original_index_order() {
+        let set = PatternSet::build([
+            "",
+            "needle",
+            r"n\w+",
+            "",
+            "needle",
+            r"^needle$",
+            r"n\w+",
+            r"(?:)",
+        ])
+        .unwrap();
+        assert_eq!(set.always_match_indices, [0, 3]);
+
+        // Repeated matches of one pattern collapse to one index, while
+        // duplicate patterns remain distinct original entries across tiers.
+        assert_eq!(
+            set.matched_indices("needle needle"),
+            vec![0, 1, 2, 3, 4, 6, 7]
+        );
+        assert_eq!(set.matched_indices("needle"), (0..=7).collect::<Vec<_>>());
+        assert_eq!(set.matched_indices("other"), vec![0, 3, 7]);
+        assert_eq!(set.matched_indices(""), vec![0, 3, 7]);
     }
 
     #[test]

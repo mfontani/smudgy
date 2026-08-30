@@ -232,6 +232,145 @@ impl std::fmt::Display for SyntaxChoice {
     }
 }
 
+/// The selected tab for one foreground or background color channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatcherColorKind {
+    Any,
+    Ansi,
+    Xterm,
+    Truecolor,
+    ColorRange,
+}
+
+/// Identifies the color-range endpoint that an editor control changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorRangeEndpoint {
+    First,
+    Second,
+}
+
+impl ColorRangeEndpoint {
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
+}
+
+/// Identifies an RGB input in the exact truecolor editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruecolorComponent {
+    Red,
+    Green,
+    Blue,
+}
+
+impl TruecolorComponent {
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Red => 0,
+            Self::Green => 1,
+            Self::Blue => 2,
+        }
+    }
+}
+
+impl MatcherColorKind {
+    pub const ALL: [Self; 5] = [
+        Self::Any,
+        Self::Ansi,
+        Self::Xterm,
+        Self::Truecolor,
+        Self::ColorRange,
+    ];
+
+    pub fn of(color: Option<matchers::MatcherColor>) -> Self {
+        match color {
+            None => Self::Any,
+            Some(matchers::MatcherColor::Ansi { .. }) => Self::Ansi,
+            Some(matchers::MatcherColor::Xterm { .. }) => Self::Xterm,
+            Some(matchers::MatcherColor::Truecolor { range: None, .. }) => Self::Truecolor,
+            Some(matchers::MatcherColor::Truecolor { range: Some(_), .. }) => Self::ColorRange,
+        }
+    }
+}
+
+/// Editable text for one exact truecolor selection.
+///
+/// These strings preserve incomplete or invalid input while the user types.
+/// The row matcher changes only when all values are valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactTruecolorDraft {
+    pub hex: String,
+    pub rgb: [String; 3],
+    /// The last complete value. Tab changes restore the matcher from this
+    /// value without discarding incomplete text.
+    pub last_valid: [u8; 3],
+}
+
+impl ExactTruecolorDraft {
+    #[must_use]
+    pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            hex: format!("#{r:02x}{g:02x}{b:02x}"),
+            rgb: [r.to_string(), g.to_string(), b.to_string()],
+            last_valid: [r, g, b],
+        }
+    }
+}
+
+impl Default for ExactTruecolorDraft {
+    fn default() -> Self {
+        Self::from_rgb(255, 255, 255)
+    }
+}
+
+/// Editable color text for one terminal color channel.
+///
+/// The editor stores a separate draft for foreground and background. A
+/// channel-tab change does not discard a partial value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelColorDraft {
+    pub exact_truecolor: ExactTruecolorDraft,
+    pub color_range_hex: [String; 2],
+    /// The last complete range. Tab changes restore the matcher from this
+    /// value without discarding incomplete endpoint text.
+    pub color_range_last_valid: matchers::MatcherHsvRange,
+}
+
+impl ChannelColorDraft {
+    #[must_use]
+    fn from_color(color: Option<matchers::MatcherColor>) -> Self {
+        let color_range_last_valid = color_range_value(color);
+        Self {
+            exact_truecolor: exact_truecolor_draft(color),
+            color_range_hex: color_range_hexes(color_range_last_valid),
+            color_range_last_valid,
+        }
+    }
+}
+
+impl Default for ChannelColorDraft {
+    fn default() -> Self {
+        Self::from_color(None)
+    }
+}
+
+/// Parses six hexadecimal RGB digits with an optional leading `#`.
+#[must_use]
+pub fn parse_matcher_hex(value: &str) -> Option<(u8, u8, u8)> {
+    let value = value.strip_prefix('#').unwrap_or(value);
+    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let packed = u32::from_str_radix(value, 16).ok()?;
+    let [_, r, g, b] = packed.to_be_bytes();
+    Some((r, g, b))
+}
+
 /// An `ArgKind` wrapper carrying the pick-list `Display`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgKindChoice(pub ArgKind);
@@ -504,6 +643,17 @@ pub struct TriggerRow {
     pub source: String,
     pub anchor_start: bool,
     pub anchor_end: bool,
+    /// An optional color filter. Only normal and exception rows expose this
+    /// filter. Raw rows continue to match escape bytes directly.
+    pub color: Option<matchers::MatcherColorMatch>,
+    /// Identifies the color channel that the tabbed editor displays. This
+    /// field stores editor-only state.
+    pub color_channel: matchers::MatcherColorChannel,
+    /// Stores editable color text separately for foreground and background.
+    pub color_drafts: [ChannelColorDraft; 2],
+    /// The filter most recently disabled with the editor checkbox. This is
+    /// transient UI state: save/load continues to persist only [`Self::color`].
+    pub(super) remembered_color: Option<matchers::MatcherColorMatch>,
 }
 
 impl TriggerRow {
@@ -514,11 +664,109 @@ impl TriggerRow {
             source: String::new(),
             anchor_start: true,
             anchor_end: true,
+            color: None,
+            color_channel: matchers::MatcherColorChannel::Foreground,
+            color_drafts: [ChannelColorDraft::default(), ChannelColorDraft::default()],
+            remembered_color: None,
         }
+    }
+
+    /// Enables or disables the row's color filter without discarding an
+    /// authored filter during an in-editor off/on round trip.
+    pub fn set_color_enabled(&mut self, enabled: bool) {
+        if enabled {
+            if self.color.is_none() {
+                self.color = Some(self.remembered_color.take().unwrap_or_else(|| {
+                    matchers::MatcherColorMatch {
+                        foreground: Some(matchers::MatcherColor::Ansi { index: 7 }),
+                        ..Default::default()
+                    }
+                }));
+            }
+        } else if let Some(color) = self.color.take() {
+            self.remembered_color = Some(color);
+        }
+    }
+
+    #[must_use]
+    pub const fn color_channel_index(channel: matchers::MatcherColorChannel) -> usize {
+        match channel {
+            matchers::MatcherColorChannel::Foreground => 0,
+            matchers::MatcherColorChannel::Background => 1,
+        }
+    }
+
+    #[must_use]
+    pub fn color_draft(&self, channel: matchers::MatcherColorChannel) -> &ChannelColorDraft {
+        &self.color_drafts[Self::color_channel_index(channel)]
+    }
+
+    pub fn color_draft_mut(
+        &mut self,
+        channel: matchers::MatcherColorChannel,
+    ) -> &mut ChannelColorDraft {
+        &mut self.color_drafts[Self::color_channel_index(channel)]
+    }
+
+    fn color_draft_error(&self) -> Option<String> {
+        let filter = self.color.as_ref()?;
+        if self.role != PatternKind::Raw
+            && self.source.is_empty()
+            && filter.foreground.is_none()
+            && filter.background.is_none()
+            && filter.attributes.is_empty()
+        {
+            return Some(crate::i18n::t!("editor-color-needs-constraint"));
+        }
+        for (channel, color) in [
+            (matchers::MatcherColorChannel::Foreground, filter.foreground),
+            (matchers::MatcherColorChannel::Background, filter.background),
+        ] {
+            let draft = self.color_draft(channel);
+            let error = match color {
+                Some(matchers::MatcherColor::Truecolor { range: None, .. })
+                    if parse_matcher_hex(&draft.exact_truecolor.hex).is_none() =>
+                {
+                    Some(crate::i18n::t!("editor-color-invalid-hex"))
+                }
+                Some(matchers::MatcherColor::Truecolor { range: None, .. })
+                    if !draft
+                        .exact_truecolor
+                        .rgb
+                        .iter()
+                        .all(|value| value.parse::<u8>().is_ok()) =>
+                {
+                    Some(crate::i18n::t!("editor-color-invalid-rgb"))
+                }
+                Some(matchers::MatcherColor::Truecolor { range: Some(_), .. })
+                    if draft
+                        .color_range_hex
+                        .iter()
+                        .any(|value| parse_matcher_hex(value).is_none()) =>
+                {
+                    Some(crate::i18n::t!("editor-color-invalid-hex"))
+                }
+                _ => None,
+            };
+            if let Some(error) = error {
+                let channel = crate::i18n::translate_static(match channel {
+                    matchers::MatcherColorChannel::Foreground => "editor-color-foreground",
+                    matchers::MatcherColorChannel::Background => "editor-color-background",
+                });
+                return Some(format!("{channel}: {error}"));
+            }
+        }
+        None
     }
 
     /// The stored regex this row derives to, or a display-ready error.
     pub fn compiled(&self) -> Result<String, String> {
+        if let Some(error) = self.color_draft_error() {
+            return Err(error);
+        }
+        if self.source.is_empty() && self.color.is_some() && self.role != PatternKind::Raw {
+            return Ok(String::new());
+        }
         match self.syntax {
             MatcherSyntax::Pattern => {
                 let compiled =
@@ -563,6 +811,17 @@ pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<TriggerRow> {
                     source: m.source.clone(),
                     anchor_start: m.anchor_start,
                     anchor_end: m.anchor_end,
+                    color: m.color.clone(),
+                    color_channel: matchers::MatcherColorChannel::Foreground,
+                    color_drafts: [
+                        ChannelColorDraft::from_color(
+                            m.color.as_ref().and_then(|filter| filter.foreground),
+                        ),
+                        ChannelColorDraft::from_color(
+                            m.color.as_ref().and_then(|filter| filter.background),
+                        ),
+                    ],
+                    remembered_color: None,
                 })
                 .collect();
         }
@@ -591,6 +850,33 @@ pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<TriggerRow> {
     rows
 }
 
+fn exact_truecolor_draft(color: Option<matchers::MatcherColor>) -> ExactTruecolorDraft {
+    let Some(matchers::MatcherColor::Truecolor { r, g, b, .. }) = color else {
+        return ExactTruecolorDraft::default();
+    };
+    ExactTruecolorDraft::from_rgb(r, g, b)
+}
+
+fn color_range_value(color: Option<matchers::MatcherColor>) -> matchers::MatcherHsvRange {
+    let (r, g, b, range) = match color {
+        Some(matchers::MatcherColor::Truecolor { r, g, b, range }) => (r, g, b, range),
+        _ => (255, 255, 255, None),
+    };
+    let point = matchers::MatcherHsv::from_rgb(r, g, b);
+    range
+        .unwrap_or_else(|| matchers::MatcherHsvRange::from_to(point, point))
+        .rgb_canonicalized()
+}
+
+fn color_range_hexes(range: matchers::MatcherHsvRange) -> [String; 2] {
+    let (from, to) = range.directed_endpoints();
+    let hex = |hsv: matchers::MatcherHsv| {
+        let (r, g, b) = hsv.to_rgb();
+        format!("#{r:02x}{g:02x}{b:02x}")
+    };
+    [hex(from), hex(to)]
+}
+
 /// Rebuilds a trigger's three pattern vectors (and its sidecar) from the row
 /// list — the save path. The sidecar is written only when it carries real
 /// authoring intent: a Pattern-syntax row, or a Raw row whose stored form
@@ -610,11 +896,12 @@ pub fn rows_into_trigger(
     let mut wants_sidecar = false;
 
     for (i, row) in rows.iter().enumerate() {
-        if row.source.trim().is_empty() {
+        if row.source.trim().is_empty() && row.color.is_none() {
             continue;
         }
         let compiled = row.compiled().map_err(|e| (i, e))?;
-        wants_sidecar |= row.syntax == MatcherSyntax::Pattern || compiled != row.source;
+        wants_sidecar |=
+            row.syntax == MatcherSyntax::Pattern || compiled != row.source || row.color.is_some();
         match row.role {
             PatternKind::Match => patterns.push(compiled),
             PatternKind::Anti => anti_patterns.push(compiled),
@@ -628,13 +915,14 @@ pub fn rows_into_trigger(
     trigger.raw_patterns = some(raw_patterns);
     trigger.matchers = wants_sidecar.then(|| {
         rows.iter()
-            .filter(|row| !row.source.trim().is_empty())
+            .filter(|row| !row.source.trim().is_empty() || row.color.is_some())
             .map(|row| TriggerMatcherSource {
                 role: row.role.role(),
                 syntax: row.syntax,
                 source: row.source.clone(),
                 anchor_start: row.anchor_start,
                 anchor_end: row.anchor_end,
+                color: row.color.clone(),
             })
             .collect()
     });
@@ -1148,6 +1436,7 @@ mod tests {
                     source: "You are {state}.".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    ..TriggerRow::new(PatternKind::Match)
                 },
                 TriggerRow {
                     role: PatternKind::Raw,
@@ -1155,6 +1444,7 @@ mod tests {
                     source: r"\e\[31m".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    ..TriggerRow::new(PatternKind::Raw)
                 },
             ];
             let mut trigger = triggers::TriggerDefinition::default();
@@ -1191,6 +1481,247 @@ mod tests {
         }
 
         #[test]
+        fn blank_color_row_is_persisted_as_a_color_only_matcher() {
+            let rows = vec![TriggerRow {
+                color: Some(matchers::MatcherColorMatch {
+                    foreground: Some(matchers::MatcherColor::Ansi { index: 1 }),
+                    ..Default::default()
+                }),
+                ..TriggerRow::new(PatternKind::Match)
+            }];
+            let mut trigger = triggers::TriggerDefinition::default();
+            rows_into_trigger(&rows, &mut trigger).unwrap();
+            assert_eq!(trigger.patterns.as_deref(), Some(&[String::new()][..]));
+            assert!(trigger.matchers.is_some());
+            assert_eq!(trigger_rows(&trigger), rows);
+        }
+
+        #[test]
+        fn color_toggle_restores_the_filter_without_persisting_editor_memory() {
+            let filter = matchers::MatcherColorMatch {
+                foreground: Some(matchers::MatcherColor::Ansi { index: 2 }),
+                background: Some(matchers::MatcherColor::Xterm { index: 196 }),
+                attributes: vec![
+                    matchers::MatcherTextAttribute::Bold,
+                    matchers::MatcherTextAttribute::Italic,
+                ],
+            };
+            let mut row = TriggerRow {
+                source: "ready".to_string(),
+                color: Some(filter.clone()),
+                ..TriggerRow::new(PatternKind::Match)
+            };
+
+            row.set_color_enabled(false);
+            assert!(row.color.is_none());
+            assert_eq!(row.remembered_color.as_ref(), Some(&filter));
+
+            let mut trigger = triggers::TriggerDefinition::default();
+            rows_into_trigger(&[row.clone()], &mut trigger).unwrap();
+            assert!(
+                trigger.matchers.is_none(),
+                "transient toggle memory must not force a persisted sidecar"
+            );
+            assert_eq!(
+                trigger.patterns.as_deref(),
+                Some(&["ready".to_string()][..])
+            );
+
+            row.set_color_enabled(true);
+            assert_eq!(row.color.as_ref(), Some(&filter));
+            assert!(row.remembered_color.is_none());
+            rows_into_trigger(&[row.clone()], &mut trigger).unwrap();
+            assert_eq!(trigger_rows(&trigger), vec![row]);
+        }
+
+        #[test]
+        fn first_color_enable_keeps_the_ansi_white_default() {
+            let mut row = TriggerRow::new(PatternKind::Match);
+            row.set_color_enabled(true);
+            assert_eq!(
+                row.color,
+                Some(matchers::MatcherColorMatch {
+                    foreground: Some(matchers::MatcherColor::Ansi { index: 7 }),
+                    ..Default::default()
+                })
+            );
+        }
+
+        #[test]
+        fn color_only_row_requires_a_surviving_constraint() {
+            let mut row = TriggerRow {
+                color: Some(matchers::MatcherColorMatch::default()),
+                ..TriggerRow::new(PatternKind::Match)
+            };
+            assert_eq!(
+                row.compiled().unwrap_err(),
+                crate::i18n::t!("editor-color-needs-constraint")
+            );
+
+            let mut trigger = triggers::TriggerDefinition::default();
+            let (index, error) = rows_into_trigger(&[row.clone()], &mut trigger).unwrap_err();
+            assert_eq!(index, 0);
+            assert_eq!(error, crate::i18n::t!("editor-color-needs-constraint"));
+
+            row.color
+                .as_mut()
+                .unwrap()
+                .attributes
+                .push(matchers::MatcherTextAttribute::Bold);
+            assert_eq!(row.compiled().unwrap(), "");
+            rows_into_trigger(&[row.clone()], &mut trigger).unwrap();
+            assert_eq!(trigger.patterns.as_deref(), Some(&[String::new()][..]));
+            assert_eq!(trigger_rows(&trigger), vec![row]);
+        }
+
+        #[test]
+        fn whitespace_colored_regex_stays_verbatim_and_keeps_a_fresh_sidecar() {
+            let rows = vec![TriggerRow {
+                source: " ".to_string(),
+                color: Some(matchers::MatcherColorMatch {
+                    foreground: Some(matchers::MatcherColor::Ansi { index: 1 }),
+                    ..Default::default()
+                }),
+                ..TriggerRow::new(PatternKind::Match)
+            }];
+            let mut trigger = triggers::TriggerDefinition::default();
+
+            rows_into_trigger(&rows, &mut trigger).unwrap();
+
+            assert_eq!(trigger.patterns.as_deref(), Some(&[" ".to_string()][..]));
+            let sidecar = trigger.matchers.as_ref().expect("colored regex sidecar");
+            assert_eq!(sidecar[0].syntax, MatcherSyntax::Regex);
+            assert_eq!(sidecar[0].source, " ");
+            let derived = matchers::trigger_patterns(sidecar).expect("fresh sidecar");
+            assert_eq!(
+                derived.patterns,
+                trigger.patterns.clone().unwrap_or_default()
+            );
+            assert_eq!(
+                derived.anti_patterns,
+                trigger.anti_patterns.clone().unwrap_or_default()
+            );
+            assert_eq!(
+                derived.raw_patterns,
+                trigger.raw_patterns.clone().unwrap_or_default()
+            );
+            assert_eq!(trigger_rows(&trigger), rows);
+        }
+
+        #[test]
+        fn truecolor_range_round_trips_with_both_endpoint_buffers() {
+            let range = matchers::MatcherHsvRange::from_to(
+                matchers::MatcherHsv {
+                    hue: 12,
+                    saturation: 210,
+                    value: 180,
+                },
+                matchers::MatcherHsv {
+                    hue: 42,
+                    saturation: 120,
+                    value: 240,
+                },
+            );
+            let (r, g, b) = range.first.to_rgb();
+            let endpoint_hex = |endpoint: matchers::MatcherHsv| {
+                let (r, g, b) = endpoint.to_rgb();
+                format!("#{r:02x}{g:02x}{b:02x}")
+            };
+            let rows = vec![TriggerRow {
+                source: "target".to_string(),
+                color: Some(matchers::MatcherColorMatch {
+                    foreground: Some(matchers::MatcherColor::Truecolor {
+                        r,
+                        g,
+                        b,
+                        range: Some(range),
+                    }),
+                    ..Default::default()
+                }),
+                color_drafts: [
+                    ChannelColorDraft {
+                        exact_truecolor: ExactTruecolorDraft::from_rgb(r, g, b),
+                        color_range_hex: [endpoint_hex(range.first), endpoint_hex(range.second)],
+                        color_range_last_valid: range,
+                    },
+                    ChannelColorDraft::default(),
+                ],
+                ..TriggerRow::new(PatternKind::Match)
+            }];
+            let mut trigger = triggers::TriggerDefinition::default();
+            rows_into_trigger(&rows, &mut trigger).unwrap();
+
+            assert_eq!(trigger_rows(&trigger), rows);
+        }
+
+        #[test]
+        fn exact_truecolor_and_color_range_use_separate_tabs() {
+            let exact = matchers::MatcherColor::Truecolor {
+                r: 10,
+                g: 20,
+                b: 30,
+                range: None,
+            };
+            let point = matchers::MatcherHsv::from_rgb(10, 20, 30);
+            let range = matchers::MatcherColor::Truecolor {
+                r: 10,
+                g: 20,
+                b: 30,
+                range: Some(matchers::MatcherHsvRange::from_to(point, point)),
+            };
+
+            assert_eq!(
+                MatcherColorKind::of(Some(exact)),
+                MatcherColorKind::Truecolor
+            );
+            assert_eq!(
+                MatcherColorKind::of(Some(range)),
+                MatcherColorKind::ColorRange
+            );
+            assert_eq!(ExactTruecolorDraft::from_rgb(10, 20, 30).hex, "#0a141e");
+        }
+
+        #[test]
+        fn configured_truecolor_channels_require_valid_drafts() {
+            let exact = matchers::MatcherColor::Truecolor {
+                r: 10,
+                g: 20,
+                b: 30,
+                range: None,
+            };
+            let point = matchers::MatcherHsv::from_rgb(40, 50, 60);
+            let range = matchers::MatcherColor::Truecolor {
+                r: 40,
+                g: 50,
+                b: 60,
+                range: Some(matchers::MatcherHsvRange::from_to(point, point)),
+            };
+            let mut row = TriggerRow {
+                source: "target".to_string(),
+                color: Some(matchers::MatcherColorMatch {
+                    foreground: Some(exact),
+                    background: Some(range),
+                    attributes: Vec::new(),
+                }),
+                color_drafts: [
+                    ChannelColorDraft::from_color(Some(exact)),
+                    ChannelColorDraft::from_color(Some(range)),
+                ],
+                ..TriggerRow::new(PatternKind::Match)
+            };
+            assert!(row.compiled().is_ok());
+
+            row.color_drafts[0].exact_truecolor.hex = "#123".to_string();
+            assert!(row.compiled().is_err());
+            row.color_drafts[0] = ChannelColorDraft::from_color(Some(exact));
+            row.color_drafts[0].exact_truecolor.rgb[1] = "300".to_string();
+            assert!(row.compiled().is_err());
+            row.color_drafts[0] = ChannelColorDraft::from_color(Some(exact));
+            row.color_drafts[1].color_range_hex[1] = "#abcd".to_string();
+            assert!(row.compiled().is_err());
+        }
+
+        #[test]
         fn hand_edited_vectors_degrade_sidecar_rows_to_regex() {
             let rows = vec![TriggerRow {
                 role: PatternKind::Match,
@@ -1198,6 +1729,7 @@ mod tests {
                 source: "You are {state}.".to_string(),
                 anchor_start: true,
                 anchor_end: true,
+                ..TriggerRow::new(PatternKind::Match)
             }];
             let mut trigger = triggers::TriggerDefinition::default();
             rows_into_trigger(&rows, &mut trigger).unwrap();

@@ -31,6 +31,11 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Which runtime vector a trigger matcher lands in. `Anti` is the model and
 /// on-disk word (matching `anti_patterns` / `antiPatterns`); the UI renders it
 /// as "Exceptions".
@@ -49,6 +54,333 @@ pub enum MatcherRole {
 pub enum MatcherSyntax {
     Pattern,
     Regex,
+}
+
+/// The terminal color channel that a trigger color filter checks.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MatcherColorChannel {
+    #[default]
+    Foreground,
+    Background,
+}
+
+/// A terminal color that a trigger can match.
+///
+/// ANSI stores the 16-color palette slot, not the current theme RGB value. A
+/// theme change does not change the filter. Xterm stores its palette index.
+/// Matching preserves xterm indices 0 through 15 as ANSI colors. The VT parser
+/// converts xterm indices 16 through 255 and truecolor values to RGB.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum MatcherColor {
+    Ansi {
+        index: u8,
+    },
+    Xterm {
+        index: u8,
+    },
+    Truecolor {
+        r: u8,
+        g: u8,
+        b: u8,
+        /// An optional HSV range. The RGB triplet remains the exact-match value
+        /// and the fallback for readers that do not support the `range` field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<MatcherHsvRange>,
+    },
+}
+
+impl Default for MatcherColor {
+    fn default() -> Self {
+        Self::Ansi { index: 7 }
+    }
+}
+
+/// An HSV range endpoint.
+///
+/// Hue is an integer in degrees. The matcher normalizes it modulo 360 before use.
+/// Saturation and value use the full `u8` range (`0` through `255`). They do
+/// not use a lossy integer percentage.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatcherHsv {
+    pub hue: u16,
+    pub saturation: u8,
+    pub value: u8,
+}
+
+impl MatcherHsv {
+    /// The number of integer degrees in the hue circle.
+    pub const HUE_PERIOD: u16 = 360;
+
+    /// Converts an RGB color to the persisted HSV representation.
+    ///
+    /// This canonical integer conversion rounds to the nearest value. The UI
+    /// and runtime should use it instead of separate floating-point conversions.
+    #[must_use]
+    pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let delta = max - min;
+        let saturation = if max == 0 {
+            0
+        } else {
+            let numerator = u32::from(delta) * 255 + u32::from(max) / 2;
+            u8::try_from(numerator / u32::from(max)).unwrap_or(255)
+        };
+        let hue = if delta == 0 {
+            0
+        } else {
+            let (offset, difference) = if max == r {
+                (0, i32::from(g) - i32::from(b))
+            } else if max == g {
+                (120, i32::from(b) - i32::from(r))
+            } else {
+                (240, i32::from(r) - i32::from(g))
+            };
+            let numerator = difference * 60;
+            let denominator = i32::from(delta);
+            let rounded = if numerator >= 0 {
+                (numerator + denominator / 2) / denominator
+            } else {
+                (numerator - denominator / 2) / denominator
+            };
+            u16::try_from((offset + rounded).rem_euclid(i32::from(Self::HUE_PERIOD))).unwrap_or(0)
+        };
+
+        Self {
+            hue,
+            saturation,
+            value: max,
+        }
+    }
+
+    /// Converts a persisted HSV endpoint to its canonical RGB preview color.
+    #[must_use]
+    pub fn to_rgb(self) -> (u8, u8, u8) {
+        let hsv = self.normalized();
+        if hsv.saturation == 0 {
+            return (hsv.value, hsv.value, hsv.value);
+        }
+
+        let chroma = (u32::from(hsv.value) * u32::from(hsv.saturation) + 127) / 255;
+        let sector = hsv.hue / 60;
+        let remainder = u32::from(hsv.hue % 60);
+        let secondary_numerator = if sector.is_multiple_of(2) {
+            chroma * remainder
+        } else {
+            chroma * (60 - remainder)
+        };
+        let secondary = (secondary_numerator + 30) / 60;
+        let minimum = u32::from(hsv.value) - chroma;
+        let (r, g, b) = match sector {
+            0 => (chroma, secondary, 0),
+            1 => (secondary, chroma, 0),
+            2 => (0, chroma, secondary),
+            3 => (0, secondary, chroma),
+            4 => (secondary, 0, chroma),
+            _ => (chroma, 0, secondary),
+        };
+        let component = |value: u32| u8::try_from(value + minimum).unwrap_or(255);
+        (component(r), component(g), component(b))
+    }
+
+    /// Converts this endpoint to 8-bit RGB and back to canonical HSV.
+    ///
+    /// An achromatic RGB swatch cannot show its hue. This method preserves the
+    /// specified hue because it remains useful as a range boundary. Matchers do
+    /// not compare hue for an achromatic input color.
+    #[must_use]
+    pub fn rgb_canonicalized(self) -> Self {
+        let authored = self.normalized();
+        let (r, g, b) = authored.to_rgb();
+        let mut canonical = Self::from_rgb(r, g, b);
+        if canonical.saturation == 0 {
+            canonical.hue = authored.hue;
+        }
+        canonical
+    }
+
+    /// Returns this endpoint with its hue in the canonical `0..360` interval.
+    #[must_use]
+    pub const fn normalized(self) -> Self {
+        Self {
+            hue: self.hue % Self::HUE_PERIOD,
+            saturation: self.saturation,
+            value: self.value,
+        }
+    }
+}
+
+/// An axis-aligned match region in HSV color space. The two endpoints define
+/// opposite corners.
+///
+/// Saturation and value have unordered bounds. Hue is a directed interval from
+/// the UI's "From" endpoint to its "To" endpoint, moving through increasing
+/// degrees. For example, 350° to 10° crosses 0° and selects a narrow range.
+/// The persisted `first`, `second`, and `wrap_hue` fields retain the original
+/// storage format. Use [`Self::from_to`] and [`Self::directed_endpoints`] instead
+/// of interpreting these fields as UI endpoint labels.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatcherHsvRange {
+    pub first: MatcherHsv,
+    pub second: MatcherHsv,
+    /// The legacy storage flag for a hue interval that crosses 0°.
+    ///
+    /// Keep this field for saved-file compatibility. New code must derive it
+    /// with [`Self::from_to`]. [`Self::directed_endpoints`] also converts saved
+    /// ranges whose field order does not agree with this flag.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wrap_hue: bool,
+}
+
+impl MatcherHsvRange {
+    /// Creates a range directed from `from` to `to` through increasing hue.
+    ///
+    /// The method normalizes both stored hues to `0..360`. When `to` has a
+    /// smaller hue, the interval continues through 360° and then 0°. Equal
+    /// hues select one hue. Saturation and value remain unordered bounds.
+    #[must_use]
+    pub const fn from_to(from: MatcherHsv, to: MatcherHsv) -> Self {
+        let from = from.normalized();
+        let to = to.normalized();
+        Self {
+            first: from,
+            second: to,
+            wrap_hue: from.hue > to.hue,
+        }
+    }
+
+    /// Returns this saved range as directed `(from, to)` UI endpoints.
+    ///
+    /// Older editors treated `first` and `second` as unordered. This method
+    /// uses the saved `wrap_hue` flag to orient those endpoints without
+    /// changing the matched hue, saturation, or value intervals. Returned hues
+    /// are in `0..360`. Rebuilding the result with [`Self::from_to`] preserves
+    /// the saved match semantics. An old wrapped range with equal hues becomes
+    /// an unwrapped equal-hue range. Both forms select only that hue.
+    #[must_use]
+    pub const fn directed_endpoints(self) -> (MatcherHsv, MatcherHsv) {
+        let first = self.first.normalized();
+        let second = self.second.normalized();
+        let order_matches_direction = first.hue == second.hue
+            || (self.wrap_hue && first.hue > second.hue)
+            || (!self.wrap_hue && first.hue < second.hue);
+        if order_matches_direction {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    /// Converts both endpoints to the HSV values that their 8-bit RGB swatches
+    /// represent.
+    ///
+    /// The runtime represents truecolor input as RGB. This conversion makes
+    /// narrow ranges match the colors that the editor shows. It establishes
+    /// the saved direction before quantization because quantization can move
+    /// one endpoint across 0°.
+    #[must_use]
+    pub fn rgb_canonicalized(self) -> Self {
+        let (from, to) = self.directed_endpoints();
+        Self::from_to(from.rgb_canonicalized(), to.rgb_canonicalized())
+    }
+
+    /// Returns the inclusive directed hue interval as increasing degrees.
+    ///
+    /// The first value is in `0..360`. The second value can be in `360..720`
+    /// when the interval crosses 0°. For example, 350° to 10° returns
+    /// `(350, 370)`. This 360..720 representation lets callers test one linear
+    /// interval.
+    #[must_use]
+    pub const fn directed_hue_bounds(self) -> (u16, u16) {
+        let (from, to) = self.directed_endpoints();
+        let lifted_to = if to.hue < from.hue {
+            to.hue + MatcherHsv::HUE_PERIOD
+        } else {
+            to.hue
+        };
+        (from.hue, lifted_to)
+    }
+
+    /// Returns inclusive, sorted hue bounds in integer degrees.
+    ///
+    /// This method supports code that also reads the legacy `wrap_hue` flag.
+    /// Use [`Self::directed_hue_bounds`] for new directed-range code.
+    #[must_use]
+    pub const fn hue_bounds(self) -> (u16, u16) {
+        let first = self.first.hue % MatcherHsv::HUE_PERIOD;
+        let second = self.second.hue % MatcherHsv::HUE_PERIOD;
+        if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    /// Returns true if `hue` is in the selected circular interval.
+    #[must_use]
+    pub const fn hue_matches(self, hue: u16) -> bool {
+        let hue = hue % MatcherHsv::HUE_PERIOD;
+        let (minimum, maximum) = self.hue_bounds();
+        if minimum == maximum {
+            hue == minimum
+        } else if self.wrap_hue {
+            hue <= minimum || hue >= maximum
+        } else {
+            hue >= minimum && hue <= maximum
+        }
+    }
+
+    /// Returns inclusive saturation bounds on the `0..=255` scale.
+    #[must_use]
+    pub const fn saturation_bounds(self) -> (u8, u8) {
+        if self.first.saturation <= self.second.saturation {
+            (self.first.saturation, self.second.saturation)
+        } else {
+            (self.second.saturation, self.first.saturation)
+        }
+    }
+
+    /// Returns inclusive value bounds on the `0..=255` scale.
+    #[must_use]
+    pub const fn value_bounds(self) -> (u8, u8) {
+        if self.first.value <= self.second.value {
+            (self.first.value, self.second.value)
+        } else {
+            (self.second.value, self.first.value)
+        }
+    }
+}
+
+/// An SGR text attribute that a color filter can require.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatcherTextAttribute {
+    Bold,
+    Faint,
+    Italic,
+    Underline,
+    DoubleUnderline,
+    SlowBlink,
+    FastBlink,
+    CrossedOut,
+    Reverse,
+}
+
+/// A color filter for a normal pattern or anti-pattern.
+///
+/// `None` accepts any color in that channel. The filter can constrain the
+/// foreground, background, or both. An empty attribute list accepts any
+/// attributes. Otherwise, the filter requires every listed attribute.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct MatcherColorMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground: Option<MatcherColor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<MatcherColor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<MatcherTextAttribute>,
 }
 
 /// Which characters may group a multi-word Command argument into one token.
@@ -136,6 +468,10 @@ pub struct TriggerMatcherSource {
     pub anchor_start: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub anchor_end: bool,
+    /// An optional color filter. Raw matchers ignore this field. They run their
+    /// escape-aware regex against raw input, including terminal escape bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<MatcherColorMatch>,
 }
 
 /// A pattern-compilation error. These are typed so the editor can render
@@ -844,6 +1180,19 @@ pub fn trigger_patterns(
     let mut errors = Vec::new();
 
     for (index, matcher) in matchers.iter().enumerate() {
+        // A blank row with a color filter is a color-only matcher. The compiler
+        // stores an empty regex for both editor syntaxes. The runtime recognizes
+        // this exact form and scans styled spans directly.
+        // `Trigger::new` keeps blank unfiltered rows inactive for compatibility.
+        if matcher.source.is_empty() && matcher.color.is_some() && matcher.role != MatcherRole::Raw
+        {
+            match matcher.role {
+                MatcherRole::Match => derived.patterns.push(String::new()),
+                MatcherRole::Anti => derived.anti_patterns.push(String::new()),
+                MatcherRole::Raw => unreachable!(),
+            }
+            continue;
+        }
         let compiled = match matcher.syntax {
             MatcherSyntax::Pattern => {
                 let compiled =
@@ -1453,6 +1802,7 @@ mod tests {
                     source: "You are {state}.".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    color: None,
                 },
                 TriggerMatcherSource {
                     role: MatcherRole::Anti,
@@ -1460,6 +1810,7 @@ mod tests {
                     source: "no longer".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    color: None,
                 },
                 TriggerMatcherSource {
                     role: MatcherRole::Raw,
@@ -1467,6 +1818,7 @@ mod tests {
                     source: r"\e\[31m".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    color: None,
                 },
             ];
             let derived = trigger_patterns(&rows).unwrap();
@@ -1485,6 +1837,7 @@ mod tests {
                     source: "fine".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    color: None,
                 },
                 TriggerMatcherSource {
                     role: MatcherRole::Match,
@@ -1492,12 +1845,47 @@ mod tests {
                     source: "[unclosed".to_string(),
                     anchor_start: true,
                     anchor_end: true,
+                    color: None,
                 },
             ];
             let errors = trigger_patterns(&rows).unwrap_err();
             assert_eq!(errors.len(), 1);
             assert_eq!(errors[0].0, 1);
             assert!(matches!(errors[0].1, PatternError::Engine { .. }));
+        }
+
+        #[test]
+        fn blank_color_rows_compile_as_color_only_matchers() {
+            let rows = vec![TriggerMatcherSource {
+                role: MatcherRole::Match,
+                syntax: MatcherSyntax::Pattern,
+                source: String::new(),
+                anchor_start: true,
+                anchor_end: true,
+                color: Some(MatcherColorMatch {
+                    foreground: Some(MatcherColor::Ansi { index: 1 }),
+                    background: None,
+                    attributes: Vec::new(),
+                }),
+            }];
+            assert_eq!(trigger_patterns(&rows).unwrap().patterns, vec![""]);
+        }
+
+        #[test]
+        fn whitespace_colored_regex_remains_a_text_matcher() {
+            let rows = vec![TriggerMatcherSource {
+                role: MatcherRole::Match,
+                syntax: MatcherSyntax::Regex,
+                source: " ".to_string(),
+                anchor_start: true,
+                anchor_end: true,
+                color: Some(MatcherColorMatch {
+                    foreground: Some(MatcherColor::Ansi { index: 1 }),
+                    background: None,
+                    attributes: Vec::new(),
+                }),
+            }];
+            assert_eq!(trigger_patterns(&rows).unwrap().patterns, vec![" "]);
         }
     }
 
@@ -1588,6 +1976,281 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<TriggerMatcherSource>(&json).unwrap(),
                 row
+            );
+        }
+
+        #[test]
+        fn trigger_color_filter_round_trips_both_channels_and_attributes() {
+            let filter = MatcherColorMatch {
+                foreground: Some(MatcherColor::Ansi { index: 9 }),
+                background: Some(MatcherColor::Truecolor {
+                    r: 1,
+                    g: 2,
+                    b: 3,
+                    range: None,
+                }),
+                attributes: vec![MatcherTextAttribute::Bold, MatcherTextAttribute::Italic],
+            };
+            let json = serde_json::to_string(&filter).unwrap();
+            assert_eq!(
+                serde_json::from_str::<MatcherColorMatch>(&json).unwrap(),
+                filter
+            );
+            assert!(json.contains("foreground"));
+            assert!(json.contains("background"));
+            assert!(json.contains("bold"));
+        }
+
+        #[test]
+        fn exact_truecolor_json_stays_sparse_and_backward_compatible() {
+            let color = MatcherColor::Truecolor {
+                r: 1,
+                g: 2,
+                b: 3,
+                range: None,
+            };
+            let json = serde_json::to_string(&color).unwrap();
+            assert_eq!(json, r#"{"kind":"truecolor","r":1,"g":2,"b":3}"#);
+            assert_eq!(serde_json::from_str::<MatcherColor>(&json).unwrap(), color);
+        }
+
+        #[test]
+        fn truecolor_hsv_range_round_trips_and_normalizes_bounds() {
+            let range = MatcherHsvRange {
+                first: MatcherHsv {
+                    hue: 721,
+                    saturation: 240,
+                    value: 30,
+                },
+                second: MatcherHsv {
+                    hue: 330,
+                    saturation: 40,
+                    value: 210,
+                },
+                wrap_hue: false,
+            };
+            assert_eq!(range.first.normalized().hue, 1);
+            assert_eq!(range.hue_bounds(), (1, 330));
+            assert_eq!(range.saturation_bounds(), (40, 240));
+            assert_eq!(range.value_bounds(), (30, 210));
+
+            let color = MatcherColor::Truecolor {
+                r: 128,
+                g: 64,
+                b: 32,
+                range: Some(range),
+            };
+            let json = serde_json::to_string(&color).unwrap();
+            assert!(json.contains(r#""range""#));
+            assert_eq!(serde_json::from_str::<MatcherColor>(&json).unwrap(), color);
+        }
+
+        #[test]
+        fn wrapped_hue_range_crosses_zero_and_serializes_explicitly() {
+            let range = MatcherHsvRange {
+                first: MatcherHsv {
+                    hue: 350,
+                    saturation: 0,
+                    value: 0,
+                },
+                second: MatcherHsv {
+                    hue: 10,
+                    saturation: 255,
+                    value: 255,
+                },
+                wrap_hue: true,
+            };
+            assert!(range.hue_matches(355));
+            assert!(range.hue_matches(5));
+            assert!(!range.hue_matches(180));
+            assert!(serde_json::to_string(&range).unwrap().contains("wrap_hue"));
+        }
+
+        #[test]
+        fn from_to_hue_range_follows_increasing_degrees() {
+            let endpoint = |hue| MatcherHsv {
+                hue,
+                saturation: 255,
+                value: 255,
+            };
+
+            let narrow = MatcherHsvRange::from_to(endpoint(350), endpoint(10));
+            assert_eq!((narrow.first.hue, narrow.second.hue), (350, 10));
+            assert_eq!(narrow.directed_hue_bounds(), (350, 370));
+            assert!(narrow.wrap_hue);
+            assert!(narrow.hue_matches(355));
+            assert!(narrow.hue_matches(5));
+            assert!(!narrow.hue_matches(180));
+
+            let broad = MatcherHsvRange::from_to(endpoint(10), endpoint(350));
+            assert_eq!((broad.first.hue, broad.second.hue), (10, 350));
+            assert_eq!(broad.directed_hue_bounds(), (10, 350));
+            assert!(!broad.wrap_hue);
+            assert!(broad.hue_matches(180));
+            assert!(!broad.hue_matches(5));
+            assert!(!broad.hue_matches(355));
+
+            let equal = MatcherHsvRange::from_to(endpoint(45), endpoint(45));
+            assert!(!equal.wrap_hue);
+            assert!(equal.hue_matches(45));
+            assert!(!equal.hue_matches(44));
+
+            let normalized = MatcherHsvRange::from_to(endpoint(721), endpoint(720));
+            assert_eq!((normalized.first.hue, normalized.second.hue), (1, 0));
+            assert!(normalized.wrap_hue);
+        }
+
+        #[test]
+        fn directed_endpoints_preserve_legacy_range_semantics() {
+            let endpoint = |hue, saturation, value| MatcherHsv {
+                hue,
+                saturation,
+                value,
+            };
+            let legacy_ranges = [
+                MatcherHsvRange {
+                    first: endpoint(350, 20, 220),
+                    second: endpoint(10, 200, 40),
+                    wrap_hue: false,
+                },
+                MatcherHsvRange {
+                    first: endpoint(10, 200, 40),
+                    second: endpoint(350, 20, 220),
+                    wrap_hue: true,
+                },
+            ];
+
+            for legacy in legacy_ranges {
+                let (from, to) = legacy.directed_endpoints();
+                let rebuilt = MatcherHsvRange::from_to(from, to);
+                for hue in 0..MatcherHsv::HUE_PERIOD {
+                    assert_eq!(
+                        rebuilt.hue_matches(hue),
+                        legacy.hue_matches(hue),
+                        "legacy {legacy:?} changed at hue {hue}",
+                    );
+                }
+                assert_eq!(rebuilt.saturation_bounds(), legacy.saturation_bounds());
+                assert_eq!(rebuilt.value_bounds(), legacy.value_bounds());
+            }
+
+            assert_eq!(
+                legacy_ranges[0].directed_endpoints(),
+                (endpoint(10, 200, 40), endpoint(350, 20, 220)),
+            );
+            assert_eq!(
+                legacy_ranges[1].directed_endpoints(),
+                (endpoint(350, 20, 220), endpoint(10, 200, 40)),
+            );
+        }
+
+        #[test]
+        fn rgb_canonicalization_preserves_direction_across_zero() {
+            let from = MatcherHsv {
+                hue: 359,
+                saturation: 10,
+                value: 30,
+            };
+            let to = MatcherHsv {
+                hue: 1,
+                saturation: 255,
+                value: 255,
+            };
+            let canonical = MatcherHsvRange::from_to(from, to).rgb_canonicalized();
+            let canonical_from = from.rgb_canonicalized();
+            let canonical_to = to.rgb_canonicalized();
+
+            // RGB quantization moves only the low-saturation endpoint across
+            // 0°. The resulting range must remain the narrow directed arc.
+            assert_eq!(canonical_from.hue, 0);
+            assert_eq!(canonical_to.hue, 1);
+            assert_eq!(
+                canonical.directed_endpoints(),
+                (canonical_from, canonical_to)
+            );
+            assert_eq!(canonical.directed_hue_bounds(), (0, 1));
+            assert!(canonical.hue_matches(0));
+            assert!(canonical.hue_matches(1));
+            assert!(!canonical.hue_matches(180));
+        }
+
+        #[test]
+        fn fast_hue_matcher_equals_lifted_directed_interval() {
+            const ENDPOINT_HUES: [u16; 13] =
+                [0, 1, 10, 45, 179, 180, 181, 349, 350, 358, 359, 360, 721];
+            let endpoint = |hue| MatcherHsv {
+                hue,
+                saturation: 128,
+                value: 128,
+            };
+
+            for first in ENDPOINT_HUES {
+                for second in ENDPOINT_HUES {
+                    for wrap_hue in [false, true] {
+                        let range = MatcherHsvRange {
+                            first: endpoint(first),
+                            second: endpoint(second),
+                            wrap_hue,
+                        };
+                        let (from, to) = range.directed_hue_bounds();
+                        for hue in 0..MatcherHsv::HUE_PERIOD {
+                            let lifted_hue = if hue < from {
+                                hue + MatcherHsv::HUE_PERIOD
+                            } else {
+                                hue
+                            };
+                            let lifted_match = (from..=to).contains(&lifted_hue);
+                            assert_eq!(
+                                range.hue_matches(hue),
+                                lifted_match,
+                                "range {range:?} differs at hue {hue}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn matcher_hsv_quantization_is_exact_for_selected_colors() {
+            for rgb in [
+                (0, 255, 255),
+                (128, 128, 128),
+                (106, 60, 60),
+                (64, 96, 160),
+                (123, 45, 67),
+            ] {
+                let hsv = MatcherHsv::from_rgb(rgb.0, rgb.1, rgb.2);
+                assert_eq!(hsv.to_rgb(), rgb, "{rgb:?} quantized to {hsv:?}");
+            }
+
+            assert_eq!(
+                MatcherHsv::from_rgb(0, 255, 255),
+                MatcherHsv {
+                    hue: 180,
+                    saturation: 255,
+                    value: 255,
+                }
+            );
+
+            let canonical = MatcherHsv {
+                hue: 100,
+                saturation: 100,
+                value: 100,
+            }
+            .rgb_canonicalized();
+            let (r, g, b) = canonical.to_rgb();
+            assert_eq!(MatcherHsv::from_rgb(r, g, b), canonical);
+
+            assert_eq!(
+                MatcherHsv {
+                    hue: 217,
+                    saturation: 0,
+                    value: 128,
+                }
+                .rgb_canonicalized()
+                .hue,
+                217,
             );
         }
     }

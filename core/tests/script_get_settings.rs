@@ -79,6 +79,7 @@ async fn script_reads_settings_via_get_settings() {
         command_separator: Arc::new("::".to_string()),
         raw_line_prefix: Arc::new("\\".to_string()),
         log_enabled: true,
+        bold_is_bright: false,
         script_settings: Box::new(script_settings),
     })
     .unwrap();

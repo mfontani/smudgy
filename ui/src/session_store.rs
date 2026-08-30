@@ -2644,6 +2644,7 @@ impl ManagedSession {
                             command_separator: Arc::new(settings.command_separator),
                             raw_line_prefix: Arc::new(settings.raw_line_prefix),
                             log_enabled: settings.logging.enabled,
+                            bold_is_bright: settings.terminal_bold_mode.uses_bright_palette(),
                             script_settings: Box::new(script_settings),
                         }) {
                             log::error!("Failed to send settings to runtime: {e}");
@@ -3112,6 +3113,7 @@ impl ManagedSession {
                     command_separator: Arc::new(settings.command_separator),
                     raw_line_prefix: Arc::new(settings.raw_line_prefix),
                     log_enabled: settings.logging.enabled,
+                    bold_is_bright: settings.terminal_bold_mode.uses_bright_palette(),
                     script_settings: Box::new(script_settings),
                 });
 
