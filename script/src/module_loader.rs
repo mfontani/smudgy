@@ -320,6 +320,20 @@ impl ScriptModuleLoader {
         )))
     }
 
+    fn resolve_npm_package_import(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<Option<ModuleSpecifier>, ModuleLoaderError> {
+        let Some(npm) = &self.npm else {
+            return Ok(None);
+        };
+        let Ok(referrer) = ModuleSpecifier::parse(referrer) else {
+            return Ok(None);
+        };
+        npm.resolve_package_import(specifier, &referrer)
+    }
+
     fn load_sync(&self, specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
         let source = match specifier.scheme() {
             "file" => {
@@ -549,6 +563,8 @@ impl ModuleLoader for ScriptModuleLoader {
         };
         let resolved = if specifier.starts_with("npm:") {
             ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err)?
+        } else if let Some(resolved) = self.resolve_npm_package_import(specifier, &referrer)? {
+            resolved
         } else {
             deno_core::resolve_import(specifier, &referrer).map_err(JsErrorBox::from_err)?
         };
@@ -1079,6 +1095,46 @@ mod jsr_async_tests {
             format!("{registry_url}/@scope/pkg/1.2.0/sub.ts")
         );
         server.join().expect("test registry thread panicked");
+    }
+}
+
+#[cfg(test)]
+mod npm_resolution_tests {
+    use super::*;
+    use crate::ImportPolicy;
+
+    #[test]
+    fn npm_esm_bare_builtin_uses_node_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        // `NpmCacheDir` canonicalizes its root. macOS exposes temporary paths through
+        // `/var` while canonicalization resolves them through `/private/var`, so build
+        // the loader and fixture paths from the same canonical root.
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let data_dir = temp_root.join("data");
+        let (npm, _node_services) = crate::npm_resolver::SmudgyNpmServices::new(data_dir.clone())
+            .expect("create npm services");
+        let loader = ScriptModuleLoader::with_npm(
+            temp_root,
+            ModulePolicy {
+                allow_https: true,
+                import_policy: ImportPolicy::Any,
+            },
+            npm,
+        );
+        let referrer = ModuleSpecifier::from_file_path(
+            data_dir
+                .join("npm")
+                .join("registry.npmjs.org")
+                .join("fixture")
+                .join("1.0.0")
+                .join("index.mjs"),
+        )
+        .unwrap();
+
+        let resolved = loader
+            .resolve("module", referrer.as_str(), ResolutionKind::Import)
+            .expect("bare Node builtin should resolve from npm ESM");
+        assert_eq!(resolved.as_str(), "node:module");
     }
 }
 
