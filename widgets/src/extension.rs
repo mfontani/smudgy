@@ -2067,9 +2067,11 @@ struct MapStyleProp {
     room_fill: Option<String>,
     room_stroke: Option<String>,
     room_stroke_width: Option<f32>,
+    room_opacity: Option<f32>,
     room_border_radius: Option<f32>,
     connection_color: Option<String>,
     connection_width: Option<f32>,
+    connection_opacity: Option<f32>,
     door_color: Option<String>,
     cross_area_label_visibility: Option<CrossAreaLabelVisibilityProp>,
     cross_area_label_background: Option<String>,
@@ -2099,9 +2101,11 @@ impl From<MapStyleProp> for smudgy_map_widget::MapStyle {
             room_fill: value.room_fill,
             room_stroke: value.room_stroke,
             room_stroke_width: value.room_stroke_width,
+            room_opacity: value.room_opacity,
             room_border_radius: value.room_border_radius,
             connection_color: value.connection_color,
             connection_width: value.connection_width,
+            connection_opacity: value.connection_opacity,
             door_color: value.door_color,
             cross_area_label_visibility: value.cross_area_label_visibility.map(Into::into),
             cross_area_label_background: value.cross_area_label_background,
@@ -3412,13 +3416,17 @@ mod tests {
 
         let style = map_style_from_node(&Node::from(json!({
             "roomStroke": "#ff00ff",
+            "roomOpacity": 0.6,
             "connectionWidth": 2.0,
+            "connectionOpacity": 0.4,
             "crossAreaLabelVisibility": "hover",
             "crossAreaLabelBackground": "rgba(7, 7, 6, 0.88)",
         })))
         .expect("style parses");
         assert_eq!(style.room_stroke.as_deref(), Some("#ff00ff"));
+        assert_eq!(style.room_opacity, Some(0.6));
         assert_eq!(style.connection_width, Some(2.0));
+        assert_eq!(style.connection_opacity, Some(0.4));
         assert_eq!(style.room_fill, None);
         assert_eq!(
             style.cross_area_label_visibility,

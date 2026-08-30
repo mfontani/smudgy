@@ -617,11 +617,13 @@ impl MapView {
                                             self.active_area_id,
                                             connection.room.get_room_number(),
                                         );
+                                        let connection_opacity =
+                                            ghost_opacity * paint.opacity.unwrap_or(1.0);
                                         render::draw_connection_styled(
                                             frame,
                                             &atlas,
                                             &connection,
-                                            ghost_opacity,
+                                            connection_opacity,
                                             false,
                                             true,
                                             None,
@@ -634,6 +636,7 @@ impl MapView {
                                             cross_area_labels.push((
                                                 connection,
                                                 paint.cross_area_label_background,
+                                                connection_opacity,
                                             ));
                                         }
                                     }
@@ -646,7 +649,8 @@ impl MapView {
                                         room,
                                         room.get_x() * spacing,
                                         room.get_y() * spacing,
-                                        ghost_opacity,
+                                        ghost_opacity
+                                            * resolved.base_room.opacity.unwrap_or(1.0),
                                         false,
                                         // Ghost floors take the defaultStyle
                                         // base only; per-room apply entries
@@ -655,12 +659,12 @@ impl MapView {
                                     );
                                 }
                             });
-                            for (connection, background) in &cross_area_labels {
+                            for (connection, background, connection_opacity) in &cross_area_labels {
                                 render::draw_cross_area_connection_label(
                                     frame,
                                     &atlas,
                                     connection,
-                                    ghost_opacity,
+                                    *connection_opacity,
                                     false,
                                     *background,
                                 );
@@ -701,6 +705,7 @@ impl MapView {
                         let connection = connection.with_room_spacing(spacing);
                         let (anchor, far) = connection_exit_keys(&connection);
                         let paint = resolved.conn_paint(anchor, far);
+                        let connection_opacity = opacity * paint.opacity.unwrap_or(1.0);
                         let label_visible = cross_area_label_visible(
                             paint.cross_area_label_visibility,
                             self.hovered_room.as_ref(),
@@ -719,7 +724,7 @@ impl MapView {
                             frame,
                             &atlas,
                             &connection,
-                            opacity,
+                            connection_opacity,
                             false,
                             false,
                             paint.color,
@@ -729,8 +734,11 @@ impl MapView {
                             paint.cross_area_label_background,
                         );
                         if label_visible && is_cross_area_connection(&connection) {
-                            cross_area_labels
-                                .push((connection, paint.cross_area_label_background));
+                            cross_area_labels.push((
+                                connection,
+                                paint.cross_area_label_background,
+                                connection_opacity,
+                            ));
                         }
                         connections_drawn.set(connections_drawn.get() + 1);
                     }
@@ -745,7 +753,7 @@ impl MapView {
                             room,
                             room.get_x() * spacing,
                             room.get_y() * spacing,
-                            opacity,
+                            opacity * paint.opacity.unwrap_or(1.0),
                             false,
                             &paint,
                         );
@@ -756,12 +764,12 @@ impl MapView {
                 // Destination labels are an overlay: their optional
                 // backgrounds and text must remain legible even when the
                 // outward label anchor overlaps a room glyph.
-                for (connection, background) in &cross_area_labels {
+                for (connection, background, connection_opacity) in &cross_area_labels {
                     render::draw_cross_area_connection_label(
                         frame,
                         &atlas,
                         connection,
-                        opacity,
+                        *connection_opacity,
                         false,
                         *background,
                     );
