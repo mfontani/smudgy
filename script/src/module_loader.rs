@@ -1106,11 +1106,15 @@ mod npm_resolution_tests {
     #[test]
     fn npm_esm_bare_builtin_uses_node_resolution() {
         let temp = tempfile::tempdir().unwrap();
-        let data_dir = temp.path().join("data");
+        // `NpmCacheDir` canonicalizes its root. macOS exposes temporary paths through
+        // `/var` while canonicalization resolves them through `/private/var`, so build
+        // the loader and fixture paths from the same canonical root.
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let data_dir = temp_root.join("data");
         let (npm, _node_services) = crate::npm_resolver::SmudgyNpmServices::new(data_dir.clone())
             .expect("create npm services");
         let loader = ScriptModuleLoader::with_npm(
-            temp.path().to_path_buf(),
+            temp_root,
             ModulePolicy {
                 allow_https: true,
                 import_policy: ImportPolicy::Any,
