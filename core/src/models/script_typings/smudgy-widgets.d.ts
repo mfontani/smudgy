@@ -183,10 +183,14 @@ declare module "smudgy:widgets" {
         roomFill?: string;
         roomStroke?: string;
         roomStrokeWidth?: number;
+        /** Multiplies the whole room glyph's opacity. Clamped to 0..=1. */
+        roomOpacity?: number;
         /** Rounded-room corner radius in map units, clamped to 0..0.25. */
         roomBorderRadius?: number;
         connectionColor?: string;
         connectionWidth?: number;
+        /** Multiplies the whole connection, including markers and doors. Clamped to 0..=1. */
+        connectionOpacity?: number;
         doorColor?: string;
         /** When to draw named and redacted cross-area destination labels. The
          *  connection stub and marker remain visible. Default "always". */

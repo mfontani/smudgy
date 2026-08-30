@@ -70,10 +70,14 @@ pub struct MapStyle {
     pub room_fill: Option<String>,
     pub room_stroke: Option<String>,
     pub room_stroke_width: Option<f32>,
+    /// Multiplier for the whole room glyph (`0..=1`).
+    pub room_opacity: Option<f32>,
     /// Rounded-room corner radius in map units (`0..=0.25`).
     pub room_border_radius: Option<f32>,
     pub connection_color: Option<String>,
     pub connection_width: Option<f32>,
+    /// Multiplier for the whole connection, including markers and doors (`0..=1`).
+    pub connection_opacity: Option<f32>,
     pub door_color: Option<String>,
     /// Visibility policy for named and redacted cross-area destination
     /// labels. The connection stub and marker remain visible in every mode.
@@ -89,12 +93,18 @@ impl MapStyle {
         self.room_stroke_width = self
             .room_stroke_width
             .map(|value| finite_clamp(value, 0.0, 20.0, 2.0));
+        self.room_opacity = self
+            .room_opacity
+            .map(|value| finite_clamp(value, 0.0, 1.0, 1.0));
         self.room_border_radius = self
             .room_border_radius
             .map(|value| finite_clamp(value, 0.0, 0.25, 0.1));
         self.connection_width = self
             .connection_width
             .map(|value| finite_clamp(value, 0.0, 20.0, 1.0));
+        self.connection_opacity = self
+            .connection_opacity
+            .map(|value| finite_clamp(value, 0.0, 1.0, 1.0));
         self
     }
 }
@@ -264,11 +274,13 @@ fn resolve_style(style: &MapStyle, name: &str) -> (ResolvedRoomStyle, ResolvedCo
             fill: color(&style.room_fill, "roomFill"),
             stroke: color(&style.room_stroke, "roomStroke"),
             stroke_width: style.room_stroke_width,
+            opacity: style.room_opacity,
             border_radius: style.room_border_radius,
         },
         ResolvedConnStyle {
             color: color(&style.connection_color, "connectionColor"),
             width: style.connection_width,
+            opacity: style.connection_opacity,
             door_color: color(&style.door_color, "doorColor"),
             cross_area_label_visibility: style.cross_area_label_visibility,
             cross_area_label_background: color(
@@ -286,6 +298,7 @@ pub struct ResolvedRoomStyle {
     pub fill: Option<Color>,
     pub stroke: Option<Color>,
     pub stroke_width: Option<f32>,
+    pub opacity: Option<f32>,
     pub border_radius: Option<f32>,
 }
 
@@ -301,6 +314,9 @@ impl ResolvedRoomStyle {
         if patch.stroke_width.is_some() {
             self.stroke_width = patch.stroke_width;
         }
+        if patch.opacity.is_some() {
+            self.opacity = patch.opacity;
+        }
         if patch.border_radius.is_some() {
             self.border_radius = patch.border_radius;
         }
@@ -313,6 +329,7 @@ impl ResolvedRoomStyle {
 pub struct ResolvedConnStyle {
     pub color: Option<Color>,
     pub width: Option<f32>,
+    pub opacity: Option<f32>,
     pub door_color: Option<Color>,
     pub cross_area_label_visibility: Option<CrossAreaLabelVisibility>,
     pub cross_area_label_background: Option<Color>,
@@ -326,6 +343,9 @@ impl ResolvedConnStyle {
         }
         if patch.width.is_some() {
             self.width = patch.width;
+        }
+        if patch.opacity.is_some() {
+            self.opacity = patch.opacity;
         }
         if patch.door_color.is_some() {
             self.door_color = patch.door_color;
@@ -430,12 +450,14 @@ mod tests {
                 room_border_radius: Some(8.0),
                 connection_width: Some(-2.0),
                 room_stroke_width: Some(f32::INFINITY),
+                room_opacity: Some(-3.0),
                 ..MapStyle::default()
             },
             styles: HashMap::from([(
                 "hot".to_string(),
                 MapStyle {
                     connection_width: Some(500.0),
+                    connection_opacity: Some(f32::NAN),
                     ..MapStyle::default()
                 },
             )]),
@@ -446,7 +468,9 @@ mod tests {
         assert_eq!(presentation.default_style.room_border_radius, Some(0.25));
         assert_eq!(presentation.default_style.connection_width, Some(0.0));
         assert_eq!(presentation.default_style.room_stroke_width, Some(2.0));
+        assert_eq!(presentation.default_style.room_opacity, Some(0.0));
         assert_eq!(presentation.styles["hot"].connection_width, Some(20.0));
+        assert_eq!(presentation.styles["hot"].connection_opacity, Some(1.0));
     }
 
     #[test]
@@ -463,6 +487,8 @@ mod tests {
                     MapStyle {
                         room_fill: Some("#111111".to_string()),
                         connection_color: Some("#222222".to_string()),
+                        room_opacity: Some(0.6),
+                        connection_opacity: Some(0.6),
                         ..MapStyle::default()
                     },
                 ),
@@ -472,6 +498,8 @@ mod tests {
                         room_stroke: Some("#00ff00".to_string()),
                         room_stroke_width: Some(5.0),
                         connection_color: Some("#00ff00".to_string()),
+                        room_opacity: Some(1.0),
+                        connection_opacity: Some(1.0),
                         ..MapStyle::default()
                     },
                 ),
@@ -500,11 +528,13 @@ mod tests {
         assert_eq!(paint.fill, smudgy_cloud::parse_css_color("#111111"));
         assert_eq!(paint.stroke, smudgy_cloud::parse_css_color("#00ff00"));
         assert_eq!(paint.stroke_width, Some(5.0));
+        assert_eq!(paint.opacity, Some(1.0));
 
         // The later connection color wins; the default width shows through.
         let conn = resolved.conn_paint(exit(3, ExitDirection::North), None);
         assert_eq!(conn.color, smudgy_cloud::parse_css_color("#00ff00"));
         assert_eq!(conn.width, Some(1.0));
+        assert_eq!(conn.opacity, Some(1.0));
     }
 
     /// Port of `explicit_room_fill_does_not_erase_route_stroke` from the
