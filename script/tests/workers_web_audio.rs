@@ -1,17 +1,9 @@
-//! Workers spawned from an audio-snapshot parent — the QA crash regression.
+//! Regression tests for workers beside a live Web Audio parent.
 //!
-//! V8's shared heap (string table included) is process-global: the first live
-//! isolate's snapshot blob initializes it and every later `Isolate::New`
-//! verifies against it. A worker booting the BASE blob while its parent's
-//! AUDIO-blob isolate is live is a fatal `Check failed: index < size()` in
-//! `SharedHeapDeserializer::DeserializeStringTable`. The fix boots workers
-//! from the parent's blob, registering a matching state-free deno_audio
-//! extension whose ops the realm guard disables.
-//!
-//! This suite lives in its own test binary ON PURPOSE: cargo gives each
-//! integration test file its own process, so these audio-blob isolates never
-//! coexist with the base-blob parents in `workers.rs`. Do not merge the two
-//! files — mixed blobs in one process is exactly the crash under test.
+//! Before snapshot selection became build-wide, a worker could use the base snapshot
+//! while its parent used the Web Audio snapshot. V8 then terminated with `index < size()`
+//! during shared-heap deserialization. Every isolate in this binary now uses the Web
+//! Audio snapshot. Workers register deno_audio for compatibility but do not expose its API.
 #![cfg(feature = "web-audio")]
 
 use std::path::Path;
@@ -50,9 +42,7 @@ impl Drop for EnteredIsolate {
     }
 }
 
-/// An audio-snapshot parent runtime with workers enabled — the exact shape the
-/// application session runs (deno_audio at custom-extension index 0 selects
-/// the audio snapshot; state-free default options suffice for realm boot).
+/// Creates the runtime shape used by a session with Web Audio and trusted workers.
 fn audio_script_runtime(data_dir: &Path) -> Result<(Rc<tokio::runtime::Runtime>, ScriptRuntime)> {
     let mut audio = deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
     smudgy_script::prepare_deferred_web_audio_extension(&mut audio);
@@ -97,9 +87,7 @@ fn eval_async_bool(
     })
 }
 
-/// The regression: a worker constructed while the audio-blob parent isolate is
-/// live must boot (matching blob), round-trip a message, and terminate — not
-/// abort the process in shared-heap deserialization.
+/// Keeps the Web Audio parent live while a worker starts, exchanges a message, and stops.
 #[test]
 fn worker_boots_beside_a_live_audio_snapshot_parent() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -132,9 +120,10 @@ fn worker_boots_beside_a_live_audio_snapshot_parent() -> Result<()> {
     Ok(())
 }
 
-/// Audio stays absent inside the worker even on the audio blob: the matching
-/// extension exists purely for snapshot-prefix/blob compatibility, its entry
-/// point never evaluates, and its ops are disabled by the realm guard.
+/// Verifies that snapshot compatibility does not expose Web Audio in the worker.
+///
+/// The worker registers deno_audio to match the snapshot sequence. It does not evaluate
+/// the ESM entry point, and the realm guard disables the native audio operations.
 #[test]
 fn audio_blob_worker_has_no_audio_surface() -> Result<()> {
     let temp = tempfile::tempdir()?;

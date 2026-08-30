@@ -458,33 +458,26 @@ impl ModuleLoader for WorkerModuleLoader {
     }
 }
 
-/// The callback [`op_create_worker`] invokes **on the worker's own OS
-/// thread**, inside the current-thread tokio runtime deno_runtime creates for
-/// it, to construct the worker realm. Everything here is built fresh on that
-/// thread; nothing session-bound (and nothing `!Send`) is captured.
+/// Creates the callback that constructs a worker realm on its OS thread.
 ///
-/// `web_audio` records which snapshot the PARENT runtime booted. V8's shared
-/// heap (string table included) is process-global: the first live isolate's
-/// blob initializes it and every later `Isolate::New` verifies against it, so
-/// a worker booting a different blob than its concurrently-live parent is a
-/// fatal `Check failed: index < size()` inside snapshot deserialization. The
-/// worker therefore always boots the parent's snapshot; on the audio blob it
-/// registers a matching state-free deno_audio extension (options-default,
-/// exactly like the snapshot build) whose ops the realm guard disables.
+/// deno_runtime invokes the callback inside a current-thread Tokio runtime. The callback
+/// creates all worker state there and captures no session state or non-`Send` values.
+///
+/// Each worker uses the build-selected snapshot. In Web Audio builds, the worker also
+/// registers a matching deno_audio extension. It does not evaluate deno_audio ESM, and
+/// the realm guard disables the native audio operations.
 pub(crate) fn create_web_worker_callback(
-    web_audio: bool,
     package_sources: WorkerModuleSourceChannel,
     mode: WorkerMode,
 ) -> Arc<CreateWebWorkerCb> {
     debug_assert!(mode.enabled());
     Arc::new(move |args: CreateWebWorkerArgs| {
-        create_compute_worker(args, web_audio, Arc::clone(&package_sources), mode)
+        create_compute_worker(args, Arc::clone(&package_sources), mode)
     })
 }
 
 fn create_compute_worker(
     args: CreateWebWorkerArgs,
-    web_audio: bool,
     package_sources: WorkerModuleSourceChannel,
     mode: WorkerMode,
 ) -> (WebWorker, deno_runtime::web_worker::SendableWebWorkerHandle) {
@@ -517,46 +510,26 @@ fn create_compute_worker(
         };
 
     #[cfg(feature = "web-audio")]
-    let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = if web_audio {
-        (
-            crate::WEB_AUDIO_STARTUP_SNAPSHOT,
-            crate::RESIDUAL_LAZY_AUDIO_JS_SOURCES,
-            crate::RESIDUAL_LAZY_AUDIO_ESM_SOURCES,
-        )
-    } else {
-        (
-            crate::STARTUP_SNAPSHOT,
-            crate::RESIDUAL_LAZY_JS_SOURCES,
-            crate::RESIDUAL_LAZY_ESM_SOURCES,
-        )
-    };
+    let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = (
+        crate::WEB_AUDIO_STARTUP_SNAPSHOT,
+        crate::RESIDUAL_LAZY_AUDIO_JS_SOURCES,
+        crate::RESIDUAL_LAZY_AUDIO_ESM_SOURCES,
+    );
     #[cfg(not(feature = "web-audio"))]
-    let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = {
-        debug_assert!(
-            !web_audio,
-            "audio-snapshot parents require the web-audio feature"
-        );
-        (
-            crate::STARTUP_SNAPSHOT,
-            crate::RESIDUAL_LAZY_JS_SOURCES,
-            crate::RESIDUAL_LAZY_ESM_SOURCES,
-        )
-    };
+    let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = (
+        crate::STARTUP_SNAPSHOT,
+        crate::RESIDUAL_LAZY_JS_SOURCES,
+        crate::RESIDUAL_LAZY_ESM_SOURCES,
+    );
 
-    // On the audio blob the snapshot's frozen extension prefix ends with
-    // deno_audio, so the worker registers a matching instance first — deferred
-    // ESM never imported (no bootstrap side-module runs in workers), ops
-    // disabled by the realm guard, default (state-free) options exactly like
-    // the snapshot build's instance.
+    // Match the deno_audio sequence recorded by the Web Audio snapshot. The worker
+    // does not evaluate its ESM, and the realm guard disables its native operations.
     let extensions = vec![worker_realm_guard_extension()];
     #[cfg(feature = "web-audio")]
-    let extensions = if web_audio {
-        let mut audio = deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default());
-        crate::prepare_deferred_web_audio_extension(&mut audio);
+    let extensions = {
+        let audio = crate::audio_snapshot_compatibility_extension();
         let mut extensions = extensions;
         extensions.insert(0, audio);
-        extensions
-    } else {
         extensions
     };
 

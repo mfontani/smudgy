@@ -70,12 +70,18 @@ fn op_layering_double(x: u32) -> u32 {
     x * 2
 }
 
+// The audio compatibility guard must use extension provenance, not this prefix.
+#[deno_core::op2(fast)]
+fn op_phase0_non_audio_identity(x: u32) -> u32 {
+    x
+}
+
 // Mirrors the shape of smudgy's production extensions (smudgy_ops etc.): ops +
 // an embedded ESM entry point, appended per runtime on TOP of the baked base
 // startup snapshot rather than baked into it.
 deno_core::extension!(
     smudgy_snapshot_layering_test,
-    ops = [op_layering_double],
+    ops = [op_layering_double, op_phase0_non_audio_identity],
     customizer = |ext: &mut deno_core::Extension| {
         ext.esm_files = std::borrow::Cow::Borrowed(LAYERING_TEST_ESM);
         ext.esm_entry_point = Some("ext:smudgy_snapshot_layering_test/entry.js");
@@ -90,13 +96,15 @@ static LAYERING_TEST_ESM: &[deno_core::ExtensionFileSource] =
         // only in InitMode::New), so runtime-added ops never appear there.
         // Runtime-added ops ARE (re)bound onto `Deno.core.ops` whenever
         // `skip_op_registration` is false — capture from there at eval time.
-        deno_core::ascii_str!("globalThis.__layeringDouble = Deno.core.ops.op_layering_double;\n"),
+        deno_core::ascii_str!(
+            "globalThis.__layeringDouble = Deno.core.ops.op_layering_double;\n\
+             globalThis.__phase0NonAudioIdentity = Deno.core.ops.op_phase0_non_audio_identity;\n"
+        ),
     )];
 
-/// The runtime boots from a startup snapshot holding only the deno_runtime base
-/// extension set; smudgy's own extensions are appended at runtime. This guards
-/// the layering contract: a non-snapshotted extension's ops register and its
-/// ESM entry point evaluates on top of the snapshot.
+/// Verifies that runtime extensions layer on the build-selected startup snapshot.
+/// The regression covers operation registration and ESM evaluation after the
+/// extension sequence recorded by the snapshot.
 #[test]
 fn custom_extension_layers_on_startup_snapshot() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -120,7 +128,7 @@ fn custom_extension_layers_on_startup_snapshot() -> Result<()> {
     assert!(eval_bool_in_tokio(
         &tokio,
         &mut runtime,
-        "__layeringDouble(21) === 42",
+        "__layeringDouble(21) === 42 && __phase0NonAudioIdentity(7) === 7",
     )?);
     Ok(())
 }
@@ -159,7 +167,7 @@ fn runtime_with_extensions(
 
 #[cfg(feature = "web-audio")]
 #[test]
-fn compiled_web_audio_feature_keeps_base_runtime_audio_free() -> Result<()> {
+fn compiled_web_audio_feature_keeps_compatibility_runtime_audio_free() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (tokio, mut runtime) = runtime_with_extensions(temp.path(), Vec::new())?;
     assert!(eval_bool_in_tokio(
@@ -169,12 +177,6 @@ fn compiled_web_audio_feature_keeps_base_runtime_audio_free() -> Result<()> {
     )?);
     Ok(())
 }
-
-// The positive audio-snapshot selection test lives in `runtime_web_audio.rs`,
-// its own test binary and therefore its own PROCESS: V8's shared heap is
-// process-global and blob-verified per isolate, so an audio-blob isolate must
-// never be live beside this binary's base-blob isolates. The preflight
-// rejection tests below never construct an isolate and are safe here.
 
 #[cfg(feature = "web-audio")]
 #[test]
