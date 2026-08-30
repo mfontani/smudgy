@@ -1,16 +1,10 @@
-//! Audio-snapshot runtime selection, in its own test binary ON PURPOSE.
+//! Tests Web Audio exposure and build-wide startup snapshot compatibility.
 //!
-//! V8's shared heap (string table included) is process-global: the first live
-//! isolate's snapshot blob initializes it and every later `Isolate::New`
-//! verifies against it. `runtime.rs` is full of base-blob isolates running in
-//! parallel test threads, so a concurrently-live AUDIO-blob isolate there is
-//! an intermittent process crash (access violation / `Check failed:
-//! index < size()` depending on timing) — observed deterministically on
-//! high-core machines while low-core CI scheduling masked it. Each cargo
-//! integration test file is its own process; every isolate in this one boots
-//! the audio blob.
+//! Every isolate in this binary uses the Web Audio snapshot. This includes helper
+//! runtimes, such as the declaration generator, that do not expose the Web Audio API.
 #![cfg(feature = "web-audio")]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -69,10 +63,9 @@ fn eval_bool(
     })
 }
 
-/// A deno_audio extension at custom index 0 selects the audio startup snapshot
-/// and its deferred entry point installs the Web Audio globals.
+/// Verifies that an explicit deno_audio extension installs the Web Audio globals.
 #[test]
-fn exact_audio_extension_selects_audio_snapshot_and_installs_globals() -> Result<()> {
+fn exact_audio_extension_installs_globals_on_audio_snapshot() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (tokio, mut runtime) = audio_runtime(temp.path())?;
     assert!(eval_bool(
@@ -80,5 +73,32 @@ fn exact_audio_extension_selects_audio_snapshot_and_installs_globals() -> Result
         &mut runtime,
         "typeof globalThis.AudioContext === 'function' && typeof globalThis.OfflineAudioContext === 'function'",
     )?);
+    Ok(())
+}
+
+/// Runs declaration generation on another thread while a Web Audio isolate remains live.
+///
+/// Before snapshot selection became build-wide, the generator used the base snapshot.
+/// V8 then terminated with `index < size()` while deserializing its shared heap. The
+/// separate thread preserves the publish-time execution path that exposed the defect.
+#[test]
+fn declaration_generator_uses_audio_snapshot_beside_live_audio_runtime() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_tokio, _audio_runtime) = audio_runtime(temp.path())?;
+
+    let generated = std::thread::spawn(|| {
+        let sources = BTreeMap::from([(
+            "index.ts".to_string(),
+            "export const answer: number = 42;".to_string(),
+        )]);
+        smudgy_script::dts::generate_declarations(&sources, &BTreeMap::new())
+    })
+    .join()
+    .expect("declaration generator thread panicked")?;
+
+    assert_eq!(
+        generated.files.get("index.d.ts").map(String::as_str),
+        Some("export declare const answer: number;\n")
+    );
     Ok(())
 }

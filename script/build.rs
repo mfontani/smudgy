@@ -7,30 +7,31 @@
 //!    (`typescript.js`) is embedded directly via `include_str!` in `dts.rs`;
 //!    only the variable-length set of lib files is generated here.
 //!
-//! 2. **V8 startup snapshots** (`SMUDGY_RUNTIME_SNAPSHOT.bin`, optional
-//!    `SMUDGY_RUNTIME_AUDIO_SNAPSHOT.bin`, and their residual-source tables):
-//!    deno_core 0.410 is snapshot-first — every
-//!    `include_js_files!` source (and deno_runtime's `99_main.js`) is recorded
-//!    as an absolute build-machine path, never embedded. A runtime without a
-//!    startup snapshot reads those paths at every `JsRuntime::new`, which fails
-//!    on any machine but the builder. The base snapshot bakes deno_runtime. A
-//!    second feature-selected snapshot adds deno_audio's state-free op/object
-//!    table and deferred ESM while preserving true no-audio runtimes. Smudgy's own extensions
-//!    (smudgy_ops / smudgy_mapper / smudgy_widgets) carry per-session state, live
-//!    in crates above this one, and instead embed their ESM via each `extension!`'s
-//!    customizer.
-//!    The residual-source files hold `(specifier, source)` tables for
-//!    `lazy_loaded_*` files the snapshot did not consume
-//!    (`WorkerOptions::residual_lazy_{js,esm}_sources`); they load on demand
-//!    via `core.loadExtScript()` / lazy ESM imports, so they must ship embedded.
+//! 2. **V8 startup snapshot**: Each build creates one snapshot and one residual-source
+//!    table. A base build creates `SMUDGY_RUNTIME_SNAPSHOT.bin`. A Web Audio build
+//!    creates `SMUDGY_RUNTIME_AUDIO_SNAPSHOT.bin`.
 //!
-//!    `create_runtime_snapshot` emits `cargo:rerun-if-changed` for every source
-//!    it reads; the generated `include_str!`s are tracked by cargo itself.
+//!    deno_core 0.410 records extension sources as absolute paths on the build machine.
+//!    It also records the path to `deno_runtime`'s `99_main.js`. Without a startup
+//!    snapshot, `JsRuntime::new` reads those paths on the user's machine and fails.
 //!
-//!    The `SnapshotOptions` baked here only feed the snapshot-time bootstrap;
-//!    at runtime deno_runtime re-inserts `SnapshotOptions::default()` whenever
-//!    a startup snapshot is present, so what scripts observe is computed on the
-//!    running machine either way.
+//!    The base snapshot freezes state produced by the deno_runtime extensions. The Web
+//!    Audio snapshot also freezes deno_audio operation and object metadata. Its ESM
+//!    remains deferred until deno_runtime completes bootstrap. A runtime without Web
+//!    Audio registers compatibility extensions that match this metadata and disable the
+//!    native audio operations.
+//!
+//!    The snapshot excludes Smudgy's extensions because they contain session state.
+//!    Each `extension!` customizer embeds its ESM. The residual-source table embeds the
+//!    `lazy_loaded_*` files that the snapshot did not consume. The runtime uses this
+//!    table for `core.loadExtScript()` and lazy ESM imports.
+//!
+//!    `create_runtime_snapshot` tells Cargo to track each source that it reads.
+//!    Cargo also tracks the generated `include_str!` sources.
+//!
+//!    `SnapshotOptions` affects only the snapshot build.
+//!    At runtime, deno_runtime uses `SnapshotOptions::default()` with a startup snapshot.
+//!    Thus, scripts receive values that deno_runtime calculates on the current machine.
 
 use std::collections::HashSet;
 use std::{
@@ -45,6 +46,7 @@ use deno_runtime::snapshot::{LazyExtensionFileKind, create_runtime_snapshot};
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     write_dts_libs(&out_dir);
+    #[cfg(not(feature = "web-audio"))]
     write_startup_snapshot(
         &out_dir,
         "SMUDGY_RUNTIME_SNAPSHOT.bin",

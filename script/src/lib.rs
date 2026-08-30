@@ -56,16 +56,19 @@ pub use web_workers::{WorkerMode, worker_host_denied_extension};
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
 pub mod dts;
 
-// V8 startup snapshots built at compile time bake deno_runtime's base
-// extension set and, when selected, deno_audio's frozen schema (see build.rs).
-// Keeping both snapshots lets a feature-enabled app create explicit legacy
-// no-audio runtimes without violating deno_core's frozen extension prefix.
-// Booting from them means extension JS never loads
-// from disk at runtime (deno_core 0.410 records those sources as absolute
-// build-machine paths), and skips re-evaluating the base extensions per
-// isolate. Smudgy's own extensions are appended per isolate on top of the
-// selected snapshot; deno_core matches the snapshotted prefix by name and initializes
-// the rest fresh (`extensions_in_snapshot` in deno_core's extension_set).
+// Each smudgy_script build embeds one startup snapshot. V8 uses one shared heap
+// for all live isolates, so every isolate in the process must use that snapshot.
+// A base build freezes deno_runtime extension state. A Web Audio build also
+// freezes deno_audio operation and object metadata.
+//
+// Snapshot selection is build-wide, but Web Audio exposure is runtime-specific.
+// An audio runtime supplies deno_audio at custom index 0 and evaluates its ESM.
+// Other runtimes supply compatibility extensions that preserve the recorded extension
+// sequence, skip the deno_audio ESM entry point, and disable native audio operations.
+//
+// The snapshot also prevents runtime reads from absolute build-machine paths.
+// Smudgy adds its stateful extensions after the sequence recorded by the snapshot.
+#[cfg(not(feature = "web-audio"))]
 static STARTUP_SNAPSHOT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/SMUDGY_RUNTIME_SNAPSHOT.bin"));
 #[cfg(feature = "web-audio")]
@@ -77,6 +80,7 @@ static WEB_AUDIO_STARTUP_SNAPSHOT: &[u8] = include_bytes!(concat!(
 // `RESIDUAL_LAZY_JS_SOURCES` / `RESIDUAL_LAZY_ESM_SOURCES`: lazy_loaded_*
 // sources the snapshot did not consume, embedded here (generated — see
 // build.rs) and registered via `WorkerOptions::residual_lazy_*_sources`.
+#[cfg(not(feature = "web-audio"))]
 include!(concat!(env!("OUT_DIR"), "/residual_lazy_sources.rs"));
 #[cfg(feature = "web-audio")]
 include!(concat!(env!("OUT_DIR"), "/residual_lazy_audio_sources.rs"));
@@ -107,21 +111,71 @@ fn preflight_web_audio_extension(extensions: &[deno_core::Extension]) -> Result<
     }
 }
 
-/// Embeds deno_audio's exact extension modules and defers their entry point until deno_runtime
-/// has installed the URL and Event globals those modules use.
+/// Defers deno_audio ESM evaluation until deno_runtime completes bootstrap.
 ///
-/// This is feature-internal embedder glue; it does not grant a script any native authority.
+/// deno_audio imports the URL and Event globals that deno_runtime installs during
+/// bootstrap. The build-generated residual table supplies their source text at runtime.
 #[cfg(feature = "web-audio")]
 #[doc(hidden)]
 pub fn prepare_deferred_web_audio_extension(extension: &mut deno_core::Extension) {
     let deferred = std::mem::take(extension.esm_files.to_mut());
 
-    // A runtime Extension may not retain unevaluated eager ESM. Register the exact graph as
-    // lazy-loaded ESM so MainWorker can bootstrap Deno first, then import the entry point through
-    // the internal ext: module map. The matching startup snapshot supplies their embedded residual
-    // sources; static peer imports within deno_audio remain closed to that map.
+    // Move the complete graph to the lazy-loaded set. Static deno_audio imports
+    // continue to resolve through the internal ext: module map.
     extension.lazy_loaded_esm_files.to_mut().extend(deferred);
     extension.esm_entry_point = None;
+}
+
+#[cfg(feature = "web-audio")]
+#[derive(Debug)]
+struct NoAudioPermissions;
+
+#[cfg(feature = "web-audio")]
+impl deno_audio::AudioPermissions for NoAudioPermissions {
+    fn check_playback(&self, api_name: &'static str) -> Result<(), JsErrorBox> {
+        Err(JsErrorBox::generic(format!(
+            "{api_name} is unavailable in a runtime without Web Audio"
+        )))
+    }
+
+    fn check_capture(&self, api_name: &'static str) -> Result<(), JsErrorBox> {
+        Err(JsErrorBox::generic(format!(
+            "{api_name} is unavailable in a runtime without Web Audio"
+        )))
+    }
+}
+
+/// Creates a deno_audio extension without device permissions or physical output.
+#[cfg(feature = "web-audio")]
+pub(crate) fn audio_snapshot_compatibility_extension() -> deno_core::Extension {
+    let options = deno_audio::AudioExtensionOptions::default()
+        .permissions(Arc::new(NoAudioPermissions))
+        .output_factory(Arc::new(deno_audio::SilentAudioOutput::new()));
+    let mut audio = deno_audio::deno_audio::init(options);
+    prepare_deferred_web_audio_extension(&mut audio);
+    audio
+}
+
+/// Creates snapshot-compatibility extensions for a runtime without Web Audio.
+///
+/// The deno_audio extension matches the sequence recorded by the Web Audio snapshot.
+/// The guard disables every regular operation and native-object method from deno_audio.
+/// The runtime does not evaluate the ESM entry point, so it exposes no Web Audio API.
+#[cfg(feature = "web-audio")]
+fn audio_snapshot_compatibility_extensions() -> [deno_core::Extension; 2] {
+    let audio = audio_snapshot_compatibility_extension();
+    let guard = deno_core::Extension {
+        name: "smudgy_audio_snapshot_compatibility_guard",
+        context_middleware_fn: Some(Box::new(|context, op| {
+            if context.extension_name == "deno_audio" {
+                op.disable()
+            } else {
+                op
+            }
+        })),
+        ..Default::default()
+    };
+    [audio, guard]
 }
 
 #[derive(Debug, Clone, Default)]
@@ -323,8 +377,15 @@ impl ScriptRuntime {
         let initialize_web_audio = preflight_web_audio_extension(&options.extensions)?;
         let worker_mode = options.workers;
         let mut extensions = options.extensions;
-        // Appending after the preflight keeps any deno_audio extension at
-        // custom index 0, where the frozen snapshot prefix expects it.
+        #[cfg(feature = "web-audio")]
+        if !initialize_web_audio {
+            let [audio, guard] = audio_snapshot_compatibility_extensions();
+            // Keep deno_audio at custom index 0 to match the snapshot. The guard
+            // follows it and disables every operation owned by deno_audio.
+            extensions.insert(0, audio);
+            extensions.push(guard);
+        }
+        // Append the general guards after the snapshot-matching extension sequence.
         extensions.push(web_workers::embedded_process_guard_extension());
         if worker_mode == WorkerMode::Disabled {
             extensions.push(web_workers::worker_host_denied_extension());
@@ -416,21 +477,14 @@ impl ScriptRuntime {
             (None, None)
         };
 
+        // The compile-time feature selects the snapshot. `initialize_web_audio`
+        // controls API exposure only and does not select a different snapshot.
         #[cfg(feature = "web-audio")]
-        let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) =
-            if initialize_web_audio {
-                (
-                    WEB_AUDIO_STARTUP_SNAPSHOT,
-                    RESIDUAL_LAZY_AUDIO_JS_SOURCES,
-                    RESIDUAL_LAZY_AUDIO_ESM_SOURCES,
-                )
-            } else {
-                (
-                    STARTUP_SNAPSHOT,
-                    RESIDUAL_LAZY_JS_SOURCES,
-                    RESIDUAL_LAZY_ESM_SOURCES,
-                )
-            };
+        let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = (
+            WEB_AUDIO_STARTUP_SNAPSHOT,
+            RESIDUAL_LAZY_AUDIO_JS_SOURCES,
+            RESIDUAL_LAZY_AUDIO_ESM_SOURCES,
+        );
         #[cfg(not(feature = "web-audio"))]
         let (startup_snapshot, residual_lazy_js_sources, residual_lazy_esm_sources) = (
             STARTUP_SNAPSHOT,
@@ -440,9 +494,6 @@ impl ScriptRuntime {
 
         let mut worker_options = WorkerOptions {
             extensions,
-            // Select the exact frozen extension prefix. A feature-enabled
-            // application may still construct a legacy runtime with no Web
-            // Audio extension, so the base and audio snapshots coexist.
             startup_snapshot: Some(startup_snapshot),
             residual_lazy_js_sources,
             residual_lazy_esm_sources,
@@ -463,10 +514,8 @@ impl ScriptRuntime {
         // it is unused and must not be sniffed here.
         worker_options.bootstrap.has_node_modules_dir = false;
         if worker_mode.enabled() {
-            // Workers must boot the same snapshot blob as this (parent) runtime:
-            // V8's shared heap is process-global and blob-verified per isolate.
+            // The callback uses the same build-selected snapshot for each worker.
             worker_options.create_web_worker_cb = web_workers::create_web_worker_callback(
-                initialize_web_audio,
                 Arc::clone(&worker_module_sources),
                 worker_mode,
             );
@@ -493,9 +542,8 @@ impl ScriptRuntime {
             MainWorker::bootstrap_from_options(&main_module, services, worker_options)
         };
 
-        // deno_audio's exact module graph is registered as lazy-loaded ESM. Import its entry point
-        // only after deno_runtime has installed the URL/Event globals it imports. Native state and
-        // ops were supplied by the matching runtime extension before bootstrap.
+        // Evaluate deno_audio only after deno_runtime installs the URL and Event globals.
+        // The matching runtime extension registered native state before bootstrap.
         if initialize_web_audio {
             let specifier = ModuleSpecifier::parse("file:///__smudgy_web_audio_bootstrap.js")
                 .context("failed to parse the Web Audio bootstrap module")?;
