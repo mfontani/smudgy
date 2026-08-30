@@ -129,11 +129,47 @@ async fn wait_until_observing<S, F, O>(
     );
 }
 
-fn room_exists(mapper: &Mapper, external_id: &str) -> bool {
-    mapper
-        .get_current_atlas()
-        .find_room_by_external_id(external_id)
-        .is_some()
+/// Atlas predicates observe the mapper's journaled optimistic state. Once a final effect is
+/// visible, drain its already-enqueued mutation before a test relies on durable backend state.
+async fn drain_mutation_queue(mapper: &Mapper) {
+    match mapper.wait_for_sync_completion(60).await {
+        Ok(true) => {}
+        Ok(false) => panic!("mutation queue still pending after 60 seconds"),
+        Err(()) => panic!("mutation queue reported failed operations"),
+    }
+}
+
+/// Wait for the package's final location event rather than the earlier optimistic room publish.
+/// Matching the event's exact room key also ignores stale location events left in the stream.
+async fn wait_until_current_room<S>(
+    events: &mut S,
+    lines: &mut Vec<String>,
+    description: &str,
+    mapper: &Mapper,
+    external_id: &str,
+) where
+    S: Stream<Item = TaggedSessionEvent> + Unpin,
+{
+    let located = Cell::new(false);
+    wait_until_observing(
+        events,
+        lines,
+        description,
+        |_| located.get(),
+        |event| {
+            let SessionEvent::SetCurrentLocation(area_id, Some(room_number)) = event else {
+                return;
+            };
+            let atlas = mapper.get_current_atlas();
+            let room_number = RoomNumber(*room_number);
+            let is_requested_room = atlas.get_area(area_id).is_some_and(|area| {
+                area.get_room(&room_number)
+                    .is_some_and(|room| room.get_external_id() == Some(external_id))
+            });
+            located.set(is_requested_room);
+        },
+    )
+    .await;
 }
 
 fn room_title_is(mapper: &Mapper, external_id: &str, title: &str) -> bool {
@@ -471,6 +507,9 @@ async fn auto_mapper_maps_follows_and_persists() {
         },
     )
     .await;
+    // The predicate above becomes true when the final mutation is optimistically published.
+    // Confirm it reached the local backend before shutting this mapper down and reloading it.
+    drain_mutation_queue(&mapper).await;
     let transcript = lines.join("\n");
     let atlas = mapper.get_current_atlas();
     let (key102, _) = atlas
@@ -1362,11 +1401,12 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         r#"{ "num": 903, "name": "Ambiguous Trail", "zone": "trailfields", "exits": {} }"#,
     ))
     .unwrap();
-    wait_until(
+    wait_until_current_room(
         &mut events,
         &mut lines,
         "ambiguous-arrival room 903",
-        |_| room_exists(&mapper, "903"),
+        &mapper,
+        "903",
     )
     .await;
     let transcript = lines.join("\n");
@@ -1398,11 +1438,12 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         r#"{ "num": 902, "name": "Far Field", "zone": "trailfields", "coords": "1,999999999,5", "exits": {} }"#,
     ))
     .unwrap();
-    wait_until(
+    wait_until_current_room(
         &mut events,
         &mut lines,
         "bounded-coordinate room 902",
-        |_| room_exists(&mapper, "902"),
+        &mapper,
+        "902",
     )
     .await;
     let transcript = lines.join("\n");
@@ -1853,12 +1894,24 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
     ))
     .unwrap();
 
-    wait_until(
+    let fallback_located = Cell::new(false);
+    wait_until_observing(
         &mut events,
         &mut lines,
         "the unwritable-map retry to create room 701 in a fallback area",
-        |lines| {
-            lines.iter().any(|line| line.contains("not writable")) && room_exists(&mapper, "701")
+        |lines| lines.iter().any(|line| line.contains("not writable")) && fallback_located.get(),
+        |event| {
+            let SessionEvent::SetCurrentLocation(area_id, Some(room_number)) = event else {
+                return;
+            };
+            let atlas = mapper.get_current_atlas();
+            let room_number = RoomNumber(*room_number);
+            let is_fallback_room = *area_id != bound
+                && atlas.get_area(area_id).is_some_and(|area| {
+                    area.get_room(&room_number)
+                        .is_some_and(|room| room.get_external_id() == Some("701"))
+                });
+            fallback_located.set(is_fallback_room);
         },
     )
     .await;
