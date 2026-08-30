@@ -55,6 +55,12 @@ type SmudgyNodeResolver = NodeResolver<
     SmudgyNpmResolver,
     RealSys,
 >;
+type SmudgyNodeResolverRc = node_resolver::NodeResolverRc<
+    DenoInNpmPackageChecker,
+    DenoIsBuiltInNodeModuleChecker,
+    SmudgyNpmResolver,
+    RealSys,
+>;
 type SmudgyNpmModuleLoader = NpmModuleLoader<
     DenoCjsCodeAnalyzer<RealSys>,
     DenoInNpmPackageChecker,
@@ -66,6 +72,7 @@ type SmudgyNpmModuleLoader = NpmModuleLoader<
 pub struct SmudgyNpmServices {
     pub in_npm_package_checker: DenoInNpmPackageChecker,
     pub npm_resolver: SmudgyNpmResolver,
+    node_resolver: SmudgyNodeResolverRc,
     req_resolver: NpmReqResolver<
         DenoInNpmPackageChecker,
         DenoIsBuiltInNodeModuleChecker,
@@ -211,6 +218,7 @@ impl SmudgyNpmServices {
         let services = Rc::new(Self {
             in_npm_package_checker: in_npm_package_checker.clone(),
             npm_resolver: npm_resolver.clone(),
+            node_resolver: node_resolver.clone(),
             req_resolver,
             registry_info_provider,
             tarball_cache,
@@ -271,6 +279,39 @@ impl SmudgyNpmServices {
 
     pub fn is_npm_package_specifier(&self, specifier: &ModuleSpecifier) -> bool {
         node_resolver::InNpmPackageChecker::in_npm_package(&self.in_npm_package_checker, specifier)
+    }
+
+    /// Resolve an ESM import using Node semantics when its referrer is inside the managed npm
+    /// cache. This is the same boundary used by Deno's `RawDenoResolver`: once execution enters
+    /// an npm package, bare dependencies, package `imports`/`exports`, extension handling, and
+    /// legacy bare built-ins such as `"module"` all belong to the Node resolver.
+    pub fn resolve_package_import(
+        &self,
+        specifier: &str,
+        referrer: &ModuleSpecifier,
+    ) -> Result<Option<ModuleSpecifier>, ModuleLoaderError> {
+        if referrer.scheme() != "file" || !self.is_npm_package_specifier(referrer) {
+            return Ok(None);
+        }
+
+        let resolution = self
+            .node_resolver
+            .resolve(
+                specifier,
+                referrer,
+                ResolutionMode::Import,
+                node_resolver::NodeResolutionKind::Execution,
+            )
+            .map_err(|err| {
+                generic_loader_error(format!(
+                    "failed resolving npm package import {specifier} from {referrer}: {err}"
+                ))
+            })?;
+        resolution.into_url().map(Some).map_err(|err| {
+            generic_loader_error(format!(
+                "npm package import {specifier} from {referrer} did not resolve to a URL: {err}"
+            ))
+        })
     }
 
     async fn load_npm_module(
@@ -759,9 +800,15 @@ impl NodeRequireLoader for SmudgyNodeRequireLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use deno_ast::{MediaType, ParseParams};
+    use deno_npm::resolution::{
+        SerializedNpmResolutionSnapshot, SerializedNpmResolutionSnapshotPackage,
+    };
+    use deno_npm::{NpmPackageId, NpmResolutionPackageSystemInfo};
+    use deno_semver::package::PackageReq;
     use node_resolver::analyze::{CjsAnalysis, CjsCodeAnalyzer, EsmAnalysisMode};
 
     use super::*;
@@ -778,6 +825,79 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    fn snapshot_package(
+        id: &NpmPackageId,
+        dependencies: &[(&str, &NpmPackageId)],
+    ) -> SerializedNpmResolutionSnapshotPackage {
+        SerializedNpmResolutionSnapshotPackage {
+            id: id.clone(),
+            system: NpmResolutionPackageSystemInfo::default(),
+            dist: None,
+            dependencies: dependencies
+                .iter()
+                .map(|(name, id)| ((*name).into(), (*id).clone()))
+                .collect(),
+            optional_dependencies: HashSet::new(),
+            optional_peer_dependencies: HashSet::new(),
+            extra: None,
+            is_deprecated: false,
+            has_bin: false,
+            has_scripts: false,
+        }
+    }
+
+    #[test]
+    fn npm_esm_bare_dependency_resolves_from_managed_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = std::fs::canonicalize(temp.path()).unwrap();
+        let (services, _node_services) = SmudgyNpmServices::new(data_dir.clone()).unwrap();
+        let app_id = NpmPackageId::from_serialized("fixture-app@1.0.0").unwrap();
+        let dependency_id = NpmPackageId::from_serialized("fixture-dep@2.0.0").unwrap();
+        let snapshot = SerializedNpmResolutionSnapshot {
+            root_packages: HashMap::from([(
+                PackageReq::from_str("fixture-app@1").unwrap(),
+                app_id.clone(),
+            )]),
+            packages: vec![
+                snapshot_package(&app_id, &[("fixture-dep", &dependency_id)]),
+                snapshot_package(&dependency_id, &[]),
+            ],
+        };
+        services
+            .npm_resolution
+            .set_snapshot(NpmResolutionSnapshot::new(snapshot.into_valid().unwrap()));
+
+        let registry_dir = data_dir.join("npm").join("registry.npmjs.org");
+        let app_dir = registry_dir.join("fixture-app").join("1.0.0");
+        let dependency_dir = registry_dir.join("fixture-dep").join("2.0.0");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&dependency_dir).unwrap();
+        std::fs::write(
+            app_dir.join("package.json"),
+            r#"{"name":"fixture-app","version":"1.0.0","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(app_dir.join("index.mjs"), "import 'fixture-dep';\n").unwrap();
+        std::fs::write(
+            dependency_dir.join("package.json"),
+            r#"{"name":"fixture-dep","version":"2.0.0","type":"module","exports":"./index.mjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dependency_dir.join("index.mjs"),
+            "export const value = 42;\n",
+        )
+        .unwrap();
+
+        let referrer = ModuleSpecifier::from_file_path(app_dir.join("index.mjs")).unwrap();
+        let resolved = services
+            .resolve_package_import("fixture-dep", &referrer)
+            .expect("resolve bare dependency")
+            .expect("npm referrer should use Node resolution");
+        let expected = ModuleSpecifier::from_file_path(dependency_dir.join("index.mjs")).unwrap();
+        assert_eq!(resolved, expected);
     }
 
     #[test]
