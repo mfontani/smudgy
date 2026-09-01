@@ -148,6 +148,8 @@ preferences-discord-rich-presence-help = Wyświetla „Gra Smudgy” oraz nazwę
 preferences-updates = Aktualizacje
 preferences-auto-updates = Automatycznie sprawdzaj dostępność aktualizacji
 preferences-mask-password-input = Ukryj wpisywany tekst, gdy serwer prosi o hasło
+preferences-history-case-sensitive-match = Dopasowywanie historii z rozróżnianiem wielkości liter
+preferences-history-case-sensitive-match-help = Up/Down przechodzi tylko po wpisach historii zaczynających się od tekstu, który pozostał niezaznaczony. Domyślnie wyłączone — dopasowanie niezależne od wielkości liter; włącz, aby wymagać dokładnego dopasowania wielkości liter.
 preferences-invalid-value = nieprawidłowa wartość
 
 # Theme editor

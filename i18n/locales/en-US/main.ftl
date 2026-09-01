@@ -146,6 +146,8 @@ preferences-discord-rich-presence-help = Shows “Playing Smudgy”, and which s
 preferences-updates = Updates
 preferences-auto-updates = Automatically check for updates
 preferences-mask-password-input = Hide typing when the server asks for a password
+preferences-history-case-sensitive-match = Case-sensitive history matching
+preferences-history-case-sensitive-match-help = Up/Down only cycles through history entries starting with the text you've left unselected. Off by default, matching regardless of letter case; turn on to require an exact case match.
 preferences-invalid-value = invalid value
 
 # Theme editor
