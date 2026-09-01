@@ -5,6 +5,13 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **History matching.** for example, if you type `tell` and hit up, you'll get the
+  most recent command that started with tell.  configurable
+
 ## [0.5.6] - 2026-08-30
 
 ### Added

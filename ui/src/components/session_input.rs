@@ -50,14 +50,29 @@ fn prefix_from_selection(value: &str, selection: Option<(usize, usize)>) -> Stri
     }
 }
 
-/// Whether `entry` starts with `prefix`, case-sensitively or not.
-/// An empty `prefix` matches every entry.
-fn entry_matches_prefix(entry: &str, prefix: &str, case_sensitive: bool) -> bool {
-    if case_sensitive {
-        entry.starts_with(prefix)
-    } else {
-        entry.to_lowercase().starts_with(&prefix.to_lowercase())
+/// How many graphemes at the start of `entry` are covered by `prefix`, or
+/// `None` when `entry` does not start with it. An empty `prefix` matches every
+/// entry, covering nothing.
+///
+/// The count is what anchors the selection left behind on a recalled entry, so
+/// it is measured by consuming both strings a grapheme at a time rather than
+/// by taking the prefix's own length: under a case-insensitive match the two
+/// are not the same text, case mapping is not always length-preserving, and a
+/// byte length is not a grapheme index at all. Walking in lockstep also keeps
+/// the common path allocation-free — equal graphemes settle by comparison, and
+/// only a differing pair pays for case folding — so a match costs no more than
+/// the prefix is long however long the entry is.
+fn prefix_match_len(entry: &str, prefix: &str, case_sensitive: bool) -> Option<usize> {
+    let mut entry_graphemes = entry.graphemes(true);
+    let mut covered = 0;
+    for wanted in prefix.graphemes(true) {
+        let found = entry_graphemes.next()?;
+        if found != wanted && (case_sensitive || found.to_lowercase() != wanted.to_lowercase()) {
+            return None;
+        }
+        covered += 1;
     }
+    Some(covered)
 }
 
 /// The grapheme index in `value` whose boundary sits at (or, for a position
@@ -725,48 +740,70 @@ impl SessionInput {
         Arc::new(self.history.iter().cloned().collect())
     }
 
-    /// The *prefix* the next Up/Down history search should match against:
-    /// whatever part of the current value is *not* currently selected, read
-    /// as a prefix (the text before the selection's start). No selection at
-    /// all means the whole value is unselected (typing "gt " with a bare caret
-    /// searches for "gt "); a selection starting at 0 (select-all, or the
-    /// selection a previous match left behind once trimmed away) means an
-    /// empty prefix, which matches every entry - so that an empty input box
-    /// and/or a fully selected input box both search through the entire full
-    /// history.
+    /// The *prefix* the next Up/Down history search matches against: whatever
+    /// part of the current value is not selected, read as a prefix (the text
+    /// before the selection's start). No selection at all means the whole
+    /// value is unselected — typing "gt " with a bare caret searches for
+    /// "gt " — while a selection starting at 0 (a select-all, or the span a
+    /// previous match left behind) yields an empty prefix, which matches every
+    /// entry: an empty box and a fully selected box both browse all of history.
     ///
-    /// Of note:
-    /// When starting a fresh history search (`history_index` is `None`), the
-    /// live selection is trustworthy as no search is in flight, so whatever
-    /// the widget reports reflects genuine user state.
-    /// When *continuing* a history search, unfortunately "it depends".
-    /// The widget's `CaretChanged` echo of the `select_range` the *previous*
-    /// keypress applied is *not guaranteed* to have arrived before the next
-    /// keypress is processed (can happen when quickly pressing up/up/up etc).
-    /// When it hasn't, what's in `self.caret` still reflects the cursor state
-    /// from *before* the previous match was applied, reinterpreted against the
-    /// new, different `self.value`. If we interpreted that as "no selection, so
-    /// the prefix is the whole displayed match", nothing would likely ever
-    /// match afterwards. A live selection is therefore only trusted here when
-    /// it *provably* reflects the *current* value: its end reaches all the way
-    /// to the end of `self.value`. This is true both for a genuine fresh echo
-    /// of our own `select_range`, which always selects through to the end; and
-    /// for a real user select-all - but false for a stale echo of the shorter
-    /// or different previous value.
-    /// Anything else falls back to `self.history_prefix`, the prefix that got
-    /// us to the current entry. Synchronous, so it can't race.
+    /// `self.caret` arrives only as the widget's `CaretChanged` echo, which is
+    /// published while handling a widget *event* — never from the `operate`
+    /// pass that applies a `select_range`. Between issuing a caret operation
+    /// and the next event, `self.caret` therefore still describes the caret
+    /// from *before* that operation, reinterpreted against a value that has
+    /// already moved on. Reading a selection out of it in that window searches
+    /// for the wrong text: repeated Up presses stop advancing, and an Up
+    /// straight after a submission filters by the whole line just sent instead
+    /// of browsing everything.
+    ///
+    /// `pending_caret_echo` is exactly that in-flight bit — armed when an
+    /// operation is issued, disarmed only by the echo — so the live selection
+    /// is read only while no echo is outstanding. Otherwise the prefix comes
+    /// from state this component sets synchronously, which cannot race:
+    /// `history_prefix` while a search is running, and before one starts,
+    /// either the empty prefix a post-submit select-all is about to produce or
+    /// the whole value, nothing being selected.
     fn history_search_prefix(&self) -> String {
         let value = text_input::Value::new(&self.value);
         let selection = self.caret.cursor.selection(&value);
-        if self.history_index.is_none() {
+
+        // A fresh echo answers the question at the start of a search, and
+        // mid-search whenever it carries a real selection — our own
+        // `select_range` echo, or a span the user picked to redirect the
+        // search. Mid-search with no selection (the user collapsed it) keeps
+        // the search that is already running rather than reading the whole
+        // recalled entry as a new prefix.
+        if self.pending_caret_echo.is_none()
+            && (self.history_index.is_none() || selection.is_some())
+        {
             return prefix_from_selection(&self.value, selection);
         }
-        match selection {
-            Some((start, end)) if end == value.len() => {
-                self.value[..grapheme_to_byte(&self.value, start)].to_string()
+
+        self.history_prefix.clone().unwrap_or_else(|| {
+            if self.post_submit_selected {
+                String::new()
+            } else {
+                self.value.clone()
             }
-            _ => self.history_prefix.clone().unwrap_or_default(),
-        }
+        })
+    }
+
+    /// Leave the first `covered` graphemes of the current value unselected and
+    /// select the rest, so the matched prefix stays put and the next Up/Down
+    /// press continues the same search.
+    ///
+    /// Both endpoints are grapheme indices, the unit `select_range` counts in
+    /// (see [`CaretState`]); byte offsets would land mid-string on any value
+    /// that is not pure ASCII, and are silently clamped rather than rejected.
+    fn select_after_prefix(&mut self, covered: usize) -> Task<Message> {
+        self.pending_caret_echo = Some(InputSource::Other);
+        operation::select_range(
+            self.input_id.clone(),
+            covered,
+            self.value.graphemes(true).count(),
+        )
     }
 
     /// Navigate history up (to older commands)
@@ -778,21 +815,18 @@ impl SessionInput {
         let prefix = self.history_search_prefix();
         let case_sensitive = crate::prefs::current().history_case_sensitive_match;
         let start = self.history_index.map_or(0, |i| i + 1);
-        let Some(new_index) = (start..self.history.len())
-            .find(|&i| entry_matches_prefix(&self.history[i], &prefix, case_sensitive))
-        else {
+        let Some((new_index, covered)) = (start..self.history.len()).find_map(|i| {
+            prefix_match_len(&self.history[i], &prefix, case_sensitive).map(|len| (i, len))
+        }) else {
             return Task::none(); // No (more) matching entries.
         };
 
         self.history_index = Some(new_index);
-        self.history_prefix = Some(prefix.clone());
+        self.history_prefix = Some(prefix);
         self.value = self.history[new_index].as_str().to_string();
         self.completion_state = None;
 
-        // Leave the search prefix unselected and select the rest, so the
-        // next Up/Down press continues searching with the same prefix.
-        self.pending_caret_echo = Some(InputSource::Other);
-        operation::select_range(self.input_id.clone(), prefix.len(), self.value.len())
+        self.select_after_prefix(covered)
     }
 
     /// Navigate history down (to newer commands)
@@ -816,31 +850,31 @@ impl SessionInput {
             Some(i) => {
                 let prefix = self.history_search_prefix();
                 let case_sensitive = crate::prefs::current().history_case_sensitive_match;
-                match (0..i)
-                    .rev()
-                    .find(|&j| entry_matches_prefix(&self.history[j], &prefix, case_sensitive))
-                {
-                    Some(new_index) => {
+                let newer = (0..i).rev().find_map(|j| {
+                    prefix_match_len(&self.history[j], &prefix, case_sensitive).map(|len| (j, len))
+                });
+                match newer {
+                    Some((new_index, covered)) => {
                         self.history_index = Some(new_index);
-                        self.history_prefix = Some(prefix.clone());
+                        self.history_prefix = Some(prefix);
                         self.value = self.history[new_index].as_str().to_string();
                         self.completion_state = None;
 
-                        // Leave the search prefix unselected and select the
-                        // rest, same as navigate_history_up.
-                        self.pending_caret_echo = Some(InputSource::Other);
-                        operation::select_range(
-                            self.input_id.clone(),
-                            prefix.len(),
-                            self.value.len(),
-                        )
+                        self.select_after_prefix(covered)
                     }
                     None => {
+                        // Down past the newest match ends the search where it
+                        // began: the text being searched for, caret after it,
+                        // ready to keep typing. Discarding it would throw away
+                        // what the user typed to get here — an empty prefix
+                        // (an empty or fully selected box) still empties the
+                        // box, as it always did.
                         self.history_index = None;
                         self.history_prefix = None;
-                        self.value.clear();
-                        // No selection needed for empty text
-                        Task::none()
+                        self.value = prefix;
+                        let end = self.value.graphemes(true).count();
+                        self.pending_caret_echo = Some(InputSource::Other);
+                        operation::move_cursor_to(self.input_id.clone(), end)
                     }
                 }
             }
@@ -2182,11 +2216,22 @@ mod tests {
         settings: smudgy_core::models::settings::Settings,
         body: impl FnOnce() -> R,
     ) -> R {
+        /// Restores the defaults on the way out however `body` leaves — a
+        /// panicking assertion would otherwise leak its settings into whatever
+        /// test takes the lock next, turning one failure into several.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::prefs::apply(&smudgy_core::models::settings::Settings::default());
+            }
+        }
+
+        // Declared after the guard, so it drops *before* it: the defaults are
+        // back in place by the time the next test can take the lock.
         let _guard = crate::prefs::lock_prefs_test();
+        let _restore = Restore;
         crate::prefs::apply(&settings);
-        let result = body();
-        crate::prefs::apply(&smudgy_core::models::settings::Settings::default());
-        result
+        body()
     }
 
     /// As prefix-matching is always turned on, an empty input box should
@@ -2196,9 +2241,6 @@ mod tests {
         let mut input = SessionInput::new();
         submit_unmasked(&mut input, "gt foo");
         submit_unmasked(&mut input, "bash mob");
-        // "Clear" the input box, so the search starts from an empty string.
-        // Else this would start searching backwards for "bash mob", as every
-        // submission of the input leaves behind the last value.
         let _ = input.update(Message::InputChanged(String::new()));
 
         let _ = input.update(Message::NavigateHistoryUp);
@@ -2206,6 +2248,58 @@ mod tests {
             input.value, "bash mob",
             "Up with nothing typed jumps to the newest entry"
         );
+    }
+
+    /// Up straight after a submission browses the whole history, not just the
+    /// entries starting with the line just sent.
+    ///
+    /// The default post-submit behavior leaves the sent text in the box and
+    /// selects all of it, which is an empty prefix — but the `select_all` is a
+    /// `Task`, and its `CaretChanged` echo has not landed when Up is pressed
+    /// straight afterwards (never, in a unit test). Reading the live caret
+    /// there sees the pre-submit cursor: no selection, so the whole line as
+    /// the prefix. `post_submit_selected` is the synchronous truth that keeps
+    /// the answer the same however fast the keys arrive.
+    #[test]
+    fn up_straight_after_a_submission_browses_the_whole_history() {
+        let mut input = SessionInput::new();
+        submit_unmasked(&mut input, "gt foo");
+        submit_unmasked(&mut input, "bash mob");
+        assert_eq!(input.value, "bash mob", "the sent line is left in the box");
+        assert!(input.post_submit_selected, "and is fully selected");
+
+        // No InputChanged in between: exactly the Enter-then-Up sequence.
+        let _ = input.update(Message::NavigateHistoryUp);
+        assert_eq!(input.value, "bash mob", "Up recalls the newest entry");
+        let _ = input.update(Message::NavigateHistoryUp);
+        assert_eq!(
+            input.value, "gt foo",
+            "a second Up keeps browsing, rather than filtering by \"bash mob\""
+        );
+    }
+
+    /// A recalled entry that is not pure ASCII anchors its selection by
+    /// grapheme count, and keeps searching for the same prefix afterwards.
+    #[test]
+    fn history_search_handles_non_ascii_entries() {
+        let mut input = SessionInput::new();
+        submit_unmasked(&mut input, "gö north");
+        submit_unmasked(&mut input, "bash mob");
+        submit_unmasked(&mut input, "gö south");
+        let _ = input.update(Message::InputChanged("gö ".to_string()));
+
+        let _ = input.update(Message::NavigateHistoryUp);
+        assert_eq!(input.value, "gö south");
+        let _ = input.update(Message::NavigateHistoryUp);
+        assert_eq!(
+            input.value, "gö north",
+            "the search continues past the non-matching \"bash mob\""
+        );
+
+        // The prefix the next press searches for is the typed text, not a
+        // byte-offset slice of the recalled entry ("gö n" would be the
+        // symptom of anchoring the selection by byte length).
+        assert_eq!(input.history_prefix.as_deref(), Some("gö "));
     }
 
     /// Up finds the newest history entry starting with the typed text,
@@ -2246,11 +2340,6 @@ mod tests {
     /// selection yet" situation the real app hit under fast repeated
     /// presses. `history_prefix`'s synchronous fallback (see
     /// `history_search_prefix`) is what makes this pass either way.
-    /// Test for a bug found whilst developing the `history_prefix` feature:
-    /// repeated "Up" keypresses didn't work sometimes as the widget's
-    /// `CaretChanged` echo of the first keypress's `select_range` is not
-    /// guaranteed to have arrived by the time the second keypress was
-    /// processed.
     #[test]
     fn history_search_continues_the_same_prefix_across_presses_without_a_caret_echo() {
         let mut input = SessionInput::new();
@@ -2276,16 +2365,22 @@ mod tests {
         let _ = input.update(Message::NavigateHistoryUp);
         assert_eq!(input.value, "gt foo");
 
-        // Down retraces the matches, then clears to empty.
+        // Down retraces the matches, then hands back the text the search
+        // started from rather than an empty box.
         let _ = input.update(Message::NavigateHistoryDown);
         assert_eq!(input.value, "gt bar");
         let _ = input.update(Message::NavigateHistoryDown);
         assert_eq!(
-            input.value, "",
-            "Down past the first match clears, like today"
+            input.value, "gt ",
+            "Down past the newest match restores what was being searched for"
         );
         assert!(input.history_index.is_none());
         assert!(input.history_prefix.is_none());
+
+        // And the search is genuinely over: Up starts again from the restored
+        // text, finding the newest match rather than resuming mid-history.
+        let _ = input.update(Message::NavigateHistoryUp);
+        assert_eq!(input.value, "gt bar");
     }
 
     /// An empty box (nothing typed at all) still browses the whole history
@@ -2377,16 +2472,38 @@ mod tests {
     }
 
     #[test]
-    fn entry_matches_prefix_empty_prefix_matches_everything() {
-        assert!(entry_matches_prefix("anything at all", "", true));
-        assert!(entry_matches_prefix("anything at all", "", false));
+    fn prefix_match_len_empty_prefix_matches_everything_covering_nothing() {
+        assert_eq!(prefix_match_len("anything at all", "", true), Some(0));
+        assert_eq!(prefix_match_len("anything at all", "", false), Some(0));
     }
 
     #[test]
-    fn entry_matches_prefix_respects_case_sensitivity() {
-        assert!(entry_matches_prefix("GT foo", "gt", false));
-        assert!(!entry_matches_prefix("GT foo", "gt", true));
-        assert!(entry_matches_prefix("GT foo", "GT", true));
+    fn prefix_match_len_respects_case_sensitivity() {
+        assert_eq!(prefix_match_len("GT foo", "gt", false), Some(2));
+        assert_eq!(prefix_match_len("GT foo", "gt", true), None);
+        assert_eq!(prefix_match_len("GT foo", "GT", true), Some(2));
+        assert_eq!(prefix_match_len("bash mob", "gt", false), None);
+    }
+
+    /// The covered length is a grapheme count, the unit `select_range` takes —
+    /// not a byte length. They differ for anything outside ASCII, and feeding
+    /// bytes to `select_range` mis-anchors the selection left on the recalled
+    /// entry (silently, since it clamps rather than rejects).
+    #[test]
+    fn prefix_match_len_counts_graphemes_not_bytes() {
+        // "gö " is 3 graphemes but 4 bytes (ö is 2 bytes in UTF-8).
+        assert_eq!(prefix_match_len("gö north", "gö ", false), Some(3));
+        assert_ne!("gö ".len(), 3, "the byte length is the wrong anchor");
+
+        // A grapheme cluster counts once however many code points it spans.
+        assert_eq!(prefix_match_len("👨‍👩‍👧 home", "👨‍👩‍👧", true), Some(1));
+    }
+
+    /// Case folding is applied per grapheme, so the covered length is valid
+    /// for the *entry* as well as the prefix even when the two differ in case.
+    #[test]
+    fn prefix_match_len_covers_the_entrys_own_graphemes_when_case_differs() {
+        assert_eq!(prefix_match_len("Gö North", "gö ", false), Some(3));
     }
 
     #[test]
