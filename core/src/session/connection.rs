@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -605,18 +606,44 @@ const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// retained-memory growth the bounded frame queue exists to prevent.
 const SEND_BUFFER_BYTES: u32 = 256 * 1024;
 
-/// Resolve `addr` and connect, trying each candidate address like
-/// `TcpStream::connect` does, but with the send buffer pinned before the
-/// connect (see [`SEND_BUFFER_BYTES`]). A refused buffer size is logged and
-/// ignored: it is a tuning knob, never worth failing the connection over.
-async fn connect_tcp(addr: &str) -> io::Result<TcpStream> {
+/// Return numeric loopback endpoints for the special `localhost` name, avoiding an OS
+/// name-service lookup. IPv4 comes first because local development servers commonly bind
+/// only there; the IPv6 fallback preserves support for IPv6-only listeners.
+fn localhost_candidates(host: &str, port: u16) -> Option<[SocketAddr; 2]> {
+    (host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.")).then_some([
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ])
+}
+
+/// Remove URI-style brackets before using the host-and-port resolver form. Smudgy has
+/// historically accepted bracketed IPv6 literals because it formatted them as `[::1]:port`.
+fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Connect to the first reachable candidate, with the send buffer pinned before the
+/// connect (see [`SEND_BUFFER_BYTES`]). A refused buffer size is logged and ignored: it is
+/// a tuning knob, never worth failing the connection over.
+async fn connect_tcp_candidates(
+    candidates: impl IntoIterator<Item = SocketAddr>,
+) -> io::Result<TcpStream> {
     let mut last_error = None;
-    for candidate in tokio::net::lookup_host(addr).await? {
-        let socket = if candidate.is_ipv4() {
+    for candidate in candidates {
+        let socket_result = if candidate.is_ipv4() {
             TcpSocket::new_v4()
         } else {
             TcpSocket::new_v6()
-        }?;
+        };
+        let socket = match socket_result {
+            Ok(socket) => socket,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
         if let Err(err) = socket.set_send_buffer_size(SEND_BUFFER_BYTES) {
             warn!("Failed to pin the socket send buffer size: {err}");
         }
@@ -633,15 +660,27 @@ async fn connect_tcp(addr: &str) -> io::Result<TcpStream> {
     }))
 }
 
+/// Resolve `host` and connect, trying each candidate address like
+/// `TcpStream::connect` does, but with the send buffer pinned before the
+/// connect (see [`SEND_BUFFER_BYTES`]). A refused buffer size is logged and
+/// ignored: it is a tuning knob, never worth failing the connection over.
+async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
+    if let Some(candidates) = localhost_candidates(host, port) {
+        return connect_tcp_candidates(candidates).await;
+    }
+
+    connect_tcp_candidates(tokio::net::lookup_host((unbracket_host(host), port)).await?).await
+}
+
 /// Connect the transport: TCP, then a TLS handshake if requested. `host` is the server name
 /// for certificate verification and SNI (a DNS name or IP literal).
-async fn connect_stream(addr: &str, host: &str, tls: TlsMode) -> io::Result<GameStream> {
+async fn connect_stream(host: &str, port: u16, tls: TlsMode) -> io::Result<GameStream> {
     // rustls 0.23 needs a process-global CryptoProvider. `smudgy_script` installs the
     // aws_lc_rs provider, but a session may connect before any script runs (and headless
     // tests have no script runtime), so install it here too — idempotent.
     static PROVIDER: OnceLock<()> = OnceLock::new();
 
-    let stream = connect_tcp(addr).await?;
+    let stream = connect_tcp(host, port).await?;
     stream.set_nodelay(true)?;
     if tls == TlsMode::Off {
         return Ok(GameStream::Plain(stream));
@@ -1180,7 +1219,7 @@ impl Connection {
             // black-holed handshake that otherwise only CONNECT_TIMEOUT ends.
             let run = async {
                 let connect_result =
-                    match tokio::time::timeout(CONNECT_TIMEOUT, connect_stream(&addr, &host, tls))
+                    match tokio::time::timeout(CONNECT_TIMEOUT, connect_stream(&host, port, tls))
                         .await
                     {
                         Ok(result) => result,
@@ -1795,6 +1834,26 @@ mod tests {
             ),
             runtime_rx,
         )
+    }
+
+    #[test]
+    fn socket_resolution_bypasses_name_service_for_localhost() {
+        let port = 4000;
+        let expected = [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        ];
+
+        assert_eq!(localhost_candidates("localhost", port), Some(expected));
+        assert_eq!(localhost_candidates("LOCALHOST", port), Some(expected));
+        assert_eq!(localhost_candidates("localhost.", port), Some(expected));
+        assert_eq!(localhost_candidates("example.com", port), None);
+    }
+
+    #[test]
+    fn socket_resolution_preserves_bracketed_ipv6_hosts() {
+        assert_eq!(unbracket_host("[::1]"), "::1");
+        assert_eq!(unbracket_host("::1"), "::1");
     }
 
     #[test]
