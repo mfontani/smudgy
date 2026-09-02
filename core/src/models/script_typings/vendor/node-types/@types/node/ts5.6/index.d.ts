@@ -37,22 +37,10 @@
 
 // Definitions for Node.js modules that are not specific to any version of TypeScript:
 /// <reference path="../globals.d.ts" />
-/// <reference path="../web-globals/abortcontroller.d.ts" />
-/// <reference path="../web-globals/blob.d.ts" />
-/// <reference path="../web-globals/console.d.ts" />
-/// <reference path="../web-globals/crypto.d.ts" />
-/// <reference path="../web-globals/domexception.d.ts" />
-/// <reference path="../web-globals/encoding.d.ts" />
-/// <reference path="../web-globals/events.d.ts" />
-/// <reference path="../web-globals/fetch.d.ts" />
-/// <reference path="../web-globals/importmeta.d.ts" />
-/// <reference path="../web-globals/messaging.d.ts" />
-/// <reference path="../web-globals/navigator.d.ts" />
-/// <reference path="../web-globals/performance.d.ts" />
-/// <reference path="../web-globals/storage.d.ts" />
-/// <reference path="../web-globals/streams.d.ts" />
+// Smudgy runs Node-compatible modules inside Deno, whose declarations own the
+// overlapping web-global surface. Keep only the Node-compatible immediate API
+// and Smudgy's Deno-correct timer overloads from the web-global declarations.
 /// <reference path="../web-globals/timers.d.ts" />
-/// <reference path="../web-globals/url.d.ts" />
 /// <reference path="../assert.d.ts" />
 /// <reference path="../assert/strict.d.ts" />
 /// <reference path="../async_hooks.d.ts" />

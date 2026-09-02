@@ -21,13 +21,13 @@ interface Worker extends EventTarget {
    * Called for each message the worker posts back. The value the worker sent
    * is `event.data`.
    */
-  onmessage: ((this: Worker, event: MessageEvent) => unknown) | null;
+  onmessage: ((this: Worker, event: MessageEvent<unknown>) => unknown) | null;
 
   /**
    * Called when a message from the worker could not be delivered because its
    * value could not be copied between threads.
    */
-  onmessageerror: ((this: Worker, event: MessageEvent) => unknown) | null;
+  onmessageerror: ((this: Worker, event: MessageEvent<unknown>) => unknown) | null;
 
   /**
    * Called when an error inside the worker goes uncaught. `event.message`
@@ -50,7 +50,7 @@ interface Worker extends EventTarget {
    */
   addEventListener(
     type: "message" | "messageerror",
-    listener: (this: Worker, event: MessageEvent) => unknown,
+    listener: (this: Worker, event: MessageEvent<unknown>) => unknown,
     options?: boolean | AddEventListenerOptions,
   ): void;
   addEventListener(
@@ -58,17 +58,27 @@ interface Worker extends EventTarget {
     listener: (this: Worker, event: ErrorEvent) => unknown,
     options?: boolean | AddEventListenerOptions,
   ): void;
+  addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
 
   /** Removes a listener added with `addEventListener`. */
   removeEventListener(
     type: "message" | "messageerror",
-    listener: (this: Worker, event: MessageEvent) => unknown,
+    listener: (this: Worker, event: MessageEvent<unknown>) => unknown,
     options?: boolean | EventListenerOptions,
   ): void;
   removeEventListener(
     type: "error",
     listener: (this: Worker, event: ErrorEvent) => unknown,
     options?: boolean | EventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: EventListenerOptions | boolean,
   ): void;
 
   /**
@@ -93,7 +103,10 @@ interface Worker extends EventTarget {
  * // ...and a worker tallies the pile off-thread.
  * const source = `
  *   self.onmessage = (e) => {
- *     const kills = e.data.filter((line) => line.includes(" is DEAD!")).length;
+ *     const lines = Array.isArray(e.data)
+ *       ? e.data.filter((line) => typeof line === "string")
+ *       : [];
+ *     const kills = lines.filter((line) => line.includes(" is DEAD!")).length;
  *     self.postMessage(kills);
  *   };
  * `;
@@ -102,7 +115,7 @@ interface Worker extends EventTarget {
  *   { type: "module" },
  * );
  * tally.onmessage = (e) => {
- *   echo(`Kills this session: ${e.data}`); // prints the worker's answer
+ *   if (typeof e.data === "number") echo(`Kills this session: ${e.data}`);
  *   tally.terminate();
  * };
  * tally.postMessage(capturedLines);

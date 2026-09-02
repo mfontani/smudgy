@@ -51,7 +51,7 @@ type KeyFormat =
 /** @category Crypto */
 type NamedCurve = string;
 /** @category Crypto */
-type BigInteger = Uint8Array<ArrayBuffer>;
+type BigInteger = Uint8Array;
 
 /** @category Crypto */
 interface RsaOtherPrimesInfo {

@@ -181,9 +181,9 @@ declare namespace Deno {
     unref(): void;
 
     /** A {@linkcode ReadableStream} of the data received over the connection. */
-    readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly readable: ReadableStream<Uint8Array>;
     /** A {@linkcode WritableStream} for sending data over the connection. */
-    readonly writable: WritableStream<Uint8Array<ArrayBufferLike>>;
+    readonly writable: WritableStream<Uint8Array>;
   }
 
   /** Information about a completed TLS handshake.
@@ -989,7 +989,7 @@ declare namespace Deno {
      * `maxDatagramSize`. */
     sendDatagram(data: Uint8Array): Promise<void>;
     /** Receive a datagram. */
-    readDatagram(): Promise<Uint8Array<ArrayBuffer>>;
+    readDatagram(): Promise<Uint8Array>;
 
     /** The endpoint for this connection. */
     readonly endpoint: QuicEndpoint;
@@ -1039,7 +1039,7 @@ declare namespace Deno {
    * @category Network
    */
   export interface QuicSendStream
-    extends WritableStream<Uint8Array<ArrayBufferLike>> {
+    extends WritableStream<Uint8Array> {
     /** Indicates the send priority of this stream relative to other streams for
      * which the value has been set. */
     sendOrder: number;
@@ -1057,7 +1057,7 @@ declare namespace Deno {
    * @category Network
    */
   export interface QuicReceiveStream
-    extends ReadableStream<Uint8Array<ArrayBuffer>> {
+    extends ReadableStream<Uint8Array> {
     /**
      * 62-bit stream ID, unique within this connection.
      */

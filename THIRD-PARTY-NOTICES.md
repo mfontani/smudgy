@@ -22,15 +22,17 @@ Every other bundled font is licensed under the **SIL Open Font License, Version 
 - **Fira Mono** — Digitized data copyright © 2012–2015 The Mozilla Foundation and Telefónica S.A.
 - **Lilex** — Copyright 2019 The Lilex Project Authors
 - **VT323** — Copyright 2011 The VT323 Project Authors
+- **Font Awesome 7 Free** (Regular, Solid, and Brands desktop fonts) — Copyright © Font Awesome
 
 ## Icons
 
 - **Bootstrap Icons** (icon font and SVG artwork) — Copyright © 2019–2024 The Bootstrap Authors — MIT License
 - **Heroicons** (SVG artwork) — Copyright © Tailwind Labs, Inc. — MIT License
 
-> Some Bootstrap Icons depict third-party brand logos. Those marks remain the
-> property of their respective owners; the MIT License covers the icon artwork
-> only, not any trademark rights.
+> Some Bootstrap Icons and Font Awesome glyphs depict third-party brand logos.
+> Those marks remain the property of their respective owners; the applicable
+> open-source licenses cover the artwork or font software, not any trademark
+> rights.
 
 ## Microsoft Visual C++ Runtime
 
@@ -162,8 +164,8 @@ covers.
 
 **Summary**
 
-- MIT License: 968
-- Apache License 2.0: 89
+- MIT License: 998
+- Apache License 2.0: 90
 - Mozilla Public License 2.0: 41
 - Unicode License v3: 28
 - BSD 3-Clause "New" or "Revised" License: 15
@@ -2972,6 +2974,7 @@ Apache License
 Used by:
 
 - ab_glyph 0.2.29
+- accesskit_winit 0.33.2
 - ast_node 5.0.0
 - aws-lc-sys 0.40.0
 - aws-lc-sys 0.41.0
@@ -3994,7 +3997,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
-- smudgy_core 0.5.4
+- smudgy_core 0.5.6
 - rustybuzz 0.20.1
 
 ~~~
@@ -5220,6 +5223,7 @@ Used by:
 
 - coreaudio-rs 0.14.2
 - either 1.15.0
+- itertools 0.11.0
 - itertools 0.14.0
 
 ~~~
@@ -5324,6 +5328,35 @@ Used by:
 
 ~~~
 Copyright (c) 2015 Elinor Berger
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
+- base62 2.2.4
+
+~~~
+Copyright (c) 2015 François Bernier
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -6808,6 +6841,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- globwalk 0.8.1
 - memoffset 0.9.1
 
 ~~~
@@ -10164,6 +10198,37 @@ SOFTWARE.
 
 Used by:
 
+- atspi-common 0.13.0
+- atspi-proxies 0.13.0
+- atspi 0.29.0
+
+~~~
+Copyright (c) 2022 Tait Hoyem <tait@tait.tech>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
 - inout 0.1.4
 
 ~~~
@@ -10967,6 +11032,7 @@ Used by:
 - zbus 5.7.1
 - zbus_macros 5.7.1
 - zbus_names 4.2.0
+- zbus_xml 5.0.2
 - zvariant 5.5.3
 - zvariant_derive 5.5.3
 
@@ -11169,6 +11235,8 @@ DEALINGS IN THE SOFTWARE.
 Used by:
 
 - env_logger 0.10.2
+- serde_spanned 0.6.8
+- toml 0.7.8
 - toml_datetime 0.7.5+spec-1.1.0
 - toml_edit 0.19.15
 - toml_edit 0.20.2
@@ -12266,6 +12334,37 @@ SOFTWARE.
 
 Used by:
 
+- num-format 0.4.4
+
+~~~
+MIT License
+
+Copyright (c) 2018 Brian Myers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
 - lazy-regex 3.4.1
 
 ~~~
@@ -13111,6 +13210,37 @@ SOFTWARE.
 
 Used by:
 
+- normpath 1.5.1
+
+~~~
+MIT License
+
+Copyright (c) 2020 dylni (https://github.com/dylni)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
 - junction 1.2.0
 
 ~~~
@@ -13210,6 +13340,37 @@ Used by:
 MIT License
 
 Copyright (c) 2021 1Password
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
+- rust-i18n 3.1.2
+
+~~~
+MIT License
+
+Copyright (c) 2021 Longbridge
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -13823,12 +13984,74 @@ SOFTWARE.
 
 Used by:
 
+- iced_font_awesome 0.4.4
+
+~~~
+MIT License
+
+Copyright (c) 2024 Daniel M Bomfim
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
 - capacity_builder 0.5.0
 
 ~~~
 MIT License
 
 Copyright (c) 2024 David Sherret
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
+- iced_fonts 0.3.0
+
+~~~
+MIT License
+
+Copyright (c) 2024 Redhawk
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14021,8 +14244,19 @@ SOFTWARE.
 
 Used by:
 
+- iced-code-editor 0.5.1
+- deno_core 0.410.0
 - deno_permissions 0.116.0
+- deno_runtime 0.265.0
 - iced_graphics 0.14.0
+- iced_runtime 0.14.0
+- iced_winit 0.14.0
+- accesskit 0.24.1
+- accesskit_atspi_common 0.19.1
+- accesskit_consumer 0.38.0
+- accesskit_macos 0.26.3
+- accesskit_unix 0.22.1
+- accesskit_windows 0.34.0
 - aead-gcm-stream 0.4.0
 - asn1-rs-derive 0.4.0
 - asn1-rs-impl 0.1.0
@@ -14048,7 +14282,6 @@ Used by:
 - deno_cache_dir 0.49.0
 - deno_canvas 0.119.0
 - deno_config 0.107.0
-- deno_core 0.410.0
 - deno_cron 0.137.0
 - deno_crypto 0.271.0
 - deno_crypto_provider 0.51.0
@@ -14079,7 +14312,6 @@ Used by:
 - deno_package_json 0.59.0
 - deno_process 0.72.0
 - deno_resolver 0.88.0
-- deno_runtime 0.265.0
 - deno_signals 0.48.0
 - deno_subprocess_windows 0.52.0
 - deno_telemetry 0.79.0
@@ -14114,15 +14346,14 @@ Used by:
 - iced_anim 0.3.1
 - iced_core 0.14.0
 - iced_debug 0.14.0
+- iced_fonts_macros 0.3.0
 - iced_futures 0.14.0
 - iced_highlighter 0.14.0
 - iced_program 0.14.0
 - iced_renderer 0.14.0
-- iced_runtime 0.14.0
 - iced_tiny_skia 0.14.0
 - iced_wgpu 0.14.0
 - iced_widget 0.14.2
-- iced_winit 0.14.0
 - import_map 0.25.0
 - include_dir 0.7.4
 - include_dir_macros 0.7.4
@@ -14169,6 +14400,8 @@ Used by:
 - profiling 1.0.16
 - realfft 3.5.0
 - rstar 0.12.2
+- rust-i18n-macro 3.1.2
+- rust-i18n-support 3.1.2
 - rustls-tokio-stream 0.8.0
 - sacabase 2.0.0
 - serde_v8 0.319.0
@@ -14773,6 +15006,37 @@ SOFTWARE.
 
 Used by:
 
+- iced_aw 0.13.0
+
+~~~
+MIT License
+
+Copyright (c) 2020 Kaiden42
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
 - fontconfig-parser 0.5.8
 
 ~~~
@@ -15000,6 +15264,7 @@ Used by:
 - is-terminal 0.4.16
 - itoa 1.0.15
 - khronos-egl 6.0.0
+- libyml 0.0.4
 - linux-raw-sys 0.4.15
 - linux-raw-sys 0.9.4
 - minimal-lexical 0.2.1
@@ -15033,6 +15298,7 @@ Used by:
 - serde_derive 1.0.228
 - serde_json 1.0.140
 - serde_repr 0.1.20
+- serde_yml 0.0.11
 - smol_str 0.2.2
 - syn 1.0.109
 - syn 2.0.101
@@ -15049,6 +15315,8 @@ Used by:
 - utf-8 0.7.6
 - x11-dl 2.21.0
 - x11 2.21.0
+- zbus-lockstep-macros 0.5.2
+- zbus-lockstep 0.5.2
 - zvariant_utils 3.2.0
 
 ~~~
@@ -16986,6 +17254,7 @@ SOFTWARE.
 Used by:
 
 - quick-xml 0.32.0
+- quick-xml 0.36.2
 - quick-xml 0.37.5
 
 ~~~

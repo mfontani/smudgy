@@ -1021,6 +1021,11 @@ pub fn run() -> anyhow::Result<()> {
 
     log::info!("Application closing");
 
+    // Iced has dropped every Automations window, so all window-scoped language services
+    // have begun their nonblocking teardown. Join their tracked reapers before process exit
+    // so Deno can release each temporary data directory even when the app itself is closing.
+    smudgy_script::language_service_worker::join_language_service_reapers();
+
     #[cfg(not(feature = "web-audio-cpal"))]
     {
         smudgy_core::session::connection::shutdown_io_runtime();
