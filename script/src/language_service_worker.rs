@@ -504,6 +504,18 @@ impl WorkerState {
                     result,
                 })])
             }
+            Command::RequestSignatureHelp(command) => {
+                let current = self.require_request(command.identity)?;
+                self.ensure_engine_project(current.document.key.project)?;
+                let result = self
+                    .engine
+                    .signature_help(current.document.key.document_id, command.position)?;
+                Ok(vec![Event::SignatureHelp(DocumentResult {
+                    identity: command.identity,
+                    analyzed_uri: self.current_uri(command.identity)?,
+                    result,
+                })])
+            }
             Command::RequestDefinition(command) => {
                 let current = self.require_request(command.identity)?;
                 self.ensure_engine_project(current.document.key.project)?;
@@ -1022,6 +1034,7 @@ fn failure_scope(state: &WorkerState, command: &Command) -> FailureScope {
         Command::RequestDiagnostics(command) => FailureScope::Document(command.identity),
         Command::RequestCompletion(command)
         | Command::RequestHover(command)
+        | Command::RequestSignatureHelp(command)
         | Command::RequestDefinition(command) => FailureScope::Document(command.identity),
         Command::RequestFormatting(command) => FailureScope::Document(command.identity),
         Command::OpenProject(command) => state.project_identity(command.project).map_or(
@@ -1294,6 +1307,120 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == Some(DiagnosticCode::Number(2322)))
         );
         host.shutdown().expect("worker must shut down cleanly");
+    }
+
+    #[test]
+    fn worker_returns_signature_help_with_exact_identity_and_uri() {
+        let mut host = LanguageServiceHost::spawn();
+        let descriptor = descriptor();
+        host.client()
+            .send(Command::OpenProject(OpenProject {
+                project: descriptor.document.key.project,
+            }))
+            .expect("queue open project");
+        wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::ProjectOpened(_))
+            )
+        });
+        host.client()
+            .send(Command::OpenDocument(OpenDocument {
+                descriptor: descriptor.clone(),
+                text: "function send(message: string, urgent?: boolean): void {}\nsend(".to_owned(),
+            }))
+            .expect("queue open document");
+        let opened = wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::DocumentOpened(_))
+            )
+        });
+        let Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state)) = opened.event
+        else {
+            unreachable!();
+        };
+        let identity = DocumentResultIdentity {
+            state,
+            request_id: number::<RequestId>(18),
+        };
+        host.client()
+            .send(Command::RequestSignatureHelp(
+                crate::language_service::PositionRequest {
+                    identity,
+                    position: crate::language_service::Utf16Position {
+                        line: 1,
+                        character: 5,
+                    },
+                },
+            ))
+            .expect("queue signature help");
+        let event = wait_for(&mut host, |event| matches!(event, Event::SignatureHelp(_)));
+        let Event::SignatureHelp(result) = event.event else {
+            unreachable!();
+        };
+        assert_eq!(result.identity, identity);
+        assert_eq!(
+            result.analyzed_uri.as_deref(),
+            Some(descriptor.uri.as_str())
+        );
+        let help = result.result.expect("signature help at incomplete call");
+        assert_eq!(help.prefix, "send(");
+        assert_eq!(help.active_parameter, Some(0));
+        assert_eq!(help.parameters.len(), 2);
+        assert!(help.parameters[1].is_optional);
+        host.shutdown().expect("worker must shut down cleanly");
+    }
+
+    #[test]
+    fn worker_rejects_signature_help_for_a_stale_document_version() {
+        let engine = EmbeddedLanguageService::new().expect("boot language service");
+        let mut state = WorkerState::new(engine, allocate_worker_generation());
+        let descriptor = descriptor();
+        state
+            .open_project(OpenProject {
+                project: descriptor.document.key.project,
+            })
+            .expect("open project");
+        state
+            .open_document(OpenDocument {
+                descriptor: descriptor.clone(),
+                text: "function send(message: string): void {}\nsend(".to_owned(),
+            })
+            .expect("open document");
+        let stale_identity = DocumentResultIdentity {
+            state: state
+                .document_identity(descriptor.document.key)
+                .expect("current document identity"),
+            request_id: number::<RequestId>(19),
+        };
+        state
+            .change_document(ChangeDocument {
+                document: descriptor.document,
+                new_version: number::<DocumentVersion>(2),
+                changes: crate::language_service::DocumentChanges {
+                    changes: vec![crate::language_service::TextChange {
+                        range: None,
+                        text: "function send(message: string): void {}\nsend()".to_owned(),
+                    }],
+                },
+            })
+            .expect("advance document version");
+
+        assert!(
+            state
+                .handle(Command::RequestSignatureHelp(
+                    crate::language_service::PositionRequest {
+                        identity: stale_identity,
+                        position: crate::language_service::Utf16Position {
+                            line: 1,
+                            character: 5,
+                        },
+                    },
+                ))
+                .is_err(),
+            "the complete request identity must fence stale signature help"
+        );
     }
 
     #[test]

@@ -1520,11 +1520,56 @@ fn markdown_style(colors: smudgy_theme::markdown::MarkdownColors) -> iced::widge
 ///
 /// Inline-code spans already carry their color/background/font from [`markdown_style`], so the
 /// per-span pass leaves them untouched.
-struct SmudgyMarkdownViewer {
+#[derive(Debug, Clone, Copy)]
+pub struct SmudgyMarkdownViewer {
     colors: smudgy_theme::markdown::MarkdownColors,
 }
 
 impl SmudgyMarkdownViewer {
+    /// Captures the current live Markdown palette for one coherent render.
+    ///
+    /// Call this while building a view rather than retaining it across frames so
+    /// terminal-palette changes are reflected without rebuilding the source model.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            colors: *smudgy_theme::markdown::current(),
+        }
+    }
+
+    /// Returns the exact live-palette snapshot used by this renderer.
+    #[must_use]
+    pub fn colors(&self) -> smudgy_theme::markdown::MarkdownColors {
+        self.colors
+    }
+
+    /// Returns the Iced Markdown style resolved from this palette snapshot.
+    #[must_use]
+    pub fn style(&self) -> iced::widget::markdown::Style {
+        markdown_style(self.colors)
+    }
+
+    /// Returns themed Markdown settings using Iced's default text size.
+    #[must_use]
+    pub fn settings(&self) -> iced::widget::markdown::Settings {
+        iced::widget::markdown::Settings::with_style(self.style())
+    }
+
+    /// Returns themed Markdown settings using the requested base text size.
+    #[must_use]
+    pub fn settings_with_text_size(&self, text_size: f32) -> iced::widget::markdown::Settings {
+        iced::widget::markdown::Settings::with_text_size(text_size, self.style())
+    }
+
+    /// Renders parsed Markdown with this exact palette snapshot.
+    pub fn view<'a>(
+        &self,
+        items: impl IntoIterator<Item = &'a iced::widget::markdown::Item>,
+        settings: iced::widget::markdown::Settings,
+    ) -> iced::Element<'a, iced::widget::markdown::Uri, smudgy_theme::Theme, iced::Renderer> {
+        iced::widget::markdown::view_with(items, settings, self)
+    }
+
     /// Clones the cached, style-resolved spans for a run of text and applies smudgy's overrides:
     /// links become chips, uncolored (plain/bold/italic) spans get the body color, and already
     /// colored spans (inline code) pass through.
@@ -1557,6 +1602,33 @@ impl SmudgyMarkdownViewer {
                 span
             })
             .collect()
+    }
+
+    /// Applies the code-panel fallback foreground without replacing syntax
+    /// colors supplied by Iced 0.14's Base16Ocean highlighter.
+    fn restyle_code_line(
+        &self,
+        text: &iced::widget::markdown::Text,
+        style: &iced::widget::markdown::Style,
+    ) -> Vec<iced::advanced::text::Span<'static, iced::widget::markdown::Uri>> {
+        text.spans(*style)
+            .iter()
+            .cloned()
+            .map(|mut span| {
+                if span.color.is_none() {
+                    span.color = Some(self.colors.code_foreground);
+                }
+                span
+            })
+            .collect()
+    }
+
+    fn code_block_style(&self) -> iced::widget::container::Style {
+        iced::widget::container::Style {
+            background: Some(iced::Background::Color(self.colors.code_background)),
+            border: iced::border::rounded(4),
+            ..iced::widget::container::Style::default()
+        }
     }
 }
 
@@ -1626,22 +1698,10 @@ impl<'a>
         _code: &'a str,
         lines: &'a [iced::widget::markdown::Text],
     ) -> iced::Element<'a, iced::widget::markdown::Uri, smudgy_theme::Theme, iced::Renderer> {
-        let text_color = self.colors.code_foreground;
-        let panel_background = self.colors.code_background;
+        let panel_style = self.code_block_style();
 
         let rows = lines.iter().map(move |line| {
-            // Pin only uncolored spans: syntax-highlighted spans already carry their own color.
-            let spans: Vec<_> = line
-                .spans(settings.style)
-                .iter()
-                .cloned()
-                .map(|mut span| {
-                    if span.color.is_none() {
-                        span.color = Some(text_color);
-                    }
-                    span
-                })
-                .collect();
+            let spans = self.restyle_code_line(line, &settings.style);
             iced::Element::from(
                 iced::widget::rich_text(spans)
                     .on_link_click(Self::on_link_click)
@@ -1663,13 +1723,7 @@ impl<'a>
         )
         .width(iced::Length::Fill)
         .padding(settings.code_size / 4)
-        .style(
-            move |_theme: &smudgy_theme::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(panel_background)),
-                border: iced::border::rounded(4),
-                ..iced::widget::container::Style::default()
-            },
-        )
+        .style(move |_theme: &smudgy_theme::Theme| panel_style)
         .into()
     }
 
@@ -1784,26 +1838,23 @@ fn op_smudgy_widget_build_markdown(
         // Colors are read every render (not snapshotted at build), so switching the terminal scheme
         // reflows mounted Markdown without a rebuild. `current()` is a lock-free `ArcSwap` load; the
         // UI resolves these from the active terminal palette (`smudgy_theme::markdown`).
-        let colors = *smudgy_theme::markdown::current();
+        let viewer = SmudgyMarkdownViewer::current();
         let settings = match size.as_ref().and_then(DynProp::get) {
-            Some(size) => {
-                iced::widget::markdown::Settings::with_text_size(size, markdown_style(colors))
-            }
-            None => iced::widget::markdown::Settings::with_style(markdown_style(colors)),
+            Some(size) => viewer.settings_with_text_size(size),
+            None => viewer.settings(),
         };
-        let viewer = SmudgyMarkdownViewer { colors };
         let on_link = on_link.clone();
         let isolate = isolate.clone();
-        iced::widget::markdown::view_with(items.iter(), settings, &viewer).map(move |url| {
-            match &on_link {
+        viewer
+            .view(items.iter(), settings)
+            .map(move |url| match &on_link {
                 Some(callback) => WidgetMessage::InvokeCallback {
                     callback: callback.clone(),
                     isolate: isolate.clone(),
                     args: vec![url],
                 },
                 None => WidgetMessage::Noop,
-            }
-        })
+            })
     })
 }
 
@@ -3676,6 +3727,91 @@ mod tests {
             extract_markdown_links("[![alt](i.png) enter](<enter temple>)"),
             vec![link(" enter", "enter temple")]
         );
+    }
+
+    #[test]
+    fn markdown_viewer_uses_light_palette_without_repainting_base16_code() {
+        let colors = smudgy_theme::markdown::MarkdownColors {
+            body: iced::Color::from_rgb8(0x20, 0x24, 0x2A),
+            link: iced::Color::from_rgb8(0x00, 0x56, 0xA6),
+            link_background: iced::Color::from_rgba8(0x00, 0x56, 0xA6, 0.14),
+            code_background: iced::Color::from_rgb8(0x18, 0x1A, 0x1F),
+            code_foreground: iced::Color::from_rgb8(0xD4, 0xD4, 0xD4),
+        };
+        let viewer = SmudgyMarkdownViewer { colors };
+        let style = viewer.style();
+
+        assert_eq!(style.inline_code_color, colors.code_foreground);
+        assert_eq!(style.link_color, colors.link);
+        assert_eq!(
+            style.inline_code_highlight.background,
+            iced::Background::Color(colors.code_background)
+        );
+        assert_eq!(
+            viewer.code_block_style().background,
+            Some(iced::Background::Color(colors.code_background)),
+            "fenced code keeps a dark panel even with light surrounding UI"
+        );
+
+        let content = iced::widget::markdown::Content::parse(concat!(
+            "Body [link](#target) and `inline`.\n\n",
+            "```ts\nconst value: number = 1;\n```"
+        ));
+        let paragraph = content
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                iced::widget::markdown::Item::Paragraph(text) => Some(text),
+                _ => None,
+            })
+            .expect("paragraph");
+        let paragraph_spans = viewer.restyle(paragraph, &style);
+        assert!(
+            paragraph_spans
+                .iter()
+                .any(|span| { span.text.contains("Body") && span.color == Some(colors.body) })
+        );
+        let link = paragraph_spans
+            .iter()
+            .find(|span| span.link.is_some())
+            .expect("link span");
+        assert_eq!(link.color, Some(colors.link));
+        assert_eq!(
+            link.highlight
+                .as_ref()
+                .map(|highlight| highlight.background),
+            Some(iced::Background::Color(colors.link_background))
+        );
+        assert!(paragraph_spans.iter().any(|span| {
+            span.text.contains("inline")
+                && span.color == Some(colors.code_foreground)
+                && span.highlight.as_ref().is_some_and(|highlight| {
+                    highlight.background == iced::Background::Color(colors.code_background)
+                })
+        }));
+
+        let code_line = content
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                iced::widget::markdown::Item::CodeBlock { lines, .. } => lines.first(),
+                _ => None,
+            })
+            .expect("fenced TypeScript line");
+        let base16_spans = code_line.spans(style);
+        assert!(
+            base16_spans.iter().any(|span| span.color.is_some()),
+            "Iced 0.14's Base16Ocean parser supplies syntax colors"
+        );
+        let restyled = viewer.restyle_code_line(code_line, &style);
+        assert_eq!(base16_spans.len(), restyled.len());
+        for (base16, rendered) in base16_spans.iter().zip(&restyled) {
+            assert_eq!(
+                rendered.color,
+                base16.color.or(Some(colors.code_foreground)),
+                "palette fallback must not replace Base16Ocean syntax colors"
+            );
+        }
     }
 
     #[test]

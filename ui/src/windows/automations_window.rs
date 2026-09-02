@@ -393,10 +393,20 @@ pub enum Message {
     CodeEditorAction(code_editor::BoundEditorMessage),
     /// Applies a language-service completion from the visible candidate list.
     ApplyCodeCompletion(code_editor::CompletionSelection),
+    /// Synchronizes keyboard reveal state with an exact completion popup's scroll viewport.
+    CodeCompletionViewportChanged(code_editor::CompletionViewportTarget),
     /// Requests completions at the active code-editor caret (Ctrl/Command+Space or button).
     TriggerCodeCompletion,
     /// Closes host-owned completion and hover overlays without changing source.
     DismissCodeOverlays,
+    /// Keeps one exact hover card alive while the pointer is over its rich content.
+    CodeHoverOverlayEntered(code_editor::HoverOverlayTarget),
+    /// Starts the grace period for dismissing one exact hover card.
+    CodeHoverOverlayExited(code_editor::HoverOverlayTarget),
+    /// An intentionally inert link from user-authored hover documentation.
+    CodeHoverLinkPressed(code_editor::HoverOverlayTarget, markdown::Uri),
+    /// An intentionally inert link from signature or parameter documentation.
+    CodeSignatureLinkPressed(code_editor::SignatureOverlayTarget, markdown::Uri),
     /// Opens the first current-project target from an accepted definition response.
     NavigateCodeDefinition(code_editor::DefinitionNavigation),
     /// An edit in a plaintext hotkey body (JS/TS hotkeys use `CodeEditorAction`).
@@ -1648,6 +1658,10 @@ impl AutomationsWindow {
                 }
                 Update::with_task(task)
             }
+            Message::CodeCompletionViewportChanged(target) => {
+                self.code_completion_viewport_changed(target);
+                Update::none()
+            }
             Message::TriggerCodeCompletion => {
                 let Some(message) = self.bind_code_editor_message(
                     code_editor::IcedCodeEditorSurface::explicit_completion_message(),
@@ -1659,8 +1673,28 @@ impl AutomationsWindow {
             }
             Message::DismissCodeOverlays => {
                 if let Some(editor) = &mut self.code_editor {
-                    editor.dismiss_overlays();
+                    editor.dismiss_pointer_overlays();
                 }
+                Update::none()
+            }
+            Message::CodeHoverOverlayEntered(target) => {
+                self.code_hover_overlay_entered(target);
+                Update::none()
+            }
+            Message::CodeHoverOverlayExited(target) => {
+                self.code_hover_overlay_exited(target);
+                Update::none()
+            }
+            Message::CodeHoverLinkPressed(target, _uri) => {
+                // Hover documentation is rich but inert: scripts cannot turn JSDoc
+                // into navigation or external-open side effects.
+                self.code_hover_overlay_entered(target);
+                Update::none()
+            }
+            Message::CodeSignatureLinkPressed(target, _uri) => {
+                // Signature documentation uses the same rich, inert link policy
+                // as hover documentation.
+                self.code_signature_link_pressed(target);
                 Update::none()
             }
             Message::NavigateCodeDefinition(navigation) => {
@@ -2562,7 +2596,9 @@ impl AutomationsWindow {
                 self.palette_open = false;
                 // Unconsumed Escape routes here even with no palette open, so
                 // it also provides conventional, source-preserving dismissal
-                // for the host-owned completion and hover overlays.
+                // for all host-owned intelligence overlays. Signature help is
+                // suppressed until `(` or `,` starts a new call lifecycle, so
+                // the following passive caret notification cannot reopen it.
                 if let Some(editor) = &mut self.code_editor {
                     editor.dismiss_overlays();
                 }

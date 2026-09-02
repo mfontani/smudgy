@@ -21,8 +21,10 @@ use crate::language_service::{
     CompletionItem, CompletionItemId, CompletionKind, CompletionResult, DefinitionResult,
     DefinitionTarget, Diagnostic, DiagnosticCode, DiagnosticSeverity, DiagnosticsResult,
     DocumentId, FormattingOptions, FormattingResult, HoverResult, InsertTextFormat, Language,
-    LanguageServiceLibrary, MAX_DIAGNOSTICS_PER_DOCUMENT, MarkupContent, MarkupKind, TextEdit,
-    Utf16Position, Utf16Range, validate_document_text,
+    LanguageServiceLibrary, MAX_DIAGNOSTICS_PER_DOCUMENT, MAX_RESULT_METADATA_BYTES,
+    MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES, MAX_SIGNATURE_HELP_PARAMETERS, MarkupContent,
+    MarkupKind, SignatureHelpParameter, SignatureHelpResult, TextEdit, Utf16Position, Utf16Range,
+    validate_document_text,
 };
 use crate::{
     ModulePolicy, Permissions, PermissionsContainer, ScriptRuntime, ScriptRuntimeOptions,
@@ -299,6 +301,100 @@ impl EmbeddedLanguageService {
                     value,
                 },
             }
+        }))
+    }
+
+    /// Returns TypeScript's selected call signature at an exact UTF-16 position.
+    pub fn signature_help(
+        &mut self,
+        document_id: DocumentId,
+        position: Utf16Position,
+    ) -> Result<Option<SignatureHelpResult>> {
+        self.validate_position(document_id, position)?;
+        let file_name = self.file(document_id)?.file_name.clone();
+        let raw: RawSignatureHelpResponse = self.call(
+            "signatureHelp",
+            &json!({ "fileName": file_name, "position": position }),
+        )?;
+        let Some(help) = raw.signature_help else {
+            return Ok(None);
+        };
+
+        help.applicable_range
+            .to_byte_range(&self.file(document_id)?.text)
+            .context("signature-help range is outside the requested document")?;
+        if !signature_range_contains_request(help.applicable_range, position) {
+            bail!("signature-help range does not contain the requested position");
+        }
+        if help.parameters.len() > MAX_SIGNATURE_HELP_PARAMETERS {
+            bail!(
+                "signature help returned {} parameters; maximum is {MAX_SIGNATURE_HELP_PARAMETERS}",
+                help.parameters.len()
+            );
+        }
+        if help.signature_count == 0 || help.selected_signature >= help.signature_count {
+            bail!("signature help returned invalid overload metadata");
+        }
+        if help
+            .active_parameter
+            .is_some_and(|index| usize::from(index) >= help.parameters.len())
+        {
+            bail!("signature help returned an invalid active parameter");
+        }
+
+        let documentation_bytes = help
+            .parameters
+            .iter()
+            .try_fold(help.documentation.len(), |total, parameter| {
+                total.checked_add(parameter.documentation.len())
+            })
+            .context("signature-help documentation size overflow")?;
+        if documentation_bytes > MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES {
+            bail!(
+                "signature help returned {documentation_bytes} documentation bytes; maximum is \
+                 {MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES}"
+            );
+        }
+        let metadata_bytes = help
+            .parameters
+            .iter()
+            .try_fold(
+                help.prefix
+                    .len()
+                    .checked_add(help.separator.len())
+                    .and_then(|total| total.checked_add(help.suffix.len()))
+                    .and_then(|total| total.checked_add(documentation_bytes))
+                    .context("signature-help metadata size overflow")?,
+                |total, parameter| total.checked_add(parameter.label.len()),
+            )
+            .context("signature-help metadata size overflow")?;
+        if metadata_bytes > MAX_RESULT_METADATA_BYTES {
+            bail!(
+                "signature help returned {metadata_bytes} metadata bytes; maximum is \
+                 {MAX_RESULT_METADATA_BYTES}"
+            );
+        }
+
+        Ok(Some(SignatureHelpResult {
+            applicable_range: help.applicable_range,
+            prefix: help.prefix,
+            separator: help.separator,
+            suffix: help.suffix,
+            parameters: help
+                .parameters
+                .into_iter()
+                .map(|parameter| SignatureHelpParameter {
+                    label: parameter.label,
+                    documentation: markdown_content(parameter.documentation),
+                    is_optional: parameter.is_optional,
+                    is_rest: parameter.is_rest,
+                })
+                .collect(),
+            active_parameter: help.active_parameter,
+            selected_signature: help.selected_signature,
+            signature_count: help.signature_count,
+            argument_count: help.argument_count,
+            documentation: markdown_content(help.documentation),
         }))
     }
 
@@ -611,23 +707,40 @@ fn diagnostic_severity(category: &str) -> DiagnosticSeverity {
 fn completion_kind(kind: &str) -> CompletionKind {
     match kind {
         "method" => CompletionKind::Method,
-        "function" | "local function" => CompletionKind::Function,
-        "constructor" => CompletionKind::Constructor,
-        "property" | "getter" | "setter" | "JSX attribute" => CompletionKind::Property,
-        "class" => CompletionKind::Class,
-        "interface" | "type" => CompletionKind::Interface,
+        "function" | "local function" | "call" => CompletionKind::Function,
+        "constructor" | "construct" => CompletionKind::Constructor,
+        "property" | "getter" | "setter" | "accessor" | "index" | "JSX attribute" => {
+            CompletionKind::Property
+        }
+        "class" | "local class" => CompletionKind::Class,
+        "interface" => CompletionKind::Interface,
+        "type" => CompletionKind::TypeAlias,
         "module" | "external module name" => CompletionKind::Module,
         "enum" => CompletionKind::Enum,
         "enum member" => CompletionKind::EnumMember,
         "const" => CompletionKind::Constant,
-        "var" | "let" | "local var" | "parameter" => CompletionKind::Variable,
+        "var" | "let" | "local var" | "parameter" | "using" | "await using" => {
+            CompletionKind::Variable
+        }
         "type parameter" => CompletionKind::TypeParameter,
         "keyword" | "primitive type" => CompletionKind::Keyword,
         "directory" => CompletionKind::Folder,
         "script" => CompletionKind::File,
-        "alias" => CompletionKind::Reference,
+        "alias" | "label" | "link" | "link name" | "link text" => CompletionKind::Reference,
+        "string" => CompletionKind::Value,
         _ => CompletionKind::Text,
     }
+}
+
+fn markdown_content(value: String) -> Option<MarkupContent> {
+    (!value.is_empty()).then_some(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    })
+}
+
+fn signature_range_contains_request(range: Utf16Range, position: Utf16Position) -> bool {
+    range.start <= position && position <= range.end
 }
 
 #[derive(Debug, Deserialize)]
@@ -711,6 +824,36 @@ struct RawHoverResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RawSignatureHelpResponse {
+    signature_help: Option<RawSignatureHelp>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSignatureHelp {
+    applicable_range: Utf16Range,
+    prefix: String,
+    separator: String,
+    suffix: String,
+    parameters: Vec<RawSignatureHelpParameter>,
+    active_parameter: Option<u16>,
+    selected_signature: u16,
+    signature_count: u16,
+    argument_count: u16,
+    documentation: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSignatureHelpParameter {
+    label: String,
+    documentation: String,
+    is_optional: bool,
+    is_rest: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawDefinitions {
     definitions: Vec<RawDefinition>,
 }
@@ -785,6 +928,67 @@ impl Drop for TemporaryDataDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_kind_maps_current_typescript_symbol_categories() {
+        for (kind, expected) in [
+            ("call", CompletionKind::Function),
+            ("construct", CompletionKind::Constructor),
+            ("accessor", CompletionKind::Property),
+            ("index", CompletionKind::Property),
+            ("local class", CompletionKind::Class),
+            ("type", CompletionKind::TypeAlias),
+            ("using", CompletionKind::Variable),
+            ("await using", CompletionKind::Variable),
+            ("label", CompletionKind::Reference),
+            ("link name", CompletionKind::Reference),
+            ("string", CompletionKind::Value),
+        ] {
+            assert_eq!(completion_kind(kind), expected, "TypeScript kind {kind}");
+        }
+    }
+
+    #[test]
+    fn signature_range_must_contain_the_exact_request_position() {
+        let range = Utf16Range {
+            start: Utf16Position {
+                line: 2,
+                character: 4,
+            },
+            end: Utf16Position {
+                line: 2,
+                character: 9,
+            },
+        };
+        assert!(signature_range_contains_request(
+            range,
+            Utf16Position {
+                line: 2,
+                character: 4,
+            }
+        ));
+        assert!(signature_range_contains_request(
+            range,
+            Utf16Position {
+                line: 2,
+                character: 9,
+            }
+        ));
+        assert!(!signature_range_contains_request(
+            range,
+            Utf16Position {
+                line: 1,
+                character: 8,
+            }
+        ));
+        assert!(!signature_range_contains_request(
+            range,
+            Utf16Position {
+                line: 3,
+                character: 0,
+            }
+        ));
+    }
 
     fn document_id(byte: u8) -> DocumentId {
         DocumentId::try_from([byte; 16]).expect("non-nil test document ID")
@@ -953,6 +1157,332 @@ mod tests {
             )
             .expect("formatting request");
         assert!(!formatting.edits.is_empty());
+    }
+
+    #[test]
+    fn hover_converts_jsdoc_inline_links_to_safe_markdown() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                1,
+                "/links.ts",
+                Language::TypeScript,
+                concat!(
+                    "/** Creates a {@link createEvent}, ",
+                    "{@linkcode createEvent code event}, ",
+                    "{@linkplain createEvent|plain event}, and ",
+                    "{@link Missing unresolved event}, ",
+                    "{@linkcode Missing|unresolved code}, ",
+                    "{@linkplain Missing unresolved plain}, ",
+                    "{@link https://external.invalid|external event}, ",
+                    "{@linkcode https://external.invalid external code}, ",
+                    "{@linkplain https://external.invalid|external plain}. ",
+                    "{@link createEvent|unsafe ](https://example.invalid) *label*}.\n",
+                    " * @returns See {@link createEvent}.\n",
+                    " */\n",
+                    "function createEvent(): void {}\n",
+                    "createEvent;\n",
+                ),
+            )])
+            .expect("open JSDoc link project");
+
+        let hover = service
+            .hover(
+                document_id(1),
+                Utf16Position {
+                    line: 4,
+                    character: 1,
+                },
+            )
+            .expect("hover request")
+            .expect("hover result");
+        let markdown = hover.contents.value;
+        assert!(markdown.contains("[createEvent](#smudgy-jsdoc-link-1)"));
+        assert!(markdown.contains("[`code event`](#smudgy-jsdoc-link-2)"));
+        assert!(markdown.contains("[plain event](#smudgy-jsdoc-link-3)"));
+        assert!(markdown.contains("[unresolved event](#smudgy-jsdoc-link-4)"));
+        assert!(markdown.contains("[`unresolved code`](#smudgy-jsdoc-link-5)"));
+        assert!(markdown.contains("[unresolved plain](#smudgy-jsdoc-link-6)"));
+        assert!(markdown.contains("[external event](#smudgy-jsdoc-link-7)"));
+        assert!(markdown.contains("[`external code`](#smudgy-jsdoc-link-8)"));
+        assert!(markdown.contains("[external plain](#smudgy-jsdoc-link-9)"));
+        assert!(markdown.contains(
+            "[unsafe \\]\\(https://example\\.invalid\\) \\*label\\*](#smudgy-jsdoc-link-10)"
+        ));
+        assert!(markdown.contains("[createEvent](#smudgy-jsdoc-link-11)"));
+        assert!(!markdown.contains("external.invalid"));
+        assert!(!markdown.contains("](https://example.invalid)"));
+        assert!(!markdown.contains("{@link"));
+    }
+
+    #[test]
+    fn hover_recovers_normalized_jsdoc_namepath_labels_without_live_destinations() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                1,
+                "/namepaths.ts",
+                Language::TypeScript,
+                concat!(
+                    "/** Links {@link import(\"pkg\").Type imported label}, ",
+                    "{@linkcode import(\"pkg\").Type|imported code}, ",
+                    "{@linkplain import(\"pkg\").Type}, ",
+                    "{@link module:\"pkg\" module label}, ",
+                    "{@linkcode module:\"pkg\"|module code}, and ",
+                    "{@linkplain module:\"pkg\"}. */\n",
+                    "function useNamepaths(): void {}\n",
+                    "useNamepaths;\n",
+                ),
+            )])
+            .expect("open normalized-namepath project");
+
+        let hover = service
+            .hover(
+                document_id(1),
+                Utf16Position {
+                    line: 2,
+                    character: 1,
+                },
+            )
+            .expect("hover request")
+            .expect("hover result");
+        let markdown = hover.contents.value;
+        assert!(markdown.contains("[imported label](#smudgy-jsdoc-link-1)"));
+        assert!(markdown.contains("[`imported code`](#smudgy-jsdoc-link-2)"));
+        assert!(markdown.contains("[import \\(\"pkg\"\\)\\.Type](#smudgy-jsdoc-link-3)"));
+        assert!(markdown.contains("[module label](#smudgy-jsdoc-link-4)"));
+        assert!(markdown.contains("[`module code`](#smudgy-jsdoc-link-5)"));
+        assert!(markdown.contains("[module :\"pkg\"](#smudgy-jsdoc-link-6)"));
+        assert_eq!(markdown.matches("#smudgy-jsdoc-link-").count(), 6);
+        assert!(!markdown.contains("](import"));
+        assert!(!markdown.contains("](module"));
+    }
+
+    #[test]
+    fn hover_recovers_generic_and_colon_namepath_labels_without_live_destinations() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                1,
+                "/generic-namepaths.ts",
+                Language::TypeScript,
+                concat!(
+                    "/** Links {@link Missing<T | U> generic label}, ",
+                    "{@linkcode Missing<T | U>|generic code}, ",
+                    "{@linkplain Missing<T | U>}, ",
+                    "{@link Missing<Map<string, Array<T | U>>> nested label}, ",
+                    "{@link event:ready event label}, ",
+                    "{@linkplain event:ready}, ",
+                    "{@linkcode external:vendor|external code}, ",
+                    "{@link external:vendor}, ",
+                    "{@linkplain namespace:\"tool kit\" namespace label}, and ",
+                    "{@link namespace:tools}. */\n",
+                    "function useGenericNamepaths(): void {}\n",
+                    "useGenericNamepaths;\n",
+                ),
+            )])
+            .expect("open generic and colon-namepath project");
+
+        let hover = service
+            .hover(
+                document_id(1),
+                Utf16Position {
+                    line: 2,
+                    character: 1,
+                },
+            )
+            .expect("hover request")
+            .expect("hover result");
+        let markdown = hover.contents.value;
+        assert!(markdown.contains("[generic label](#smudgy-jsdoc-link-1)"));
+        assert!(markdown.contains("[`generic code`](#smudgy-jsdoc-link-2)"));
+        assert!(markdown.contains("[Missing\\<T \\| U\\>](#smudgy-jsdoc-link-3)"));
+        assert!(markdown.contains("[nested label](#smudgy-jsdoc-link-4)"));
+        assert!(markdown.contains("[event label](#smudgy-jsdoc-link-5)"));
+        assert!(markdown.contains("[event :ready](#smudgy-jsdoc-link-6)"));
+        assert!(markdown.contains("[`external code`](#smudgy-jsdoc-link-7)"));
+        assert!(markdown.contains("[external :vendor](#smudgy-jsdoc-link-8)"));
+        assert!(markdown.contains("[namespace label](#smudgy-jsdoc-link-9)"));
+        assert!(markdown.contains("[namespace :tools](#smudgy-jsdoc-link-10)"));
+        assert_eq!(markdown.matches("#smudgy-jsdoc-link-").count(), 10);
+        for destination in ["](Missing", "](event", "](external", "](namespace"] {
+            assert!(!markdown.contains(destination));
+        }
+    }
+
+    #[test]
+    fn hover_recovers_labels_when_typescript_resolves_only_the_link_prefix() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                1,
+                "/resolved-prefixes.ts",
+                Language::TypeScript,
+                concat!(
+                    "const event = 1;\n",
+                    "const https = 1;\n",
+                    "const marker = 1; const Foo = 1;\n",
+                    "/** Links {@link event:ready pretty event}, ",
+                    "{@linkcode event:ready|event code}, ",
+                    "{@linkplain event:ready}, ",
+                    "{@link https://external.invalid pretty URL}, ",
+                    "{@linkcode https://external.invalid|URL code}, ",
+                    "{@linkplain https://external.invalid}, ",
+                    "{@link marker (deprecated)}, ",
+                    "{@linkcode marker [legacy]}, and ",
+                    "{@link Foo :note}. */\n",
+                    "function useResolvedPrefixes(): void {}\n",
+                    "useResolvedPrefixes;\n",
+                ),
+            )])
+            .expect("open resolved-prefix project");
+
+        let hover = service
+            .hover(
+                document_id(1),
+                Utf16Position {
+                    line: 5,
+                    character: 1,
+                },
+            )
+            .expect("hover request")
+            .expect("hover result");
+        let markdown = hover.contents.value;
+        assert!(markdown.contains("[pretty event](#smudgy-jsdoc-link-1)"));
+        assert!(markdown.contains("[`event code`](#smudgy-jsdoc-link-2)"));
+        assert!(markdown.contains("[event:ready](#smudgy-jsdoc-link-3)"));
+        assert!(markdown.contains("[pretty URL](#smudgy-jsdoc-link-4)"));
+        assert!(markdown.contains("[`URL code`](#smudgy-jsdoc-link-5)"));
+        assert!(markdown.contains("[https://external\\.invalid](#smudgy-jsdoc-link-6)"));
+        assert!(markdown.contains("[\\(deprecated\\)](#smudgy-jsdoc-link-7)"));
+        assert!(markdown.contains("[`[legacy]`](#smudgy-jsdoc-link-8)"));
+        assert!(markdown.contains("[:note](#smudgy-jsdoc-link-9)"));
+        assert_eq!(markdown.matches("#smudgy-jsdoc-link-").count(), 9);
+        assert!(!markdown.contains("](event"));
+        assert!(!markdown.contains("](https"));
+        assert!(!markdown.contains("](http"));
+    }
+
+    #[test]
+    fn hover_keeps_jsdoc_example_fences_block_parseable() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                1,
+                "/example.ts",
+                Language::TypeScript,
+                concat!(
+                    "/** Demonstrates the helper.\n",
+                    " * @example\n",
+                    " * ```ts\n",
+                    " * const value: number = helper();\n",
+                    " * ```\n",
+                    " */\n",
+                    "function helper(): number { return 1; }\n",
+                    "helper;\n",
+                ),
+            )])
+            .expect("open JSDoc example project");
+
+        let hover = service
+            .hover(
+                document_id(1),
+                Utf16Position {
+                    line: 7,
+                    character: 1,
+                },
+            )
+            .expect("hover request")
+            .expect("hover result");
+        assert!(hover.contents.value.contains("`@example`\n\n```ts\n"));
+        assert!(
+            hover
+                .contents
+                .value
+                .contains("const value: number = helper();")
+        );
+    }
+
+    #[test]
+    fn signature_help_preserves_selected_overload_and_parameter_metadata() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                1,
+                "/signature.ts",
+                Language::TypeScript,
+                concat!(
+                    "function choose(value: string): string;\n",
+                    "/** Picks a number via {@link choose}.\n",
+                    " * @param value Number to choose.\n",
+                    " * @param radix Optional radix via {@link choose}.\n",
+                    " */\n",
+                    "function choose(value: number, radix?: number): number;\n",
+                    "function choose(value: string | number, radix?: number) { return value; }\n",
+                    "choose(1, \n",
+                ),
+            )])
+            .expect("open signature-help project");
+
+        let help = service
+            .signature_help(
+                document_id(1),
+                Utf16Position {
+                    line: 7,
+                    character: 10,
+                },
+            )
+            .expect("signature-help request")
+            .expect("signature-help result");
+        assert_eq!(help.prefix, "choose(");
+        assert_eq!(help.separator, ", ");
+        assert_eq!(help.suffix, "): number");
+        assert_eq!(help.selected_signature, 1);
+        assert_eq!(help.signature_count, 2);
+        assert_eq!(help.argument_count, 2);
+        assert_eq!(help.active_parameter, Some(1));
+        assert_eq!(help.parameters.len(), 2);
+        assert_eq!(help.parameters[0].label, "value: number");
+        assert!(!help.parameters[0].is_optional);
+        assert!(!help.parameters[0].is_rest);
+        assert_eq!(help.parameters[1].label, "radix?: number");
+        assert!(help.parameters[1].is_optional);
+        assert!(!help.parameters[1].is_rest);
+        assert!(help.documentation.as_ref().is_some_and(|documentation| {
+            documentation
+                .value
+                .contains("[choose](#smudgy-jsdoc-link-1)")
+        }));
+        assert!(
+            help.parameters[1]
+                .documentation
+                .as_ref()
+                .is_some_and(|documentation| documentation
+                    .value
+                    .contains("[choose](#smudgy-jsdoc-link-2)"))
+        );
+
+        service
+            .replace_project(vec![file(
+                1,
+                "/signature.ts",
+                Language::TypeScript,
+                "function send(...messages: string[]): void {}\nsend(\"one\", \n",
+            )])
+            .expect("replace with variadic signature");
+        let variadic = service
+            .signature_help(
+                document_id(1),
+                Utf16Position {
+                    line: 1,
+                    character: 12,
+                },
+            )
+            .expect("variadic signature-help request")
+            .expect("variadic signature-help result");
+        assert_eq!(variadic.active_parameter, Some(0));
+        assert_eq!(variadic.argument_count, 2);
+        assert!(variadic.parameters[0].is_rest);
     }
 
     #[test]

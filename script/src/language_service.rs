@@ -14,7 +14,7 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Current language-service protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Largest encoded JSON payload accepted by the eventual framed transport.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Largest editable document body.
@@ -35,6 +35,12 @@ pub const MAX_DIAGNOSTIC_RELATED_INFORMATION: usize = 2_000;
 pub const MAX_COMPLETION_ITEMS: usize = 500;
 /// Largest aggregate additional-edit list in one completion result.
 pub const MAX_COMPLETION_ADDITIONAL_EDITS: usize = 256;
+/// Largest selected-signature parameter list accepted from the worker.
+pub const MAX_SIGNATURE_HELP_PARAMETERS: usize = 256;
+/// Largest overload count represented by compact signature-help metadata.
+pub const MAX_SIGNATURE_HELP_SIGNATURES: usize = u16::MAX as usize;
+/// Largest aggregate signature and parameter documentation payload.
+pub const MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES: usize = 256 * 1024;
 /// Largest definition result.
 pub const MAX_DEFINITION_TARGETS: usize = 64;
 /// Largest hover or documentation payload.
@@ -768,6 +774,7 @@ pub enum Command {
     RequestDiagnostics(DocumentRequest),
     RequestCompletion(PositionRequest),
     RequestHover(PositionRequest),
+    RequestSignatureHelp(PositionRequest),
     RequestDefinition(PositionRequest),
     RequestFormatting(FormattingRequest),
     Cancel(CancelRequest),
@@ -824,6 +831,7 @@ impl Validate for CommandEnvelope {
             Command::RequestDiagnostics(command) => command.identity.validate(),
             Command::RequestCompletion(command)
             | Command::RequestHover(command)
+            | Command::RequestSignatureHelp(command)
             | Command::RequestDefinition(command) => command.identity.validate(),
             Command::RequestFormatting(command) => {
                 command.identity.validate()?;
@@ -913,6 +921,7 @@ pub enum CompletionKind {
     Variable,
     Class,
     Interface,
+    TypeAlias,
     Module,
     Property,
     Unit,
@@ -972,6 +981,36 @@ pub struct CompletionResult {
 pub struct HoverResult {
     pub range: Option<Utf16Range>,
     pub contents: MarkupContent,
+}
+
+/// One parameter from TypeScript's selected call signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignatureHelpParameter {
+    pub label: String,
+    pub documentation: Option<MarkupContent>,
+    pub is_optional: bool,
+    pub is_rest: bool,
+}
+
+/// Compact signature help for TypeScript's selected overload.
+///
+/// Only the selected signature's display segments cross the worker boundary. The
+/// selected index and total count preserve enough overload context for the UI without
+/// multiplying the bounded documentation payload by every candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignatureHelpResult {
+    pub applicable_range: Utf16Range,
+    pub prefix: String,
+    pub separator: String,
+    pub suffix: String,
+    pub parameters: Vec<SignatureHelpParameter>,
+    pub active_parameter: Option<u16>,
+    pub selected_signature: u16,
+    pub signature_count: u16,
+    pub argument_count: u16,
+    pub documentation: Option<MarkupContent>,
 }
 
 /// One same-project definition target. The opaque ID is the routing authority.
@@ -1081,6 +1120,7 @@ pub enum Event {
     Diagnostics(DocumentResult<DiagnosticsResult>),
     Completion(DocumentResult<CompletionResult>),
     Hover(DocumentResult<Option<HoverResult>>),
+    SignatureHelp(DocumentResult<Option<SignatureHelpResult>>),
     Definition(DocumentResult<DefinitionResult>),
     Formatting(DocumentResult<FormattingResult>),
     RequestFailed(RequestFailure),
@@ -1106,6 +1146,7 @@ impl Validate for EventEnvelope {
             Event::Diagnostics(result) => validate_diagnostics_result(result),
             Event::Completion(result) => validate_completion_result(result),
             Event::Hover(result) => validate_hover_result(result),
+            Event::SignatureHelp(result) => validate_signature_help_result(result),
             Event::Definition(result) => validate_definition_result(result),
             Event::Formatting(result) => validate_formatting_result(result),
             Event::RequestFailed(failure) => validate_request_failure(failure),
@@ -1448,6 +1489,84 @@ fn validate_hover_result(
             hover.contents.value.len(),
             MAX_HOVER_BYTES,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_signature_help_result(
+    result: &DocumentResult<Option<SignatureHelpResult>>,
+) -> Result<(), ProtocolError> {
+    validate_document_result(result)?;
+    let Some(help) = &result.result else {
+        return Ok(());
+    };
+
+    help.applicable_range.validate()?;
+    validate_count(
+        "signature help parameters",
+        help.parameters.len(),
+        MAX_SIGNATURE_HELP_PARAMETERS,
+    )?;
+    let signature_count = usize::from(help.signature_count);
+    if signature_count == 0 || signature_count > MAX_SIGNATURE_HELP_SIGNATURES {
+        return Err(ProtocolError::InvalidValue(
+            "signature help signature count",
+        ));
+    }
+    if usize::from(help.selected_signature) >= signature_count {
+        return Err(ProtocolError::InvalidValue(
+            "signature help selected signature",
+        ));
+    }
+    if help
+        .active_parameter
+        .is_some_and(|index| usize::from(index) >= help.parameters.len())
+    {
+        return Err(ProtocolError::InvalidValue(
+            "signature help active parameter",
+        ));
+    }
+
+    let mut metadata_bytes = 0_usize;
+    for value in [&help.prefix, &help.separator, &help.suffix] {
+        add_string_bytes(
+            "signature help metadata",
+            &mut metadata_bytes,
+            value,
+            MAX_RESULT_METADATA_BYTES,
+        )?;
+    }
+    for parameter in &help.parameters {
+        add_string_bytes(
+            "signature help metadata",
+            &mut metadata_bytes,
+            &parameter.label,
+            MAX_RESULT_METADATA_BYTES,
+        )?;
+    }
+
+    let mut documentation_bytes = 0_usize;
+    let mut validate_documentation = |documentation: &MarkupContent| {
+        add_string_bytes(
+            "signature help documentation",
+            &mut documentation_bytes,
+            &documentation.value,
+            MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES,
+        )?;
+        add_string_bytes(
+            "signature help metadata",
+            &mut metadata_bytes,
+            &documentation.value,
+            MAX_RESULT_METADATA_BYTES,
+        )
+    };
+    if let Some(documentation) = &help.documentation {
+        validate_documentation(documentation)?;
+    }
+    for parameter in &help.parameters {
+        if let Some(documentation) = &parameter.documentation {
+            validate_documentation(documentation)?;
+        }
     }
     Ok(())
 }
@@ -1815,6 +1934,49 @@ mod tests {
         }
     }
 
+    fn signature_help_fixture() -> SignatureHelpResult {
+        SignatureHelpResult {
+            applicable_range: Utf16Range {
+                start: Utf16Position {
+                    line: 4,
+                    character: 5,
+                },
+                end: Utf16Position {
+                    line: 4,
+                    character: 9,
+                },
+            },
+            prefix: "send(".into(),
+            separator: ", ".into(),
+            suffix: "): void".into(),
+            parameters: vec![
+                SignatureHelpParameter {
+                    label: "message: string".into(),
+                    documentation: Some(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: "Message to send.".into(),
+                    }),
+                    is_optional: false,
+                    is_rest: false,
+                },
+                SignatureHelpParameter {
+                    label: "options?: SendOptions".into(),
+                    documentation: None,
+                    is_optional: true,
+                    is_rest: false,
+                },
+            ],
+            active_parameter: Some(1),
+            selected_signature: 1,
+            signature_count: 3,
+            argument_count: 2,
+            documentation: Some(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "Sends text.".into(),
+            }),
+        }
+    }
+
     fn event<T>(result: T, make_event: impl FnOnce(DocumentResult<T>) -> Event) -> EventEnvelope {
         EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -1846,7 +2008,7 @@ mod tests {
         );
 
         let decoded: CommandEnvelope = serde_json::from_str(
-            r#"{"protocolVersion":1,"commandSequence":0,"command":{"type":"shutdown"}}"#,
+            r#"{"protocolVersion":2,"commandSequence":0,"command":{"type":"shutdown"}}"#,
         )
         .expect("shape is typed before semantic validation");
         assert!(matches!(
@@ -2066,6 +2228,35 @@ mod tests {
     }
 
     #[test]
+    fn signature_help_command_and_event_round_trip() {
+        let command = CommandEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            command_sequence: wire(20),
+            command: Command::RequestSignatureHelp(PositionRequest {
+                identity: result_identity(),
+                position: Utf16Position {
+                    line: 4,
+                    character: 9,
+                },
+            }),
+        };
+        command.validate().expect("signature-help command is valid");
+        let json = serde_json::to_string(&command).expect("serialize signature-help command");
+        let decoded: CommandEnvelope =
+            serde_json::from_str(&json).expect("deserialize signature-help command");
+        assert_eq!(decoded, command);
+        assert!(json.contains("\"type\":\"requestSignatureHelp\""));
+
+        let envelope = event(Some(signature_help_fixture()), Event::SignatureHelp);
+        envelope.validate().expect("signature-help event is valid");
+        let json = serde_json::to_string(&envelope).expect("serialize signature-help event");
+        let decoded: EventEnvelope =
+            serde_json::from_str(&json).expect("deserialize signature-help event");
+        assert_eq!(decoded, envelope);
+        assert!(json.contains("\"type\":\"signatureHelp\""));
+    }
+
+    #[test]
     fn complete_state_and_request_are_required_for_current_result() {
         let identity = result_identity();
         assert!(identity.is_current_for(&identity.state, identity.request_id));
@@ -2267,6 +2458,92 @@ mod tests {
             formatting.validate(),
             Err(ProtocolError::TooManyBytes {
                 field: "formatting edits",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn signature_help_validates_ranges_indices_counts_and_aggregate_bounds() {
+        let valid = event(Some(signature_help_fixture()), Event::SignatureHelp);
+        valid.validate().expect("valid signature help");
+
+        let mut invalid_range = signature_help_fixture();
+        invalid_range.applicable_range = Utf16Range {
+            start: Utf16Position {
+                line: 2,
+                character: 0,
+            },
+            end: Utf16Position {
+                line: 1,
+                character: 0,
+            },
+        };
+        assert!(matches!(
+            event(Some(invalid_range), Event::SignatureHelp).validate(),
+            Err(ProtocolError::InvalidRange(_))
+        ));
+
+        let mut invalid_active = signature_help_fixture();
+        invalid_active.active_parameter = Some(
+            u16::try_from(invalid_active.parameters.len()).expect("fixture parameter count fits"),
+        );
+        assert_eq!(
+            event(Some(invalid_active), Event::SignatureHelp).validate(),
+            Err(ProtocolError::InvalidValue(
+                "signature help active parameter"
+            ))
+        );
+
+        let mut invalid_selected = signature_help_fixture();
+        invalid_selected.selected_signature = invalid_selected.signature_count;
+        assert_eq!(
+            event(Some(invalid_selected), Event::SignatureHelp).validate(),
+            Err(ProtocolError::InvalidValue(
+                "signature help selected signature"
+            ))
+        );
+
+        let mut zero_signatures = signature_help_fixture();
+        zero_signatures.signature_count = 0;
+        assert_eq!(
+            event(Some(zero_signatures), Event::SignatureHelp).validate(),
+            Err(ProtocolError::InvalidValue(
+                "signature help signature count"
+            ))
+        );
+
+        let mut too_many_parameters = signature_help_fixture();
+        too_many_parameters.parameters = vec![
+            SignatureHelpParameter {
+                label: "value: unknown".into(),
+                documentation: None,
+                is_optional: false,
+                is_rest: false,
+            };
+            MAX_SIGNATURE_HELP_PARAMETERS + 1
+        ];
+        assert!(matches!(
+            event(Some(too_many_parameters), Event::SignatureHelp).validate(),
+            Err(ProtocolError::TooManyItems {
+                field: "signature help parameters",
+                ..
+            })
+        ));
+
+        let mut excessive_documentation = signature_help_fixture();
+        excessive_documentation.documentation = Some(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "x".repeat(MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES),
+        });
+        excessive_documentation.parameters[0].documentation = Some(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "x".into(),
+        });
+        assert!(matches!(
+            event(Some(excessive_documentation), Event::SignatureHelp).validate(),
+            Err(ProtocolError::TooManyBytes {
+                field: "signature help documentation",
                 ..
             })
         ));

@@ -33,6 +33,8 @@
     jsx: ts.JsxEmit.ReactJSX,
     jsxImportSource: "smudgy:widgets",
   });
+  const MAX_SIGNATURE_HELP_PARAMETERS = 256;
+  const MAX_SIGNATURE_HELP_COUNT = 0xffff;
 
   function normalize(fileName) {
     let value = String(fileName).replace(/\\/g, "/");
@@ -254,6 +256,252 @@
     return ts.displayPartsToString(parts || []);
   }
 
+  function escapeMarkdownLabel(value) {
+    const punctuation = "\\`*_{}[]()<>#+-.!|";
+    let escaped = "";
+    for (const character of String(value)) {
+      if (punctuation.includes(character)) escaped += "\\";
+      escaped += character;
+    }
+    return escaped;
+  }
+
+  function markdownCodeSpan(value) {
+    const text = String(value).replace(/\s+/g, " ").trim();
+    const runs = text.match(/`+/g) || [];
+    const fence = "`".repeat(
+      runs.reduce((longest, run) => Math.max(longest, run.length), 0) + 1,
+    );
+    const needsPadding = text.startsWith("`") || text.endsWith("`") ||
+      (text.startsWith(" ") && text.endsWith(" "));
+    return fence + (needsPadding ? ` ${text} ` : text) + fence;
+  }
+
+  const MAX_JSDOC_LINK_TARGET_SCAN = 4096;
+
+  function topLevelLinkDelimiter(value) {
+    let quote = "";
+    let escaped = false;
+    let depth = 0;
+    const limit = Math.min(value.length, MAX_JSDOC_LINK_TARGET_SCAN);
+    for (let index = 0; index < limit; index += 1) {
+      const character = value[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "\"" || character === "'" || character === "`") {
+        quote = character;
+      } else if (
+        character === "(" || character === "[" || character === "{" || character === "<"
+      ) {
+        depth += 1;
+      } else if (
+        character === ")" || character === "]" || character === "}" || character === ">"
+      ) {
+        depth = Math.max(0, depth - 1);
+      } else if (character === "|" && depth === 0) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  function skipLinkWhitespace(value, start, limit) {
+    let index = start;
+    while (index < limit && /\s/.test(value[index])) index += 1;
+    return index;
+  }
+
+  function quotedLinkTargetEnd(value, start, limit) {
+    const quote = value[start];
+    if (quote !== "\"" && quote !== "'" && quote !== "`") return -1;
+    let escaped = false;
+    for (let index = start + 1; index < limit; index += 1) {
+      const character = value[index];
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) return index + 1;
+    }
+    return -1;
+  }
+
+  function balancedLinkTargetEnd(value, start, limit) {
+    let quote = "";
+    let escaped = false;
+    let depth = 0;
+    for (let index = start; index < limit; index += 1) {
+      const character = value[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "\"" || character === "'" || character === "`") {
+        quote = character;
+      } else if (
+        character === "(" || character === "[" || character === "{" || character === "<"
+      ) {
+        depth += 1;
+      } else if (
+        character === ")" || character === "]" || character === "}" || character === ">"
+      ) {
+        depth = Math.max(0, depth - 1);
+      } else if (depth === 0 && (/\s/.test(character) || character === "|")) {
+        return index;
+      }
+    }
+    return limit;
+  }
+
+  function normalizedColonNamepathEnd(value, limit) {
+    let prefixEnd = 0;
+    while (prefixEnd < limit && /[\w$.-]/.test(value[prefixEnd])) prefixEnd += 1;
+    if (prefixEnd === 0) return -1;
+    const colon = skipLinkWhitespace(value, prefixEnd, limit);
+    if (value[colon] !== ":") return -1;
+    const target = skipLinkWhitespace(value, colon + 1, limit);
+    return balancedLinkTargetEnd(value, target, limit);
+  }
+
+  // TypeScript normalizes unresolved JSDoc namepaths before emitting linkText:
+  // import("pkg").Type becomes `import ("pkg").Type`, and standard colon
+  // namepaths such as module:"pkg" or event:ready gain a space before `:`.
+  // Generic references also retain spaces inside balanced `<...>`. Recover
+  // those bounded target shapes so their whitespace and union pipes are not
+  // mistaken for custom-label separators.
+  function unboundLinkTargetEnd(value) {
+    const limit = Math.min(value.length, MAX_JSDOC_LINK_TARGET_SCAN);
+    if (value.startsWith("import")) {
+      let index = skipLinkWhitespace(value, "import".length, limit);
+      if (value[index] === "(") {
+        index = skipLinkWhitespace(value, index + 1, limit);
+        const quotedEnd = quotedLinkTargetEnd(value, index, limit);
+        if (quotedEnd >= 0) {
+          index = skipLinkWhitespace(value, quotedEnd, limit);
+          if (value[index] === ")") {
+            return balancedLinkTargetEnd(value, index + 1, limit);
+          }
+        }
+      }
+    }
+
+    const colonNamepathEnd = normalizedColonNamepathEnd(value, limit);
+    return colonNamepathEnd >= 0
+      ? colonNamepathEnd
+      : balancedLinkTargetEnd(value, 0, limit);
+  }
+
+  function unboundLinkLabel(value) {
+    const text = String(value).trim();
+    const delimiter = topLevelLinkDelimiter(text);
+    if (delimiter >= 0) {
+      const target = text.slice(0, delimiter).trim();
+      return text.slice(delimiter + 1).trim() || target;
+    }
+    const targetEnd = unboundLinkTargetEnd(text);
+    const alternate = text.slice(targetEnd).trim();
+    return alternate || text.slice(0, targetEnd).trim();
+  }
+
+  const NORMALIZED_COLON_LINK_PREFIXES = Object.freeze([
+    "event",
+    "external",
+    "module",
+    "namespace",
+  ]);
+
+  function resolvedLinkLabel(name, rawAlternate) {
+    const alternate = rawAlternate.trim();
+    if (!alternate) return unboundLinkLabel(name);
+    // A resolvable colon-namepath prefix can become linkName while TypeScript
+    // leaves `:target label` in an adjacent linkText. Preserve leading-space
+    // evidence when TypeScript provides it, and constrain the otherwise
+    // ambiguous colon form to standard JSDoc namepath prefixes. Every other
+    // non-empty linkText is the authoritative custom label, including labels
+    // beginning with punctuation.
+    const adjacent = rawAlternate.length === alternate.length;
+    const standardPrefix = NORMALIZED_COLON_LINK_PREFIXES.includes(
+      name.trim().toLowerCase(),
+    );
+    return adjacent && alternate[0] === ":" && standardPrefix
+      ? unboundLinkLabel(name + alternate)
+      : alternate;
+  }
+
+  function markdownDisplay(parts, linkState) {
+    const values = parts || [];
+    let markdown = "";
+    for (let index = 0; index < values.length; index += 1) {
+      const part = values[index];
+      const match = part.kind === "link" &&
+        /^\{@(link|linkcode|linkplain)\s+/.exec(part.text);
+      if (!match) {
+        markdown += part.text;
+        continue;
+      }
+
+      let end = index + 1;
+      while (
+        end < values.length &&
+        !(values[end].kind === "link" && values[end].text.trim() === "}")
+      ) {
+        end += 1;
+      }
+      if (end >= values.length) {
+        markdown += part.text;
+        continue;
+      }
+
+      const body = values.slice(index + 1, end);
+      const name = body.filter((value) => value.kind === "linkName")
+        .map((value) => value.text).join("").trim();
+      const rawAlternate = body.filter((value) => value.kind === "linkText")
+        .map((value) => value.text).join("");
+      const alternate = rawAlternate.trim();
+      // TypeScript separates a resolved target into linkName + linkText, but
+      // collapses unresolved symbols and external URLs into one linkText after
+      // removing either the whitespace or `|` label delimiter. In that shape,
+      // recover the normalized target shape before selecting its custom label.
+      const label = name
+        ? resolvedLinkLabel(name, rawAlternate)
+        : unboundLinkLabel(alternate || display(body));
+      if (!label) {
+        markdown += display(values.slice(index, end + 1));
+        index = end;
+        continue;
+      }
+
+      linkState.next += 1;
+      const rendered = match[1] === "linkcode"
+        ? markdownCodeSpan(label)
+        : escapeMarkdownLabel(label);
+      markdown += `[${rendered}](#smudgy-jsdoc-link-${linkState.next})`;
+      index = end;
+    }
+    return markdown;
+  }
+
+  function markdownDocumentation(documentation, tags, linkState) {
+    const body = markdownDisplay(documentation, linkState);
+    const tagList = (tags || []).map((tag) => {
+      const text = markdownDisplay(tag.text, linkState);
+      const label = markdownCodeSpan(`@${tag.name}`);
+      if (!text) return `- ${label}`;
+      // A fenced @example (and any other multiline block) must begin after a
+      // blank line. Prefixing it on a list-item line makes the backticks
+      // literal CommonMark text, so iced never receives a highlighted block.
+      if (text.includes("\n") || /^(?:```|~~~)/.test(text.trimStart())) {
+        return `${label}\n\n${text}`;
+      }
+      return `- ${label} ${text}`;
+    }).join("\n\n");
+    return [body, tagList].filter(Boolean).join("\n\n");
+  }
+
   function diagnostic(value) {
     const fileName = value.file && normalize(value.file.fileName);
     return {
@@ -388,13 +636,87 @@
       const position = offsetAt(fileName, params.position);
       const info = service.getQuickInfoAtPosition(fileName, position);
       if (!info) return { hover: null };
-      const documentation = display(info.documentation);
-      const tags = (info.tags || []).map((tag) => `@${tag.name} ${display(tag.text)}`).join("\n");
+      const documentation = markdownDocumentation(
+        info.documentation,
+        info.tags,
+        { next: 0 },
+      );
       return {
         hover: {
           range: range(fileName, info.textSpan),
           display: display(info.displayParts),
-          documentation: [documentation, tags].filter(Boolean).join("\n\n"),
+          documentation,
+        },
+      };
+    }
+    if (method === "signatureHelp") {
+      const fileName = normalize(params.fileName);
+      const position = offsetAt(fileName, params.position);
+      const info = service.getSignatureHelpItems(fileName, position);
+      if (!info || !info.items || info.items.length === 0) {
+        return { signatureHelp: null };
+      }
+      const selectedIndex = Number(info.selectedItemIndex);
+      if (
+        !Number.isInteger(selectedIndex) || selectedIndex < 0 ||
+        selectedIndex >= info.items.length
+      ) {
+        throw new Error("invalid selected signature index");
+      }
+      if (info.items.length > MAX_SIGNATURE_HELP_COUNT) {
+        return { signatureHelp: null };
+      }
+      const selected = info.items[selectedIndex];
+      const sourceParameters = selected.parameters || [];
+      if (sourceParameters.length > MAX_SIGNATURE_HELP_PARAMETERS) {
+        return { signatureHelp: null };
+      }
+      const retainedParameters = sourceParameters;
+      const isRestParameter = (parameter, index) => !!parameter.isRest ||
+        (!!selected.isVariadic && index === sourceParameters.length - 1);
+      const argumentIndex = Number(info.argumentIndex);
+      let activeParameter = null;
+      if (
+        Number.isInteger(argumentIndex) && argumentIndex >= 0 &&
+        retainedParameters.length > 0
+      ) {
+        if (argumentIndex < retainedParameters.length) {
+          activeParameter = argumentIndex;
+        } else if (selected.isVariadic) {
+          const restIndex = retainedParameters.findIndex(isRestParameter);
+          if (restIndex >= 0 && argumentIndex >= restIndex) activeParameter = restIndex;
+        }
+      }
+      const linkState = { next: 0 };
+      const documentation = markdownDocumentation(
+        selected.documentation,
+        (selected.tags || []).filter((tag) => tag.name !== "param"),
+        linkState,
+      );
+      const argumentCount = Number(info.argumentCount);
+      if (
+        !Number.isInteger(argumentCount) || argumentCount < 0 ||
+        argumentCount > MAX_SIGNATURE_HELP_COUNT
+      ) {
+        return { signatureHelp: null };
+      }
+      return {
+        signatureHelp: {
+          applicableRange: range(fileName, info.applicableSpan),
+          prefix: display(selected.prefixDisplayParts),
+          separator: display(selected.separatorDisplayParts),
+          suffix: display(selected.suffixDisplayParts),
+          parameters: retainedParameters.map((parameter, index) => ({
+            label: display(parameter.displayParts),
+            documentation: markdownDisplay(parameter.documentation, linkState),
+            isOptional: !!parameter.isOptional,
+            isRest: isRestParameter(parameter, index),
+          })),
+          activeParameter,
+          selectedSignature: selectedIndex,
+          signatureCount: info.items.length,
+          argumentCount,
+          documentation,
         },
       };
     }

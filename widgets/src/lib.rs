@@ -5,7 +5,7 @@ mod map;
 mod text_editor;
 mod widget;
 
-pub use extension::smudgy_widgets as ext;
+pub use extension::{SmudgyMarkdownViewer, smudgy_widgets as ext};
 
 pub use image_store::{
     DecodedImage, EntryState, FetchError, FileStamp, ImageEntryCell, ImageFetcher, ImageStore,

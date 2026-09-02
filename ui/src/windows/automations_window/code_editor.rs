@@ -15,16 +15,16 @@ use std::time::{Duration, Instant};
 
 use smudgy_script::language_service::{
     AcknowledgedState, AnalysisContextId, AutomationKind, CancelRequest, ChangeDocument, ClientId,
-    CloseDocument, Command, CommandSequence, CompletionResult, DefinitionResult, DefinitionTarget,
-    Diagnostic, DiagnosticsResult, DiskRevision, DocumentChanges, DocumentDescriptor, DocumentId,
-    DocumentKey, DocumentKind, DocumentRef, DocumentRequest, DocumentResult,
-    DocumentResultIdentity, DocumentStateIdentity, DocumentVersion, Event, EventEnvelope,
-    FailureScope, FormattingOptions, FormattingRequest, GraphGeneration, HoverResult, Language,
-    LanguageServiceLibrary, MAX_DOCUMENT_BYTES, MAX_PROJECT_SOURCE_FILES,
-    MAX_PROJECT_SOURCE_TEXT_BYTES, OpenDocument, OpenProject, PositionRequest, ProjectId,
-    ProjectScope, ProjectSource, ProjectStateIdentity, ProjectStatus, RefreshProject, RequestId,
-    SaveDocument, TextEdit, Utf16Position, Utf16Range, Validate, WorkerGeneration,
-    validate_document_text,
+    CloseDocument, Command, CommandSequence, CompletionKind, CompletionResult, DefinitionResult,
+    DefinitionTarget, Diagnostic, DiagnosticCode, DiagnosticsResult, DiskRevision, DocumentChanges,
+    DocumentDescriptor, DocumentId, DocumentKey, DocumentKind, DocumentRef, DocumentRequest,
+    DocumentResult, DocumentResultIdentity, DocumentStateIdentity, DocumentVersion, Event,
+    EventEnvelope, FailureScope, FormattingOptions, FormattingRequest, GraphGeneration,
+    HoverResult, Language, LanguageServiceLibrary, MAX_DOCUMENT_BYTES, MAX_PROJECT_SOURCE_FILES,
+    MAX_PROJECT_SOURCE_TEXT_BYTES, MarkupKind, OpenDocument, OpenProject, PositionRequest,
+    ProjectId, ProjectScope, ProjectSource, ProjectStateIdentity, ProjectStatus, RefreshProject,
+    RequestId, SaveDocument, SignatureHelpResult, TextEdit, Utf16Position, Utf16Range, Validate,
+    WorkerGeneration, validate_document_text,
 };
 use smudgy_script::language_service_worker::{
     LanguageServiceClient, LanguageServiceHost, LanguageServiceSendError,
@@ -53,6 +53,9 @@ pub(super) struct SurfaceUpdate<Effect> {
     /// Latest completion position requested by the editor, expressed in the
     /// editor's scalar-column coordinates.
     pub completion: Option<CompletionIntent>,
+    /// Latest call-signature position inferred from an edit or caret move,
+    /// expressed in the editor's scalar-column coordinates.
+    pub signature_help: Option<SignatureHelpIntent>,
     /// Pointer-derived hover intent. Passive editor messages leave it unchanged;
     /// leaving text or losing canvas focus clears the current hover lifecycle.
     pub hover: HoverUpdate,
@@ -93,6 +96,15 @@ pub(super) struct CompletionIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SignatureHelpIntent {
+    pub position: ScalarPosition,
+    pub anchor: SurfacePoint,
+    /// `(` and `,` explicitly begin a new signature-help lifecycle after
+    /// Escape suppresses passive edit/caret retriggers.
+    pub starts_new_lifecycle: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct HoverIntent {
     pub position: ScalarPosition,
     pub anchor: SurfacePoint,
@@ -102,11 +114,36 @@ pub(super) struct HoverIntent {
 pub(super) enum HoverUpdate {
     #[default]
     Unchanged,
+    /// The pointer temporarily left source text. The accepted card gets a short
+    /// grace period so the pointer can cross into the card itself.
+    Leave,
+    /// A hard invalidation, such as the editor canvas losing focus.
     Clear,
     At(HoverIntent),
 }
 
 const HOVER_DEBOUNCE: Duration = Duration::from_millis(300);
+const HOVER_DISMISS_GRACE: Duration = Duration::from_millis(300);
+const COMPLETION_MAX_VISIBLE_ROWS: usize = 12;
+const COMPLETION_OVERSCAN_ROWS: usize = 4;
+const COMPLETION_ROW_HEIGHT: f32 = 26.0;
+
+#[derive(Debug, Clone, Copy)]
+enum CompletionNavigation {
+    Previous,
+    Next,
+    PageUp,
+    PageDown,
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionNavigationUpdate {
+    selected: usize,
+    count: usize,
+    scroll: Option<(iced::widget::Id, usize)>,
+}
 
 /// The minimum host seam every real automation editor surface must implement.
 ///
@@ -218,6 +255,7 @@ enum RequestKind {
     Diagnostics,
     Completion,
     Hover,
+    SignatureHelp,
     Definition,
     Formatting,
 }
@@ -227,6 +265,7 @@ struct OutstandingRequests {
     diagnostics: Option<RequestId>,
     completion: Option<RequestId>,
     hover: Option<RequestId>,
+    signature_help: Option<RequestId>,
     definition: Option<RequestId>,
     formatting: Option<RequestId>,
 }
@@ -237,6 +276,7 @@ impl OutstandingRequests {
             RequestKind::Diagnostics => self.diagnostics,
             RequestKind::Completion => self.completion,
             RequestKind::Hover => self.hover,
+            RequestKind::SignatureHelp => self.signature_help,
             RequestKind::Definition => self.definition,
             RequestKind::Formatting => self.formatting,
         }
@@ -247,6 +287,7 @@ impl OutstandingRequests {
             RequestKind::Diagnostics => &mut self.diagnostics,
             RequestKind::Completion => &mut self.completion,
             RequestKind::Hover => &mut self.hover,
+            RequestKind::SignatureHelp => &mut self.signature_help,
             RequestKind::Definition => &mut self.definition,
             RequestKind::Formatting => &mut self.formatting,
         } = request_id;
@@ -256,20 +297,21 @@ impl OutstandingRequests {
         *self = Self::default();
     }
 
-    fn take_matching(&mut self, request_id: RequestId) -> bool {
+    fn take_matching(&mut self, request_id: RequestId) -> Option<RequestKind> {
         for kind in [
             RequestKind::Diagnostics,
             RequestKind::Completion,
             RequestKind::Hover,
+            RequestKind::SignatureHelp,
             RequestKind::Definition,
             RequestKind::Formatting,
         ] {
             if self.get(kind) == Some(request_id) {
                 self.set(kind, None);
-                return true;
+                return Some(kind);
             }
         }
-        false
+        None
     }
 }
 
@@ -280,6 +322,7 @@ pub(super) struct ServiceResults {
     diagnostics: Vec<Diagnostic>,
     completion: Option<AcceptedCompletion>,
     hover: Option<AcceptedHover>,
+    signature_help: Option<AcceptedSignatureHelp>,
     definition: Option<AcceptedDefinition>,
 }
 
@@ -301,16 +344,206 @@ struct AcceptedCompletion {
     result: CompletionResult,
     anchor: SurfacePoint,
     selected: usize,
+    first_visible: usize,
+    scroll_id: iced::widget::Id,
 }
 
 #[derive(Debug)]
 struct AcceptedHover {
-    result: HoverResult,
+    identity: DocumentResultIdentity,
+    source_position: Option<Utf16Position>,
+    presentation: HoverPresentation,
     anchor: SurfacePoint,
+}
+
+#[derive(Debug)]
+struct AcceptedSignatureHelp {
+    identity: DocumentResultIdentity,
+    request_position: Utf16Position,
+    result: SignatureHelpResult,
+    documentation: Option<HoverPresentation>,
+    active_parameter_documentation: Option<HoverPresentation>,
+    anchor: SurfacePoint,
+    scroll_id: iced::widget::Id,
+}
+
+#[derive(Debug)]
+enum HoverPresentation {
+    PlainText(String),
+    Markdown(Box<iced::widget::markdown::Content>),
+}
+
+fn rich_markdown_settings(
+    viewer: &smudgy_widgets::SmudgyMarkdownViewer,
+) -> iced::widget::markdown::Settings {
+    let mut settings = viewer.settings_with_text_size(12.0);
+    settings.style.inline_code_font = crate::assets::fonts::GEIST_MONO_VF;
+    settings.style.code_block_font = crate::assets::fonts::GEIST_MONO_VF;
+    settings.h1_size = 16.0.into();
+    settings.h2_size = 15.0.into();
+    settings.h3_size = 14.0.into();
+    settings.h4_size = 13.0.into();
+    settings.h5_size = 12.0.into();
+    settings.h6_size = 12.0.into();
+    settings.code_size = 11.0.into();
+    settings.spacing = 7.0.into();
+    settings
+}
+
+impl HoverPresentation {
+    fn from_markup(markup: &smudgy_script::language_service::MarkupContent) -> Self {
+        match markup.kind {
+            MarkupKind::PlainText => Self::PlainText(markup.value.clone()),
+            MarkupKind::Markdown => Self::Markdown(Box::new(
+                iced::widget::markdown::Content::parse(&markup.value),
+            )),
+        }
+    }
+
+    fn estimated_lines(&self, chars_per_line: usize) -> usize {
+        fn wrapped_text_lines(source: &str, chars_per_line: usize) -> usize {
+            let chars_per_line = chars_per_line.max(1);
+            source
+                .lines()
+                .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
+                .sum::<usize>()
+                .max(1)
+        }
+
+        fn markdown_text_lines(
+            text: &iced::widget::markdown::Text,
+            chars_per_line: usize,
+            style: iced::widget::markdown::Style,
+        ) -> usize {
+            let visible = text
+                .spans(style)
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>();
+            wrapped_text_lines(&visible, chars_per_line)
+        }
+
+        fn markdown_item_lines(
+            item: &iced::widget::markdown::Item,
+            chars_per_line: usize,
+            style: iced::widget::markdown::Style,
+        ) -> usize {
+            use iced::widget::markdown::{Bullet, Item};
+
+            match item {
+                Item::Heading(_, text) | Item::Paragraph(text) => {
+                    markdown_text_lines(text, chars_per_line, style)
+                }
+                // Fenced code is horizontally scrollable, so each source line
+                // contributes one vertical line regardless of signature length.
+                Item::CodeBlock { lines, .. } => lines.len().max(1) + 1,
+                Item::List { bullets, .. } => bullets
+                    .iter()
+                    .map(|bullet| match bullet {
+                        Bullet::Point { items } | Bullet::Task { items, .. } => items
+                            .iter()
+                            .map(|item| markdown_item_lines(item, chars_per_line, style))
+                            .sum::<usize>()
+                            .max(1),
+                    })
+                    .sum::<usize>()
+                    .max(1),
+                Item::Image { alt, .. } => markdown_text_lines(alt, chars_per_line, style),
+                Item::Quote(items) => items
+                    .iter()
+                    .map(|item| markdown_item_lines(item, chars_per_line, style))
+                    .sum::<usize>()
+                    .max(1),
+                Item::Rule => 1,
+                Item::Table { rows, .. } => rows.len().max(1) + 1,
+            }
+        }
+
+        match self {
+            Self::PlainText(value) => wrapped_text_lines(value, chars_per_line),
+            Self::Markdown(content) => {
+                let viewer = smudgy_widgets::SmudgyMarkdownViewer::current();
+                let style = rich_markdown_settings(&viewer).style;
+                content
+                    .items()
+                    .iter()
+                    .map(|item| markdown_item_lines(item, chars_per_line, style))
+                    .sum::<usize>()
+                    .max(1)
+            }
+        }
+    }
+}
+
+fn rich_markup_view<'a>(
+    presentation: &'a HoverPresentation,
+) -> crate::theme::Element<'a, iced::widget::markdown::Uri> {
+    match presentation {
+        HoverPresentation::PlainText(value) => iced::widget::text(value.as_str())
+            .size(12.0)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .into(),
+        HoverPresentation::Markdown(content) => {
+            let viewer = smudgy_widgets::SmudgyMarkdownViewer::current();
+            let settings = rich_markdown_settings(&viewer);
+            viewer.view(content.items(), settings)
+        }
+    }
+}
+
+impl AcceptedHover {
+    fn new(
+        identity: DocumentResultIdentity,
+        source_position: Option<Utf16Position>,
+        result: HoverResult,
+        anchor: SurfacePoint,
+    ) -> Self {
+        let presentation = HoverPresentation::from_markup(&result.contents);
+        Self {
+            identity,
+            source_position,
+            presentation,
+            anchor,
+        }
+    }
+}
+
+impl AcceptedSignatureHelp {
+    fn new(
+        identity: DocumentResultIdentity,
+        request_position: Utf16Position,
+        result: SignatureHelpResult,
+        anchor: SurfacePoint,
+    ) -> Self {
+        let documentation = result
+            .documentation
+            .as_ref()
+            .map(HoverPresentation::from_markup);
+        let active_parameter_documentation = result
+            .active_parameter
+            .and_then(|index| result.parameters.get(usize::from(index)))
+            .and_then(|parameter| parameter.documentation.as_ref())
+            .map(HoverPresentation::from_markup);
+        Self {
+            identity,
+            request_position,
+            result,
+            documentation,
+            active_parameter_documentation,
+            anchor,
+            scroll_id: iced::widget::Id::unique(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PendingCompletion {
+    position: Utf16Position,
+    anchor: SurfacePoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingSignatureHelp {
     position: Utf16Position,
     anchor: SurfacePoint,
 }
@@ -322,6 +555,12 @@ struct PendingHover {
     ready_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingHoverDismiss {
+    identity: DocumentResultIdentity,
+    ready_at: Instant,
+}
+
 /// Exact UI authority for one completion row. A delayed click must not apply
 /// the same index from a later result or a remounted document.
 #[derive(Debug, Clone, Copy)]
@@ -330,6 +569,35 @@ pub(crate) struct CompletionSelection {
     mount_generation: u64,
     identity: DocumentResultIdentity,
     index: usize,
+}
+
+/// Exact UI authority for the visible row reported by one completion scrollable.
+/// Late scroll notifications from a replaced result or remounted document are inert.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompletionViewportTarget {
+    document_id: DocumentId,
+    mount_generation: u64,
+    identity: DocumentResultIdentity,
+    first_visible: usize,
+}
+
+/// Exact UI authority for pointer interaction with one rendered hover card.
+/// Delayed enter/exit messages from a replaced result or remounted document are inert.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HoverOverlayTarget {
+    document_id: DocumentId,
+    mount_generation: u64,
+    identity: DocumentResultIdentity,
+}
+
+/// Exact UI authority for an inert link inside one rendered signature card.
+/// Keeping this distinct from hover authority prevents future link behavior
+/// from accidentally authorizing an action against the wrong overlay kind.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SignatureOverlayTarget {
+    document_id: DocumentId,
+    mount_generation: u64,
+    identity: DocumentResultIdentity,
 }
 
 /// Owns one authoritative editor surface and generation-fenced language-service view.
@@ -355,9 +623,15 @@ where
     results: ServiceResults,
     pending_completion: Option<PendingCompletion>,
     completion_request_anchor: Option<SurfacePoint>,
+    pending_signature_help: Option<PendingSignatureHelp>,
+    signature_help_request_position: Option<Utf16Position>,
+    signature_help_request_anchor: Option<SurfacePoint>,
+    signature_help_suppressed: bool,
     hover_position: Option<Utf16Position>,
     pending_hover: Option<PendingHover>,
     hover_request_anchor: Option<SurfacePoint>,
+    hover_overlay_interactive: Option<DocumentResultIdentity>,
+    pending_hover_dismiss: Option<PendingHoverDismiss>,
     pending_definition: Option<Utf16Position>,
     pending_formatting: Option<FormattingOptions>,
     service_edit_applied: bool,
@@ -384,9 +658,15 @@ where
             results: ServiceResults::default(),
             pending_completion: None,
             completion_request_anchor: None,
+            pending_signature_help: None,
+            signature_help_request_position: None,
+            signature_help_request_anchor: None,
+            signature_help_suppressed: false,
             hover_position: None,
             pending_hover: None,
             hover_request_anchor: None,
+            hover_overlay_interactive: None,
+            pending_hover_dismiss: None,
             pending_definition: None,
             pending_formatting: None,
             service_edit_applied: false,
@@ -420,6 +700,35 @@ where
         &self.results
     }
 
+    fn visible_diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.results
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| !self.active_signature_hides(diagnostic))
+    }
+
+    fn active_signature_hides(&self, diagnostic: &Diagnostic) -> bool {
+        let Some(help) = &self.results.signature_help else {
+            return false;
+        };
+        self.service_state == Some(help.identity.state)
+            && diagnostic.source.as_deref() == Some("typescript")
+            && matches!(&diagnostic.code, Some(DiagnosticCode::Number(1005)))
+            && diagnostic.message == "')' expected."
+            && diagnostic.range.start == diagnostic.range.end
+            && diagnostic.range.start == help.request_position
+            && help.result.applicable_range.end == help.request_position
+    }
+
+    fn signature_help_is_current(&self, identity: DocumentResultIdentity) -> bool {
+        self.service_state == Some(identity.state)
+            && self
+                .results
+                .signature_help
+                .as_ref()
+                .is_some_and(|help| help.identity == identity)
+    }
+
     pub fn update(&mut self, message: &S::Message) -> S::Effect {
         self.update_with_change(message).0
     }
@@ -430,6 +739,7 @@ where
             effect,
             changes,
             completion,
+            signature_help,
             hover,
             semantic_context_changed,
             definition,
@@ -458,9 +768,28 @@ where
                 anchor: intent.anchor,
             });
         }
+        if let Some(intent) = signature_help {
+            if intent.starts_new_lifecycle {
+                self.signature_help_suppressed = false;
+            }
+            if !self.signature_help_suppressed {
+                self.clear_signature_help();
+                self.clear_hover();
+                if let Some(position) = scalar_to_utf16(intent.position, &self.surface.content()) {
+                    self.pending_signature_help = Some(PendingSignatureHelp {
+                        position,
+                        anchor: intent.anchor,
+                    });
+                }
+            }
+        }
         match hover {
             HoverUpdate::Unchanged => {}
-            HoverUpdate::Clear => self.clear_hover(),
+            HoverUpdate::Leave => self.leave_hover(Instant::now()),
+            HoverUpdate::Clear => {
+                self.clear_signature_help();
+                self.clear_hover();
+            }
             HoverUpdate::At(intent) => self.observe_hover_intent(intent, Instant::now()),
         }
         if let Some(position) = definition {
@@ -490,6 +819,7 @@ where
             effect,
             changes,
             completion: _,
+            signature_help,
             hover: _,
             semantic_context_changed: _,
             definition: _,
@@ -498,6 +828,19 @@ where
         let changed = changes.is_some();
         if let Some(changes) = changes {
             self.document_changed(changes);
+        }
+        if let Some(intent) = signature_help {
+            if intent.starts_new_lifecycle {
+                self.signature_help_suppressed = false;
+            }
+            if !self.signature_help_suppressed
+                && let Some(position) = scalar_to_utf16(intent.position, &self.surface.content())
+            {
+                self.pending_signature_help = Some(PendingSignatureHelp {
+                    position,
+                    anchor: intent.anchor,
+                });
+            }
         }
         self.clear_completion();
         self.clear_hover();
@@ -509,29 +852,61 @@ where
         self.apply_completion(completion.selected, completion.identity)
     }
 
-    fn move_completion_selection(&mut self, delta: i32) -> bool {
+    fn navigate_completion(
+        &mut self,
+        navigation: CompletionNavigation,
+        visible_rows: usize,
+    ) -> Option<CompletionNavigationUpdate> {
+        let Some(completion) = &mut self.results.completion else {
+            return None;
+        };
+        let count = completion.result.items.len();
+        if count == 0 {
+            return None;
+        }
+        let page_rows = visible_rows.saturating_sub(1).max(1);
+        let previous_first_visible = completion.first_visible;
+        completion.selected = match navigation {
+            CompletionNavigation::Previous => completion
+                .selected
+                .checked_sub(1)
+                .unwrap_or(count.saturating_sub(1)),
+            CompletionNavigation::Next => completion.selected.saturating_add(1) % count,
+            CompletionNavigation::PageUp => completion.selected.saturating_sub(page_rows),
+            CompletionNavigation::PageDown => completion
+                .selected
+                .saturating_add(page_rows)
+                .min(count.saturating_sub(1)),
+            CompletionNavigation::First => 0,
+            CompletionNavigation::Last => count.saturating_sub(1),
+        };
+        completion.first_visible = reveal_completion_selection(
+            completion.first_visible,
+            completion.selected,
+            count,
+            visible_rows,
+        );
+        Some(CompletionNavigationUpdate {
+            selected: completion.selected,
+            count,
+            scroll: (completion.first_visible != previous_first_visible)
+                .then(|| (completion.scroll_id.clone(), completion.first_visible)),
+        })
+    }
+
+    fn completion_viewport_changed(
+        &mut self,
+        expected: DocumentResultIdentity,
+        first_visible: usize,
+    ) -> bool {
         let Some(completion) = &mut self.results.completion else {
             return false;
         };
-        // The popup intentionally renders at most eight rows. Keyboard state
-        // must stay within that visible set instead of selecting an unseen
-        // item from a larger protocol result.
-        let count = completion.result.items.len().min(8);
-        if count == 0 {
+        if completion.identity != expected || self.service_state != Some(expected.state) {
             return false;
         }
-        completion.selected = if delta.is_negative() {
-            completion
-                .selected
-                .checked_sub(delta.unsigned_abs() as usize)
-                .unwrap_or(count.saturating_sub(1))
-        } else {
-            completion
-                .selected
-                .saturating_add(delta as usize)
-                .checked_rem(count)
-                .unwrap_or(0)
-        };
+        completion.first_visible =
+            first_visible.min(completion.result.items.len().saturating_sub(1));
         true
     }
 
@@ -549,9 +924,15 @@ where
         self.clear_service_state();
         self.pending_completion = None;
         self.completion_request_anchor = None;
+        self.pending_signature_help = None;
+        self.signature_help_request_position = None;
+        self.signature_help_request_anchor = None;
+        self.signature_help_suppressed = false;
         self.hover_position = None;
         self.pending_hover = None;
         self.hover_request_anchor = None;
+        self.hover_overlay_interactive = None;
+        self.pending_hover_dismiss = None;
         self.pending_definition = None;
         self.pending_formatting = None;
         self.service_edit_applied = false;
@@ -591,6 +972,7 @@ where
     pub fn lose_focus(&mut self) {
         self.surface.lose_focus();
         self.clear_completion();
+        self.clear_signature_help();
         self.clear_hover();
         self.pending_definition = None;
         self.pending_formatting = None;
@@ -634,6 +1016,27 @@ where
             true
         } else {
             self.pending_completion = Some(pending);
+            false
+        }
+    }
+
+    /// Sends the newest caret-derived signature probe after its exact document
+    /// version has been acknowledged by the worker.
+    pub fn request_pending_signature_help(&mut self, request_id: RequestId) -> bool {
+        let Some(pending) = self.pending_signature_help.take() else {
+            return false;
+        };
+        if self.begin_request(RequestKind::SignatureHelp, request_id, |identity| {
+            Command::RequestSignatureHelp(PositionRequest {
+                identity,
+                position: pending.position,
+            })
+        }) {
+            self.signature_help_request_position = Some(pending.position);
+            self.signature_help_request_anchor = Some(pending.anchor);
+            true
+        } else {
+            self.pending_signature_help = Some(pending);
             false
         }
     }
@@ -701,22 +1104,118 @@ where
         self.results.completion = None;
     }
 
+    fn clear_signature_help(&mut self) {
+        self.pending_signature_help = None;
+        self.signature_help_request_position = None;
+        self.signature_help_request_anchor = None;
+        self.outstanding.set(RequestKind::SignatureHelp, None);
+        self.results.signature_help = None;
+    }
+
     fn clear_hover(&mut self) {
         self.hover_position = None;
         self.pending_hover = None;
         self.hover_request_anchor = None;
+        self.hover_overlay_interactive = None;
+        self.pending_hover_dismiss = None;
         self.outstanding.set(RequestKind::Hover, None);
         self.results.hover = None;
     }
 
+    fn clear_hover_request(&mut self) {
+        self.pending_hover = None;
+        self.hover_request_anchor = None;
+        self.outstanding.set(RequestKind::Hover, None);
+    }
+
+    fn restore_hover_position_to_accepted(&mut self) {
+        self.hover_position = self
+            .results
+            .hover
+            .as_ref()
+            .and_then(|hover| hover.source_position);
+    }
+
+    fn leave_hover(&mut self, now: Instant) {
+        self.clear_hover_request();
+        self.restore_hover_position_to_accepted();
+        let Some(hover) = &self.results.hover else {
+            self.hover_overlay_interactive = None;
+            self.pending_hover_dismiss = None;
+            return;
+        };
+        if self.hover_overlay_interactive == Some(hover.identity) {
+            return;
+        }
+        self.pending_hover_dismiss = Some(PendingHoverDismiss {
+            identity: hover.identity,
+            ready_at: now + HOVER_DISMISS_GRACE,
+        });
+    }
+
+    fn hover_overlay_entered(&mut self, identity: DocumentResultIdentity) -> bool {
+        let Some(hover) = &self.results.hover else {
+            return false;
+        };
+        if hover.identity != identity {
+            return false;
+        }
+        let source_position = hover.source_position;
+        self.clear_hover_request();
+        self.hover_position = source_position;
+        self.hover_overlay_interactive = Some(identity);
+        self.pending_hover_dismiss = None;
+        true
+    }
+
+    fn hover_overlay_exited(&mut self, identity: DocumentResultIdentity, now: Instant) -> bool {
+        if self
+            .results
+            .hover
+            .as_ref()
+            .is_none_or(|hover| hover.identity != identity)
+        {
+            return false;
+        }
+        self.hover_overlay_interactive = None;
+        self.pending_hover_dismiss = Some(PendingHoverDismiss {
+            identity,
+            ready_at: now + HOVER_DISMISS_GRACE,
+        });
+        true
+    }
+
+    fn expire_hover_dismiss(&mut self, now: Instant) -> bool {
+        let Some(pending) = self.pending_hover_dismiss else {
+            return false;
+        };
+        if self
+            .results
+            .hover
+            .as_ref()
+            .is_none_or(|hover| hover.identity != pending.identity)
+        {
+            self.pending_hover_dismiss = None;
+            return false;
+        }
+        if now < pending.ready_at || self.hover_overlay_interactive == Some(pending.identity) {
+            return false;
+        }
+        self.clear_hover();
+        true
+    }
+
     fn clear_transient_intelligence(&mut self) {
         self.clear_completion();
+        self.clear_signature_help();
         self.clear_hover();
     }
 
     fn observe_hover_intent(&mut self, intent: HoverIntent, now: Instant) {
         // Completion is the active interaction; background hover motion must
-        // never replace it or open a competing overlay.
+        // never replace it or open a competing overlay. Signature help is
+        // passive and remains accepted underneath a deliberate hover so it can
+        // return as soon as the hover card closes.
         if self.pending_completion.is_some()
             || self.outstanding.completion.is_some()
             || self.results.completion.is_some()
@@ -725,13 +1224,19 @@ where
             return;
         }
         let Some(position) = scalar_to_utf16(intent.position, &self.surface.content()) else {
-            self.clear_hover();
+            self.leave_hover(now);
             return;
         };
+        if self.hover_overlay_interactive.is_some() {
+            return;
+        }
+        self.pending_hover_dismiss = None;
         if self.hover_position == Some(position) {
             return;
         }
-        self.clear_hover();
+        // Keep the accepted card visible while a replacement hover debounces.
+        // This avoids a distracting blank flash while moving between symbols.
+        self.clear_hover_request();
         self.hover_position = Some(position);
         self.pending_hover = Some(PendingHover {
             position,
@@ -740,9 +1245,16 @@ where
         });
     }
 
-    pub(super) fn dismiss_overlays(&mut self) {
+    pub(super) fn dismiss_pointer_overlays(&mut self) {
         self.clear_completion();
         self.clear_hover();
+    }
+
+    pub(super) fn dismiss_overlays(&mut self) {
+        self.clear_completion();
+        self.clear_signature_help();
+        self.clear_hover();
+        self.signature_help_suppressed = true;
     }
 
     pub fn request_definition(&mut self, request_id: RequestId, position: Utf16Position) -> bool {
@@ -779,8 +1291,20 @@ where
     }
 
     pub fn cancel_request(&mut self, request_id: RequestId) -> bool {
-        if !self.outstanding.take_matching(request_id) {
+        let Some(kind) = self.outstanding.take_matching(request_id) else {
             return false;
+        };
+        match kind {
+            RequestKind::Completion => self.completion_request_anchor = None,
+            RequestKind::SignatureHelp => {
+                self.signature_help_request_position = None;
+                self.signature_help_request_anchor = None;
+            }
+            RequestKind::Hover => {
+                self.hover_request_anchor = None;
+                self.restore_hover_position_to_accepted();
+            }
+            RequestKind::Diagnostics | RequestKind::Definition | RequestKind::Formatting => {}
         }
         let project = self.document.document.key.project;
         self.send(Command::Cancel(CancelRequest {
@@ -847,6 +1371,8 @@ where
                         result: result.result.clone(),
                         anchor,
                         selected: 0,
+                        first_visible: 0,
+                        scroll_id: iced::widget::Id::unique(),
                     });
                 self.outstanding.set(RequestKind::Completion, None);
                 EventDisposition::Applied
@@ -865,11 +1391,56 @@ where
                     return EventDisposition::Invalid;
                 }
                 let anchor = self.hover_request_anchor.take().unwrap_or_default();
+                let source_position = self.hover_position;
+                let identity = result.identity;
+                self.hover_overlay_interactive = None;
+                self.pending_hover_dismiss = None;
                 self.results.hover = result
                     .result
                     .clone()
-                    .map(|result| AcceptedHover { result, anchor });
+                    .map(|result| AcceptedHover::new(identity, source_position, result, anchor));
+                if self.results.hover.is_none() {
+                    self.hover_position = None;
+                }
                 self.outstanding.set(RequestKind::Hover, None);
+                EventDisposition::Applied
+            }
+            Event::SignatureHelp(result) => {
+                if !self.accepts_result(result, RequestKind::SignatureHelp) {
+                    return EventDisposition::Stale;
+                }
+                let text = self.surface.content();
+                if !result.result.as_ref().is_none_or(|help| {
+                    range_fits(help.applicable_range, &text)
+                        && self
+                            .signature_help_request_position
+                            .is_some_and(|position| {
+                                range_fits(
+                                    Utf16Range {
+                                        start: position,
+                                        end: position,
+                                    },
+                                    &text,
+                                ) && help.applicable_range.start <= position
+                                    && position <= help.applicable_range.end
+                            })
+                }) {
+                    self.clear_signature_help();
+                    return EventDisposition::Invalid;
+                }
+                let request_position = self.signature_help_request_position.take();
+                let anchor = self
+                    .signature_help_request_anchor
+                    .take()
+                    .unwrap_or_default();
+                let identity = result.identity;
+                self.results.signature_help = match (request_position, result.result.clone()) {
+                    (Some(position), Some(help)) => {
+                        Some(AcceptedSignatureHelp::new(identity, position, help, anchor))
+                    }
+                    _ => None,
+                };
+                self.outstanding.set(RequestKind::SignatureHelp, None);
                 EventDisposition::Applied
             }
             Event::Definition(result) => {
@@ -929,6 +1500,7 @@ where
                     ProjectStatus::Ready => ServiceStatus::Ready,
                     ProjectStatus::Degraded { .. } => {
                         self.outstanding.clear();
+                        self.clear_transient_intelligence();
                         self.results.clear();
                         ServiceStatus::Unavailable
                     }
@@ -1050,6 +1622,9 @@ where
     fn clear_service_state(&mut self) {
         self.service_state = None;
         self.completion_request_anchor = None;
+        self.pending_signature_help = None;
+        self.signature_help_request_position = None;
+        self.signature_help_request_anchor = None;
         self.clear_hover();
         self.pending_definition = None;
         self.pending_formatting = None;
@@ -1126,6 +1701,7 @@ where
             }
             self.outstanding.clear();
             self.completion_request_anchor = None;
+            self.clear_signature_help();
             self.clear_hover();
             self.results.clear();
             self.status = ServiceStatus::Ready;
@@ -1182,8 +1758,26 @@ where
                 let Some(state) = self.service_state else {
                     return EventDisposition::Stale;
                 };
-                if identity.state != state || !self.outstanding.take_matching(identity.request_id) {
+                if identity.state != state {
                     return EventDisposition::Stale;
+                }
+                let Some(kind) = self.outstanding.take_matching(identity.request_id) else {
+                    return EventDisposition::Stale;
+                };
+                match kind {
+                    RequestKind::Completion => self.completion_request_anchor = None,
+                    RequestKind::SignatureHelp => {
+                        self.signature_help_request_position = None;
+                        self.signature_help_request_anchor = None;
+                        self.results.signature_help = None;
+                    }
+                    RequestKind::Hover => {
+                        self.hover_request_anchor = None;
+                        self.restore_hover_position_to_accepted();
+                    }
+                    RequestKind::Diagnostics
+                    | RequestKind::Definition
+                    | RequestKind::Formatting => {}
                 }
                 EventDisposition::Applied
             }
@@ -1199,6 +1793,7 @@ where
                     return EventDisposition::Stale;
                 }
                 self.outstanding.clear();
+                self.clear_transient_intelligence();
                 self.results.clear();
                 self.status = ServiceStatus::Unavailable;
                 EventDisposition::Applied
@@ -1243,6 +1838,10 @@ impl ActiveCodeEditor {
         self.surface.view()
     }
 
+    fn sync_theme_from_prefs(&mut self) {
+        self.surface.sync_theme_from_prefs();
+    }
+
     fn overlay_metrics(&self) -> OverlayMetrics {
         self.surface.overlay_metrics()
     }
@@ -1256,6 +1855,322 @@ struct OverlayPlacement {
     height: f32,
 }
 
+fn reveal_completion_selection(
+    first_visible: usize,
+    selected: usize,
+    count: usize,
+    visible_rows: usize,
+) -> usize {
+    let visible_rows = visible_rows.max(1).min(count.max(1));
+    let max_first = count.saturating_sub(visible_rows);
+    let first_visible = first_visible.min(max_first);
+    if selected < first_visible {
+        selected
+    } else if selected >= first_visible.saturating_add(visible_rows) {
+        selected.saturating_add(1).saturating_sub(visible_rows)
+    } else {
+        first_visible
+    }
+    .min(max_first)
+}
+
+fn completion_scroll_task(
+    scroll_id: iced::widget::Id,
+    first_visible: usize,
+) -> iced::Task<super::Message> {
+    iced::widget::operation::scroll_to(
+        scroll_id,
+        iced::widget::scrollable::AbsoluteOffset {
+            x: 0.0,
+            y: first_visible as f32 * COMPLETION_ROW_HEIGHT,
+        },
+    )
+}
+
+const fn completion_kind_label(kind: CompletionKind) -> &'static str {
+    match kind {
+        CompletionKind::Text => "text",
+        CompletionKind::Method => "method",
+        CompletionKind::Function => "function",
+        CompletionKind::Constructor => "constructor",
+        CompletionKind::Field => "field",
+        CompletionKind::Variable => "variable",
+        CompletionKind::Class => "class",
+        CompletionKind::Interface => "interface",
+        CompletionKind::TypeAlias => "type alias",
+        CompletionKind::Module => "module",
+        CompletionKind::Property => "property",
+        CompletionKind::Unit => "unit",
+        CompletionKind::Value => "value",
+        CompletionKind::Enum => "enum",
+        CompletionKind::Keyword => "keyword",
+        CompletionKind::Snippet => "snippet",
+        CompletionKind::Color => "color",
+        CompletionKind::File => "file",
+        CompletionKind::Reference => "reference",
+        CompletionKind::Folder => "folder",
+        CompletionKind::EnumMember => "enum member",
+        CompletionKind::Constant => "constant",
+        CompletionKind::Struct => "struct",
+        CompletionKind::Event => "event",
+        CompletionKind::Operator => "operator",
+        CompletionKind::TypeParameter => "type parameter",
+    }
+}
+
+fn color_luminance(color: iced::Color) -> f32 {
+    fn linear(channel: f32) -> f32 {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+}
+
+fn contrast_ratio(first: iced::Color, second: iced::Color) -> f32 {
+    let first = color_luminance(first);
+    let second = color_luminance(second);
+    (first.max(second) + 0.05) / (first.min(second) + 0.05)
+}
+
+fn mix_color(first: iced::Color, second: iced::Color, amount: f32) -> iced::Color {
+    let amount = amount.clamp(0.0, 1.0);
+    iced::Color {
+        r: (second.r - first.r).mul_add(amount, first.r),
+        g: (second.g - first.g).mul_add(amount, first.g),
+        b: (second.b - first.b).mul_add(amount, first.b),
+        a: (second.a - first.a).mul_add(amount, first.a),
+    }
+}
+
+fn completion_surface_color(theme: &crate::theme::Theme) -> iced::Color {
+    let overlay = theme.styles.general.overlay_background;
+    let background = theme.styles.general.background;
+    iced::Color {
+        r: overlay
+            .r
+            .mul_add(overlay.a, background.r * (1.0 - overlay.a)),
+        g: overlay
+            .g
+            .mul_add(overlay.a, background.g * (1.0 - overlay.a)),
+        b: overlay
+            .b
+            .mul_add(overlay.a, background.b * (1.0 - overlay.a)),
+        a: 1.0,
+    }
+}
+
+fn completion_row_background(
+    theme: &crate::theme::Theme,
+    selected: bool,
+    status: iced::widget::button::Status,
+) -> iced::Color {
+    let surface = completion_surface_color(theme);
+    let theme_text = iced::Color {
+        a: 1.0,
+        ..theme.styles.text.normal
+    };
+    let black = iced::Color::BLACK;
+    let white = iced::Color::WHITE;
+    let fallback = if contrast_ratio(black, surface) >= contrast_ratio(white, surface) {
+        black
+    } else {
+        white
+    };
+    let wash = if contrast_ratio(theme_text, surface) >= 4.5 {
+        theme_text
+    } else {
+        fallback
+    };
+    let amount = match (selected, status) {
+        (false, iced::widget::button::Status::Active) => 0.04,
+        (false, iced::widget::button::Status::Hovered) => 0.10,
+        (false, iced::widget::button::Status::Pressed) => 0.14,
+        (false, iced::widget::button::Status::Disabled) => 0.04,
+        (true, iced::widget::button::Status::Active) => 0.18,
+        (true, iced::widget::button::Status::Hovered) => 0.24,
+        (true, iced::widget::button::Status::Pressed) => 0.28,
+        (true, iced::widget::button::Status::Disabled) => 0.18,
+    };
+    mix_color(surface, wash, amount)
+}
+
+fn completion_row_style(
+    selected: bool,
+) -> impl Fn(&crate::theme::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    move |theme, status| iced::widget::button::Style {
+        background: Some(completion_row_background(theme, selected, status).into()),
+        text_color: theme.styles.text.normal,
+        ..iced::widget::button::Style::default()
+    }
+}
+
+fn readable_semantic_color(
+    candidate: iced::Color,
+    theme: &crate::theme::Theme,
+    minimum_contrast: f32,
+) -> iced::Color {
+    let background = completion_surface_color(theme);
+    let candidate = iced::Color {
+        a: 1.0,
+        ..candidate
+    };
+    if contrast_ratio(candidate, background) >= minimum_contrast {
+        return candidate;
+    }
+
+    let text = iced::Color {
+        a: 1.0,
+        ..theme.styles.text.normal
+    };
+    for step in 1..=12 {
+        let adjusted = mix_color(candidate, text, step as f32 / 12.0);
+        if contrast_ratio(adjusted, background) >= minimum_contrast {
+            return adjusted;
+        }
+    }
+
+    let black = iced::Color::BLACK;
+    let white = iced::Color::WHITE;
+    if contrast_ratio(black, background) >= contrast_ratio(white, background) {
+        black
+    } else {
+        white
+    }
+}
+
+fn completion_kind_color(theme: &crate::theme::Theme, kind: CompletionKind) -> iced::Color {
+    let light_surface = color_luminance(completion_surface_color(theme)) > 0.5;
+    let candidate = match (light_surface, kind) {
+        (true, CompletionKind::Method | CompletionKind::Function | CompletionKind::Constructor) => {
+            iced::Color::from_rgb8(0x79, 0x5E, 0x26)
+        }
+        (
+            true,
+            CompletionKind::Class
+            | CompletionKind::Interface
+            | CompletionKind::TypeAlias
+            | CompletionKind::Enum
+            | CompletionKind::Struct
+            | CompletionKind::TypeParameter,
+        ) => iced::Color::from_rgb8(0x26, 0x7F, 0x99),
+        (
+            true,
+            CompletionKind::Field
+            | CompletionKind::Variable
+            | CompletionKind::Property
+            | CompletionKind::Value
+            | CompletionKind::EnumMember
+            | CompletionKind::Constant,
+        ) => iced::Color::from_rgb8(0x00, 0x10, 0x80),
+        (
+            true,
+            CompletionKind::Module
+            | CompletionKind::File
+            | CompletionKind::Reference
+            | CompletionKind::Folder,
+        ) => iced::Color::from_rgb8(0xA3, 0x15, 0x15),
+        (true, CompletionKind::Keyword | CompletionKind::Operator) => {
+            iced::Color::from_rgb8(0x00, 0x00, 0xFF)
+        }
+        (true, CompletionKind::Unit | CompletionKind::Color) => {
+            iced::Color::from_rgb8(0x09, 0x86, 0x58)
+        }
+        (true, CompletionKind::Event) => iced::Color::from_rgb8(0xAF, 0x00, 0xDB),
+        (true, CompletionKind::Text | CompletionKind::Snippet) => theme.styles.text.normal,
+        (false, kind) => match kind {
+            CompletionKind::Method | CompletionKind::Function | CompletionKind::Constructor => {
+                iced::Color::from_rgb8(0xDC, 0xDC, 0xAA)
+            }
+            CompletionKind::Class
+            | CompletionKind::Interface
+            | CompletionKind::TypeAlias
+            | CompletionKind::Enum
+            | CompletionKind::Struct
+            | CompletionKind::TypeParameter => iced::Color::from_rgb8(0x4E, 0xC9, 0xB0),
+            CompletionKind::Field
+            | CompletionKind::Variable
+            | CompletionKind::Property
+            | CompletionKind::Value
+            | CompletionKind::EnumMember
+            | CompletionKind::Constant => iced::Color::from_rgb8(0x9C, 0xDC, 0xFE),
+            CompletionKind::Module
+            | CompletionKind::File
+            | CompletionKind::Reference
+            | CompletionKind::Folder => iced::Color::from_rgb8(0xCE, 0x91, 0x78),
+            CompletionKind::Keyword | CompletionKind::Operator => {
+                iced::Color::from_rgb8(0xC5, 0x86, 0xC0)
+            }
+            CompletionKind::Unit | CompletionKind::Color => {
+                iced::Color::from_rgb8(0xB5, 0xCE, 0xA8)
+            }
+            CompletionKind::Event => iced::Color::from_rgb8(0xD1, 0x69, 0x69),
+            CompletionKind::Text | CompletionKind::Snippet => theme.styles.text.normal,
+        },
+    };
+    readable_semantic_color(candidate, theme, 3.0)
+}
+
+fn completion_kind_style(
+    kind: CompletionKind,
+    deprecated: bool,
+) -> impl Fn(&crate::theme::Theme) -> iced::widget::text::Style {
+    move |theme| {
+        let color = completion_kind_color(theme, kind);
+        let color = if deprecated {
+            let faded = mix_color(color, completion_surface_color(theme), 0.24);
+            readable_semantic_color(faded, theme, 2.25)
+        } else {
+            color
+        };
+        iced::widget::text::Style { color: Some(color) }
+    }
+}
+
+fn concise_completion_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let head = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn completion_desired_height(count: usize) -> f32 {
+    8.0 + count.min(COMPLETION_MAX_VISIBLE_ROWS) as f32 * COMPLETION_ROW_HEIGHT
+}
+
+fn fit_overlay_vertically(
+    anchor_y: f32,
+    line_height: f32,
+    viewport_height: f32,
+    desired_height: f32,
+    prefer_below: bool,
+) -> (f32, f32) {
+    const GAP: f32 = 4.0;
+    let anchor_y = anchor_y.clamp(0.0, viewport_height);
+    let anchor_bottom = (anchor_y + line_height).min(viewport_height);
+    let above = (anchor_y - GAP).max(0.0);
+    let below = (viewport_height - anchor_bottom - GAP).max(0.0);
+    let show_below = if prefer_below {
+        below >= desired_height || (above < desired_height && below >= above)
+    } else {
+        !(above >= desired_height || (below < desired_height && above >= below))
+    };
+    let available = if show_below { below } else { above };
+    let height = desired_height.min(available).max(1.0);
+    let y = if show_below {
+        anchor_bottom + GAP
+    } else {
+        (anchor_y - GAP - height).max(0.0)
+    };
+    (height, y)
+}
+
 fn completion_placement(
     anchor: SurfacePoint,
     metrics: OverlayMetrics,
@@ -1263,18 +2178,17 @@ fn completion_placement(
 ) -> OverlayPlacement {
     let viewport_width = metrics.viewport_width.max(8.0);
     let viewport_height = metrics.viewport_height.max(8.0);
-    let width = 340.0_f32.min((viewport_width - 8.0).max(1.0));
-    let height = desired_height.min((viewport_height - 8.0).max(1.0));
-    let adjusted_y = (anchor.y - metrics.viewport_scroll).max(0.0);
-    let space_below = viewport_height - adjusted_y - metrics.line_height;
-    let show_above = space_below < height + 4.0 && adjusted_y >= height + 4.0;
+    let width = 520.0_f32.min((viewport_width - 8.0).max(1.0));
+    let adjusted_y = (anchor.y - metrics.viewport_scroll).clamp(0.0, viewport_height);
+    let (height, y) = fit_overlay_vertically(
+        adjusted_y,
+        metrics.line_height,
+        viewport_height,
+        desired_height,
+        true,
+    );
     let max_x = (viewport_width - width - 4.0).max(4.0);
     let x = anchor.x.clamp(4.0, max_x);
-    let y = if show_above {
-        (adjusted_y - height - 4.0).max(0.0)
-    } else {
-        (adjusted_y + metrics.line_height + 4.0).min((viewport_height - height).max(0.0))
-    };
     OverlayPlacement {
         x,
         y,
@@ -1290,9 +2204,15 @@ fn hover_placement(
 ) -> OverlayPlacement {
     let viewport_width = metrics.viewport_width.max(8.0);
     let viewport_height = metrics.viewport_height.max(8.0);
-    let width = 380.0_f32.min((viewport_width - 8.0).max(1.0));
-    let height = desired_height.min((viewport_height - 8.0).max(1.0));
-    let adjusted_y = (anchor.y - metrics.viewport_scroll).max(0.0);
+    let width = 520.0_f32.min((viewport_width - 8.0).max(1.0));
+    let adjusted_y = (anchor.y - metrics.viewport_scroll).clamp(0.0, viewport_height);
+    let (height, y) = fit_overlay_vertically(
+        adjusted_y,
+        metrics.line_height,
+        viewport_height,
+        desired_height,
+        false,
+    );
     let gap_x = (metrics.char_width * 0.5).max(2.0);
     let max_x = (viewport_width - width - 4.0).max(0.0);
     let right = anchor.x + gap_x;
@@ -1304,11 +2224,6 @@ fn hover_placement(
     } else {
         right.clamp(0.0, max_x)
     };
-    let y = if adjusted_y >= height + 4.0 {
-        (adjusted_y - height - 4.0).max(0.0)
-    } else {
-        (adjusted_y + metrics.line_height + 4.0).min((viewport_height - height).max(0.0))
-    };
     OverlayPlacement {
         x,
         y,
@@ -1317,7 +2232,200 @@ fn hover_placement(
     }
 }
 
+fn anchor_is_visible(anchor: SurfacePoint, metrics: OverlayMetrics) -> bool {
+    let adjusted_y = anchor.y - metrics.viewport_scroll;
+    adjusted_y >= -metrics.line_height && adjusted_y <= metrics.viewport_height
+}
+
+fn signature_overlay_should_render(
+    signature: &AcceptedSignatureHelp,
+    hover: Option<&AcceptedHover>,
+    metrics: OverlayMetrics,
+) -> bool {
+    anchor_is_visible(signature.anchor, metrics)
+        && !hover.is_some_and(|hover| anchor_is_visible(hover.anchor, metrics))
+}
+
+fn signature_desired_height(signature: &AcceptedSignatureHelp, metrics: OverlayMetrics) -> f32 {
+    let available_width = 520.0_f32.min((metrics.viewport_width - 8.0).max(1.0));
+    let chars_per_line =
+        ((available_width - 24.0).max(1.0) / metrics.char_width.max(4.0)).floor() as usize;
+    let signature_chars = signature.result.prefix.chars().count()
+        + signature.result.suffix.chars().count()
+        + signature
+            .result
+            .parameters
+            .iter()
+            .map(|parameter| parameter.label.chars().count())
+            .sum::<usize>()
+        + signature
+            .result
+            .separator
+            .chars()
+            .count()
+            .saturating_mul(signature.result.parameters.len().saturating_sub(1));
+    let signature_lines = signature_chars.max(1).div_ceil(chars_per_line.max(1));
+    let documentation_lines = signature
+        .active_parameter_documentation
+        .iter()
+        .chain(signature.documentation.iter())
+        .map(|documentation| documentation.estimated_lines(chars_per_line))
+        .sum::<usize>();
+    (18.0 + signature_lines as f32 * 18.0 + documentation_lines as f32 * 18.0).clamp(42.0, 240.0)
+}
+
+fn allocate_stacked_overlay_heights(
+    available: f32,
+    signature_desired: f32,
+    completion_desired: f32,
+) -> (f32, f32) {
+    const BETWEEN: f32 = 4.0;
+    const SIGNATURE_MIN: f32 = 42.0;
+    const COMPLETION_MIN: f32 = 34.0;
+
+    let usable = (available - BETWEEN).max(0.0);
+    if usable == 0.0 {
+        return (0.0, 0.0);
+    }
+    let signature_min = signature_desired.min(SIGNATURE_MIN);
+    let completion_min = completion_desired.min(COMPLETION_MIN);
+    let minimum_total = signature_min + completion_min;
+    if usable < minimum_total {
+        let signature = usable * signature_min / minimum_total.max(1.0);
+        return (signature, usable - signature);
+    }
+
+    let extra = usable - minimum_total;
+    let signature_gap = (signature_desired - signature_min).max(0.0);
+    let completion_gap = (completion_desired - completion_min).max(0.0);
+    let total_gap = signature_gap + completion_gap;
+    if total_gap == 0.0 {
+        return (signature_min, completion_min);
+    }
+    let distributed = extra.min(total_gap);
+    let signature_extra = distributed * signature_gap / total_gap;
+    let completion_extra = distributed - signature_extra;
+    (
+        signature_min + signature_extra,
+        completion_min + completion_extra,
+    )
+}
+
+/// Places simultaneous signature and completion cards as one visual unit.
+/// Prefer the conventional split around the source line. Near an edge, stack
+/// both on the roomier side so neither card vanishes. No card may cover the
+/// source line or the other card.
+fn coordinated_signature_completion_placements(
+    signature_anchor: SurfacePoint,
+    signature_desired: f32,
+    completion_anchor: SurfacePoint,
+    completion_desired: f32,
+    metrics: OverlayMetrics,
+) -> (OverlayPlacement, OverlayPlacement) {
+    const GAP: f32 = 4.0;
+    const MIN_USABLE_CARD: f32 = 20.0;
+
+    let viewport_height = metrics.viewport_height.max(8.0);
+    let line_height = metrics.line_height.max(0.0);
+    let signature_anchor_y =
+        (signature_anchor.y - metrics.viewport_scroll).clamp(0.0, viewport_height);
+    let completion_anchor_y =
+        (completion_anchor.y - metrics.viewport_scroll).clamp(0.0, viewport_height);
+    let source_top = signature_anchor_y.min(completion_anchor_y);
+    let source_bottom = (signature_anchor_y + line_height)
+        .max(completion_anchor_y + line_height)
+        .min(viewport_height);
+    let above_end = (source_top - GAP).max(0.0);
+    let below_start = (source_bottom + GAP).min(viewport_height);
+    let above = above_end;
+    let below = viewport_height - below_start;
+
+    let mut signature = hover_placement(signature_anchor, metrics, signature_desired);
+    let mut completion = completion_placement(completion_anchor, metrics, completion_desired);
+    let split_signature_height = signature_desired.min(above);
+    let split_completion_height = completion_desired.min(below);
+    if split_signature_height >= MIN_USABLE_CARD && split_completion_height >= MIN_USABLE_CARD {
+        signature.height = split_signature_height;
+        signature.y = above_end - split_signature_height;
+        completion.height = split_completion_height;
+        completion.y = below_start;
+        return (signature, completion);
+    }
+
+    let stack_above =
+        allocate_stacked_overlay_heights(above, signature_desired, completion_desired);
+    let stack_below =
+        allocate_stacked_overlay_heights(below, signature_desired, completion_desired);
+    let above_is_usable = stack_above.0 >= MIN_USABLE_CARD && stack_above.1 >= MIN_USABLE_CARD;
+    let below_is_usable = stack_below.0 >= MIN_USABLE_CARD && stack_below.1 >= MIN_USABLE_CARD;
+    if above_is_usable || below_is_usable {
+        if above_is_usable && (!below_is_usable || above >= below) {
+            signature.height = stack_above.0;
+            completion.height = stack_above.1;
+            completion.y = above_end - completion.height;
+            signature.y = completion.y - GAP - signature.height;
+        } else {
+            signature.height = stack_below.0;
+            completion.height = stack_below.1;
+            completion.y = below_start;
+            signature.y = completion.y + completion.height + GAP;
+        }
+        return (signature, completion);
+    }
+
+    // There is not enough room for two usable cards on either side. Keep each
+    // in its conventional region; the view will clip their scrollable bodies.
+    signature.height = split_signature_height;
+    signature.y = above_end - split_signature_height;
+    completion.height = split_completion_height;
+    completion.y = below_start;
+    (signature, completion)
+}
+
+fn completion_placement_with_signature(
+    completion: &AcceptedCompletion,
+    signature: Option<&AcceptedSignatureHelp>,
+    metrics: OverlayMetrics,
+) -> OverlayPlacement {
+    let completion_desired = completion_desired_height(completion.result.items.len());
+    signature
+        .filter(|signature| anchor_is_visible(signature.anchor, metrics))
+        .map(|signature| {
+            coordinated_signature_completion_placements(
+                signature.anchor,
+                signature_desired_height(signature, metrics),
+                completion.anchor,
+                completion_desired,
+                metrics,
+            )
+            .1
+        })
+        .unwrap_or_else(|| completion_placement(completion.anchor, metrics, completion_desired))
+}
+
+fn completion_visible_rows(
+    completion: &AcceptedCompletion,
+    signature: Option<&AcceptedSignatureHelp>,
+    metrics: OverlayMetrics,
+) -> usize {
+    let count = completion.result.items.len();
+    if count == 0 {
+        return 1;
+    }
+    let placement = completion_placement_with_signature(completion, signature, metrics);
+    (((placement.height - 8.0).max(1.0) / COMPLETION_ROW_HEIGHT).floor() as usize)
+        .clamp(1, count.min(COMPLETION_MAX_VISIBLE_ROWS))
+}
+
 impl super::AutomationsWindow {
+    /// Applies Smudgy's current palette to the active upstream editor without
+    /// disturbing its text, caret, selection, history, or language-service state.
+    pub(crate) fn sync_code_editor_theme(&mut self) {
+        if let Some(editor) = &mut self.code_editor {
+            editor.sync_theme_from_prefs();
+        }
+    }
+
     pub(super) fn bind_code_editor_message(
         &self,
         message: IcedEditorMessage,
@@ -1431,28 +2539,179 @@ impl super::AutomationsWindow {
             .height(iced::Length::Fixed(height))
             .into(),
         ];
+        // Keep a permanent stack slot for signature help. Iced diffs Stack
+        // children positionally; without this placeholder, a late signature
+        // response shifts the completion scrollable to a new tree position
+        // and discards its live scroll state.
+        let signature_layer_index = editor_layers.len();
+        editor_layers.push(
+            iced::widget::container(iced::widget::space::vertical())
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fixed(height))
+                .into(),
+        );
+
+        if !editor.is_dialog_open()
+            && let Some(signature) = &editor.results().signature_help
+        {
+            let metrics = editor.overlay_metrics();
+            if signature_overlay_should_render(signature, editor.results().hover.as_ref(), metrics)
+            {
+                let desired_height = signature_desired_height(signature, metrics);
+                let placement = editor
+                    .results()
+                    .completion
+                    .as_ref()
+                    .filter(|completion| !completion.result.items.is_empty())
+                    .map(|completion| {
+                        coordinated_signature_completion_placements(
+                            signature.anchor,
+                            desired_height,
+                            completion.anchor,
+                            completion_desired_height(completion.result.items.len()),
+                            metrics,
+                        )
+                        .0
+                    })
+                    .unwrap_or_else(|| hover_placement(signature.anchor, metrics, desired_height));
+                let target = SignatureOverlayTarget {
+                    document_id,
+                    mount_generation,
+                    identity: signature.identity,
+                };
+
+                let active_parameter = signature.result.active_parameter.map(usize::from);
+                let mut signature_spans: Vec<iced::widget::text::Span<'_, ()>> =
+                    vec![iced::widget::text::Span::new(
+                        signature.result.prefix.as_str(),
+                    )];
+                for (index, parameter) in signature.result.parameters.iter().enumerate() {
+                    if index > 0 {
+                        signature_spans.push(iced::widget::text::Span::new(
+                            signature.result.separator.as_str(),
+                        ));
+                    }
+                    let mut span = iced::widget::text::Span::new(parameter.label.as_str());
+                    if active_parameter == Some(index) {
+                        // Span colors cannot be theme closures in iced 0.14.
+                        // Underlining inherits the current palette's readable
+                        // text color while still marking the active parameter.
+                        span = span.underline(true).padding([0.0, 2.0]);
+                    }
+                    signature_spans.push(span);
+                }
+                signature_spans.push(iced::widget::text::Span::new(
+                    signature.result.suffix.as_str(),
+                ));
+                let signature_line: super::Elem<'_> = iced::widget::rich_text(signature_spans)
+                    .font(crate::assets::fonts::GEIST_MONO_VF)
+                    .size(11.0)
+                    .width(iced::Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into();
+                let mut signature_row = iced::widget::Row::new()
+                    .align_y(iced::alignment::Vertical::Center)
+                    .spacing(8.0)
+                    .push(signature_line);
+                if signature.result.signature_count > 1 {
+                    signature_row = signature_row.push(
+                        iced::widget::text(format!(
+                            "{}/{}",
+                            signature.result.selected_signature.saturating_add(1),
+                            signature.result.signature_count
+                        ))
+                        .size(9.0)
+                        .style(super::common::muted),
+                    );
+                }
+
+                let mut body = iced::widget::Column::new().spacing(6.0).push(signature_row);
+                if let Some(documentation) = &signature.active_parameter_documentation {
+                    body = body.push(
+                        rich_markup_view(documentation)
+                            .map(move |uri| super::Message::CodeSignatureLinkPressed(target, uri)),
+                    );
+                }
+                if let Some(documentation) = &signature.documentation {
+                    body = body.push(
+                        rich_markup_view(documentation)
+                            .map(move |uri| super::Message::CodeSignatureLinkPressed(target, uri)),
+                    );
+                }
+
+                let scroll_height = (placement.height - 12.0).max(1.0);
+                let scrolling: super::Elem<'_> = iced::widget::scrollable(body)
+                    .id(signature.scroll_id.clone())
+                    .height(iced::Length::Fixed(scroll_height))
+                    .into();
+                let scrolling = iced::widget::keyed_column([(signature.identity, scrolling)])
+                    .width(iced::Length::Fill)
+                    .height(iced::Length::Fixed(scroll_height));
+                let card = iced::widget::container(scrolling)
+                    .padding(6.0)
+                    .width(iced::Length::Fixed(placement.width))
+                    .height(iced::Length::Fixed(placement.height))
+                    .style(crate::theme::builtins::container::tooltip);
+                let card =
+                    iced::widget::mouse_area(card).interaction(iced::mouse::Interaction::Idle);
+                editor_layers[signature_layer_index] = iced::widget::container(
+                    iced::widget::column![
+                        iced::widget::space::vertical().height(iced::Length::Fixed(placement.y)),
+                        iced::widget::row![
+                            iced::widget::space::horizontal()
+                                .width(iced::Length::Fixed(placement.x)),
+                            card
+                        ]
+                    ]
+                    .spacing(0.0),
+                )
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fixed(height))
+                .into();
+            }
+        }
 
         if !editor.is_dialog_open()
             && let Some(completion) = &editor.results().completion
             && !completion.result.items.is_empty()
+            && anchor_is_visible(completion.anchor, editor.overlay_metrics())
         {
-            let visible = completion.result.items.len().min(8);
-            let visible = f32::from(u16::try_from(visible).unwrap_or(8));
-            let placement = completion_placement(
-                completion.anchor,
-                editor.overlay_metrics(),
-                30.0 + visible * 26.0,
+            let metrics = editor.overlay_metrics();
+            let visible_rows = completion_visible_rows(
+                completion,
+                editor.results().signature_help.as_ref(),
+                metrics,
             );
-            let mut candidates = iced::widget::Column::new().spacing(0.0).push(
-                iced::widget::text(crate::i18n::t!("automation-code-completions"))
-                    .size(11.0)
-                    .style(super::common::regular),
+            let placement = completion_placement_with_signature(
+                completion,
+                editor.results().signature_help.as_ref(),
+                metrics,
             );
-            for (index, item) in completion.result.items.iter().take(8).enumerate() {
-                let label = item.detail.as_ref().map_or_else(
-                    || item.label.clone(),
-                    |detail| format!("{}  —  {detail}", item.label),
-                );
+            let item_count = completion.result.items.len();
+            let first_visible = completion
+                .first_visible
+                .min(item_count.saturating_sub(visible_rows));
+            let render_start = first_visible.saturating_sub(COMPLETION_OVERSCAN_ROWS);
+            let render_end = first_visible
+                .saturating_add(visible_rows)
+                .saturating_add(COMPLETION_OVERSCAN_ROWS)
+                .min(item_count);
+            let mut candidates = iced::widget::Column::new().spacing(0.0);
+            if render_start > 0 {
+                candidates = candidates.push(iced::widget::space::vertical().height(
+                    iced::Length::Fixed(render_start as f32 * COMPLETION_ROW_HEIGHT),
+                ));
+            }
+            for (index, item) in completion
+                .result
+                .items
+                .iter()
+                .enumerate()
+                .skip(render_start)
+                .take(render_end.saturating_sub(render_start))
+            {
+                let label = concise_completion_text(&item.label, 60);
+                let kind = completion_kind_label(item.kind);
                 let selection = CompletionSelection {
                     document_id,
                     mount_generation,
@@ -1460,26 +2719,70 @@ impl super::AutomationsWindow {
                     index,
                 };
                 candidates = candidates.push(
-                    iced::widget::button(iced::widget::text(label).size(11.0))
-                        .padding([3.0, 6.0])
-                        .width(iced::Length::Fill)
-                        .height(iced::Length::Fixed(26.0))
-                        .style(if index == completion.selected {
-                            crate::theme::builtins::button::list_item_selected
-                        } else {
-                            crate::theme::builtins::button::list_item
-                        })
-                        .on_press(super::Message::ApplyCodeCompletion(selection)),
+                    iced::widget::button(
+                        iced::widget::row![
+                            iced::widget::text(label)
+                                .font(crate::assets::fonts::GEIST_MONO_VF)
+                                .size(11.0)
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .style(if item.deprecated {
+                                    super::common::muted
+                                } else {
+                                    super::common::regular
+                                })
+                                .width(iced::Length::Fill),
+                            iced::widget::container(
+                                iced::widget::text(kind)
+                                    .font(crate::assets::fonts::GEIST_MONO_VF)
+                                    .size(9.0)
+                                    .style(completion_kind_style(item.kind, item.deprecated)),
+                            )
+                            .width(iced::Length::Fixed(78.0))
+                            .align_x(iced::alignment::Horizontal::Right),
+                        ]
+                        .spacing(8.0)
+                        .align_y(iced::alignment::Vertical::Center),
+                    )
+                    .padding([3.0, 6.0])
+                    .width(iced::Length::Fill)
+                    .height(iced::Length::Fixed(COMPLETION_ROW_HEIGHT))
+                    .style(completion_row_style(index == completion.selected))
+                    .on_press(super::Message::ApplyCodeCompletion(selection)),
                 );
             }
-            let card = iced::widget::container(
-                iced::widget::scrollable(candidates)
-                    .height(iced::Length::Fixed((placement.height - 8.0).max(1.0))),
-            )
-            .padding(4.0)
-            .width(iced::Length::Fixed(placement.width))
-            .height(iced::Length::Fixed(placement.height))
-            .style(crate::theme::builtins::container::tooltip);
+            if render_end < item_count {
+                candidates =
+                    candidates.push(iced::widget::space::vertical().height(iced::Length::Fixed(
+                        item_count.saturating_sub(render_end) as f32 * COMPLETION_ROW_HEIGHT,
+                    )));
+            }
+            let scroll_height = (placement.height - 8.0).max(1.0);
+            let identity = completion.identity;
+            let max_first = item_count.saturating_sub(visible_rows);
+            let scrolling: super::Elem<'_> = iced::widget::scrollable(candidates)
+                .id(completion.scroll_id.clone())
+                .height(iced::Length::Fixed(scroll_height))
+                .on_scroll(move |viewport| {
+                    let first_visible = (viewport.absolute_offset().y / COMPLETION_ROW_HEIGHT)
+                        .floor()
+                        .max(0.0) as usize;
+                    super::Message::CodeCompletionViewportChanged(CompletionViewportTarget {
+                        document_id,
+                        mount_generation,
+                        identity,
+                        first_visible: first_visible.min(max_first),
+                    })
+                })
+                .into();
+            let scrolling = iced::widget::keyed_column([(completion.identity, scrolling)])
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fixed(scroll_height));
+            let card = iced::widget::container(scrolling)
+                .padding(4.0)
+                .width(iced::Length::Fixed(placement.width))
+                .height(iced::Length::Fixed(placement.height))
+                .style(crate::theme::builtins::container::tooltip);
+            let card = iced::widget::mouse_area(card).interaction(iced::mouse::Interaction::Idle);
             editor_layers.push(
                 iced::widget::container(
                     iced::widget::column![
@@ -1498,28 +2801,45 @@ impl super::AutomationsWindow {
             );
         } else if !editor.is_dialog_open()
             && let Some(hover) = &editor.results().hover
+            && anchor_is_visible(hover.anchor, editor.overlay_metrics())
         {
-            let lines = hover.result.contents.value.lines().count().clamp(1, 8);
-            let lines = f32::from(u16::try_from(lines).unwrap_or(8));
+            let metrics = editor.overlay_metrics();
+            let available_width = 520.0_f32.min((metrics.viewport_width - 8.0).max(1.0));
+            let chars_per_line =
+                ((available_width - 24.0).max(1.0) / metrics.char_width.max(4.0)).floor() as usize;
+            let lines = hover
+                .presentation
+                .estimated_lines(chars_per_line)
+                .clamp(2, 16) as f32;
             let placement = hover_placement(
                 hover.anchor,
-                editor.overlay_metrics(),
-                (16.0 + lines * 18.0).clamp(42.0, 180.0),
+                metrics,
+                (28.0 + lines * 18.0).clamp(64.0, 320.0),
             );
-            // Keep the embedded service's bounded markup inert here. Rendering
-            // plain text avoids creating links or actions from user-authored docs.
-            let card = iced::widget::container(
-                iced::widget::scrollable(
-                    iced::widget::text(hover.result.contents.value.as_str())
-                        .size(12.0)
-                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                )
-                .height(iced::Length::Fixed((placement.height - 12.0).max(1.0))),
-            )
-            .padding(6.0)
-            .width(iced::Length::Fixed(placement.width))
-            .height(iced::Length::Fixed(placement.height))
-            .style(crate::theme::builtins::container::tooltip);
+            let target = HoverOverlayTarget {
+                document_id,
+                mount_generation,
+                identity: hover.identity,
+            };
+            let body: super::Elem<'_> = rich_markup_view(&hover.presentation)
+                .map(move |uri| super::Message::CodeHoverLinkPressed(target, uri));
+            let scroll_height = (placement.height - 12.0).max(1.0);
+            let scrolling: super::Elem<'_> = iced::widget::scrollable(body)
+                .height(iced::Length::Fixed(scroll_height))
+                .into();
+            let scrolling = iced::widget::keyed_column([(hover.identity, scrolling)])
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fixed(scroll_height));
+            let card = iced::widget::container(scrolling)
+                .padding(6.0)
+                .width(iced::Length::Fixed(placement.width))
+                .height(iced::Length::Fixed(placement.height))
+                .style(crate::theme::builtins::container::tooltip);
+            let card = iced::widget::mouse_area(card)
+                .interaction(iced::mouse::Interaction::Idle)
+                .on_enter(super::Message::CodeHoverOverlayEntered(target))
+                .on_move(move |_| super::Message::CodeHoverOverlayEntered(target))
+                .on_exit(super::Message::CodeHoverOverlayExited(target));
             editor_layers.push(
                 iced::widget::container(
                     iced::widget::column![
@@ -1566,13 +2886,14 @@ impl super::AutomationsWindow {
             .push(editor_area)
             .push(status_row);
 
-        if !editor.results().diagnostics.is_empty() {
+        let visible_diagnostics = editor.visible_diagnostics().take(4).collect::<Vec<_>>();
+        if !visible_diagnostics.is_empty() {
             let mut problems = iced::widget::Column::new().spacing(2.0).push(
                 iced::widget::text(crate::i18n::t!("automation-code-problems"))
                     .size(11.0)
                     .style(super::common::regular),
             );
-            for diagnostic in editor.results().diagnostics.iter().take(4) {
+            for diagnostic in visible_diagnostics {
                 problems = problems.push(
                     iced::widget::text(format!(
                         "{}:{}  {}",
@@ -1604,18 +2925,47 @@ impl super::AutomationsWindow {
         if self.code_editor_mount_generation != message.mount_generation {
             return (iced::Task::none(), false);
         }
-        if editor.results.completion.is_some() {
-            let moved = match message.message {
+        if editor
+            .results
+            .completion
+            .as_ref()
+            .is_some_and(|completion| {
+                anchor_is_visible(completion.anchor, editor.overlay_metrics())
+            })
+        {
+            let visible_rows = editor
+                .results
+                .completion
+                .as_ref()
+                .map(|completion| {
+                    completion_visible_rows(
+                        completion,
+                        editor.results.signature_help.as_ref(),
+                        editor.overlay_metrics(),
+                    )
+                })
+                .unwrap_or(1);
+            let navigation = match message.message {
                 IcedEditorMessage::ArrowKey(iced_code_editor::ArrowDirection::Up, false) => {
-                    editor.move_completion_selection(-1)
+                    Some(CompletionNavigation::Previous)
                 }
                 IcedEditorMessage::ArrowKey(iced_code_editor::ArrowDirection::Down, false) => {
-                    editor.move_completion_selection(1)
+                    Some(CompletionNavigation::Next)
                 }
-                _ => false,
+                IcedEditorMessage::PageUp(false) => Some(CompletionNavigation::PageUp),
+                IcedEditorMessage::PageDown(false) => Some(CompletionNavigation::PageDown),
+                IcedEditorMessage::Home(false) => Some(CompletionNavigation::First),
+                IcedEditorMessage::End(false) => Some(CompletionNavigation::Last),
+                _ => None,
             };
-            if moved {
-                return (iced::Task::none(), false);
+            if let Some(update) = navigation
+                .and_then(|navigation| editor.navigate_completion(navigation, visible_rows))
+            {
+                debug_assert!(update.selected < update.count);
+                let task = update.scroll.map_or_else(iced::Task::none, |(id, first)| {
+                    completion_scroll_task(id, first)
+                });
+                return (task, false);
             }
             if matches!(message.message, IcedEditorMessage::Enter)
                 && let Some((task, changed)) = editor.apply_selected_completion()
@@ -1640,6 +2990,10 @@ impl super::AutomationsWindow {
                 let request = next_wire_value::<RequestId>(&mut self.next_language_request_id);
                 let _ = editor.request_pending_completion(request);
             }
+            if editor.pending_signature_help.is_some() {
+                let request = next_wire_value::<RequestId>(&mut self.next_language_request_id);
+                let _ = editor.request_pending_signature_help(request);
+            }
             if editor.pending_definition.is_some() {
                 let request = next_wire_value::<RequestId>(&mut self.next_language_request_id);
                 let _ = editor.request_pending_definition(request);
@@ -1661,6 +3015,20 @@ impl super::AutomationsWindow {
             }),
             changed,
         )
+    }
+
+    /// Tracks the scroll position of one exact completion result so subsequent
+    /// keyboard navigation only reveals a row after it leaves the viewport.
+    pub(super) fn code_completion_viewport_changed(&mut self, target: CompletionViewportTarget) {
+        let Some(editor) = &mut self.code_editor else {
+            return;
+        };
+        if target.document_id != editor.document().document.key.document_id
+            || target.mount_generation != self.code_editor_mount_generation
+        {
+            return;
+        }
+        let _ = editor.completion_viewport_changed(target.identity, target.first_visible);
     }
 
     /// Applies a completion selected from the visible candidate list.
@@ -1692,6 +3060,42 @@ impl super::AutomationsWindow {
             }),
             changed,
         )
+    }
+
+    pub(super) fn code_hover_overlay_entered(&mut self, target: HoverOverlayTarget) {
+        let Some(editor) = &mut self.code_editor else {
+            return;
+        };
+        if target.document_id != editor.document().document.key.document_id
+            || target.mount_generation != self.code_editor_mount_generation
+        {
+            return;
+        }
+        let _ = editor.hover_overlay_entered(target.identity);
+    }
+
+    pub(super) fn code_hover_overlay_exited(&mut self, target: HoverOverlayTarget) {
+        let Some(editor) = &mut self.code_editor else {
+            return;
+        };
+        if target.document_id != editor.document().document.key.document_id
+            || target.mount_generation != self.code_editor_mount_generation
+        {
+            return;
+        }
+        let _ = editor.hover_overlay_exited(target.identity, Instant::now());
+    }
+
+    pub(super) fn code_signature_link_pressed(&self, target: SignatureOverlayTarget) {
+        let Some(editor) = &self.code_editor else {
+            return;
+        };
+        if target.document_id != editor.document().document.key.document_id
+            || target.mount_generation != self.code_editor_mount_generation
+        {
+            return;
+        }
+        let _ = editor.signature_help_is_current(target.identity);
     }
 
     /// Closes the active document while retaining the resident window-scoped worker.
@@ -1768,6 +3172,7 @@ impl super::AutomationsWindow {
                         )
                     );
             }
+            let _ = editor.expire_hover_dismiss(Instant::now());
             editor.retry_service_sync();
             accepted_definition = editor.take_definition();
             service_edit_applied = editor.take_service_edit_applied();
@@ -1795,6 +3200,10 @@ impl super::AutomationsWindow {
             if editor.pending_completion.is_some() {
                 let request = next_wire_value::<RequestId>(&mut self.next_language_request_id);
                 let _ = editor.request_pending_completion(request);
+            }
+            if editor.pending_signature_help.is_some() {
+                let request = next_wire_value::<RequestId>(&mut self.next_language_request_id);
+                let _ = editor.request_pending_signature_help(request);
             }
             let now = Instant::now();
             if editor
@@ -2692,8 +4101,8 @@ mod tests {
         DocumentId, DocumentKey, DocumentKind, DocumentRef, DocumentResult, DocumentResultIdentity,
         EventEnvelope, FormattingResult, GraphGeneration, InsertTextFormat, Language,
         MAX_DOCUMENT_CHANGES, MarkupContent, MarkupKind, PROTOCOL_VERSION, ProjectId, ProjectScope,
-        ProjectStateIdentity, ProjectStatusEvent, ServiceGeneration, TextChange, Utf16Range,
-        WorkerGeneration,
+        ProjectStateIdentity, ProjectStatusEvent, ServiceGeneration, SignatureHelpParameter,
+        TextChange, Utf16Range, WorkerGeneration,
     };
 
     use super::*;
@@ -2853,6 +4262,10 @@ mod tests {
         Navigate,
         Passive,
         RequestCompletion(ScalarPosition),
+        RequestSignatureHelp {
+            position: ScalarPosition,
+            starts_new_lifecycle: bool,
+        },
         Hover(HoverUpdate),
     }
 
@@ -2897,6 +4310,7 @@ mod tests {
                             }],
                         }),
                         completion: None,
+                        signature_help: None,
                         hover: HoverUpdate::Unchanged,
                         semantic_context_changed: true,
                         definition: None,
@@ -2907,6 +4321,7 @@ mod tests {
                     effect: (),
                     changes: None,
                     completion: None,
+                    signature_help: None,
                     hover: HoverUpdate::Unchanged,
                     semantic_context_changed: true,
                     definition: None,
@@ -2916,6 +4331,7 @@ mod tests {
                     effect: (),
                     changes: None,
                     completion: None,
+                    signature_help: None,
                     hover: HoverUpdate::Unchanged,
                     semantic_context_changed: false,
                     definition: None,
@@ -2928,8 +4344,26 @@ mod tests {
                         position: *position,
                         anchor: SurfacePoint { x: 24.0, y: 36.0 },
                     }),
+                    signature_help: None,
                     hover: HoverUpdate::Unchanged,
                     semantic_context_changed: false,
+                    definition: None,
+                    formatting: None,
+                },
+                SurfaceMessage::RequestSignatureHelp {
+                    position,
+                    starts_new_lifecycle,
+                } => SurfaceUpdate {
+                    effect: (),
+                    changes: None,
+                    completion: None,
+                    signature_help: Some(SignatureHelpIntent {
+                        position: *position,
+                        anchor: SurfacePoint { x: 24.0, y: 36.0 },
+                        starts_new_lifecycle: *starts_new_lifecycle,
+                    }),
+                    hover: HoverUpdate::Unchanged,
+                    semantic_context_changed: true,
                     definition: None,
                     formatting: None,
                 },
@@ -2937,6 +4371,7 @@ mod tests {
                     effect: (),
                     changes: None,
                     completion: None,
+                    signature_help: None,
                     hover: *hover,
                     semantic_context_changed: false,
                     definition: None,
@@ -2961,6 +4396,14 @@ mod tests {
                     }],
                 }),
                 completion: None,
+                signature_help: Some(SignatureHelpIntent {
+                    position: ScalarPosition {
+                        line: 0,
+                        character: u32::try_from(self.text.chars().count()).unwrap_or(u32::MAX),
+                    },
+                    anchor: SurfacePoint { x: 24.0, y: 36.0 },
+                    starts_new_lifecycle: false,
+                }),
                 hover: HoverUpdate::Clear,
                 semantic_context_changed: true,
                 definition: None,
@@ -3133,6 +4576,618 @@ mod tests {
         }
     }
 
+    fn signature_help(position: Utf16Position) -> SignatureHelpResult {
+        SignatureHelpResult {
+            applicable_range: Utf16Range {
+                start: position,
+                end: position,
+            },
+            prefix: "send(".to_owned(),
+            separator: ", ".to_owned(),
+            suffix: "): void".to_owned(),
+            parameters: vec![
+                SignatureHelpParameter {
+                    label: "target: string".to_owned(),
+                    documentation: Some(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: "Where to send.".to_owned(),
+                    }),
+                    is_optional: false,
+                    is_rest: false,
+                },
+                SignatureHelpParameter {
+                    label: "text?: string".to_owned(),
+                    documentation: None,
+                    is_optional: true,
+                    is_rest: false,
+                },
+            ],
+            active_parameter: Some(0),
+            selected_signature: 0,
+            signature_count: 1,
+            argument_count: 0,
+            documentation: Some(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "Sends text.".to_owned(),
+            }),
+        }
+    }
+
+    fn install_plain_hover(
+        editor: &mut AutomationCodeEditor<FakeSurface, FakeChannel>,
+        request_id: u64,
+    ) -> DocumentResultIdentity {
+        let identity = DocumentResultIdentity {
+            state: state(editor.document.document),
+            request_id: number::<RequestId>(request_id),
+        };
+        let position = Utf16Position::default();
+        editor.hover_position = Some(position);
+        editor.results.hover = Some(AcceptedHover::new(
+            identity,
+            Some(position),
+            HoverResult {
+                range: None,
+                contents: MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: "documentation".to_owned(),
+                },
+            },
+            SurfacePoint { x: 12.0, y: 18.0 },
+        ));
+        identity
+    }
+
+    #[test]
+    fn rich_hover_parses_markdown_and_highlights_fenced_typescript() {
+        let descriptor = descriptor(3, 1, "smudgy-inline:///alias/test.ts");
+        let identity = DocumentResultIdentity {
+            state: state(descriptor.document),
+            request_id: number::<RequestId>(90),
+        };
+        let accepted = AcceptedHover::new(
+            identity,
+            Some(Utf16Position::default()),
+            HoverResult {
+                range: None,
+                contents: MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: concat!(
+                        "Use `value` with **care** and ",
+                        "[createEvent](#smudgy-jsdoc-link-1).\n\n",
+                        "```ts\nconst value: number = 1;\n```"
+                    )
+                    .to_owned(),
+                },
+            },
+            SurfacePoint::default(),
+        );
+
+        let HoverPresentation::Markdown(content) = &accepted.presentation else {
+            panic!("Markdown hover must retain parsed Markdown content");
+        };
+        let viewer = smudgy_widgets::SmudgyMarkdownViewer::current();
+        let style = rich_markdown_settings(&viewer).style;
+        let paragraph_has_inline_code = content.items().iter().any(|item| {
+            matches!(
+                item,
+                iced::widget::markdown::Item::Paragraph(text)
+                    if text.spans(style).iter().any(|span| span.highlight.is_some())
+            )
+        });
+        let paragraph_has_link = content.items().iter().any(|item| {
+            matches!(
+                item,
+                iced::widget::markdown::Item::Paragraph(text)
+                    if text.spans(style).iter().any(|span| span.link.is_some())
+            )
+        });
+        let code_block_is_highlighted = content.items().iter().any(|item| {
+            matches!(
+                item,
+                iced::widget::markdown::Item::CodeBlock {
+                    language: Some(language),
+                    lines,
+                    ..
+                } if language == "ts"
+                    && lines.iter().flat_map(|line| line.spans(style).iter().cloned().collect::<Vec<_>>())
+                        .any(|span| span.color.is_some())
+            )
+        });
+        assert!(paragraph_has_inline_code);
+        assert!(paragraph_has_link);
+        assert!(code_block_is_highlighted);
+    }
+
+    #[test]
+    fn rich_hover_render_settings_retain_live_palette_and_geist_code_fonts() {
+        let viewer = smudgy_widgets::SmudgyMarkdownViewer::current();
+        let colors = viewer.colors();
+        assert_eq!(colors, *smudgy_theme::markdown::current());
+
+        let settings = rich_markdown_settings(&viewer);
+        assert_eq!(settings.style.link_color, colors.link);
+        assert_eq!(settings.style.inline_code_color, colors.code_foreground);
+        assert_eq!(
+            settings.style.inline_code_highlight.background,
+            iced::Background::Color(colors.code_background)
+        );
+        assert_eq!(
+            settings.style.inline_code_font,
+            crate::assets::fonts::GEIST_MONO_VF
+        );
+        assert_eq!(
+            settings.style.code_block_font,
+            crate::assets::fonts::GEIST_MONO_VF
+        );
+
+        let presentation =
+            HoverPresentation::Markdown(Box::new(iced::widget::markdown::Content::parse(
+                "Body [link](#inert).\n\n```ts\nlet x = 1;\n```",
+            )));
+        let _view = rich_markup_view(&presentation);
+    }
+
+    #[test]
+    fn plaintext_hover_keeps_markdown_punctuation_literal() {
+        let descriptor = descriptor(3, 1, "smudgy-inline:///alias/test.ts");
+        let identity = DocumentResultIdentity {
+            state: state(descriptor.document),
+            request_id: number::<RequestId>(91),
+        };
+        let accepted = AcceptedHover::new(
+            identity,
+            None,
+            HoverResult {
+                range: None,
+                contents: MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: "**literal** `ticks`".to_owned(),
+                },
+            },
+            SurfacePoint::default(),
+        );
+
+        assert!(matches!(
+            accepted.presentation,
+            HoverPresentation::PlainText(ref value) if value == "**literal** `ticks`"
+        ));
+    }
+
+    #[test]
+    fn hover_card_entry_cancels_grace_and_exit_expires_the_exact_result() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("value"),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let identity = install_plain_hover(&mut editor, 92);
+        let now = Instant::now();
+
+        editor.leave_hover(now);
+        assert!(editor.results.hover.is_some());
+        assert!(editor.pending_hover_dismiss.is_some());
+        assert!(editor.hover_overlay_entered(identity));
+        assert_eq!(editor.hover_overlay_interactive, Some(identity));
+        assert!(editor.pending_hover_dismiss.is_none());
+        assert!(!editor.expire_hover_dismiss(now + HOVER_DISMISS_GRACE * 2));
+
+        assert!(editor.hover_overlay_exited(identity, now));
+        assert!(!editor.expire_hover_dismiss(now + HOVER_DISMISS_GRACE / 2));
+        assert!(editor.results.hover.is_some());
+        assert!(editor.expire_hover_dismiss(now + HOVER_DISMISS_GRACE));
+        assert!(editor.results.hover.is_none());
+    }
+
+    #[test]
+    fn hover_transit_keeps_docs_and_stale_card_messages_are_inert() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("value next"),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let identity = install_plain_hover(&mut editor, 93);
+        let stale_identity = DocumentResultIdentity {
+            state: identity.state,
+            request_id: number::<RequestId>(94),
+        };
+        let now = Instant::now();
+
+        editor.leave_hover(now);
+        editor.observe_hover_intent(
+            HoverIntent {
+                position: ScalarPosition {
+                    line: 0,
+                    character: 7,
+                },
+                anchor: SurfacePoint { x: 60.0, y: 18.0 },
+            },
+            now,
+        );
+        assert!(editor.results.hover.is_some());
+        assert!(editor.pending_hover.is_some());
+        assert!(!editor.hover_overlay_entered(stale_identity));
+        assert!(!editor.hover_overlay_exited(stale_identity, now));
+
+        assert!(editor.hover_overlay_entered(identity));
+        assert!(editor.pending_hover.is_none());
+        assert_eq!(editor.hover_position, Some(Utf16Position::default()));
+        editor.update(&SurfaceMessage::Navigate);
+        assert!(editor.results.hover.is_none());
+    }
+
+    #[test]
+    fn leaving_during_a_replacement_hover_restores_the_accepted_position_for_retry() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("value next"),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        install_plain_hover(&mut editor, 95);
+        let now = Instant::now();
+        let replacement = HoverIntent {
+            position: ScalarPosition {
+                line: 0,
+                character: 7,
+            },
+            anchor: SurfacePoint { x: 60.0, y: 18.0 },
+        };
+
+        editor.observe_hover_intent(replacement, now);
+        assert_eq!(
+            editor.hover_position,
+            Some(Utf16Position {
+                line: 0,
+                character: 7,
+            })
+        );
+        editor.leave_hover(now);
+        assert_eq!(editor.hover_position, Some(Utf16Position::default()));
+
+        editor.observe_hover_intent(replacement, now);
+        assert!(editor.pending_hover.is_some());
+        assert_eq!(editor.pending_hover.unwrap().position.character, 7);
+    }
+
+    #[test]
+    fn failed_replacement_hover_restores_the_accepted_position_for_retry() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("value next"),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let accepted = install_plain_hover(&mut editor, 96);
+        editor.service_state = Some(accepted.state);
+        editor.status = ServiceStatus::Ready;
+        let now = Instant::now();
+        let replacement = HoverIntent {
+            position: ScalarPosition {
+                line: 0,
+                character: 7,
+            },
+            anchor: SurfacePoint { x: 60.0, y: 18.0 },
+        };
+        editor.observe_hover_intent(replacement, now);
+        editor.pending_hover = None;
+        let request_id = number::<RequestId>(97);
+        editor.outstanding.set(RequestKind::Hover, Some(request_id));
+        editor.hover_request_anchor = Some(replacement.anchor);
+
+        assert_eq!(
+            editor.apply_service_event(&event(Event::RequestFailed(
+                smudgy_script::language_service::RequestFailure {
+                    scope: FailureScope::Document(DocumentResultIdentity {
+                        state: accepted.state,
+                        request_id,
+                    }),
+                    code: "fixture".to_owned(),
+                    retryable: true,
+                    user_message: "retry".to_owned(),
+                    log_detail: None,
+                }
+            ))),
+            EventDisposition::Applied
+        );
+        assert_eq!(editor.hover_position, Some(Utf16Position::default()));
+        assert!(editor.hover_request_anchor.is_none());
+
+        editor.observe_hover_intent(replacement, now);
+        assert!(editor.pending_hover.is_some());
+    }
+
+    #[test]
+    fn hover_line_estimate_accounts_for_wrapped_jsdoc_paragraphs() {
+        let source = "A long paragraph of JSDoc prose that should wrap across several lines in a narrow hover card instead of receiving the minimum two-line card.";
+        let presentation =
+            HoverPresentation::Markdown(Box::new(iced::widget::markdown::Content::parse(source)));
+
+        assert!(presentation.estimated_lines(24) >= 6);
+    }
+
+    #[test]
+    fn hover_line_estimate_does_not_wrap_horizontally_scrollable_code() {
+        let source = "```ts\nfunction extraordinarilyLongSignature(firstParameter: string, secondParameter: number, thirdParameter: boolean): Promise<void>\n```";
+        let presentation =
+            HoverPresentation::Markdown(Box::new(iced::widget::markdown::Content::parse(source)));
+
+        assert_eq!(presentation.estimated_lines(24), 2);
+    }
+
+    #[test]
+    fn completion_helpers_cover_all_kinds_and_unicode_without_byte_splitting() {
+        let kinds = [
+            CompletionKind::Text,
+            CompletionKind::Method,
+            CompletionKind::Function,
+            CompletionKind::Constructor,
+            CompletionKind::Field,
+            CompletionKind::Variable,
+            CompletionKind::Class,
+            CompletionKind::Interface,
+            CompletionKind::TypeAlias,
+            CompletionKind::Module,
+            CompletionKind::Property,
+            CompletionKind::Unit,
+            CompletionKind::Value,
+            CompletionKind::Enum,
+            CompletionKind::Keyword,
+            CompletionKind::Snippet,
+            CompletionKind::Color,
+            CompletionKind::File,
+            CompletionKind::Reference,
+            CompletionKind::Folder,
+            CompletionKind::EnumMember,
+            CompletionKind::Constant,
+            CompletionKind::Struct,
+            CompletionKind::Event,
+            CompletionKind::Operator,
+            CompletionKind::TypeParameter,
+        ];
+        assert!(
+            kinds
+                .into_iter()
+                .all(|kind| !completion_kind_label(kind).is_empty())
+        );
+        assert_eq!(concise_completion_text("🙂🙂🙂", 2), "🙂🙂…");
+        assert_eq!(reveal_completion_selection(0, 1, 500, 12), 0);
+        assert_eq!(reveal_completion_selection(0, 11, 500, 12), 0);
+        assert_eq!(reveal_completion_selection(0, 12, 500, 12), 1);
+        assert_eq!(reveal_completion_selection(1, 499, 500, 12), 488);
+        assert_eq!(reveal_completion_selection(488, 0, 500, 12), 0);
+    }
+
+    #[test]
+    fn completion_overlay_height_is_compact_and_has_no_header_allowance() {
+        assert_eq!(completion_desired_height(1), 34.0);
+        assert_eq!(completion_desired_height(12), 320.0);
+        assert_eq!(completion_desired_height(500), 320.0);
+    }
+
+    #[test]
+    fn completion_row_washes_remain_distinct_on_light_and_dark_surfaces() {
+        fn background(
+            theme: &crate::theme::Theme,
+            selected: bool,
+            status: iced::widget::button::Status,
+        ) -> iced::Color {
+            match completion_row_style(selected)(theme, status).background {
+                Some(iced::Background::Color(color)) => color,
+                background => panic!("completion row needs a solid wash, got {background:?}"),
+            }
+        }
+
+        let dark = crate::theme::Theme::default();
+        let mut light = crate::theme::Theme::default();
+        light.styles.general.background = iced::Color::from_rgb8(0xFD, 0xF6, 0xE3);
+        light.styles.general.overlay_background = iced::Color::from_rgba8(0xFD, 0xF6, 0xE3, 0.92);
+        light.styles.text.normal = iced::Color::from_rgb8(0x00, 0x2B, 0x36);
+
+        for (name, theme) in [("dark", &dark), ("light", &light)] {
+            let surface = completion_surface_color(theme);
+            let normal = background(theme, false, iced::widget::button::Status::Active);
+            let hovered = background(theme, false, iced::widget::button::Status::Hovered);
+            let selected = background(theme, true, iced::widget::button::Status::Active);
+            let selected_hovered = background(theme, true, iced::widget::button::Status::Hovered);
+
+            assert!(
+                contrast_ratio(normal, surface) >= 1.03,
+                "{name} normal wash must remain visible"
+            );
+            assert!(
+                contrast_ratio(hovered, surface) > contrast_ratio(normal, surface),
+                "{name} hover must be stronger than the normal wash"
+            );
+            assert!(
+                contrast_ratio(selected, surface) > contrast_ratio(hovered, surface),
+                "{name} keyboard selection must be stronger than pointer hover"
+            );
+            assert!(
+                contrast_ratio(selected_hovered, surface) > contrast_ratio(selected, surface),
+                "{name} selected hover must remain distinct"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_kind_colors_group_symbols_semantically_and_dim_deprecated_items() {
+        let theme = crate::theme::Theme::default();
+
+        assert_eq!(
+            completion_kind_color(&theme, CompletionKind::Function),
+            completion_kind_color(&theme, CompletionKind::Method)
+        );
+        assert_eq!(
+            completion_kind_color(&theme, CompletionKind::Class),
+            completion_kind_color(&theme, CompletionKind::TypeAlias)
+        );
+        assert_eq!(
+            completion_kind_color(&theme, CompletionKind::Variable),
+            completion_kind_color(&theme, CompletionKind::Property)
+        );
+        assert_ne!(
+            completion_kind_color(&theme, CompletionKind::Function),
+            completion_kind_color(&theme, CompletionKind::Class)
+        );
+        assert_ne!(
+            completion_kind_color(&theme, CompletionKind::Variable),
+            completion_kind_color(&theme, CompletionKind::Keyword)
+        );
+
+        let regular = completion_kind_style(CompletionKind::Function, false)(&theme)
+            .color
+            .expect("completion kinds carry a visible color");
+        let deprecated = completion_kind_style(CompletionKind::Function, true)(&theme)
+            .color
+            .expect("deprecated completion kinds retain their hue");
+        assert_ne!(deprecated, regular);
+        assert!(contrast_ratio(deprecated, completion_surface_color(&theme)) >= 2.25);
+
+        let mut light = crate::theme::Theme::default();
+        light.styles.general.background = iced::Color::from_rgb8(0xFD, 0xF6, 0xE3);
+        light.styles.general.overlay_background = iced::Color::from_rgba8(0xFD, 0xF6, 0xE3, 0.92);
+        light.styles.text.normal = iced::Color::from_rgb8(0x00, 0x2B, 0x36);
+        for kind in [
+            CompletionKind::Function,
+            CompletionKind::Class,
+            CompletionKind::Variable,
+            CompletionKind::Module,
+            CompletionKind::Keyword,
+            CompletionKind::Event,
+        ] {
+            let color = completion_kind_color(&light, kind);
+            assert!(contrast_ratio(color, completion_surface_color(&light)) >= 3.0);
+        }
+        let light_deprecated = completion_kind_style(CompletionKind::Function, true)(&light)
+            .color
+            .expect("light-palette deprecated kinds remain visible");
+        assert!(contrast_ratio(light_deprecated, completion_surface_color(&light)) >= 2.25);
+    }
+
+    #[test]
+    fn oversized_overlays_fit_one_side_of_the_source_line() {
+        let (completion_height, completion_y) =
+            fit_overlay_vertically(100.0, 18.0, 220.0, 500.0, true);
+        assert!(completion_y >= 122.0);
+        assert!(completion_y + completion_height <= 220.0);
+
+        let (hover_height, hover_y) = fit_overlay_vertically(100.0, 18.0, 220.0, 500.0, false);
+        assert!(hover_y + hover_height <= 100.0 || hover_y >= 118.0);
+        assert!(hover_y + hover_height <= 220.0);
+    }
+
+    #[test]
+    fn simultaneous_signature_and_completion_cards_never_overlap_or_cover_source() {
+        let metrics = OverlayMetrics {
+            viewport_width: 400.0,
+            viewport_height: 220.0,
+            viewport_scroll: 0.0,
+            line_height: 18.0,
+            char_width: 8.0,
+        };
+
+        for anchor_y in [0.0, 100.0, 202.0] {
+            let anchor = SurfacePoint {
+                x: 120.0,
+                y: anchor_y,
+            };
+            let (signature, completion) =
+                coordinated_signature_completion_placements(anchor, 180.0, anchor, 180.0, metrics);
+            let source_top = anchor_y;
+            let source_bottom = anchor_y + metrics.line_height;
+            for placement in [signature, completion] {
+                assert!(placement.height >= 20.0);
+                assert!(placement.y >= 0.0);
+                assert!(placement.y + placement.height <= metrics.viewport_height);
+                assert!(
+                    placement.y + placement.height <= source_top || placement.y >= source_bottom
+                );
+            }
+            assert!(
+                signature.y + signature.height <= completion.y
+                    || completion.y + completion.height <= signature.y
+            );
+        }
+    }
+
+    #[test]
+    fn offscreen_overlay_anchors_are_not_considered_visible() {
+        let metrics = OverlayMetrics {
+            viewport_width: 400.0,
+            viewport_height: 100.0,
+            viewport_scroll: 50.0,
+            line_height: 18.0,
+            char_width: 8.0,
+        };
+        assert!(!anchor_is_visible(
+            SurfacePoint { x: 10.0, y: 20.0 },
+            metrics
+        ));
+        assert!(anchor_is_visible(
+            SurfacePoint { x: 10.0, y: 50.0 },
+            metrics
+        ));
+        assert!(!anchor_is_visible(
+            SurfacePoint { x: 10.0, y: 170.0 },
+            metrics
+        ));
+    }
+
+    #[test]
+    fn offscreen_hover_does_not_suppress_a_visible_signature_overlay() {
+        let metrics = OverlayMetrics {
+            viewport_width: 400.0,
+            viewport_height: 100.0,
+            viewport_scroll: 50.0,
+            line_height: 18.0,
+            char_width: 8.0,
+        };
+        let current_state = state(descriptor(3, 1, "smudgy-inline:///alias/test.ts").document);
+        let position = Utf16Position::default();
+        let signature = AcceptedSignatureHelp::new(
+            DocumentResultIdentity {
+                state: current_state,
+                request_id: number::<RequestId>(90),
+            },
+            position,
+            signature_help(position),
+            SurfacePoint { x: 80.0, y: 80.0 },
+        );
+        let mut hover = AcceptedHover::new(
+            DocumentResultIdentity {
+                state: current_state,
+                request_id: number::<RequestId>(91),
+            },
+            Some(position),
+            HoverResult {
+                range: None,
+                contents: MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: "Offscreen documentation".to_owned(),
+                },
+            },
+            SurfacePoint { x: 12.0, y: 20.0 },
+        );
+
+        assert!(anchor_is_visible(signature.anchor, metrics));
+        assert!(!anchor_is_visible(hover.anchor, metrics));
+        assert!(signature_overlay_should_render(
+            &signature,
+            Some(&hover),
+            metrics
+        ));
+
+        hover.anchor.y = 80.0;
+        assert!(!signature_overlay_should_render(
+            &signature,
+            Some(&hover),
+            metrics
+        ));
+    }
+
     #[test]
     fn navigation_invalidates_pending_and_outstanding_completions() {
         let (channel, _, _) = FakeChannel::new();
@@ -3162,6 +5217,8 @@ mod tests {
             },
             anchor: SurfacePoint::default(),
             selected: 0,
+            first_visible: 0,
+            scroll_id: iced::widget::Id::unique(),
         });
 
         editor.update(&SurfaceMessage::Navigate);
@@ -3224,7 +5281,368 @@ mod tests {
     }
 
     #[test]
-    fn completion_keyboard_selection_wraps_within_the_eight_visible_rows() {
+    fn signature_help_uses_the_post_edit_utf16_cursor_and_coexists_with_completion() {
+        let (channel, commands, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("🙂send("),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let current_state = state(editor.document.document);
+        assert_eq!(
+            editor.apply_service_event(&event(Event::StateAcknowledged(
+                AcknowledgedState::DocumentOpened(current_state),
+            ))),
+            EventDisposition::Applied
+        );
+
+        editor.update(&SurfaceMessage::RequestSignatureHelp {
+            position: ScalarPosition {
+                line: 0,
+                character: 6,
+            },
+            starts_new_lifecycle: true,
+        });
+        assert_eq!(
+            editor
+                .pending_signature_help
+                .map(|pending| pending.position),
+            Some(Utf16Position {
+                line: 0,
+                character: 7,
+            })
+        );
+        let signature_request = number::<RequestId>(42);
+        assert!(editor.request_pending_signature_help(signature_request));
+        assert!(matches!(
+            commands.borrow().last(),
+            Some(Command::RequestSignatureHelp(request))
+                if request.position.character == 7
+        ));
+        let request_position = Utf16Position {
+            line: 0,
+            character: 7,
+        };
+        assert_eq!(
+            editor.apply_service_event(&event(Event::SignatureHelp(DocumentResult {
+                identity: DocumentResultIdentity {
+                    state: current_state,
+                    request_id: signature_request,
+                },
+                analyzed_uri: Some(editor.document.uri.clone()),
+                result: Some(signature_help(request_position)),
+            }))),
+            EventDisposition::Applied
+        );
+        assert!(editor.results.signature_help.is_some());
+
+        let completion_request = number::<RequestId>(43);
+        assert!(editor.request_completion(completion_request, request_position));
+        assert_eq!(
+            editor.apply_service_event(&event(Event::Completion(DocumentResult {
+                identity: DocumentResultIdentity {
+                    state: current_state,
+                    request_id: completion_request,
+                },
+                analyzed_uri: Some(editor.document.uri.clone()),
+                result: CompletionResult {
+                    is_incomplete: false,
+                    items: vec![completion_item(1)],
+                },
+            }))),
+            EventDisposition::Applied
+        );
+        assert!(editor.results.signature_help.is_some());
+        assert!(editor.results.completion.is_some());
+
+        editor.dismiss_pointer_overlays();
+        assert!(editor.results.completion.is_none());
+        assert!(editor.results.signature_help.is_some());
+    }
+
+    #[test]
+    fn escape_suppresses_passive_signature_retrigger_until_a_new_call_lifecycle() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("send("),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let current_state = state(editor.document.document);
+        assert_eq!(
+            editor.apply_service_event(&event(Event::StateAcknowledged(
+                AcknowledgedState::DocumentOpened(current_state),
+            ))),
+            EventDisposition::Applied
+        );
+        let position = ScalarPosition {
+            line: 0,
+            character: 5,
+        };
+        editor.update(&SurfaceMessage::RequestSignatureHelp {
+            position,
+            starts_new_lifecycle: true,
+        });
+        let dismissed_request = number::<RequestId>(44);
+        assert!(editor.request_pending_signature_help(dismissed_request));
+
+        editor.dismiss_overlays();
+        assert!(editor.signature_help_suppressed);
+        assert!(editor.pending_signature_help.is_none());
+        assert!(editor.outstanding.signature_help.is_none());
+        assert_eq!(
+            editor.apply_service_event(&event(Event::SignatureHelp(DocumentResult {
+                identity: DocumentResultIdentity {
+                    state: current_state,
+                    request_id: dismissed_request,
+                },
+                analyzed_uri: Some(editor.document.uri.clone()),
+                result: Some(signature_help(Utf16Position {
+                    line: 0,
+                    character: 5,
+                })),
+            }))),
+            EventDisposition::Stale
+        );
+
+        editor.update(&SurfaceMessage::RequestSignatureHelp {
+            position,
+            starts_new_lifecycle: false,
+        });
+        assert!(editor.pending_signature_help.is_none());
+        assert!(editor.signature_help_suppressed);
+
+        editor.update(&SurfaceMessage::RequestSignatureHelp {
+            position,
+            starts_new_lifecycle: true,
+        });
+        assert!(editor.pending_signature_help.is_some());
+        assert!(!editor.signature_help_suppressed);
+        let accepted_request = number::<RequestId>(45);
+        assert!(editor.request_pending_signature_help(accepted_request));
+        assert_eq!(
+            editor.apply_service_event(&event(Event::SignatureHelp(DocumentResult {
+                identity: DocumentResultIdentity {
+                    state: current_state,
+                    request_id: accepted_request,
+                },
+                analyzed_uri: Some(editor.document.uri.clone()),
+                result: Some(signature_help(Utf16Position {
+                    line: 0,
+                    character: 5,
+                })),
+            }))),
+            EventDisposition::Applied
+        );
+        assert!(editor.results.signature_help.is_some());
+        editor.dismiss_overlays();
+        assert!(editor.results.signature_help.is_none());
+
+        let completion_identity = DocumentResultIdentity {
+            state: current_state,
+            request_id: number::<RequestId>(46),
+        };
+        editor.results.completion = Some(AcceptedCompletion {
+            identity: completion_identity,
+            result: CompletionResult {
+                is_incomplete: false,
+                items: vec![completion_item(1)],
+            },
+            anchor: SurfacePoint::default(),
+            selected: 0,
+            first_visible: 0,
+            scroll_id: iced::widget::Id::unique(),
+        });
+        assert!(editor.apply_completion(0, completion_identity).is_some());
+        assert!(editor.signature_help_suppressed);
+        assert!(editor.pending_signature_help.is_none());
+    }
+
+    #[test]
+    fn signature_help_rejects_an_unrelated_in_bounds_applicable_range() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("send("),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let current_state = state(editor.document.document);
+        assert_eq!(
+            editor.apply_service_event(&event(Event::StateAcknowledged(
+                AcknowledgedState::DocumentOpened(current_state),
+            ))),
+            EventDisposition::Applied
+        );
+        editor.update(&SurfaceMessage::RequestSignatureHelp {
+            position: ScalarPosition {
+                line: 0,
+                character: 5,
+            },
+            starts_new_lifecycle: true,
+        });
+        let request_id = number::<RequestId>(48);
+        assert!(editor.request_pending_signature_help(request_id));
+        let mut unrelated = signature_help(Utf16Position {
+            line: 0,
+            character: 5,
+        });
+        unrelated.applicable_range = Utf16Range {
+            start: Utf16Position {
+                line: 0,
+                character: 0,
+            },
+            end: Utf16Position {
+                line: 0,
+                character: 1,
+            },
+        };
+
+        assert_eq!(
+            editor.apply_service_event(&event(Event::SignatureHelp(DocumentResult {
+                identity: DocumentResultIdentity {
+                    state: current_state,
+                    request_id,
+                },
+                analyzed_uri: Some(editor.document.uri.clone()),
+                result: Some(unrelated),
+            }))),
+            EventDisposition::Invalid
+        );
+        assert!(editor.outstanding.signature_help.is_none());
+        assert!(editor.results.signature_help.is_none());
+    }
+
+    #[test]
+    fn deliberate_hover_temporarily_coexists_with_accepted_signature_help() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("send(value"),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let current_state = state(editor.document.document);
+        editor.service_state = Some(current_state);
+        editor.status = ServiceStatus::Ready;
+        editor.results.signature_help = Some(AcceptedSignatureHelp::new(
+            DocumentResultIdentity {
+                state: current_state,
+                request_id: number::<RequestId>(46),
+            },
+            Utf16Position {
+                line: 0,
+                character: 10,
+            },
+            signature_help(Utf16Position {
+                line: 0,
+                character: 10,
+            }),
+            SurfacePoint { x: 80.0, y: 18.0 },
+        ));
+
+        let now = Instant::now();
+        editor.observe_hover_intent(
+            HoverIntent {
+                position: ScalarPosition {
+                    line: 0,
+                    character: 6,
+                },
+                anchor: SurfacePoint { x: 48.0, y: 18.0 },
+            },
+            now,
+        );
+        let hover_request = number::<RequestId>(47);
+        assert!(editor.request_pending_hover(hover_request, now + HOVER_DEBOUNCE));
+        assert_eq!(
+            editor.apply_service_event(&event(Event::Hover(DocumentResult {
+                identity: DocumentResultIdentity {
+                    state: current_state,
+                    request_id: hover_request,
+                },
+                analyzed_uri: Some(editor.document.uri.clone()),
+                result: Some(HoverResult {
+                    range: None,
+                    contents: MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: "Hovered docs.".to_owned(),
+                    },
+                }),
+            }))),
+            EventDisposition::Applied
+        );
+        assert!(editor.results.hover.is_some());
+        assert!(editor.results.signature_help.is_some());
+
+        editor.clear_hover();
+        assert!(editor.results.signature_help.is_some());
+    }
+
+    #[test]
+    fn active_signature_hides_only_the_exact_missing_close_parenthesis_problem() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new("send("),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let current_state = state(editor.document.document);
+        editor.service_state = Some(current_state);
+        editor.status = ServiceStatus::Ready;
+        let position = Utf16Position {
+            line: 0,
+            character: 5,
+        };
+        editor.results.signature_help = Some(AcceptedSignatureHelp::new(
+            DocumentResultIdentity {
+                state: current_state,
+                request_id: number::<RequestId>(44),
+            },
+            position,
+            signature_help(position),
+            SurfacePoint::default(),
+        ));
+        let diagnostic = |code, message: &str, character| Diagnostic {
+            range: Utf16Range {
+                start: Utf16Position { line: 0, character },
+                end: Utf16Position { line: 0, character },
+            },
+            severity: DiagnosticSeverity::Error,
+            code,
+            source: Some("typescript".to_owned()),
+            message: message.to_owned(),
+            related_information: Vec::new(),
+        };
+        let mut foreign_source = diagnostic(Some(DiagnosticCode::Number(1005)), "')' expected.", 5);
+        foreign_source.source = Some("host".to_owned());
+        editor.results.diagnostics = vec![
+            diagnostic(Some(DiagnosticCode::Number(1005)), "')' expected.", 5),
+            diagnostic(Some(DiagnosticCode::Number(1005)), "'}' expected.", 5),
+            diagnostic(Some(DiagnosticCode::Number(1005)), "')' expected.", 4),
+            diagnostic(
+                Some(DiagnosticCode::String("1005".to_owned())),
+                "')' expected.",
+                5,
+            ),
+            foreign_source,
+        ];
+
+        let visible = editor.visible_diagnostics().collect::<Vec<_>>();
+        assert_eq!(visible.len(), 4);
+        assert!(
+            visible
+                .iter()
+                .any(|item| item.source.as_deref() == Some("host"))
+        );
+
+        editor.clear_signature_help();
+        assert_eq!(editor.visible_diagnostics().count(), 5);
+    }
+
+    #[test]
+    fn completion_keyboard_selection_navigates_the_complete_result() {
+        fn selection(update: Option<CompletionNavigationUpdate>) -> Option<(usize, usize)> {
+            update.map(|update| (update.selected, update.count))
+        }
+
         let (channel, _, _) = FakeChannel::new();
         let mut editor = AutomationCodeEditor::new(
             FakeSurface::new("console"),
@@ -3244,14 +5662,88 @@ mod tests {
             },
             anchor: SurfacePoint::default(),
             selected: 0,
+            first_visible: 0,
+            scroll_id: iced::widget::Id::unique(),
         });
 
-        for _ in 0..8 {
-            assert!(editor.move_completion_selection(1));
+        for expected in 1..10 {
+            assert_eq!(
+                selection(editor.navigate_completion(CompletionNavigation::Next, 5)),
+                Some((expected, 10))
+            );
         }
-        assert_eq!(editor.results.completion.as_ref().unwrap().selected, 0);
-        assert!(editor.move_completion_selection(-1));
-        assert_eq!(editor.results.completion.as_ref().unwrap().selected, 7);
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::Next, 5)),
+            Some((0, 10))
+        );
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::Previous, 5)),
+            Some((9, 10))
+        );
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::First, 5)),
+            Some((0, 10))
+        );
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::PageDown, 5)),
+            Some((4, 10))
+        );
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::PageUp, 5)),
+            Some((0, 10))
+        );
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::Last, 5)),
+            Some((9, 10))
+        );
+        assert_eq!(
+            selection(editor.navigate_completion(CompletionNavigation::PageUp, 1)),
+            Some((8, 10))
+        );
+    }
+
+    #[test]
+    fn completion_beyond_the_old_eight_row_boundary_applies_normally() {
+        let (channel, _, _) = FakeChannel::new();
+        let mut editor = AutomationCodeEditor::new(
+            FakeSurface::new(""),
+            descriptor(3, 1, "smudgy-inline:///alias/test.ts"),
+            Some(channel),
+        );
+        let current_state = state(editor.document.document);
+        editor.service_state = Some(current_state);
+        editor.results.completion = Some(AcceptedCompletion {
+            identity: DocumentResultIdentity {
+                state: current_state,
+                request_id: number::<RequestId>(61),
+            },
+            result: CompletionResult {
+                is_incomplete: false,
+                items: (1..=20).map(completion_item).collect(),
+            },
+            anchor: SurfacePoint::default(),
+            selected: 0,
+            first_visible: 0,
+            scroll_id: iced::widget::Id::unique(),
+        });
+
+        assert_eq!(
+            editor
+                .navigate_completion(CompletionNavigation::Last, 12)
+                .map(|update| (update.selected, update.count)),
+            Some((19, 20))
+        );
+        assert!(editor.apply_selected_completion().is_some());
+        assert_eq!(editor.content(), "item 20");
+        assert_eq!(
+            editor
+                .pending_signature_help
+                .map(|pending| pending.position),
+            Some(Utf16Position {
+                line: 0,
+                character: 7,
+            })
+        );
     }
 
     #[test]
@@ -3388,18 +5880,26 @@ mod tests {
             },
             anchor: SurfacePoint::default(),
             selected: 0,
+            first_visible: 0,
+            scroll_id: iced::widget::Id::unique(),
         });
         editor.hover_position = Some(Utf16Position::default());
-        editor.results.hover = Some(AcceptedHover {
-            result: HoverResult {
+        let hover_identity = DocumentResultIdentity {
+            state: current_state,
+            request_id: number::<RequestId>(63),
+        };
+        editor.results.hover = Some(AcceptedHover::new(
+            hover_identity,
+            Some(Utf16Position::default()),
+            HoverResult {
                 range: None,
                 contents: MarkupContent {
                     kind: MarkupKind::PlainText,
                     value: "docs".to_owned(),
                 },
             },
-            anchor: SurfacePoint::default(),
-        });
+            SurfacePoint::default(),
+        ));
 
         editor.dismiss_overlays();
 
@@ -4010,6 +6510,8 @@ mod tests {
             service_generation: current_state.service_generation,
             worker_generation: current_state.worker_generation,
         };
+        let hover_identity = install_plain_hover(&mut editor, 98);
+        assert!(editor.hover_overlay_entered(hover_identity));
         editor.apply_service_event(&event(Event::ProjectStatus(ProjectStatusEvent {
             identity: project,
             status: ProjectStatus::Degraded {
@@ -4025,6 +6527,20 @@ mod tests {
         )));
 
         assert_eq!(editor.service_status(), ServiceStatus::Unavailable);
+        assert!(editor.results.hover.is_none());
+        assert!(editor.hover_overlay_interactive.is_none());
+        assert!(editor.pending_hover_dismiss.is_none());
+        editor.observe_hover_intent(
+            HoverIntent {
+                position: ScalarPosition {
+                    line: 0,
+                    character: 1,
+                },
+                anchor: SurfacePoint { x: 16.0, y: 18.0 },
+            },
+            Instant::now(),
+        );
+        assert!(editor.pending_hover.is_some());
         assert!(!editor.request_diagnostics(number::<RequestId>(99)));
     }
 

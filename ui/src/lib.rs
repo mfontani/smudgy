@@ -965,9 +965,13 @@ pub fn run() -> anyhow::Result<()> {
 
     let iced_result = daemon
         .theme(|smudgy: &Smudgy, window_id| {
-            if smudgy.smudgy_windows.contains_key(&window_id) {
+            if smudgy.smudgy_windows.contains_key(&window_id)
+                || smudgy.automations_windows.contains_key(&window_id)
+            {
                 // Palette-aware: re-evaluated per frame, so theme changes in
-                // the Preferences tab apply live.
+                // the Preferences tab apply live. Automations joins the main
+                // windows here so its editor and Smudgy-owned LSP overlays use
+                // one coherent light/dark palette.
                 prefs::app_theme()
             } else {
                 smudgy_theme::secondary()
@@ -4465,6 +4469,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         // out to every live session (scrollback, span
                         // restyle, runtime separator/prefix/logging).
                         prefs::apply(&settings);
+                        for window in smudgy.automations_windows.values_mut() {
+                            window.sync_code_editor_theme();
+                        }
                         let fan_out: Vec<Task<Message>> = smudgy
                             .sessions
                             .iter()
