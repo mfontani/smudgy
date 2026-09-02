@@ -9,6 +9,16 @@
 import type { Matches, SmudgyApi } from "smudgy:core";
 
 declare global {
+  /**
+   * Shared persistent variables inferred from assignments in this user's inline
+   * aliases, triggers, and hotkeys. Known properties are merged into this
+   * interface by the embedded authoring service; dynamic keys retain the
+   * runtime's permissive behavior.
+   */
+  interface SmudgyUserVars {
+    [key: string]: any;
+  }
+
   const echo: SmudgyApi["echo"];
   const style: SmudgyApi["style"];
   const link: SmudgyApi["link"];
@@ -42,7 +52,7 @@ declare global {
   const triggers: SmudgyApi["triggers"];
   const timers: SmudgyApi["timers"];
   const hotkeys: SmudgyApi["hotkeys"];
-  const vars: SmudgyApi["vars"];
+  const vars: SmudgyUserVars;
   const line: SmudgyApi["line"];
   const buffer: SmudgyApi["buffer"];
   const submission: SmudgyApi["submission"];

@@ -1037,6 +1037,167 @@ mod tests {
         .expect("valid project file")
     }
 
+    fn inline_bridge(byte: u8) -> ProjectFile {
+        file(
+            byte,
+            "/projects/1/1/inline/context.d.ts",
+            Language::TypeScript,
+            concat!(
+                "export {};\n",
+                "declare global {\n",
+                "  interface SmudgyUserVars { [key: string]: any; }\n",
+                "  const vars: SmudgyUserVars;\n",
+                "}\n",
+            ),
+        )
+    }
+
+    #[test]
+    fn inline_project_shares_global_and_inferred_vars_state_across_scripts() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![
+                inline_bridge(1),
+                file(
+                    2,
+                    "/projects/1/1/inline/aliases/setup.js",
+                    Language::JavaScript,
+                    concat!(
+                        "class Target { name = \"goblin\"; }\n",
+                        "globalThis.rounds = 1;\n",
+                        "vars.target = \"goblin\";\n",
+                        "vars.targetObject = new Target();\n",
+                    ),
+                ),
+                file(
+                    3,
+                    "/projects/1/1/inline/hotkeys/use.js",
+                    Language::JavaScript,
+                    concat!(
+                        "globalThis.rounds.toUpperCase();\n",
+                        "vars.target.toFixed();\n",
+                        "vars.targetObject.name.toFixed();\n",
+                        "vars.ta\n",
+                    ),
+                ),
+            ])
+            .expect("open inline project");
+
+        let diagnostics = service
+            .diagnostics(document_id(3))
+            .expect("inline diagnostics");
+        assert!(diagnostics.items.iter().any(|item| {
+            item.code == Some(DiagnosticCode::Number(2339)) && item.message.contains("toUpperCase")
+        }));
+        assert!(diagnostics.items.iter().any(|item| {
+            item.code == Some(DiagnosticCode::Number(2551)) && item.message.contains("toFixed")
+        }));
+        assert!(
+            diagnostics
+                .items
+                .iter()
+                .filter(|item| item.message.contains("toFixed"))
+                .count()
+                >= 2,
+            "a source-local class assigned to vars must be represented structurally"
+        );
+        let completion = service
+            .completion(
+                document_id(3),
+                Utf16Position {
+                    line: 3,
+                    character: 7,
+                },
+            )
+            .expect("inferred vars completion");
+        assert!(
+            completion.items.iter().any(|item| item.label == "target"),
+            "an inferred vars property must complete in another inline script"
+        );
+
+        service
+            .replace_project(vec![
+                inline_bridge(1),
+                file(
+                    2,
+                    "/projects/1/1/inline/aliases/setup.js",
+                    Language::JavaScript,
+                    "globalThis.rounds = 1; vars.target = 42;\n",
+                ),
+                file(
+                    3,
+                    "/projects/1/1/inline/hotkeys/use.js",
+                    Language::JavaScript,
+                    "vars.target.toUpperCase();\n",
+                ),
+            ])
+            .expect("replace inferred vars state");
+        let diagnostics = service
+            .diagnostics(document_id(3))
+            .expect("updated inline diagnostics");
+        assert!(diagnostics.items.iter().any(|item| {
+            item.code == Some(DiagnosticCode::Number(2339)) && item.message.contains("toUpperCase")
+        }));
+    }
+
+    #[test]
+    fn inline_project_rejects_module_syntax_and_top_level_await_only() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![
+                inline_bridge(1),
+                file(
+                    2,
+                    "/projects/1/1/inline/triggers/body.js",
+                    Language::JavaScript,
+                    concat!(
+                        "import { echo } from \"smudgy:core\";\n",
+                        "export const value = 1;\n",
+                        "void import.meta.url;\n",
+                        "void import(\"smudgy:core\");\n",
+                        "await Promise.resolve();\n",
+                        "async function allowed() { await Promise.resolve(); }\n",
+                    ),
+                ),
+            ])
+            .expect("open inline syntax project");
+        let diagnostics = service
+            .diagnostics(document_id(2))
+            .expect("inline syntax diagnostics");
+        assert_eq!(
+            diagnostics
+                .items
+                .iter()
+                .filter(|item| item.code == Some(DiagnosticCode::Number(97001)))
+                .count(),
+            3,
+        );
+        assert_eq!(
+            diagnostics
+                .items
+                .iter()
+                .filter(|item| item.code == Some(DiagnosticCode::Number(97002)))
+                .count(),
+            1,
+        );
+
+        service
+            .replace_project(vec![file(
+                3,
+                "/projects/1/1/modules/body.js",
+                Language::JavaScript,
+                "export const value = await Promise.resolve(1);\n",
+            )])
+            .expect("open module project");
+        let diagnostics = service
+            .diagnostics(document_id(3))
+            .expect("module diagnostics");
+        assert!(diagnostics.items.iter().all(|item| {
+            item.code != Some(DiagnosticCode::Number(97001))
+                && item.code != Some(DiagnosticCode::Number(97002))
+        }));
+    }
+
     #[test]
     fn embedded_service_provides_project_aware_typescript_intelligence() {
         let mut service = EmbeddedLanguageService::new().expect("boot language service");
@@ -1761,6 +1922,46 @@ mod tests {
                 .iter()
                 .any(|item| item.code == Some(DiagnosticCode::Number(2307))),
             "every explicitly materialized static and dynamic target must resolve"
+        );
+    }
+
+    #[test]
+    fn runtime_package_specifiers_do_not_report_false_missing_module_diagnostics() {
+        let mut service = EmbeddedLanguageService::new().expect("boot language service");
+        service
+            .replace_project(vec![file(
+                17,
+                "/projects/7/8/modules/packages.ts",
+                Language::TypeScript,
+                concat!(
+                    "import npmPackage from \"npm:example@1\";\n",
+                    "import * as jsrPackage from \"jsr:@scope/example@1\";\n",
+                    "import { packageValue } from \"smudgy://owner/example\";\n",
+                    "void import(\"npm:dynamic-example@1\");\n",
+                    "void import(\"jsr:@scope/dynamic-example@1\");\n",
+                    "void import(\"smudgy://owner/dynamic-example\");\n",
+                    "void npmPackage; void jsrPackage; void packageValue;\n",
+                    "void import(\"./actually-missing.ts\");\n",
+                ),
+            )])
+            .expect("open runtime-package import project");
+
+        let diagnostics = service
+            .diagnostics(document_id(17))
+            .expect("runtime-package diagnostics");
+        let missing_modules = diagnostics
+            .items
+            .iter()
+            .filter(|item| item.code == Some(DiagnosticCode::Number(2307)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing_modules.len(),
+            1,
+            "runtime-resolved package schemes must not inherit TypeScript's false TS2307"
+        );
+        assert!(
+            missing_modules[0].message.contains("./actually-missing.ts"),
+            "real missing relative modules must remain actionable"
         );
     }
 

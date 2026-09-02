@@ -1240,6 +1240,13 @@ impl AutomationsWindow {
             Message::ScriptsLoaded(scripts, errors) => {
                 self.scripts = scripts;
                 self.merge_folders();
+                if self
+                    .language_project_context_matches(&code_editor::LanguageProjectContext::Inline)
+                {
+                    self.language_project_target_context =
+                        Some(code_editor::LanguageProjectContext::Inline);
+                    self.refresh_language_project();
+                }
                 if errors.is_empty() {
                     Update::none()
                 } else {

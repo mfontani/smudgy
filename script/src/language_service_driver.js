@@ -35,6 +35,10 @@
   });
   const MAX_SIGNATURE_HELP_PARAMETERS = 256;
   const MAX_SIGNATURE_HELP_COUNT = 0xffff;
+  const MAX_INFERRED_VAR_PROPERTIES = 500;
+  const MAX_INFERRED_VAR_TYPE_LENGTH = 2048;
+  const INLINE_MODULE_SYNTAX_CODE = 97001;
+  const INLINE_TOP_LEVEL_AWAIT_CODE = 97002;
 
   function normalize(fileName) {
     let value = String(fileName).replace(/\\/g, "/");
@@ -177,6 +181,291 @@
       });
     }
     return Object.freeze(next);
+  }
+
+  function inlineProjectRoot(table) {
+    for (const name of Object.keys(table)) {
+      const match = /^(\/projects\/[^/]+\/[^/]+\/)inline\/context\.d\.ts$/.exec(name);
+      if (match) return match[1];
+    }
+    return undefined;
+  }
+
+  function inlineSourceFiles(program, projectRoot) {
+    return program.getSourceFiles().filter((sourceFile) =>
+      sourceFile.fileName.startsWith(projectRoot) &&
+      documents[normalize(sourceFile.fileName)] &&
+      !sourceFile.fileName.endsWith(".d.ts") &&
+      !sourceFile.fileName.endsWith(".d.mts") &&
+      !sourceFile.fileName.endsWith(".d.cts")
+    );
+  }
+
+  function varsPropertyWrite(node) {
+    if (!ts.isBinaryExpression(node)) return undefined;
+    if (
+      node.operatorToken.kind !== ts.SyntaxKind.EqualsToken &&
+      node.operatorToken.kind !== ts.SyntaxKind.QuestionQuestionEqualsToken &&
+      node.operatorToken.kind !== ts.SyntaxKind.BarBarEqualsToken &&
+      node.operatorToken.kind !== ts.SyntaxKind.AmpersandAmpersandEqualsToken
+    ) {
+      return undefined;
+    }
+    const target = node.left;
+    if (ts.isPropertyAccessExpression(target) && ts.isIdentifier(target.expression)) {
+      return target.expression.text === "vars"
+        ? { receiver: target.expression, name: target.name.text, value: node.right }
+        : undefined;
+    }
+    if (
+      ts.isElementAccessExpression(target) &&
+      ts.isIdentifier(target.expression) &&
+      target.expression.text === "vars" &&
+      target.argumentExpression &&
+      (ts.isStringLiteralLike(target.argumentExpression) ||
+        ts.isNumericLiteral(target.argumentExpression))
+    ) {
+      return {
+        receiver: target.expression,
+        name: target.argumentExpression.text,
+        value: node.right,
+      };
+    }
+    return undefined;
+  }
+
+  function isInlineVarsSymbol(checker, receiver, projectRoot) {
+    const symbol = checker.getSymbolAtLocation(receiver);
+    return !!symbol && (symbol.declarations || []).some((declaration) =>
+      normalize(declaration.getSourceFile().fileName) === projectRoot + "inline/context.d.ts"
+    );
+  }
+
+  function projectLocalSymbol(symbol, projectRoot) {
+    return !!symbol && (symbol.declarations || []).some((declaration) => {
+      const fileName = normalize(declaration.getSourceFile().fileName);
+      return fileName.startsWith(projectRoot) && !declaration.getSourceFile().isDeclarationFile;
+    });
+  }
+
+  function portableTypeText(checker, type, location, projectRoot, seen, depth) {
+    if (depth > 6 || seen.has(type)) return "unknown";
+    if (type.isUnion && type.isUnion()) {
+      return type.types.map((part) =>
+        portableTypeText(checker, part, location, projectRoot, seen, depth + 1)
+      ).join(" | ");
+    }
+    if (type.isIntersection && type.isIntersection()) {
+      return type.types.map((part) =>
+        portableTypeText(checker, part, location, projectRoot, seen, depth + 1)
+      ).join(" & ");
+    }
+    if (checker.isArrayType && checker.isArrayType(type)) {
+      const element = checker.getTypeArguments(type)[0];
+      const text = portableTypeText(checker, element, location, projectRoot, seen, depth + 1);
+      return `Array<${text}>`;
+    }
+    const symbol = type.aliasSymbol || type.symbol;
+    if (projectLocalSymbol(symbol, projectRoot)) {
+      seen.add(type);
+      const members = checker.getPropertiesOfType(type).slice(0, 64).map((property) => {
+        const propertyType = checker.getTypeOfSymbolAtLocation(property, location);
+        const propertyText = portableTypeText(
+          checker,
+          propertyType,
+          location,
+          projectRoot,
+          seen,
+          depth + 1,
+        );
+        const optional = property.flags & ts.SymbolFlags.Optional ? "?" : "";
+        return `${JSON.stringify(property.getName())}${optional}: ${propertyText};`;
+      });
+      seen.delete(type);
+      return members.length === 0 ? "unknown" : `{ ${members.join(" ")} }`;
+    }
+    const typeArguments = type.aliasTypeArguments || type.typeArguments;
+    if (
+      typeArguments && typeArguments.length > 0 &&
+      typeArguments.some((argument) => projectLocalSymbol(argument.aliasSymbol || argument.symbol, projectRoot))
+    ) {
+      const name = symbol && symbol.getName();
+      if (name && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
+        const argumentsText = typeArguments.map((argument) =>
+          portableTypeText(checker, argument, location, projectRoot, seen, depth + 1)
+        ).join(", ");
+        return `${name}<${argumentsText}>`;
+      }
+      return "unknown";
+    }
+    return checker.typeToString(
+      type,
+      location,
+      ts.TypeFormatFlags.NoTruncation |
+        ts.TypeFormatFlags.UseStructuralFallback |
+        ts.TypeFormatFlags.WriteClassExpressionAsTypeLiteral |
+        ts.TypeFormatFlags.UseTypeOfFunction,
+    );
+  }
+
+  function inferredVarsDeclaration(program, projectRoot) {
+    const checker = program.getTypeChecker();
+    const properties = new Map();
+    for (const sourceFile of inlineSourceFiles(program, projectRoot)) {
+      const visit = (node) => {
+        const write = varsPropertyWrite(node);
+        if (write && isInlineVarsSymbol(checker, write.receiver, projectRoot)) {
+          let type = checker.getTypeAtLocation(write.value);
+          if (typeof checker.getWidenedType === "function") {
+            type = checker.getWidenedType(type);
+          }
+          const text = portableTypeText(
+            checker,
+            type,
+            write.value,
+            projectRoot,
+            new Set(),
+            0,
+          );
+          if (text && text.length <= MAX_INFERRED_VAR_TYPE_LENGTH) {
+            let types = properties.get(write.name);
+            if (!types) {
+              if (properties.size === MAX_INFERRED_VAR_PROPERTIES) return;
+              types = new Set();
+              properties.set(write.name, types);
+            }
+            types.add(text);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+    }
+    if (properties.size === 0) return undefined;
+    const members = Array.from(properties.entries())
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, types]) =>
+        `    ${JSON.stringify(name)}: ${Array.from(types).sort().join(" | ")};`
+      )
+      .join("\n");
+    return `export {};\ndeclare global {\n  interface SmudgyUserVars {\n${members}\n  }\n}\n`;
+  }
+
+  function hasExportModifier(node) {
+    return !!node.modifiers && node.modifiers.some((modifier) =>
+      modifier.kind === ts.SyntaxKind.ExportKeyword ||
+      modifier.kind === ts.SyntaxKind.DefaultKeyword
+    );
+  }
+
+  function inlineRuntimeDiagnostics(fileName) {
+    const projectRoot = inlineProjectRoot(documents);
+    const sourceFile = service.getProgram() && service.getProgram().getSourceFile(fileName);
+    if (
+      !projectRoot || !sourceFile ||
+      !sourceFile.fileName.startsWith(projectRoot) ||
+      !documents[normalize(sourceFile.fileName)] ||
+      sourceFile.isDeclarationFile
+    ) {
+      return [];
+    }
+    const values = [];
+    const add = (node, code, messageText) => values.push({
+      file: sourceFile,
+      start: node.getStart(sourceFile),
+      length: Math.max(1, node.getWidth(sourceFile)),
+      category: ts.DiagnosticCategory.Error,
+      code,
+      messageText,
+    });
+    for (const statement of sourceFile.statements) {
+      if (
+        ts.isImportDeclaration(statement) ||
+        ts.isImportEqualsDeclaration(statement) ||
+        ts.isExportDeclaration(statement) ||
+        ts.isExportAssignment(statement) ||
+        hasExportModifier(statement)
+      ) {
+        add(
+          statement,
+          INLINE_MODULE_SYNTAX_CODE,
+          "Static imports and exports are unavailable in inline automations; move this code to a module or package.",
+        );
+      }
+    }
+    const visitImportMeta = (node) => {
+      if (
+        ts.isMetaProperty(node) &&
+        node.keywordToken === ts.SyntaxKind.ImportKeyword
+      ) {
+        add(
+          node,
+          INLINE_MODULE_SYNTAX_CODE,
+          "import.meta is unavailable in inline automations; move this code to a module or package.",
+        );
+        return;
+      }
+      ts.forEachChild(node, visitImportMeta);
+    };
+    visitImportMeta(sourceFile);
+    const visitAwait = (node) => {
+      if (node !== sourceFile && ts.isFunctionLike(node)) return;
+      if (
+        ts.isAwaitExpression(node) ||
+        (ts.isForOfStatement(node) && node.awaitModifier) ||
+        (ts.isVariableDeclarationList(node) && ts.isVarAwaitUsing(node))
+      ) {
+        add(
+          node,
+          INLINE_TOP_LEVEL_AWAIT_CODE,
+          "Top-level await is unavailable in inline automations; move this code to an async function, module, or package.",
+        );
+        return;
+      }
+      ts.forEachChild(node, visitAwait);
+    };
+    visitAwait(sourceFile);
+    return values;
+  }
+
+  function isRuntimePackageSpecifier(value) {
+    return (value.startsWith("npm:") && value.length > "npm:".length) ||
+      (value.startsWith("jsr:") && value.length > "jsr:".length) ||
+      (value.startsWith("smudgy://") && value.length > "smudgy://".length);
+  }
+
+  function stringLiteralAtPosition(sourceFile, position) {
+    let found;
+    const visit = (node) => {
+      if (found || position < node.getFullStart() || position >= node.end) return;
+      if (ts.isStringLiteralLike(node)) {
+        found = node;
+        return;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    return found;
+  }
+
+  function isRuntimePackageMissingModuleDiagnostic(value, sourceFile) {
+    if (value.code !== 2307 || !sourceFile || typeof value.start !== "number") return false;
+    const literal = stringLiteralAtPosition(sourceFile, value.start);
+    return !!literal && isRuntimePackageSpecifier(literal.text);
+  }
+
+  function authoredDiagnostics(fileName) {
+    const program = service.getProgram();
+    const sourceFile = program && program.getSourceFile(fileName);
+    // npm:, jsr:, and smudgy:// are resolved asynchronously by Smudgy's runtime. This
+    // synchronous, snapshot-only TypeScript host cannot ask those resolvers to fetch a
+    // package, so TS2307 would be a false claim that valid runtime syntax is missing.
+    // Exact ambient/package declarations still participate normally and provide their
+    // completion, hover, and definition information; every other diagnostic is retained.
+    return service.getSyntacticDiagnostics(fileName)
+      .concat(service.getSemanticDiagnostics(fileName))
+      .concat(service.getSuggestionDiagnostics(fileName))
+      .filter((value) => !isRuntimePackageMissingModuleDiagnostic(value, sourceFile));
   }
 
   function lineTerminatorLength(text, index) {
@@ -565,7 +854,22 @@
         )).sort());
         projectVersion += 1;
         // Force TypeScript to observe the new immutable snapshot before acknowledging it.
-        service.getProgram();
+        const program = service.getProgram();
+        const projectRoot = inlineProjectRoot(documents);
+        const varsDeclaration = projectRoot && program &&
+          inferredVarsDeclaration(program, projectRoot);
+        if (varsDeclaration) {
+          const generatedName = projectRoot + "inline/vars.generated.d.ts";
+          documents = makeTable({
+            ...(params.files || {}),
+            [generatedName]: varsDeclaration,
+          }, documents);
+          roots = Object.freeze(Array.from(new Set(
+            libraryRoots.concat(Object.keys(documents)),
+          )).sort());
+          projectVersion += 1;
+          service.getProgram();
+        }
       } catch (error) {
         documents = previousDocuments;
         roots = previousRoots;
@@ -582,9 +886,8 @@
     }
     if (method === "diagnostics") {
       const fileName = normalize(params.fileName);
-      const values = service.getSyntacticDiagnostics(fileName)
-        .concat(service.getSemanticDiagnostics(fileName))
-        .concat(service.getSuggestionDiagnostics(fileName));
+      const values = authoredDiagnostics(fileName)
+        .concat(inlineRuntimeDiagnostics(fileName));
       return { diagnostics: values.map(diagnostic) };
     }
     if (method === "completion") {

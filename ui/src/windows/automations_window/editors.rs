@@ -859,6 +859,11 @@ impl AutomationsWindow {
         if saved_code {
             self.mark_code_editor_saved();
         }
+        if self.language_project_context_matches(&code_editor::LanguageProjectContext::Inline) {
+            self.language_project_target_context =
+                Some(code_editor::LanguageProjectContext::Inline);
+            self.refresh_language_project();
+        }
         // Alias and trigger action tabs are alternative persisted bodies. Once
         // one is saved, discard the opposite draft so it cannot reappear as
         // stale user-authored content after another tab switch.
@@ -934,6 +939,11 @@ impl AutomationsWindow {
         }
         self.dirty = false;
         self.clear_code_editor();
+        if self.language_project_context_matches(&code_editor::LanguageProjectContext::Inline) {
+            self.language_project_target_context =
+                Some(code_editor::LanguageProjectContext::Inline);
+            self.refresh_language_project();
+        }
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
         let toast = self.show_toast(crate::i18n::t!("editor-deleted", "name" => original));

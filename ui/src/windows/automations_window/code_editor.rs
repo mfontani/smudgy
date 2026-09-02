@@ -189,7 +189,7 @@ impl LanguageServiceChannel for LanguageServiceClient {
 }
 
 /// Semantic kind of the single writable code document mounted in this window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum CodeDocument {
     Alias,
     Trigger,
@@ -210,7 +210,16 @@ pub(super) enum LanguageProjectContext {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum LanguageSourceKey {
     Module(String),
-    OwnedPackage { package: String, subpath: String },
+    OwnedPackage {
+        package: String,
+        subpath: String,
+    },
+    InlineAutomation {
+        kind: CodeDocument,
+        language: Language,
+        folder_name: Option<String>,
+        script_name: String,
+    },
     InlineBridge,
 }
 
@@ -3327,6 +3336,9 @@ impl super::AutomationsWindow {
                 Some(LanguageProjectContext::OwnedPackage(current)),
                 LanguageSourceKey::OwnedPackage { package, .. },
             ) => current == package,
+            (Some(LanguageProjectContext::Inline), LanguageSourceKey::InlineAutomation { .. }) => {
+                true
+            }
             _ => false,
         }
     }
@@ -3371,6 +3383,14 @@ impl super::AutomationsWindow {
             LanguageSourceKey::OwnedPackage { .. } | LanguageSourceKey::InlineBridge => {
                 return (crate::update::Update::none(), false);
             }
+            LanguageSourceKey::InlineAutomation {
+                folder_name,
+                script_name,
+                ..
+            } => self.open_script(super::model::ScriptKey {
+                folder_name,
+                script_name,
+            }),
         };
         let left_origin = !self.code_editor.as_ref().is_some_and(|editor| {
             editor.document().document.key.document_id == origin_document_id
@@ -3643,19 +3663,24 @@ impl super::AutomationsWindow {
         let mut pending = Vec::new();
         let mut total_bytes = 0_usize;
         match context {
-            // Inline automations are classic scripts compiled without a relative/bare module
-            // referrer. Keep their graph isolated: the inline-only bridge is scoped to this
-            // project, absolute ambient modules such as node: and smudgy: come from managed
-            // declarations, and relative import() remains unsupported exactly as it is at
-            // runtime.
-            LanguageProjectContext::Inline => pending.push(PendingProjectSource {
-                key: LanguageSourceKey::InlineBridge,
-                uri: "smudgy-project:///inline/context.d.ts".to_owned(),
-                language: Language::TypeScript,
-                kind: DocumentKind::Generated,
-                text: smudgy_core::models::script_typings::language_service_inline_bridge()
-                    .to_owned(),
-            }),
+            // Inline automations are isolated lexical bodies in one shared main-isolate global
+            // context. Install every saved inline body so globalThis and inferred vars state can
+            // cross aliases/triggers/hotkeys, while keeping the graph separate from modules and
+            // packages. Absolute ambient modules such as node: and smudgy: still come from the
+            // managed declarations.
+            LanguageProjectContext::Inline => {
+                let bridge = smudgy_core::models::script_typings::language_service_inline_bridge()
+                    .to_owned();
+                total_bytes = bridge.len();
+                pending.push(PendingProjectSource {
+                    key: LanguageSourceKey::InlineBridge,
+                    uri: "smudgy-project:///inline/context.d.ts".to_owned(),
+                    language: Language::TypeScript,
+                    kind: DocumentKind::Generated,
+                    text: bridge,
+                });
+                collect_inline_project_sources(&self.scripts, None, &mut pending, &mut total_bytes);
+            }
             LanguageProjectContext::Modules => {
                 for module in &self.modules {
                     if pending.len() == MAX_PROJECT_SOURCE_FILES {
@@ -3772,7 +3797,7 @@ impl super::AutomationsWindow {
         language: Language,
         kind: CodeDocument,
     ) -> DocumentDescriptor {
-        let logical = logical_editor_source(self, kind);
+        let logical = logical_editor_source(self, language, kind);
         let (document_id, uri) = logical.map_or_else(
             || {
                 let document_id = allocate_document_id();
@@ -3886,6 +3911,7 @@ fn language_project_context(
 
 fn logical_editor_source(
     window: &super::AutomationsWindow,
+    language: Language,
     kind: CodeDocument,
 ) -> Option<(LanguageSourceKey, String)> {
     match kind {
@@ -3903,7 +3929,19 @@ fn logical_editor_source(
             let uri = owned_package_source_uri(&package, &subpath)?;
             Some((LanguageSourceKey::OwnedPackage { package, subpath }, uri))
         }
-        CodeDocument::Alias | CodeDocument::Trigger | CodeDocument::Hotkey => None,
+        CodeDocument::Alias | CodeDocument::Trigger | CodeDocument::Hotkey => {
+            let super::Selection::Script(key) = &window.selection else {
+                return None;
+            };
+            let source_key = LanguageSourceKey::InlineAutomation {
+                kind,
+                language,
+                folder_name: key.folder_name.clone(),
+                script_name: key.script_name.clone(),
+            };
+            let uri = language_source_key_uri(&source_key)?;
+            Some((source_key, uri))
+        }
     }
 }
 
@@ -3924,7 +3962,102 @@ fn language_source_key_uri(key: &LanguageSourceKey) -> Option<String> {
         LanguageSourceKey::OwnedPackage { package, subpath } => {
             owned_package_source_uri(package, subpath)
         }
+        LanguageSourceKey::InlineAutomation {
+            kind,
+            language,
+            folder_name,
+            script_name,
+        } => inline_automation_source_uri(*kind, *language, folder_name.as_deref(), script_name),
         LanguageSourceKey::InlineBridge => Some("smudgy-project:///inline/context.d.ts".to_owned()),
+    }
+}
+
+fn inline_automation_source_uri(
+    kind: CodeDocument,
+    language: Language,
+    folder_name: Option<&str>,
+    script_name: &str,
+) -> Option<String> {
+    let kind = match kind {
+        CodeDocument::Alias => "aliases",
+        CodeDocument::Trigger => "triggers",
+        CodeDocument::Hotkey => "hotkeys",
+        CodeDocument::StandaloneModule | CodeDocument::OwnedPackage => return None,
+    };
+    let extension = language_extension(language);
+    let mut uri = url::Url::parse("smudgy-project:///").ok()?;
+    let mut segments = uri.path_segments_mut().ok()?;
+    segments.push("inline").push(kind);
+    if let Some(folder_name) = folder_name.filter(|folder| !folder.is_empty()) {
+        for segment in folder_name.split('/') {
+            segments.push(segment);
+        }
+    }
+    segments.push(&format!("{script_name}.{extension}"));
+    drop(segments);
+    Some(uri.into())
+}
+
+fn collect_inline_project_sources(
+    scripts: &std::collections::BTreeMap<String, super::model::Script>,
+    folder_name: Option<&str>,
+    pending: &mut Vec<PendingProjectSource>,
+    total_bytes: &mut usize,
+) {
+    for (script_name, script) in scripts {
+        if pending.len() == MAX_PROJECT_SOURCE_FILES {
+            return;
+        }
+        if let super::model::Script::Folder(_, children) = script {
+            let child_folder = folder_name.map_or_else(
+                || script_name.clone(),
+                |folder| format!("{folder}/{script_name}"),
+            );
+            collect_inline_project_sources(children, Some(&child_folder), pending, total_bytes);
+            continue;
+        }
+        let (kind, language, text) = match script {
+            super::model::Script::Alias(definition) => (
+                CodeDocument::Alias,
+                script_language(definition.language),
+                definition.script.as_deref(),
+            ),
+            super::model::Script::Trigger(definition) => (
+                CodeDocument::Trigger,
+                script_language(definition.language),
+                definition.script.as_deref(),
+            ),
+            super::model::Script::Hotkey(definition) => (
+                CodeDocument::Hotkey,
+                script_language(definition.language),
+                definition.script.as_deref(),
+            ),
+            super::model::Script::Folder(_, _) => unreachable!(),
+        };
+        let Some(text) = text.filter(|_| supports_language_service(language)) else {
+            continue;
+        };
+        let remaining = MAX_PROJECT_SOURCE_TEXT_BYTES.saturating_sub(*total_bytes);
+        if text.len() > MAX_DOCUMENT_BYTES.min(remaining) || validate_document_text(text).is_err() {
+            continue;
+        }
+        let key = LanguageSourceKey::InlineAutomation {
+            kind,
+            language,
+            folder_name: folder_name.map(str::to_owned),
+            script_name: script_name.clone(),
+        };
+        let Some(uri) = language_source_key_uri(&key) else {
+            continue;
+        };
+        *total_bytes += text.len();
+        pending.push(PendingProjectSource {
+            key,
+            uri,
+            language,
+            kind: DocumentKind::Dependency,
+            text: text.to_owned(),
+        });
     }
 }
 
@@ -7075,5 +7208,77 @@ mod tests {
         );
         assert_eq!(window.language_project_context, Some(retry.context));
         assert!(window.pending_language_project_refresh.is_none());
+    }
+}
+
+#[cfg(test)]
+mod inline_project_tests {
+    use super::*;
+
+    #[test]
+    fn inline_project_sources_share_saved_bodies_and_overlay_the_selected_script() {
+        use smudgy_core::models::{ScriptLang, aliases, triggers};
+
+        let mut window = super::super::AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "inline-shared-state-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.scripts.insert(
+            "Combat #1".to_owned(),
+            super::super::model::Script::Alias(aliases::AliasDefinition {
+                pattern: "^combat$".to_owned(),
+                script: Some("globalThis.rounds = 1; vars.target = \"goblin\";".to_owned()),
+                package: None,
+                enabled: true,
+                priority: 0,
+                fallthrough: true,
+                allow_self_match: false,
+                language: ScriptLang::JS,
+                matcher: None,
+            }),
+        );
+        let mut children = std::collections::BTreeMap::new();
+        children.insert(
+            "Status".to_owned(),
+            super::super::model::Script::Trigger(triggers::TriggerDefinition {
+                script: Some("vars.target.toUpperCase();".to_owned()),
+                package: Some("Nested Folder".to_owned()),
+                language: ScriptLang::TS,
+                ..triggers::TriggerDefinition::default()
+            }),
+        );
+        window.scripts.insert(
+            "Nested Folder".to_owned(),
+            super::super::model::Script::Folder(true, children),
+        );
+
+        let sources = window.language_project_sources(&LanguageProjectContext::Inline);
+        assert_eq!(sources.len(), 3);
+        let alias = sources
+            .iter()
+            .find(|source| source.text.contains("globalThis.rounds"))
+            .expect("saved alias source");
+        assert_eq!(alias.language, Language::JavaScript);
+        assert!(alias.uri.contains("/inline/aliases/Combat%20%231.js"));
+        let trigger = sources
+            .iter()
+            .find(|source| source.text.contains("toUpperCase"))
+            .expect("saved trigger source");
+        assert_eq!(trigger.language, Language::TypeScript);
+        assert!(
+            trigger
+                .uri
+                .contains("/inline/triggers/Nested%20Folder/Status.ts")
+        );
+
+        window.selection = super::super::Selection::Script(super::super::model::ScriptKey {
+            folder_name: None,
+            script_name: "Combat #1".to_owned(),
+        });
+        let descriptor = window.code_document_descriptor(Language::JavaScript, CodeDocument::Alias);
+        assert_eq!(descriptor.document.key.document_id, alias.document_id);
+        assert_eq!(descriptor.uri, alias.uri);
     }
 }
