@@ -390,16 +390,42 @@ fn send_event(
     };
     if let Err(error) = envelope.validate() {
         log::error!("language-service worker produced an invalid event: {error}");
-        envelope.event = Event::RequestFailed(RequestFailure {
-            scope: FailureScope::Worker { worker_generation },
-            code: "invalid_language_service_result".to_owned(),
-            retryable: true,
-            user_message: "Language intelligence returned an invalid result.".to_owned(),
-            log_detail: Some(error.to_string()),
-        });
+        let failure = |scope| {
+            Event::RequestFailed(RequestFailure {
+                scope,
+                code: "invalid_language_service_result".to_owned(),
+                retryable: true,
+                user_message: "Language intelligence returned an invalid result.".to_owned(),
+                log_detail: Some(error.to_string()),
+            })
+        };
+        // An oversized or malformed result fails only the request that
+        // produced it. The document stays open and every other request keeps
+        // working; only an event without a request identity falls back to the
+        // whole worker.
+        envelope.event = failure(invalid_result_scope(&envelope.event, worker_generation));
+        if envelope.validate().is_err() {
+            envelope.event = failure(FailureScope::Worker { worker_generation });
+        }
         debug_assert!(envelope.validate().is_ok());
     }
     events.send(envelope).is_ok()
+}
+
+/// Narrowest scope a rejected outbound event can be reported under.
+fn invalid_result_scope(event: &Event, worker_generation: WorkerGeneration) -> FailureScope {
+    match event {
+        Event::Diagnostics(result) => FailureScope::Document(result.identity),
+        Event::Completion(result) => FailureScope::Document(result.identity),
+        Event::Hover(result) => FailureScope::Document(result.identity),
+        Event::SignatureHelp(result) => FailureScope::Document(result.identity),
+        Event::Definition(result) => FailureScope::Document(result.identity),
+        Event::Formatting(result) => FailureScope::Document(result.identity),
+        Event::StateAcknowledged(_)
+        | Event::ProjectStatus(_)
+        | Event::WorkerRestarted { .. }
+        | Event::RequestFailed(_) => FailureScope::Worker { worker_generation },
+    }
 }
 
 fn allocate_worker_generation() -> WorkerGeneration {
@@ -727,14 +753,13 @@ impl WorkerState {
         let key = command.descriptor.document.key;
         self.require_project(key.project)?;
         self.require_attached_view(key.project, command.descriptor.document.view)?;
-        if self.documents.contains_key(&key) {
-            bail!(
-                "language-service document {} is already open",
-                key.document_id
-            );
-        }
         let file_name = vfs_file_name(&command.descriptor)?;
-        self.documents.insert(
+        // The parent owns document lifetime and resynchronizes with a fresh
+        // open whenever it can no longer verify what this side holds. An open
+        // for a key already held therefore replaces the held snapshot;
+        // rejecting it would leave the two sides disagreeing until the editor
+        // closes.
+        let previous = self.documents.insert(
             key,
             OpenedDocument {
                 descriptor: command.descriptor,
@@ -743,7 +768,14 @@ impl WorkerState {
             },
         );
         if let Err(error) = self.sync_engine_project(key.project) {
-            self.documents.remove(&key);
+            match previous {
+                Some(previous) => {
+                    self.documents.insert(key, previous);
+                }
+                None => {
+                    self.documents.remove(&key);
+                }
+            }
             return Err(error).context("open language-service document");
         }
         let state = self.document_identity(key)?;
@@ -1255,6 +1287,118 @@ mod tests {
     }
 
     #[test]
+    fn reopening_a_held_document_replaces_its_snapshot() {
+        let mut host = LanguageServiceHost::spawn();
+        let descriptor = descriptor();
+        host.client()
+            .send(Command::OpenProject(OpenProject {
+                project: descriptor.document.key.project,
+            }))
+            .expect("queue open project");
+        wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::ProjectOpened(_))
+            )
+        });
+        host.client()
+            .send(Command::OpenDocument(OpenDocument {
+                descriptor: descriptor.clone(),
+                text: "const value: number = 1;\n".to_owned(),
+            }))
+            .expect("queue first open");
+        wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::DocumentOpened(_))
+            )
+        });
+
+        // The parent lost track of what the worker holds and resynchronizes
+        // with a fresh snapshot under a newer version. The worker adopts it
+        // instead of rejecting the key as already open.
+        let mut reopened = descriptor.clone();
+        reopened.document.version = number::<DocumentVersion>(7);
+        host.client()
+            .send(Command::OpenDocument(OpenDocument {
+                descriptor: reopened.clone(),
+                text: "const value: number = \"wrong\";\n".to_owned(),
+            }))
+            .expect("queue second open");
+        let opened = wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state))
+                    if state.document == reopened.document
+            )
+        });
+        let Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state)) = opened.event
+        else {
+            unreachable!();
+        };
+
+        let request_id = number::<RequestId>(9);
+        host.client()
+            .send(Command::RequestDiagnostics(
+                crate::language_service::DocumentRequest {
+                    identity: DocumentResultIdentity { state, request_id },
+                },
+            ))
+            .expect("queue diagnostics");
+        let result = wait_for(&mut host, |event| matches!(event, Event::Diagnostics(_)));
+        let Event::Diagnostics(result) = result.event else {
+            unreachable!();
+        };
+        assert_eq!(result.identity.state.document, reopened.document);
+        assert!(
+            result
+                .result
+                .items
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(DiagnosticCode::Number(2322))),
+            "diagnostics must describe the replacement snapshot"
+        );
+        host.shutdown().expect("worker must shut down cleanly");
+    }
+
+    #[test]
+    fn invalid_results_fail_only_the_request_that_produced_them() {
+        let worker_generation = allocate_worker_generation();
+        let identity = DocumentResultIdentity {
+            state: DocumentStateIdentity {
+                document: descriptor().document,
+                graph_generation: number(1),
+                service_generation: number(1),
+                worker_generation,
+            },
+            request_id: number::<RequestId>(4),
+        };
+        let hover = Event::Hover(DocumentResult {
+            identity,
+            analyzed_uri: Some("smudgy-inline:///aliases/test.ts".to_owned()),
+            result: None,
+        });
+        assert_eq!(
+            invalid_result_scope(&hover, worker_generation),
+            FailureScope::Document(identity)
+        );
+
+        let status = Event::ProjectStatus(ProjectStatusEvent {
+            identity: ProjectStateIdentity {
+                project: descriptor().document.key.project,
+                graph_generation: number(1),
+                service_generation: number(1),
+                worker_generation,
+            },
+            status: ProjectStatus::Ready,
+        });
+        assert_eq!(
+            invalid_result_scope(&status, worker_generation),
+            FailureScope::Worker { worker_generation }
+        );
+    }
+
+    #[test]
     fn worker_opens_document_and_returns_fenced_diagnostics() {
         let mut host = LanguageServiceHost::spawn();
         let descriptor = descriptor();
@@ -1533,7 +1677,11 @@ mod tests {
             text: "const currentView = true;".to_owned(),
         };
         state.open_document(open.clone()).expect("open document");
-        assert!(state.open_document(open).is_err());
+        // A repeated open replaces the held snapshot instead of being rejected.
+        state
+            .open_document(open)
+            .expect("reopen replaces the held document");
+        assert_eq!(state.documents.len(), 1);
         assert!(
             state
                 .refresh_project(RefreshProject {

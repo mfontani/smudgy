@@ -21,10 +21,11 @@ use crate::language_service::{
     CompletionItem, CompletionItemId, CompletionKind, CompletionResult, DefinitionResult,
     DefinitionTarget, Diagnostic, DiagnosticCode, DiagnosticSeverity, DiagnosticsResult,
     DocumentId, FormattingOptions, FormattingResult, HoverResult, InsertTextFormat, Language,
-    LanguageServiceLibrary, MAX_DIAGNOSTICS_PER_DOCUMENT, MAX_RESULT_METADATA_BYTES,
-    MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES, MAX_SIGNATURE_HELP_PARAMETERS, MarkupContent,
-    MarkupKind, SignatureHelpParameter, SignatureHelpResult, TextEdit, Utf16Position, Utf16Range,
-    validate_document_text,
+    LanguageServiceLibrary, MAX_DEFINITION_TARGETS, MAX_DIAGNOSTICS_PER_DOCUMENT,
+    MAX_FORMATTING_EDITS, MAX_FORMATTING_REPLACEMENT_BYTES, MAX_HOVER_BYTES,
+    MAX_RESULT_METADATA_BYTES, MAX_SIGNATURE_HELP_DOCUMENTATION_BYTES,
+    MAX_SIGNATURE_HELP_PARAMETERS, MarkupContent, MarkupKind, SignatureHelpParameter,
+    SignatureHelpResult, TextEdit, Utf16Position, Utf16Range, validate_document_text,
 };
 use crate::{
     ModulePolicy, Permissions, PermissionsContainer, ScriptRuntime, ScriptRuntimeOptions,
@@ -294,6 +295,7 @@ impl EmbeddedLanguageService {
                 }
                 value.push_str(&hover.documentation);
             }
+            truncate_markdown(&mut value, MAX_HOVER_BYTES);
             HoverResult {
                 range: hover.range,
                 contents: MarkupContent {
@@ -423,6 +425,7 @@ impl EmbeddedLanguageService {
                     analyzed_uri: Some(file.uri.clone()),
                 })
             })
+            .take(MAX_DEFINITION_TARGETS)
             .collect();
         Ok(DefinitionResult { targets })
     }
@@ -444,6 +447,20 @@ impl EmbeddedLanguageService {
                 }
             }),
         )?;
+        // Formatting edits cannot be truncated: a partial edit list would
+        // corrupt the document. An oversized result fails this one request.
+        if raw.edits.len() > MAX_FORMATTING_EDITS {
+            bail!(
+                "formatting produced {} edits; the limit is {MAX_FORMATTING_EDITS}",
+                raw.edits.len()
+            );
+        }
+        let replacement_bytes: usize = raw.edits.iter().map(|edit| edit.new_text.len()).sum();
+        if replacement_bytes > MAX_FORMATTING_REPLACEMENT_BYTES {
+            bail!(
+                "formatting produced {replacement_bytes} replacement bytes; the limit is {MAX_FORMATTING_REPLACEMENT_BYTES}"
+            );
+        }
         Ok(FormattingResult { edits: raw.edits })
     }
 
@@ -730,6 +747,21 @@ fn completion_kind(kind: &str) -> CompletionKind {
         "string" => CompletionKind::Value,
         _ => CompletionKind::Text,
     }
+}
+
+/// Bounds a Markdown payload to `limit` bytes, cutting on a character
+/// boundary and marking the cut.
+fn truncate_markdown(value: &mut String, limit: usize) {
+    const ELLIPSIS: &str = "\u{2026}";
+    if value.len() <= limit {
+        return;
+    }
+    let mut cut = limit.saturating_sub(ELLIPSIS.len());
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    value.truncate(cut);
+    value.push_str(ELLIPSIS);
 }
 
 fn markdown_content(value: String) -> Option<MarkupContent> {
