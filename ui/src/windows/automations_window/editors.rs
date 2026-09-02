@@ -753,13 +753,14 @@ impl AutomationsWindow {
         } else {
             body.trim_end_matches('\n').to_string()
         };
+        let persisted_script = persisted_script(body);
         let final_script = match &self.pane {
             Pane::Editor(EditorState { node, .. }) => match node {
                 EditNode::Alias(a) => {
                     let (pattern, matcher) =
                         alias_matcher.expect("computed above for the alias arm");
                     Script::Alias(aliases::AliasDefinition {
-                        script: (!body.is_empty()).then_some(body),
+                        script: persisted_script,
                         pattern,
                         matcher,
                         ..a.clone()
@@ -774,7 +775,7 @@ impl AutomationsWindow {
                         );
                     }
                     Script::Hotkey(hotkeys::HotkeyDefinition {
-                        script: (!body.is_empty()).then_some(body),
+                        script: persisted_script,
                         ..h
                     })
                 }
@@ -791,7 +792,7 @@ impl AutomationsWindow {
                         patterns: None,
                         raw_patterns: None,
                         anti_patterns: None,
-                        script: (!body.is_empty()).then_some(body),
+                        script: persisted_script,
                         package: package.clone(),
                         language: *language,
                         enabled: *enabled,
@@ -5280,5 +5281,39 @@ mod tests {
             Action::Edit(Edit::Paste(Arc::new("b\r\nc\nd".to_string()))),
         );
         assert_eq!(single_line_text(&content), "ab c d");
+    }
+}
+
+/// The inline script an editor body persists as.
+///
+/// A body holding only line breaks is no script at all: persisting it would
+/// replace a file-backed body (`script: None`) with an empty inline one that
+/// shadows the file. Real bodies keep their trailing newline so the saved
+/// text matches the editor buffer exactly.
+fn persisted_script(body: String) -> Option<String> {
+    (!body.trim_end_matches('\n').is_empty()).then_some(body)
+}
+
+#[cfg(test)]
+mod persisted_script_tests {
+    use super::persisted_script;
+
+    #[test]
+    fn line_break_only_bodies_persist_as_no_script() {
+        assert_eq!(persisted_script(String::new()), None);
+        assert_eq!(persisted_script("\n".to_owned()), None);
+        assert_eq!(persisted_script("\n\n\n".to_owned()), None);
+    }
+
+    #[test]
+    fn real_bodies_keep_their_exact_text() {
+        assert_eq!(
+            persisted_script("echo(1);\n".to_owned()).as_deref(),
+            Some("echo(1);\n")
+        );
+        assert_eq!(
+            persisted_script("\necho(1);".to_owned()).as_deref(),
+            Some("\necho(1);")
+        );
     }
 }
