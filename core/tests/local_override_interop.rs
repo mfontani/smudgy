@@ -12,7 +12,7 @@
 //! code-load footprint, so the code-import stumble diagnostic must stay quiet. The stub fetch
 //! took the local-override branch of `resolve_impl`, which inserted into the served-set cache
 //! unconditionally — ignoring the `track == false` contract every other branch honors — and
-//! the guard then misfired on a consumer that never imported the producer's code.
+//! the package-level guard then misfired on a consumer that never imported the producer's code.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +51,15 @@ fn write_local_package(server: &str, name: &str, manifest_json: &str, index_src:
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(MANIFEST_FILE), manifest_json).unwrap();
     std::fs::write(dir.join("index.ts"), index_src).unwrap();
+}
+
+/// Add a module to a local package authored by [`write_local_package`].
+fn write_local_package_module(server: &str, name: &str, subpath: &str, source: &str) {
+    let path = packages_dir(server)
+        .expect("packages dir")
+        .join(name)
+        .join(subpath);
+    std::fs::write(path, source).unwrap();
 }
 
 /// Write a local `modules/` file for `server` (runs in the MAIN isolate, allow-all).
@@ -205,7 +214,10 @@ async fn local_producer_consumed_over_events_does_not_trip_the_stumble_notice() 
     // The regression: a `smudgy:events/…` consume of an installed LOCAL producer must not be
     // mistaken for a code import of it.
     assert!(
-        !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
+        !has_line(
+            &lines,
+            "entry module of installed smudgy://local/arctic-prompt"
+        ),
         "consuming a local producer over the events scheme must NOT trip the code-import stumble \
          notice; transcript:\n{lines:#?}"
     );
@@ -268,9 +280,67 @@ async fn local_producer_actually_code_imported_still_stumbles() {
         "the consumer package must load; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
+        has_line(
+            &lines,
+            "entry module of installed smudgy://local/arctic-prompt"
+        ),
         "a genuine code import of an installed local producer MUST still trip the stumble notice; \
          transcript:\n{lines:#?}"
+    );
+}
+
+/// The supported dual-use-library pattern: the package is installed as a runtime root, while a
+/// consumer imports only a side-effect-free helper subpath into its own isolate. Resolving package
+/// code is not enough to diagnose duplicate startup effects; only loading its entry is.
+#[tokio::test]
+async fn installed_package_helper_subpath_does_not_trip_the_stumble_notice() {
+    let server = "lo_helper_subpath";
+    prepare_server(server);
+
+    write_local_package(
+        server,
+        "arctic-prompt",
+        r#"{ "name": "arctic-prompt", "version": "1.0.0",
+             "permissions": { "smudgy": { "session": ["echo"] } } }"#,
+        r#"
+        import { echo } from "smudgy:core";
+        echo("PROMPT_ENTRY_RAN");
+        "#,
+    );
+    write_local_package_module(
+        server,
+        "arctic-prompt",
+        "helpers.ts",
+        "export const helperValue = 42;",
+    );
+    install_untrusted(server, "smudgy://local/arctic-prompt");
+
+    write_local_package(
+        server,
+        "arctic-hud",
+        r#"{ "name": "arctic-hud", "version": "1.0.0",
+             "dependencies": ["smudgy://local/arctic-prompt"],
+             "requires": ["smudgy://local/arctic-prompt"] }"#,
+        r#"
+        import { echo } from "smudgy:core";
+        import { helperValue } from "smudgy://local/arctic-prompt/helpers.ts";
+        echo("HELPER_VALUE:" + helperValue);
+        "#,
+    );
+    install_trusted(server, "smudgy://local/arctic-hud");
+
+    let lines = run_session_real_provider(9813, server).await;
+
+    assert!(
+        has_line(&lines, "PROMPT_ENTRY_RAN") && has_line(&lines, "HELPER_VALUE:42"),
+        "the installed entry and imported helper must both run; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(
+            &lines,
+            "code-imported the entry module of installed smudgy://local/arctic-prompt"
+        ),
+        "a helper subpath must not be mistaken for a duplicate entry load; transcript:\n{lines:#?}"
     );
 }
 
@@ -474,7 +544,10 @@ async fn local_producer_consumed_over_state_and_procedures_does_not_stumble() {
         "the consumer package must load; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
+        !has_line(
+            &lines,
+            "entry module of installed smudgy://local/arctic-prompt"
+        ),
         "consuming a local producer over the state/procedures schemes must NOT trip the stumble \
          notice; transcript:\n{lines:#?}"
     );
@@ -596,7 +669,10 @@ async fn two_consumers_across_isolates_each_stay_stumble_free() {
         "both consumers must load; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
+        !has_line(
+            &lines,
+            "entry module of installed smudgy://local/arctic-prompt"
+        ),
         "neither consumer isolate may trip the stumble — a stub fetch records nothing in either \
          fork's served set; transcript:\n{lines:#?}"
     );
@@ -648,7 +724,10 @@ async fn a_required_but_unconsumed_producer_does_not_stumble() {
         "the required producer must run in its own home; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
+        !has_line(
+            &lines,
+            "entry module of installed smudgy://local/arctic-prompt"
+        ),
         "a `requires` root the requirer never imports must not appear in its served set; transcript:\n{lines:#?}"
     );
 }
@@ -764,7 +843,10 @@ async fn a_deferred_dynamic_import_is_caught_at_write_not_by_the_load_stumble() 
         "the deferred dynamic import must complete; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "you code-imported smudgy://local/arctic-prompt"),
+        !has_line(
+            &lines,
+            "entry module of installed smudgy://local/arctic-prompt"
+        ),
         "a dynamic import after the load graph settles must NOT trip the load-time stumble; transcript:\n{lines:#?}"
     );
     assert!(

@@ -175,6 +175,8 @@ pub struct SmudgyPackageProvider {
     /// Non-home loads that had interop-handle exports scrubbed — read by the engine to
     /// dress a subsequent link failure with the scheme-import hint.
     scrubbed: RefCell<Vec<PackageKey>>,
+    /// Package entries served through this provider, for the duplicate-entry diagnostic.
+    entry_loads: RefCell<Vec<PackageKey>>,
     /// User-level (`file://`-referred) code imports of packages — read by the engine to
     /// warn when the target declares interop handles (interop.md §1/§3 residual).
     user_imports: RefCell<Vec<PackageKey>>,
@@ -213,6 +215,7 @@ impl SmudgyPackageProvider {
             account_nickname: crate::models::auth::load_account().and_then(|a| a.nickname),
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
+            entry_loads: RefCell::new(Vec::new()),
             user_imports: RefCell::new(Vec::new()),
             image_hosted: RefCell::new(None),
         }
@@ -267,6 +270,7 @@ impl SmudgyPackageProvider {
             // each fork for the isolate it serves.
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
+            entry_loads: RefCell::new(Vec::new()),
             user_imports: RefCell::new(Vec::new()),
             // Per-isolate: the engine wires each fork to its own isolate's image policy.
             image_hosted: RefCell::new(None),
@@ -278,9 +282,8 @@ impl SmudgyPackageProvider {
     /// its real specifier before publishing. On a code load (`track`) it's cached like a
     /// normal resolution so install + import share one instance; a stub fetch
     /// (`track == false`) leaves the cache untouched, so consuming a local producer over
-    /// `smudgy:state|events/…` records no code-load footprint (`loaded_packages()` /
-    /// the stumble diagnostic stays quiet) — the same contract the network + offline
-    /// branches keep.
+    /// `smudgy:state|events/…` records no code-load footprint (`loaded_packages()`) — the
+    /// same contract the network + offline branches keep.
     ///
     /// Known gap: a local package's `locked_deps` are **not** populated here — its
     /// manifest carries dependency *ranges*, not the concrete versions a published resolve
@@ -321,8 +324,7 @@ impl SmudgyPackageProvider {
         // local producer must leave no code-load footprint, exactly as the network +
         // offline branches gate their inserts on `track`. Otherwise consuming a
         // locally-authored producer over `smudgy:events/…` would land it in this isolate's
-        // `cache`, and the code-import stumble diagnostic would misfire on a consumer that
-        // never imported the producer's code.
+        // `cache` despite the consumer never importing the producer's code.
         if track {
             self.cache
                 .borrow_mut()
@@ -1064,8 +1066,8 @@ impl SmudgyPackageProvider {
     // body cache, and metadata persistence.
     //
     // `track` separates a code load from a kind-scheme stub fetch: a code load records the
-    // instance in `cache` (whose keys are `loaded_packages()`, the stumble diagnostic's
-    // input) and, top-level, reports the resolution into the lockfile; a stub fetch
+    // instance in `cache` (whose keys are `loaded_packages()`) and, top-level, reports the
+    // resolution into the lockfile; a stub fetch
     // (`track == false`) must leave no code-load or install footprint — notably,
     // `record_resolution` would UPSERT a lock entry for an unknown package, silently
     // installing a producer someone merely consumed.
@@ -1373,9 +1375,8 @@ impl PackageProvider for SmudgyPackageProvider {
     }
 
     /// A stub fetch is a read of the producer's declarations, not a code load: nothing lands
-    /// in the served set (`loaded_packages()` / the stumble diagnostic stays quiet) and
-    /// nothing is recorded as an install — consuming an uninstalled producer leaves it
-    /// uninstalled.
+    /// in the served set (`loaded_packages()`) and nothing is recorded as an install — consuming
+    /// an uninstalled producer leaves it uninstalled.
     async fn resolve_package_for_stub(
         &self,
         key: &PackageKey,
@@ -1420,8 +1421,7 @@ impl PackageProvider for SmudgyPackageProvider {
 
     /// Every package fetched-for-import through this provider so far. `cache` is only populated
     /// on the resolve paths (an import asked for the package), never by the `solve_closure`
-    /// manifest walk, so its keys are this isolate's actually-served package set — what the
-    /// engine's code-import stumble diagnostic inspects after module loading.
+    /// manifest walk, so its keys are this isolate's complete code-load set.
     fn loaded_packages(&self) -> Vec<PackageKey> {
         let mut keys: Vec<PackageKey> = self
             .cache
@@ -1432,6 +1432,17 @@ impl PackageProvider for SmudgyPackageProvider {
         keys.sort_by(|a, b| (&a.owner, &a.name).cmp(&(&b.owner, &b.name)));
         keys.dedup();
         keys
+    }
+
+    fn note_entry_load(&self, key: &PackageKey) {
+        let mut entries = self.entry_loads.borrow_mut();
+        if !entries.contains(key) {
+            entries.push(key.clone());
+        }
+    }
+
+    fn entry_loaded_packages(&self) -> Vec<PackageKey> {
+        self.entry_loads.borrow().clone()
     }
 
     fn set_home_packages(&self, homes: Vec<PackageKey>) {

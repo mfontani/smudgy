@@ -809,10 +809,11 @@ impl<'a> ScriptEngine<'a> {
     }
 
     /// The code-import stumble diagnostic (`docs/interop.md` §3): after an isolate's
-    /// modules evaluate, every package its loader served whose interop **home** is a different
-    /// isolate is a code-imported copy of an installed package — its module side effects
-    /// duplicate the home instance's, and the home gate will refuse its interop writes. One
-    /// teaching notice per package, emitted here at load so the wrong import is never silent.
+    /// modules evaluate, every package **entry** its loader served whose interop home is a
+    /// different isolate is a code-imported copy of an installed package — its startup side
+    /// effects duplicate the home instance's, and the home gate will refuse its interop writes.
+    /// One teaching notice per package, emitted here at load so the wrong import is never silent.
+    /// Side-effect-free subpaths are legitimate dual-use-library imports and stay quiet.
     /// Uninstalled packages (no home entry) get no notice: consuming a pure library by import is
     /// the intended path. Covers the load-time module graph; a later dynamic `import()` of a
     /// homed package is only caught at its first refused write.
@@ -834,7 +835,7 @@ impl<'a> ScriptEngine<'a> {
         };
         let scrubbed: std::collections::HashSet<(String, String)> =
             loader.scrubbed_packages().iter().map(fold).collect();
-        for key in loader.loaded_packages() {
+        for key in loader.entry_loaded_packages() {
             let folded = fold(&key);
             let producer = crate::session::runtime::store::ProducerKey::Package {
                 owner: folded.0.clone(),
@@ -866,9 +867,10 @@ impl<'a> ScriptEngine<'a> {
                     session_id,
                     emitted_line_count,
                     &format!(
-                        "[interop] you code-imported smudgy://{}/{}, which is installed \u{2014} \
-                         this copy duplicates the installed instance's side effects and cannot \
-                         publish state or events. Import types only, or read its published state.",
+                        "[interop] you code-imported the entry module of installed \
+                         smudgy://{}/{} \u{2014} this copy repeats the home instance's startup \
+                         side effects. Import a side-effect-free subpath or types only, or \
+                         consume its published state, events, or procedures.",
                         key.owner, key.name
                     ),
                 );
