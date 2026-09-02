@@ -200,6 +200,17 @@ impl EditorSurface for IcedCodeEditorSurface {
         // intentionally conservative: every real edit reaches the service, while cursor,
         // focus, scroll, and dialog messages produce no change command. Automation source
         // files are configuration-sized and this path runs only while their editor is open.
+        // The upstream buffer stores carriage returns as ordinary characters,
+        // so a CRLF clipboard would leave a stray `\r` on every pasted line.
+        // Documents are LF-only; normalize before the buffer sees the text.
+        let normalized;
+        let message = match message {
+            Message::Paste(text) if text.contains('\r') => {
+                normalized = Message::Paste(normalize_line_endings(text));
+                &normalized
+            }
+            _ => message,
+        };
         let before = self.editor.content();
         let before_cursor = self.editor.cursor_position();
         let effect = self.editor.update(message);
@@ -553,6 +564,11 @@ fn protocol_edit(
         },
         text: text.to_owned(),
     })
+}
+
+/// Rewrites CRLF and lone CR line breaks as LF.
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn protocol_position(position: Utf16Position, source: &str) -> Option<LspPosition> {
@@ -936,6 +952,26 @@ mod tests {
             })
         );
         assert_eq!(surface.canvas_focus_recoveries, recoveries + 1);
+    }
+
+    #[test]
+    fn pasted_carriage_returns_become_line_feeds() {
+        let _focus_guard = editor_focus_test_guard();
+        let mut surface = IcedCodeEditorSurface::new("", Language::TypeScript);
+        surface.request_focus();
+        let _ = surface.update(&Message::CanvasFocusGained);
+        surface.request_focus();
+
+        let update = surface.update(&Message::Paste("a\r\nb\rc\n".to_owned()));
+
+        assert_eq!(surface.content(), "a\nb\nc\n");
+        assert_eq!(
+            update
+                .changes
+                .map(|changes| changes.changes[0].text.clone())
+                .as_deref(),
+            Some("a\nb\nc\n")
+        );
     }
 
     #[test]
