@@ -325,6 +325,8 @@ profile-error-delete = Failed to delete profile: { $error }
 # Application shell and updates
 window-main-development = Smudgy — DEVELOPMENT BUILD
 window-main-release-candidate = Smudgy — RELEASE CANDIDATE { $version }
+window-main-public-test-build = Smudgy — PUBLIC TEST BUILD { $version } — built { $build }
+window-main-nightly = Smudgy — NIGHTLY { $version } — built { $build }
 window-automations = Smudgy automations — { $server }
 toolbar-connect = Connect
 toolbar-automations = Automations

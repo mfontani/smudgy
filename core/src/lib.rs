@@ -6,6 +6,13 @@ use std::sync::OnceLock;
 #[macro_use]
 extern crate log;
 
+/// UTC timestamp embedded when this crate was compiled.
+pub const BUILD_TIME_UTC: &str = build_time::build_time_utc!("%Y-%m-%d %H:%M:%S UTC");
+
+/// Git commit embedded by `build.rs`, when the source is in a Git checkout or
+/// the build environment supplies a recognized commit variable.
+pub const BUILD_COMMIT: Option<&str> = option_env!("SMUDGY_GIT_COMMIT");
+
 /// Process-wide override for the smudgy home directory. When set, it replaces
 /// the default `<Documents>/smudgy` location for every data path in the app.
 /// Set once at startup from the `--data-dir` launch flag; see
@@ -179,15 +186,15 @@ pub fn set_smudgy_home(path: impl Into<PathBuf>) {
 /// Returns the path to the smudgy home directory, creating it if it doesn't exist.
 ///
 /// Honors the [`set_smudgy_home`] override when one was set at startup; otherwise defaults
-/// to `<Documents>/smudgy` for tagged releases **and release candidates**, and
+/// to `<Documents>/smudgy` for releases and prod-like prereleases, and
 /// `<Documents>/smudgy-dev` for dev/pre-release builds. If that location is not writable (for
 /// example, when Windows Controlled Folder Access blocks Smudgy), the platform-local data
 /// directory is used instead. The local data directory is also used on systems without a
 /// discoverable Documents directory (for example, a minimal/headless Linux account).
 /// ([`crate::models::settings::is_dev_build`]), so a dev build — which also talks to the
 /// dev API — keeps its accounts, servers, and installed packages isolated from the release
-/// client's data. A release candidate deliberately shares the release home (and API), so a
-/// tester exercises the real release data on the real backend.
+/// client's data. RC, PTB, and nightly builds deliberately share the release
+/// home (and API), so a tester exercises real release data on the real backend.
 ///
 /// # Errors
 ///
@@ -331,7 +338,7 @@ pub fn init() {
         "smudgy started; version {} ({}, built on {})",
         env!("SMUDGY_BUILD_NAME"),
         env!("CARGO_PKG_VERSION"),
-        build_time::build_time_local!("%Y-%m-%d %H:%M:%S")
+        BUILD_TIME_UTC
     );
 
     deno_core::JsRuntime::init_platform(None);

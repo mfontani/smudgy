@@ -83,7 +83,7 @@ fn purge_failed_isolate_registrations(
 /// - the `advanced_scripting_features` setting is on — the user's explicit,
 ///   persisted opt-in. Its docs promise it "unlocks ... the script inspector" and
 ///   the UI gates the Inspect button on the same flag, so honoring it here is what
-///   makes Inspect work in shipped **release / release-candidate** builds (not just
+///   makes Inspect work in shipped **release / prod-like prerelease** builds (not just
 ///   dev). This setting was previously ignored here, so the button showed but did
 ///   nothing in an RC/release DMG — the bug this closes.
 /// - this is a [`Dev`](crate::models::settings::BuildChannel::Dev) build (always on

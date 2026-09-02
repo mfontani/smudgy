@@ -318,6 +318,8 @@ profile-error-delete = 無法刪除設定檔：{ $error }
 # chain, even though the application content below does.
 window-main-development = Smudgy — DEVELOPMENT BUILD
 window-main-release-candidate = Smudgy — RELEASE CANDIDATE { $version }
+window-main-public-test-build = Smudgy — PUBLIC TEST BUILD { $version } — built { $build }
+window-main-nightly = Smudgy — NIGHTLY { $version } — built { $build }
 window-automations = Smudgy automations — { $server }
 toolbar-connect = 連線
 toolbar-automations = 自動化

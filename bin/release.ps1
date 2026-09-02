@@ -123,17 +123,23 @@ $iss = Join-Path $repoRoot 'assets\installer.iss'
 # Pick the build channel from the version stamped in installer.iss and tell the
 # installer, which uses it to choose the install identity (AppId/dir/name/data
 # dir). Mirrors core::models::settings::build_channel and bin/bump-version.sh:
-# a clean X.Y.Z is a release; a prerelease whose first identifier is `rc` (the
-# next char a digit / '-' / '.' / '+' / end) is a release candidate — both keep
-# the release install identity and so upgrade/clobber each other; any other
-# '-'/'+' suffix is a dev build, which gets its own identity (the SmudgyDevBuild
-# define) and installs side by side.
+# a clean X.Y.Z is a release; a prerelease beginning with `rc`, `ptb`, or
+# `nightly` (the next char a digit / '-' / '.' / '+' / end) is prod-like. All
+# four keep the release install identity and so upgrade/clobber each other; any
+# other '-'/'+' suffix is a dev build, which gets its own identity (the
+# SmudgyDevBuild define) and installs side by side.
 $version = ([regex]'(?m)^#define\s+MyAppVersion\s+"([^"]+)"').Match((Get-Content -Raw $iss)).Groups[1].Value
 if (-not $version) { throw "could not read MyAppVersion from $iss" }
 $channel = 'release'
 if ($version -match '-') {
     $prerelease = ($version -split '-', 2)[1]
-    if ($prerelease -match '^[Rr][Cc]($|[-.+0-9])') { $channel = 'release candidate' }
+    if ($prerelease -match '^[Rr][Cc]($|[-.+0-9])') {
+        $channel = 'release candidate'
+    } elseif ($prerelease -match '^[Pp][Tt][Bb]($|[-.+0-9])') {
+        $channel = 'public test'
+    } elseif ($prerelease -match '^[Nn][Ii][Gg][Hh][Tt][Ll][Yy]($|[-.+0-9])') {
+        $channel = 'nightly'
+    }
 }
 if ($channel -eq 'release' -and $version -match '[-+]') { $channel = 'dev' }
 Write-Host "    $version -> $channel build" -ForegroundColor Cyan

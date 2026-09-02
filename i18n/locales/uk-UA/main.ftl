@@ -329,6 +329,8 @@ profile-error-delete = Не вдалося видалити профіль: { $e
 # Application shell and updates
 window-main-development = Smudgy — ВЕРСІЯ ДЛЯ РОЗРОБНИКІВ
 window-main-release-candidate = Smudgy — КАНДИДАТ НА ВИПУСК { $version }
+window-main-public-test-build = Smudgy — ПУБЛІЧНА ТЕСТОВА ВЕРСІЯ { $version } — зібрана { $build }
+window-main-nightly = Smudgy — ЩОДЕННА ВЕРСІЯ { $version } — зібрана { $build }
 window-automations = автоматизації Smudgy — { $server }
 toolbar-connect = Підключитися
 toolbar-automations = Автоматизації

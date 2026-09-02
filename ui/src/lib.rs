@@ -66,11 +66,11 @@ use windows::smudgy_window::{Event as SmudgyWindowEvent, PaneRef};
 
 /// Title for the main smudgy window, marked per build channel so a non-release
 /// build is never mistaken for the published release. A dev/pre-release build
-/// (which talks to the dev API) is tagged "DEV BUILD"; a release candidate —
-/// which behaves like a release but ships ahead of it — is tagged with its
-/// exact version so a tester can see which RC they are running. The channel
-/// decision lives in `core` so the title and the API/data-dir defaults can't
-/// drift. A clean release gets the bare title.
+/// (which talks to the dev API) is tagged "DEV BUILD"; prod-like prereleases
+/// identify their channel and version. PTB and nightly titles also carry the
+/// build timestamp and, when available, Git commit. The channel decision lives
+/// in `core` so the title and the API/data-dir defaults can't drift. A clean
+/// release gets the bare title.
 fn main_window_title() -> String {
     match smudgy_core::models::settings::build_channel() {
         smudgy_core::models::settings::BuildChannel::Dev => {
@@ -82,8 +82,29 @@ fn main_window_title() -> String {
                 "version" => env!("CARGO_PKG_VERSION")
             )
         }
+        smudgy_core::models::settings::BuildChannel::PublicTestBuild => {
+            i18n::t!(
+                "window-main-public-test-build",
+                "version" => env!("CARGO_PKG_VERSION"),
+                "build" => preview_build_stamp()
+            )
+        }
+        smudgy_core::models::settings::BuildChannel::Nightly => {
+            i18n::t!(
+                "window-main-nightly",
+                "version" => env!("CARGO_PKG_VERSION"),
+                "build" => preview_build_stamp()
+            )
+        }
         smudgy_core::models::settings::BuildChannel::Release => "smudgy".to_string(),
     }
+}
+
+fn preview_build_stamp() -> String {
+    smudgy_core::BUILD_COMMIT.map_or_else(
+        || smudgy_core::BUILD_TIME_UTC.to_string(),
+        |commit| format!("{} ({commit})", smudgy_core::BUILD_TIME_UTC),
+    )
 }
 
 use crate::cloud_account::CloudAccount;

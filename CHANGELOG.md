@@ -5,12 +5,15 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.7-ptb] - 2026-09-01
 
 ### Added
 
 - **History matching.** for example, if you type `tell` and hit up, you'll get the
   most recent command that started with tell.  configurable
+- **Public test and nightly build channels.** Versions beginning with `ptb` or
+  `nightly` use release data and services while identifying their build time and
+  source commit in the title bar.
 
 ## [0.5.6] - 2026-08-30
 
