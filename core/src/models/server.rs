@@ -189,6 +189,21 @@ pub struct Server {
     pub config: ServerConfig,
 }
 
+/// Whether `smudgy_dir` contains at least one directory that `list_servers`
+/// would recognize as a server.
+pub(crate) fn contains_valid_server(smudgy_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(smudgy_dir) else {
+        return false;
+    };
+
+    entries.filter_map(std::result::Result::ok).any(|entry| {
+        let path = entry.path();
+        path.is_dir()
+            && path.file_name().and_then(|name| name.to_str()).is_some()
+            && load_server_config(&path.join("server.json")).is_ok()
+    })
+}
+
 /// Lists all valid servers found within the smudgy home directory.
 ///
 /// A server is considered valid if it's a directory within the smudgy home
