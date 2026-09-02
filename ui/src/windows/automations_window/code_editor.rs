@@ -1821,6 +1821,14 @@ where
 pub(super) type ActiveCodeEditor =
     AutomationCodeEditor<IcedCodeEditorSurface, LanguageServiceClient>;
 
+#[cfg(test)]
+impl<C: LanguageServiceChannel> AutomationCodeEditor<IcedCodeEditorSurface, C> {
+    /// Number of times the host released this editor's keyboard focus.
+    pub(super) fn focus_losses(&self) -> usize {
+        self.surface.focus_losses
+    }
+}
+
 /// An upstream editor message fenced to the document that produced it.
 ///
 /// Some upstream actions complete asynchronously (notably clipboard reads). The
@@ -2461,6 +2469,7 @@ impl super::AutomationsWindow {
             .code_editor_mount_generation
             .checked_add(1)
             .unwrap_or(1);
+        self.pointer_over_code_editor = false;
         let needs_service = supports_language_service(language);
         let context = language_project_context(self, kind);
         let context_changed = self.language_project_target_context.as_ref() != Some(&context);
@@ -2908,7 +2917,14 @@ impl super::AutomationsWindow {
             chrome = chrome.push(problems);
         }
 
-        chrome.into()
+        // Enter/exit follow cursor motion, which child widgets do not capture,
+        // so the window can tell whether a press landed in the editor region
+        // (editor, overlays, status row, and problems) without depending on
+        // message ordering.
+        iced::widget::mouse_area(chrome)
+            .on_enter(super::Message::CodeEditorPointerEntered)
+            .on_exit(super::Message::CodeEditorPointerExited)
+            .into()
     }
 
     /// Applies one upstream editor event and maps every follow-up task back to this window.
@@ -3101,6 +3117,16 @@ impl super::AutomationsWindow {
     /// Closes the active document while retaining the resident window-scoped worker.
     pub(super) fn clear_code_editor(&mut self) {
         self.code_editor = None;
+        self.pointer_over_code_editor = false;
+    }
+
+    /// Takes keyboard focus away from the code editor because another widget
+    /// is about to receive it. The upstream canvas would otherwise keep
+    /// inserting every keystroke typed into that widget.
+    pub(super) fn release_code_editor_focus(&mut self) {
+        if let Some(editor) = &mut self.code_editor {
+            editor.lose_focus();
+        }
     }
 
     /// Records a successful durable save in both editor history and the service.

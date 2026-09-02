@@ -39,6 +39,8 @@ pub(in crate::windows::automations_window) struct IcedCodeEditorSurface {
     #[cfg(test)]
     canvas_focus_recoveries: usize,
     #[cfg(test)]
+    pub(super) focus_losses: usize,
+    #[cfg(test)]
     theme_applications: usize,
 }
 
@@ -101,6 +103,8 @@ impl IcedCodeEditorSurface {
             context_menu_position: None,
             #[cfg(test)]
             canvas_focus_recoveries: 0,
+            #[cfg(test)]
+            focus_losses: 0,
             #[cfg(test)]
             theme_applications: 1,
         }
@@ -512,6 +516,10 @@ impl EditorSurface for IcedCodeEditorSurface {
 
     fn lose_focus(&mut self) {
         self.editor.lose_focus();
+        #[cfg(test)]
+        {
+            self.focus_losses = self.focus_losses.saturating_add(1);
+        }
     }
 
     fn is_dialog_open(&self) -> bool {

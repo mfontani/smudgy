@@ -397,6 +397,16 @@ pub enum Message {
     CodeCompletionViewportChanged(code_editor::CompletionViewportTarget),
     /// Requests completions at the active code-editor caret (Ctrl+Space or button).
     TriggerCodeCompletion,
+    /// A pointer button went down somewhere in this window.
+    ///
+    /// The canvas editor keeps its own keyboard focus and never notices
+    /// clicks landing elsewhere, so the window releases that focus itself
+    /// unless the pointer is over the editor region.
+    PointerPressed(window::Id),
+    /// The pointer entered the writable code editor region (editor, overlays, and chrome).
+    CodeEditorPointerEntered,
+    /// The pointer left the writable code editor region.
+    CodeEditorPointerExited,
     /// Closes host-owned completion and hover overlays without changing source.
     DismissCodeOverlays,
     /// Keeps one exact hover card alive while the pointer is over its rich content.
@@ -742,6 +752,8 @@ pub struct AutomationsWindow {
     /// The active writable JS/TS/module/package editor. This field precedes
     /// `language_service`, so its Drop queues CloseDocument before host shutdown.
     code_editor: Option<code_editor::ActiveCodeEditor>,
+    /// Whether the pointer is over the code editor region; see `Message::PointerPressed`.
+    pointer_over_code_editor: bool,
     /// Lazily spawned and retained for this Automations-window lifetime.
     pub(super) language_service:
         Option<smudgy_script::language_service_worker::LanguageServiceHost>,
@@ -1026,6 +1038,7 @@ impl AutomationsWindow {
             chip: Chip::All,
             new_menu_open: false,
             code_editor: None,
+            pointer_over_code_editor: false,
             language_service: None,
             language_project_context: None,
             language_project_target_context: None,
@@ -1135,9 +1148,14 @@ impl AutomationsWindow {
     /// don't fight text inputs elsewhere.
     pub fn subscription(&self) -> Subscription<Message> {
         let keyboard = iced::event::listen_with(|event, status, event_window| {
-            let IcedEvent::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
-            else {
-                return None;
+            let (key, modifiers) = match event {
+                IcedEvent::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    (key, modifiers)
+                }
+                IcedEvent::Mouse(iced::mouse::Event::ButtonPressed(_)) => {
+                    return Some(Message::PointerPressed(event_window));
+                }
+                _ => return None,
             };
             match (key.as_ref(), status) {
                 _ if code_completion_shortcut(&key, modifiers, status) => {
@@ -1329,12 +1347,28 @@ impl AutomationsWindow {
             // -------- keyboard focus traversal ----------------------------
             Message::FocusColorControl(id) => Update::with_task(operation::focus(id)),
             Message::FocusNext(event_window) if event_window == self.window_id => {
+                self.release_code_editor_focus();
                 Update::with_task(operation::focus_next())
             }
             Message::FocusPrevious(event_window) if event_window == self.window_id => {
+                self.release_code_editor_focus();
                 Update::with_task(operation::focus_previous())
             }
             Message::FocusNext(_) | Message::FocusPrevious(_) => Update::none(),
+            Message::PointerPressed(event_window) => {
+                if event_window == self.window_id && !self.pointer_over_code_editor {
+                    self.release_code_editor_focus();
+                }
+                Update::none()
+            }
+            Message::CodeEditorPointerEntered => {
+                self.pointer_over_code_editor = true;
+                Update::none()
+            }
+            Message::CodeEditorPointerExited => {
+                self.pointer_over_code_editor = false;
+                Update::none()
+            }
 
             // -------- navigation -------------------------------------------
             Message::ShowDashboard => {
@@ -3204,6 +3238,45 @@ mod tab_traversal_tests {
 
         let _ = window.update(Message::SetBehavior(ScriptLang::TS));
         assert_eq!(window.code_editor_text(), "say hello();");
+    }
+
+    #[test]
+    fn pointer_presses_outside_the_editor_region_release_its_focus() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "editor-focus-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let _ = window.new_hotkey();
+        let _ = window.update(Message::SetBehavior(ScriptLang::JS));
+        let losses = |window: &AutomationsWindow| {
+            window
+                .code_editor
+                .as_ref()
+                .expect("code editor is bound")
+                .focus_losses()
+        };
+        assert_eq!(losses(&window), 0);
+
+        // A press while the pointer is over the editor region (including its
+        // overlays and chrome) keeps focus: that press is the editor's own.
+        let _ = window.update(Message::CodeEditorPointerEntered);
+        let _ = window.update(Message::PointerPressed(window.window_id));
+        assert_eq!(losses(&window), 0);
+
+        // A press anywhere else in this window hands focus to that widget.
+        let _ = window.update(Message::CodeEditorPointerExited);
+        let _ = window.update(Message::PointerPressed(window.window_id));
+        assert_eq!(losses(&window), 1);
+
+        // Other windows' presses are not this editor's concern.
+        let _ = window.update(Message::PointerPressed(window::Id::unique()));
+        assert_eq!(losses(&window), 1);
+
+        // Keyboard traversal moves focus to another widget the same way.
+        let _ = window.update(Message::FocusNext(window.window_id));
+        assert_eq!(losses(&window), 2);
     }
 
     #[test]
