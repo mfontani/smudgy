@@ -39,6 +39,7 @@ use smudgy_core::session::runtime::package_cache::PackageCache;
 use smudgy_core::session::runtime::{AutomationBody, AutomationKind};
 use smudgy_core::session::styled_line::{InvisiblePolicy, deceptive_invisible};
 
+use super::code_editor;
 use super::common;
 use super::editors::pane_scroll;
 use super::manifest::{ManifestDraft, ManifestTab};
@@ -2199,6 +2200,10 @@ impl AutomationsWindow {
     /// install of its `smudgy://<you>/<name>` specifier so an active local package keeps resolving
     /// under its new name. Renaming a fork off the source's name is also what unblocks publishing.
     pub(super) fn commit_rename_owned(&mut self) -> Update<Message, Event> {
+        if self.dirty || self.manifest_dirty {
+            self.authoring_feedback = Some(crate::i18n::t!("package-save-before-rename"));
+            return Update::none();
+        }
         let Some(new_name) = self.rename_buffer.as_ref().map(|s| s.trim().to_string()) else {
             return Update::none();
         };
@@ -2500,6 +2505,14 @@ impl AutomationsWindow {
                 return Update::none();
             }
         }
+        if self.language_project_context_matches(
+            &code_editor::LanguageProjectContext::OwnedPackage(name.clone()),
+        ) {
+            self.language_project_target_context = Some(
+                code_editor::LanguageProjectContext::OwnedPackage(name.clone()),
+            );
+            self.refresh_language_project();
+        }
         // Load the cloud share state (if published + signed in).
         if !self.signed_in() {
             return Update::none();
@@ -2575,14 +2588,19 @@ impl AutomationsWindow {
             return Update::none();
         };
         if subpath == "README.md" {
+            self.clear_code_editor();
             self.owned_selected_file = None;
             return Update::none();
         }
         match local_packages::read_local_file(&self.server_name, &name, &subpath) {
             Ok(content) => {
-                self.editor_content = iced::widget::text_editor::Content::with_text(&content);
                 self.dirty = false;
-                self.owned_selected_file = Some(subpath);
+                self.owned_selected_file = Some(subpath.clone());
+                return Update::with_task(self.bind_code_editor(
+                    &content,
+                    code_editor::path_language(&subpath),
+                    code_editor::CodeDocument::OwnedPackage,
+                ));
             }
             Err(e) => {
                 self.authoring_feedback = Some(crate::i18n::t!(
@@ -2603,20 +2621,67 @@ impl AutomationsWindow {
             (Some(name), Some(subpath)) => (name, subpath),
             _ => return Update::none(),
         };
-        if let Err(e) = local_packages::write_local_file(
-            &self.server_name,
-            &name,
-            &subpath,
-            &self.editor_content.text(),
-        ) {
-            self.authoring_feedback = Some(format!("Save failed: {e}"));
+        if !self.code_editor_is_modified() {
+            self.dirty = false;
+            self.pending_nav = None;
+            return Update::none();
+        }
+        let content = self.code_editor_text();
+        if let Err(e) =
+            local_packages::write_local_file(&self.server_name, &name, &subpath, &content)
+        {
+            self.authoring_feedback = Some(crate::i18n::t!(
+                "package-file-save-failed",
+                "error" => e.to_string()
+            ));
             return Update::none();
         }
         self.dirty = false;
-        if let Ok(Some(package)) = local_packages::load_local_package(&self.server_name, &name) {
-            self.local_readme = package.readme.as_deref().map(markdown::Content::parse);
-            self.local_package = Some(Box::new(package));
+        self.pending_nav = None;
+        self.mark_code_editor_saved();
+
+        // The durable selected-file write is authoritative even if reloading an unrelated
+        // package file fails. Patch the retained graph base first so closing this overlay can
+        // never reveal stale source to importers, then replace it with a complete reload when
+        // available.
+        if let Some(package) = self
+            .local_package
+            .as_deref_mut()
+            .filter(|package| package.name == name)
+        {
+            if let Some(module) = package
+                .modules
+                .iter_mut()
+                .find(|module| module.subpath == subpath)
+            {
+                module.content = content.as_bytes().to_vec();
+            } else {
+                package.modules.push(local_packages::LocalModule {
+                    subpath: subpath.clone(),
+                    content: content.as_bytes().to_vec(),
+                });
+            }
         }
+        match local_packages::load_local_package(&self.server_name, &name) {
+            Ok(Some(package)) => {
+                self.local_readme = package.readme.as_deref().map(markdown::Content::parse);
+                self.local_package = Some(Box::new(package));
+            }
+            Ok(None) => {
+                log::warn!("owned package {name} disappeared immediately after saving {subpath}");
+            }
+            Err(error) => {
+                log::warn!(
+                    "saved owned package file {name}/{subpath}, but package reload failed: {error}"
+                );
+                self.authoring_feedback = Some(crate::i18n::t!(
+                    "package-file-read-failed",
+                    "path" => format!("{name}/{subpath}"),
+                    "error" => error.to_string()
+                ));
+            }
+        }
+        self.refresh_language_project();
         Update::with_task(self.show_toast(crate::i18n::t!(
             "package-file-saved",
             "path" => &subpath
@@ -2624,6 +2689,10 @@ impl AutomationsWindow {
     }
 
     pub(super) fn publish_owned(&mut self) -> Update<Message, Event> {
+        if self.dirty || self.manifest_dirty {
+            self.authoring_feedback = Some(crate::i18n::t!("package-save-before-publish"));
+            return Update::none();
+        }
         let Some(name) = self.local_package.as_ref().map(|p| p.name.clone()) else {
             return Update::none();
         };
@@ -2740,6 +2809,7 @@ impl AutomationsWindow {
         self.manifest_draft = None;
         self.manifest_dirty = false;
         self.manifest_editing = false;
+        self.clear_code_editor();
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
         let toast = self.show_toast(crate::i18n::t!(
@@ -4856,14 +4926,15 @@ impl AutomationsWindow {
         // Source browser (editable).
         body = body.push(self.owned_file_browser(package));
 
-        // Publish. Publish reads the on-disk manifest, so it's disabled while the manifest editor has
-        // unsaved edits (you'd otherwise ship the pre-edit manifest). Otherwise it's gated on a
+        // Publish. Publish reads the on-disk package, so it's disabled while a source or manifest
+        // editor has unsaved edits (you'd otherwise ship the pre-edit bytes). Otherwise it's gated on a
         // semver-fluent verdict: disabled while busy, when the version isn't valid publishable semver,
         // or when the number is already used (live/yanked/deleted) — numbers are permanently reserved.
         // Package names are owner-scoped on the server, so a fork always publishes under your own
         // handle and can never clobber another author's package — no client-side rename gate needed.
         let can_publish = !self.authoring_busy
             && !self.share_busy
+            && !self.dirty
             && !self.manifest_dirty
             && matches!(verdict, PublishVerdict::Ready);
         body = body.push(
@@ -4886,7 +4957,7 @@ impl AutomationsWindow {
         );
         // Explain why Publish is disabled (when it is). Unsaved manifest edits take precedence —
         // publishing them requires saving them first.
-        if self.manifest_dirty {
+        if self.dirty || self.manifest_dirty {
             body = body.push(
                 text(crate::i18n::t!("package-save-before-publish"))
                     .size(12.0)
@@ -5112,23 +5183,7 @@ impl AutomationsWindow {
                 .into()
             }
         } else {
-            let subpath = self.owned_selected_file.clone().unwrap_or_default();
-            let token = std::path::Path::new(&subpath)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("ts")
-                .to_string();
-            let editor = iced::widget::text_editor(&self.editor_content)
-                .highlight_with::<iced::highlighter::Highlighter>(
-                    iced::highlighter::Settings {
-                        theme: iced::highlighter::Theme::SolarizedDark,
-                        token,
-                    },
-                    |h: &iced::highlighter::Highlight, _| h.to_format(),
-                )
-                .font(fonts::GEIST_MONO_VF)
-                .on_action(Message::ScriptEditorAction)
-                .height(Length::Fixed(300.0));
+            let editor = self.code_editor_view(300.0);
             column![
                 editor,
                 row![

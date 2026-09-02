@@ -22,13 +22,13 @@ declare global {
         callback: (...args: TArgs) => void,
         delay?: number,
         ...args: MakeVoidParameterOptional<TArgs>
-    ): NodeJS.Timeout;
+    ): number;
 
     function setTimeout<TArgs extends any[]>(
         callback: (...args: TArgs) => void,
         delay?: number,
         ...args: MakeVoidParameterOptional<TArgs>
-    ): NodeJS.Timeout;
+    ): number;
     namespace setTimeout {
         import __promisify__ = promises.setTimeout;
         export { __promisify__ };
@@ -36,9 +36,9 @@ declare global {
 
     function clearImmediate(immediate: NodeJS.Immediate | undefined): void;
 
-    function clearInterval(timeout: NodeJS.Timeout | string | number | undefined): void;
+    function clearInterval(timeout: number | undefined): void;
 
-    function clearTimeout(timeout: NodeJS.Timeout | string | number | undefined): void;
+    function clearTimeout(timeout: number | undefined): void;
 
     function queueMicrotask(callback: () => void): void;
 }

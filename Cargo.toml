@@ -32,6 +32,10 @@ iced = { version = "0.14", features = [
     # fetcher pre-decodes to RGBA, so iced itself never runs a codec; see the Image plan).
     "image-without-codecs",
 ] }
+# Canvas-based code editor used by writable JavaScript/TypeScript surfaces in the
+# Automations window. Pin the reviewed upstream revision so its dependency tuple
+# and integration API stay reproducible.
+iced-code-editor = { git = "https://github.com/LuDog71FR/iced-code-editor", rev = "337ec6b08ebdb13edda6b8353256fe7fcb64352e" }
 # Raster decoding for the script-facing <Image> widget: the ui fetcher decodes off-thread
 # (with `image::Limits`) to RGBA handles. `default-features = false` + explicit codecs keeps
 # the binary lean; feature-unifies with the copy deno_image already pulls.

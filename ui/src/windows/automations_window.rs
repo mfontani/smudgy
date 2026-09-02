@@ -40,6 +40,10 @@ use crate::theme::Element as ThemedElement;
 use crate::update::Update;
 
 pub(crate) mod common;
+// Host-owned writable-code controller and `iced-code-editor` adapter. The current
+// read-only previews intentionally keep their existing text widgets.
+#[allow(dead_code)]
+mod code_editor;
 mod dashboard;
 mod editors;
 mod highlight;
@@ -66,6 +70,16 @@ use packages::{
 fn tab_traversal(modifiers: keyboard::Modifiers, status: Status) -> Option<bool> {
     (status == Status::Ignored && !modifiers.control() && !modifiers.alt() && !modifiers.logo())
         .then_some(modifiers.shift())
+}
+
+fn code_completion_shortcut(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    status: Status,
+) -> bool {
+    status == Status::Ignored
+        && modifiers.control()
+        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Space))
 }
 
 fn matcher_truecolor_range(
@@ -178,8 +192,8 @@ pub enum DiscoverScope {
     All,
 }
 
-/// The body of a script editor — the per-kind editable fields. The code body
-/// lives in [`AutomationsWindow::editor_content`].
+/// The body of a script editor — the per-kind editable fields. Writable JS/TS
+/// bodies live in [`AutomationsWindow::code_editor`].
 #[derive(Debug, Clone)]
 pub enum EditNode {
     Alias(aliases::AliasDefinition),
@@ -375,7 +389,38 @@ pub enum Message {
     ToggleFallthrough,
     /// Flip the open alias's "sent text may match itself" opt-in.
     ToggleAllowSelfMatch,
-    ScriptEditorAction(text_editor::Action),
+    /// An event emitted by the active writable JS/TS editor.
+    CodeEditorAction(code_editor::BoundEditorMessage),
+    /// Applies a language-service completion from the visible candidate list.
+    ApplyCodeCompletion(code_editor::CompletionSelection),
+    /// Synchronizes keyboard reveal state with an exact completion popup's scroll viewport.
+    CodeCompletionViewportChanged(code_editor::CompletionViewportTarget),
+    /// Requests completions at the active code-editor caret (Ctrl+Space or button).
+    TriggerCodeCompletion,
+    /// A pointer button went down somewhere in this window.
+    ///
+    /// The canvas editor keeps its own keyboard focus and never notices
+    /// clicks landing elsewhere, so the window releases that focus itself
+    /// unless the pointer is over the editor region.
+    PointerPressed(window::Id),
+    /// The pointer entered the writable code editor region (editor, overlays, and chrome).
+    CodeEditorPointerEntered,
+    /// The pointer left the writable code editor region.
+    CodeEditorPointerExited,
+    /// Closes host-owned completion and hover overlays without changing source.
+    DismissCodeOverlays,
+    /// Keeps one exact hover card alive while the pointer is over its rich content.
+    CodeHoverOverlayEntered(code_editor::HoverOverlayTarget),
+    /// Starts the grace period for dismissing one exact hover card.
+    CodeHoverOverlayExited(code_editor::HoverOverlayTarget),
+    /// An intentionally inert link from user-authored hover documentation.
+    CodeHoverLinkPressed(code_editor::HoverOverlayTarget, markdown::Uri),
+    /// An intentionally inert link from signature or parameter documentation.
+    CodeSignatureLinkPressed(code_editor::SignatureOverlayTarget, markdown::Uri),
+    /// Opens the first current-project target from an accepted definition response.
+    NavigateCodeDefinition(code_editor::DefinitionNavigation),
+    /// An edit in a plaintext hotkey body (JS/TS hotkeys use `CodeEditorAction`).
+    HotkeyTextAction(text_editor::Action),
     /// An edit in the send-text action draft.
     SendTextAction(text_editor::Action),
     /// Expand/collapse the Try-it accordion (collapsed by default).
@@ -641,6 +686,9 @@ pub enum Message {
     // ---- toast -------------------------------------------------------------
     DismissToast(u64),
 
+    /// Drain ready embedded language-service events without blocking the UI.
+    PollLanguageService,
+
     // ---- live (script-created) automations --------------------------------
     AutomationEvent(AutomationEvent),
     ToggleCreator(String),
@@ -701,7 +749,30 @@ pub struct AutomationsWindow {
     pub(super) new_menu_open: bool,
 
     // ---- shared editor buffers --------------------------------------------
-    pub(super) editor_content: text_editor::Content,
+    /// The active writable JS/TS/module/package editor. This field precedes
+    /// `language_service`, so its Drop queues CloseDocument before host shutdown.
+    code_editor: Option<code_editor::ActiveCodeEditor>,
+    /// Whether the pointer is over the code editor region; see `Message::PointerPressed`.
+    pointer_over_code_editor: bool,
+    /// Lazily spawned and retained for this Automations-window lifetime.
+    pub(super) language_service:
+        Option<smudgy_script::language_service_worker::LanguageServiceHost>,
+    /// Saved-source graph currently installed beneath the active editor overlay.
+    language_project_context: Option<code_editor::LanguageProjectContext>,
+    /// Context selected by the newest editor binding, which may still be awaiting refresh.
+    language_project_target_context: Option<code_editor::LanguageProjectContext>,
+    /// Exact in-flight graph refresh. Only its acknowledgement commits the installed context.
+    pending_language_project_refresh: Option<code_editor::PendingLanguageProjectRefresh>,
+    /// Stable identities for saved module/package sources during this window lifetime.
+    language_source_ids:
+        HashMap<code_editor::LanguageSourceKey, smudgy_script::language_service::DocumentId>,
+    /// Local editor-mount fence for delayed upstream tasks such as clipboard reads.
+    code_editor_mount_generation: u64,
+    next_language_graph_generation: u64,
+    pub(super) next_language_request_id: u64,
+    pub(super) next_code_disk_revision: u64,
+    /// Legacy plaintext body used only while a hotkey's behavior is Send Text.
+    pub(super) hotkey_text_content: text_editor::Content,
     /// The send-text action draft, held separately from the script draft so
     /// switching action tabs never destroys work. Save writes whichever tab
     /// is active.
@@ -966,7 +1037,18 @@ impl AutomationsWindow {
             search: String::new(),
             chip: Chip::All,
             new_menu_open: false,
-            editor_content: text_editor::Content::new(),
+            code_editor: None,
+            pointer_over_code_editor: false,
+            language_service: None,
+            language_project_context: None,
+            language_project_target_context: None,
+            pending_language_project_refresh: None,
+            language_source_ids: HashMap::new(),
+            code_editor_mount_generation: 0,
+            next_language_graph_generation: 2,
+            next_language_request_id: 1,
+            next_code_disk_revision: 1,
+            hotkey_text_content: text_editor::Content::new(),
             send_text_content: text_editor::Content::new(),
             action_text_pinned: false,
             action_script_pinned: false,
@@ -1066,11 +1148,19 @@ impl AutomationsWindow {
     /// don't fight text inputs elsewhere.
     pub fn subscription(&self) -> Subscription<Message> {
         let keyboard = iced::event::listen_with(|event, status, event_window| {
-            let IcedEvent::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
-            else {
-                return None;
+            let (key, modifiers) = match event {
+                IcedEvent::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    (key, modifiers)
+                }
+                IcedEvent::Mouse(iced::mouse::Event::ButtonPressed(_)) => {
+                    return Some(Message::PointerPressed(event_window));
+                }
+                _ => return None,
             };
             match (key.as_ref(), status) {
+                _ if code_completion_shortcut(&key, modifiers, status) => {
+                    Some(Message::TriggerCodeCompletion)
+                }
                 (keyboard::Key::Character("p"), _) if modifiers.command() => {
                     Some(Message::OpenPalette)
                 }
@@ -1111,6 +1201,11 @@ impl AutomationsWindow {
                     .map(Message::CatalogueEvent),
             );
         }
+        if self.language_service.is_some() {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(50)).map(|_| Message::PollLanguageService),
+            );
+        }
         Subscription::batch(subscriptions)
     }
 
@@ -1140,11 +1235,18 @@ impl AutomationsWindow {
             self.dirty = true;
         }
         let refresh_generated = Self::affects_captures(&message);
-        let update = match message {
+        let mut update = match message {
             // -------- loading ----------------------------------------------
             Message::ScriptsLoaded(scripts, errors) => {
                 self.scripts = scripts;
                 self.merge_folders();
+                if self
+                    .language_project_context_matches(&code_editor::LanguageProjectContext::Inline)
+                {
+                    self.language_project_target_context =
+                        Some(code_editor::LanguageProjectContext::Inline);
+                    self.refresh_language_project();
+                }
                 if errors.is_empty() {
                     Update::none()
                 } else {
@@ -1167,7 +1269,7 @@ impl AutomationsWindow {
                         log::warn!("Failed to list modules for {}: {e}", self.server_name);
                         Vec::new()
                     });
-                Update::none()
+                Update::with_task(self.reconcile_module_language_project_reload())
             }
             Message::LoadLocalPackages => {
                 self.local_packages =
@@ -1177,7 +1279,7 @@ impl AutomationsWindow {
                             Vec::new()
                         });
                 self.rebuild_graph();
-                Update::none()
+                Update::with_task(self.reconcile_owned_package_language_project_reload())
             }
             Message::LoadInstalledPackages => {
                 // Self-heal before reading: a reserved-`local`-owner install whose folder is gone
@@ -1252,12 +1354,28 @@ impl AutomationsWindow {
             // -------- keyboard focus traversal ----------------------------
             Message::FocusColorControl(id) => Update::with_task(operation::focus(id)),
             Message::FocusNext(event_window) if event_window == self.window_id => {
+                self.release_code_editor_focus();
                 Update::with_task(operation::focus_next())
             }
             Message::FocusPrevious(event_window) if event_window == self.window_id => {
+                self.release_code_editor_focus();
                 Update::with_task(operation::focus_previous())
             }
             Message::FocusNext(_) | Message::FocusPrevious(_) => Update::none(),
+            Message::PointerPressed(event_window) => {
+                if event_window == self.window_id && !self.pointer_over_code_editor {
+                    self.release_code_editor_focus();
+                }
+                Update::none()
+            }
+            Message::CodeEditorPointerEntered => {
+                self.pointer_over_code_editor = true;
+                Update::none()
+            }
+            Message::CodeEditorPointerExited => {
+                self.pointer_over_code_editor = false;
+                Update::none()
+            }
 
             // -------- navigation -------------------------------------------
             Message::ShowDashboard => {
@@ -1428,19 +1546,39 @@ impl AutomationsWindow {
             }
             Message::InsertReference(reference) => {
                 // The badge inserts into whichever action tab is active.
-                let paste =
-                    text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(reference)));
                 if self.open_action_language() == Some(ScriptLang::Plaintext) {
                     self.action_text_pinned = true;
-                    self.send_text_content.perform(paste);
+                    self.send_text_content.perform(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(Arc::new(reference)),
+                    ));
+                    Update::none()
                 } else {
                     self.action_script_pinned = true;
-                    self.editor_content.perform(paste);
+                    let Some(message) = self
+                        .bind_code_editor_message(code_editor::IcedEditorMessage::Paste(reference))
+                    else {
+                        return Update::none();
+                    };
+                    let (task, _) = self.update_code_editor(&message);
+                    Update::with_task(task)
                 }
-                Update::none()
             }
             Message::SetScriptFolder(folder) => self.set_script_folder(folder),
             Message::SetBehavior(language) => {
+                let previous = match &self.pane {
+                    Pane::Editor(EditorState { node, .. }) => match node {
+                        EditNode::Alias(alias) => {
+                            Some((alias.language, code_editor::CodeDocument::Alias))
+                        }
+                        EditNode::Hotkey(hotkey) => {
+                            Some((hotkey.language, code_editor::CodeDocument::Hotkey))
+                        }
+                        EditNode::Trigger { language, .. } => {
+                            Some((*language, code_editor::CodeDocument::Trigger))
+                        }
+                    },
+                    _ => None,
+                };
                 if let Pane::Editor(state) = &mut self.pane {
                     match &mut state.node {
                         EditNode::Alias(a) => a.language = language,
@@ -1448,7 +1586,46 @@ impl AutomationsWindow {
                         EditNode::Trigger { language: l, .. } => *l = language,
                     }
                 }
-                Update::none()
+                let Some((previous, kind)) = previous else {
+                    return Update::none();
+                };
+                if previous == language {
+                    Update::none()
+                } else if kind == code_editor::CodeDocument::Hotkey {
+                    if previous == ScriptLang::Plaintext {
+                        let text = self.hotkey_text_content.text();
+                        Update::with_task(self.bind_code_editor(
+                            &text,
+                            code_editor::script_language(language),
+                            kind,
+                        ))
+                    } else if language == ScriptLang::Plaintext {
+                        // A hotkey has one body regardless of execution language.
+                        // Transfer the authoritative code buffer back before the
+                        // plaintext editor becomes visible.
+                        let text = self.code_editor_text();
+                        self.hotkey_text_content = text_editor::Content::with_text(&text);
+                        self.clear_code_editor();
+                        Update::none()
+                    } else {
+                        let text = self.code_editor_text();
+                        Update::with_task(self.bind_code_editor(
+                            &text,
+                            code_editor::script_language(language),
+                            kind,
+                        ))
+                    }
+                } else if language != ScriptLang::Plaintext {
+                    let text = self.code_editor_text();
+                    self.action_script_lang = language;
+                    Update::with_task(self.bind_code_editor(
+                        &text,
+                        code_editor::script_language(language),
+                        kind,
+                    ))
+                } else {
+                    Update::none()
+                }
             }
             Message::AdjustPriority(delta) => {
                 if let Pane::Editor(state) = &mut self.pane {
@@ -1486,11 +1663,86 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
-            Message::ScriptEditorAction(action) => {
-                if action.is_edit() {
-                    self.action_script_pinned = true;
+            Message::CodeEditorAction(action)
+                if matches!(
+                    action.message,
+                    code_editor::IcedEditorMessage::WriteRequested
+                ) =>
+            {
+                if !self.code_editor_message_is_current(&action) {
+                    return Update::none();
                 }
-                self.editor_content.perform(action);
+                match &self.pane {
+                    Pane::Editor(_) => self.save_open(),
+                    Pane::Module(_) => self.save_module(),
+                    Pane::OwnedPackage => self.save_owned_file(),
+                    _ => Update::none(),
+                }
+            }
+            Message::CodeEditorAction(action) => {
+                let (task, changed) = self.update_code_editor(&action);
+                if changed {
+                    self.dirty = true;
+                    if matches!(self.pane, Pane::Editor(_)) {
+                        self.action_script_pinned = true;
+                    }
+                }
+                Update::with_task(task)
+            }
+            Message::ApplyCodeCompletion(selection) => {
+                let (task, changed) = self.apply_code_completion(selection);
+                if changed {
+                    self.dirty = true;
+                    if matches!(self.pane, Pane::Editor(_)) {
+                        self.action_script_pinned = true;
+                    }
+                }
+                Update::with_task(task)
+            }
+            Message::CodeCompletionViewportChanged(target) => {
+                self.code_completion_viewport_changed(target);
+                Update::none()
+            }
+            Message::TriggerCodeCompletion => {
+                let Some(message) = self.bind_code_editor_message(
+                    code_editor::IcedCodeEditorSurface::explicit_completion_message(),
+                ) else {
+                    return Update::none();
+                };
+                let (task, _) = self.update_code_editor(&message);
+                Update::with_task(task)
+            }
+            Message::DismissCodeOverlays => {
+                if let Some(editor) = &mut self.code_editor {
+                    editor.dismiss_pointer_overlays();
+                }
+                Update::none()
+            }
+            Message::CodeHoverOverlayEntered(target) => {
+                self.code_hover_overlay_entered(target);
+                Update::none()
+            }
+            Message::CodeHoverOverlayExited(target) => {
+                self.code_hover_overlay_exited(target);
+                Update::none()
+            }
+            Message::CodeHoverLinkPressed(target, _uri) => {
+                // Hover documentation is rich but inert: scripts cannot turn JSDoc
+                // into navigation or external-open side effects.
+                self.code_hover_overlay_entered(target);
+                Update::none()
+            }
+            Message::CodeSignatureLinkPressed(target, _uri) => {
+                // Signature documentation uses the same rich, inert link policy
+                // as hover documentation.
+                self.code_signature_link_pressed(target);
+                Update::none()
+            }
+            Message::NavigateCodeDefinition(navigation) => {
+                self.navigate_code_definition(navigation)
+            }
+            Message::HotkeyTextAction(action) => {
+                self.hotkey_text_content.perform(action);
                 Update::none()
             }
             Message::SendTextAction(action) => {
@@ -1965,12 +2217,28 @@ impl AutomationsWindow {
             }
             Message::Delete => self.delete_open(),
             Message::ConfirmDiscardNav => {
-                // Discard both kinds of pending edits — the script-editor buffer and the manifest
-                // draft (re-seeded from disk when the owned package is next opened).
-                self.dirty = false;
-                self.manifest_dirty = false;
                 match self.pending_nav.take() {
-                    Some(msg) => Update::with_task(Task::done(*msg)),
+                    Some(msg) => match *msg {
+                        // Definition results are state-fenced and can become stale while this
+                        // confirmation is open. Execute synchronously and clear dirty state only
+                        // if the jump really leaves the origin; otherwise the mounted draft must
+                        // remain protected by the next navigation guard.
+                        Message::NavigateCodeDefinition(navigation) => {
+                            let (update, left_origin) =
+                                self.navigate_code_definition_checked(navigation);
+                            if left_origin {
+                                self.accept_discarded_navigation();
+                            }
+                            update
+                        }
+                        message => {
+                            // Other guarded navigation is replayed through the normal update path.
+                            // Re-seed the manifest immediately so Discard cannot leave a dormant
+                            // edited draft behind if the destination remains in this package.
+                            self.accept_discarded_navigation();
+                            Update::with_task(Task::done(message))
+                        }
+                    },
                     None => Update::none(),
                 }
             }
@@ -2000,10 +2268,30 @@ impl AutomationsWindow {
             // -------- module -----------------------------------------------
             Message::SaveModule => self.save_module(),
             Message::SetNewModuleName(value) => {
-                if let Pane::Module(state) = &mut self.pane {
-                    state.name = value;
+                let is_module = if let Pane::Module(state) = &mut self.pane {
+                    state.name.clone_from(&value);
+                    true
+                } else {
+                    false
+                };
+                if !is_module {
+                    return Update::none();
                 }
-                Update::none()
+                let language = code_editor::path_language(&value);
+                if self
+                    .code_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.document().language == language)
+                {
+                    Update::none()
+                } else {
+                    let text = self.code_editor_text();
+                    Update::with_task(self.bind_code_editor(
+                        &text,
+                        language,
+                        code_editor::CodeDocument::StandaloneModule,
+                    ))
+                }
             }
             Message::CreateModule => self.create_module(),
 
@@ -2347,6 +2635,14 @@ impl AutomationsWindow {
             }
             Message::ClosePalette => {
                 self.palette_open = false;
+                // Unconsumed Escape routes here even with no palette open, so
+                // it also provides conventional, source-preserving dismissal
+                // for all host-owned intelligence overlays. Signature help is
+                // suppressed until `(` or `,` starts a new call lifecycle, so
+                // the following passive caret notification cannot reopen it.
+                if let Some(editor) = &mut self.code_editor {
+                    editor.dismiss_overlays();
+                }
                 Update::none()
             }
             Message::PaletteInput(value) => {
@@ -2368,11 +2664,21 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
+            Message::PollLanguageService => {
+                let (task, changed) = self.poll_language_service();
+                if changed {
+                    self.dirty = true;
+                    if matches!(self.pane, Pane::Editor(_)) {
+                        self.action_script_pinned = true;
+                    }
+                }
+                Update::with_task(task)
+            }
         };
         // An unpinned action draft follows the live matcher: any edit that can
         // change what is captured regenerates the example bodies.
         if refresh_generated {
-            self.refresh_generated_actions();
+            update.task = Task::batch([update.task, self.refresh_generated_actions()]);
         }
         update
     }
@@ -2381,7 +2687,7 @@ impl AutomationsWindow {
 
     fn is_edit_message(message: &Message) -> bool {
         match message {
-            Message::ScriptEditorAction(action)
+            Message::HotkeyTextAction(action)
             | Message::SendTextAction(action)
             | Message::AliasPatternAction(action)
             | Message::AliasRegexAction(action)
@@ -2389,6 +2695,7 @@ impl AutomationsWindow {
                 matches!(action, text_editor::Action::Edit(_))
             }
             Message::SetName(_)
+            | Message::SetNewModuleName(_)
             | Message::SetAliasKind(_)
             | Message::SetArgName(_, _)
             | Message::SetArgKind(_, _)
@@ -2474,7 +2781,11 @@ impl AutomationsWindow {
                 | Message::SelectFolder(_)
                 | Message::SelectModule(_)
                 | Message::SelectOwnedPackage(_)
+                | Message::SelectOwnedFile(_)
+                | Message::NavigateCodeDefinition(_)
                 | Message::SelectInstalledPackage(_)
+                | Message::SelectDependency { .. }
+                | Message::SelectCreatorAutomation { .. }
                 | Message::ShowDashboard
                 | Message::OpenDiscover
                 | Message::OpenShared
@@ -2486,6 +2797,16 @@ impl AutomationsWindow {
                 | Message::NewModule
                 | Message::NewPackage
         )
+    }
+
+    /// Commits the user's Discard choice before navigation consumes the current pane.
+    /// Re-seeding the manifest matters for same-package definition jumps, which replace only
+    /// the source editor and otherwise retain the structured manifest form in memory.
+    fn accept_discarded_navigation(&mut self) {
+        self.dirty = false;
+        if self.manifest_dirty {
+            let _ = self.revert_manifest();
+        }
     }
 
     /// Swaps a trigger row with its neighbor **within its role group** — the
@@ -2554,6 +2875,7 @@ impl AutomationsWindow {
 
     /// Resets per-pane selection scaffolding before opening a new pane.
     pub(super) fn clear_selection(&mut self) {
+        self.clear_code_editor();
         self.new_menu_open = false;
         self.confirm_folder_delete = false;
         self.confirm_delete_local = false;
@@ -2838,6 +3160,365 @@ mod tab_traversal_tests {
         ] {
             assert_eq!(tab_traversal(modifier, Status::Ignored), None);
         }
+    }
+
+    #[test]
+    fn control_space_requests_completion_only_when_unconsumed() {
+        let space = keyboard::Key::Named(keyboard::key::Named::Space);
+        assert!(code_completion_shortcut(
+            &space,
+            keyboard::Modifiers::CTRL,
+            Status::Ignored
+        ));
+        assert!(!code_completion_shortcut(
+            &space,
+            keyboard::Modifiers::CTRL,
+            Status::Captured
+        ));
+        assert!(!code_completion_shortcut(
+            &space,
+            keyboard::Modifiers::empty(),
+            Status::Ignored
+        ));
+    }
+
+    #[test]
+    fn escape_route_closes_transient_ui_without_editing_code() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "escape-code-overlay-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let _ = window.bind_code_editor(
+            "const value = 1;",
+            smudgy_script::language_service::Language::TypeScript,
+            code_editor::CodeDocument::StandaloneModule,
+        );
+        window.palette_open = true;
+
+        let _ = window.update(Message::ClosePalette);
+
+        assert!(!window.palette_open);
+        assert_eq!(window.code_editor_text(), "const value = 1;");
+        assert!(!window.dirty);
+    }
+
+    #[test]
+    fn hotkey_preserves_its_single_body_across_language_changes() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "hotkey-code-transition-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let _ = window.new_hotkey();
+        window.hotkey_text_content = text_editor::Content::with_text("say hello");
+
+        let _ = window.update(Message::SetBehavior(ScriptLang::JS));
+
+        assert!(window.code_editor.is_some());
+        assert!(window.language_service.is_some());
+        assert_eq!(window.code_editor_text(), "say hello");
+        let message = window
+            .bind_code_editor_message(code_editor::IcedEditorMessage::CtrlEnd)
+            .expect("code editor is bound");
+        let _ = window.update(Message::CodeEditorAction(message));
+        let message = window
+            .bind_code_editor_message(code_editor::IcedEditorMessage::Paste("();".to_owned()))
+            .expect("code editor is bound");
+        let _ = window.update(Message::CodeEditorAction(message));
+        let _ = window.update(Message::SetBehavior(ScriptLang::Plaintext));
+
+        assert_eq!(window.hotkey_text_content.text(), "say hello();");
+        assert!(window.code_editor.is_none());
+        assert!(matches!(
+            &window.pane,
+            Pane::Editor(EditorState {
+                node: EditNode::Hotkey(hotkeys::HotkeyDefinition {
+                    language: ScriptLang::Plaintext,
+                    ..
+                }),
+                ..
+            })
+        ));
+
+        let _ = window.update(Message::SetBehavior(ScriptLang::TS));
+        assert_eq!(window.code_editor_text(), "say hello();");
+    }
+
+    #[test]
+    fn pointer_presses_outside_the_editor_region_release_its_focus() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "editor-focus-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let _ = window.new_hotkey();
+        let _ = window.update(Message::SetBehavior(ScriptLang::JS));
+        let losses = |window: &AutomationsWindow| {
+            window
+                .code_editor
+                .as_ref()
+                .expect("code editor is bound")
+                .focus_losses()
+        };
+        assert_eq!(losses(&window), 0);
+
+        // A press while the pointer is over the editor region (including its
+        // overlays and chrome) keeps focus: that press is the editor's own.
+        let _ = window.update(Message::CodeEditorPointerEntered);
+        let _ = window.update(Message::PointerPressed(window.window_id));
+        assert_eq!(losses(&window), 0);
+
+        // A press anywhere else in this window hands focus to that widget.
+        let _ = window.update(Message::CodeEditorPointerExited);
+        let _ = window.update(Message::PointerPressed(window.window_id));
+        assert_eq!(losses(&window), 1);
+
+        // Other windows' presses are not this editor's concern.
+        let _ = window.update(Message::PointerPressed(window::Id::unique()));
+        assert_eq!(losses(&window), 1);
+
+        // Keyboard traversal moves focus to another widget the same way.
+        let _ = window.update(Message::FocusNext(window.window_id));
+        assert_eq!(losses(&window), 2);
+    }
+
+    #[test]
+    fn non_script_writable_files_do_not_start_the_language_service() {
+        for language in [
+            smudgy_script::language_service::Language::PlainText,
+            smudgy_script::language_service::Language::Json,
+        ] {
+            let mut window = AutomationsWindow::new(
+                window::Id::unique(),
+                "non-script-editor-test".to_string(),
+                crate::cloud_account::test_handles(),
+                SessionId::from(1),
+            );
+
+            let _ = window.bind_code_editor(
+                "notes only",
+                language,
+                code_editor::CodeDocument::OwnedPackage,
+            );
+
+            assert!(window.code_editor.is_some());
+            assert!(window.language_service.is_none());
+            assert_eq!(window.code_editor_text(), "notes only");
+        }
+    }
+
+    #[test]
+    fn new_module_rebinds_language_from_its_name_without_losing_text() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "new-module-language-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let _ = window.new_module();
+        let original = window.code_editor_text();
+
+        let _ = window.update(Message::SetNewModuleName("helpers.js".to_owned()));
+        assert_eq!(
+            window.code_editor.as_ref().unwrap().document().language,
+            smudgy_script::language_service::Language::JavaScript
+        );
+        assert_eq!(window.code_editor_text(), original);
+
+        let _ = window.update(Message::SetNewModuleName("data.json".to_owned()));
+        let editor = window.code_editor.as_ref().unwrap();
+        assert_eq!(
+            editor.document().language,
+            smudgy_script::language_service::Language::Json
+        );
+        assert!(!editor.has_language_service());
+        assert_eq!(window.code_editor_text(), original);
+        assert!(window.dirty);
+    }
+
+    #[test]
+    fn stale_async_editor_message_cannot_mutate_a_remounted_stable_document() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "stale-editor-message-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.pane = Pane::Module(ModuleState {
+            mode: ModuleMode::View,
+            subpath: "same.ts".to_owned(),
+            path: Some(std::path::PathBuf::from("same.ts")),
+            name: String::new(),
+            error: None,
+        });
+        let _ = window.bind_code_editor(
+            "first",
+            smudgy_script::language_service::Language::TypeScript,
+            code_editor::CodeDocument::StandaloneModule,
+        );
+        let first_document = window
+            .code_editor
+            .as_ref()
+            .unwrap()
+            .document()
+            .document
+            .key
+            .document_id;
+        let stale = window
+            .bind_code_editor_message(code_editor::IcedEditorMessage::Paste(" stale".to_owned()))
+            .unwrap();
+        let _ = window.bind_code_editor(
+            "second",
+            smudgy_script::language_service::Language::TypeScript,
+            code_editor::CodeDocument::StandaloneModule,
+        );
+        assert_eq!(
+            window
+                .code_editor
+                .as_ref()
+                .unwrap()
+                .document()
+                .document
+                .key
+                .document_id,
+            first_document,
+            "saved paths deliberately reuse their stable routing identity"
+        );
+        assert_ne!(
+            stale.mount_generation, window.code_editor_mount_generation,
+            "each surface binding needs a distinct asynchronous-task fence"
+        );
+
+        let _ = window.update(Message::CodeEditorAction(stale));
+
+        assert_eq!(window.code_editor_text(), "second");
+        assert!(!window.dirty);
+    }
+
+    #[test]
+    fn module_reload_rebinds_clean_text_and_preserves_a_dirty_overlay() {
+        let directory = tempfile::tempdir().expect("temporary module directory");
+        let path = directory.path().join("same.ts");
+        std::fs::write(&path, "export const value = 1;\n").expect("seed module");
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "module-reload-overlay-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.modules = vec![smudgy_core::models::modules::ModuleFile {
+            subpath: "same.ts".to_owned(),
+            path: path.clone(),
+        }];
+        window.selection = Selection::Module("same.ts".to_owned());
+        window.pane = Pane::Module(ModuleState {
+            mode: ModuleMode::View,
+            subpath: "same.ts".to_owned(),
+            path: Some(path.clone()),
+            name: String::new(),
+            error: None,
+        });
+        let _ = window.bind_code_editor(
+            "export const value = 1;\n",
+            smudgy_script::language_service::Language::TypeScript,
+            code_editor::CodeDocument::StandaloneModule,
+        );
+        let stable_id = window
+            .code_editor
+            .as_ref()
+            .unwrap()
+            .document()
+            .document
+            .key
+            .document_id;
+
+        std::fs::write(&path, "export const value = 2;\n").expect("update clean module");
+        let _ = window.reconcile_module_language_project_reload();
+        assert_eq!(window.code_editor_text(), "export const value = 2;\n");
+        assert_eq!(
+            window
+                .code_editor
+                .as_ref()
+                .unwrap()
+                .document()
+                .document
+                .key
+                .document_id,
+            stable_id
+        );
+
+        let end = window
+            .bind_code_editor_message(code_editor::IcedEditorMessage::CtrlEnd)
+            .unwrap();
+        let _ = window.update(Message::CodeEditorAction(end));
+        let paste = window
+            .bind_code_editor_message(code_editor::IcedEditorMessage::Paste(
+                "// unsaved\n".to_owned(),
+            ))
+            .unwrap();
+        let _ = window.update(Message::CodeEditorAction(paste));
+        let dirty_text = window.code_editor_text();
+        assert!(window.dirty);
+
+        std::fs::write(&path, "export const value = 3;\n").expect("update disk beneath overlay");
+        let _ = window.reconcile_module_language_project_reload();
+        assert_eq!(window.code_editor_text(), dirty_text);
+        assert!(window.dirty);
+    }
+
+    #[test]
+    fn every_sidebar_document_route_is_guarded_while_source_is_dirty() {
+        let messages = [
+            Message::SelectDependency {
+                parent: "parent".to_owned(),
+                spec: "smudgy://owner/package".to_owned(),
+            },
+            Message::SelectCreatorAutomation {
+                creator_id: "creator".to_owned(),
+                kind: AutomationKind::Alias,
+                name: "generated".to_owned(),
+            },
+        ];
+        for message in messages {
+            let mut window = AutomationsWindow::new(
+                window::Id::unique(),
+                "guarded-sidebar-route-test".to_string(),
+                crate::cloud_account::test_handles(),
+                SessionId::from(1),
+            );
+            window.dirty = true;
+
+            let _ = window.update(message);
+
+            assert!(window.pending_nav.is_some());
+            assert!(window.dirty);
+        }
+    }
+
+    #[test]
+    fn selecting_another_owned_file_is_guarded_while_source_is_dirty() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "owned-file-navigation-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.selection = Selection::OwnedPackage("demo".to_owned());
+        window.pane = Pane::OwnedPackage;
+        window.owned_selected_file = Some("first.ts".to_owned());
+        window.dirty = true;
+
+        let _ = window.update(Message::SelectOwnedFile("second.ts".to_owned()));
+
+        assert_eq!(window.owned_selected_file.as_deref(), Some("first.ts"));
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SelectOwnedFile(path)) if path == "second.ts"
+        ));
     }
 
     #[test]

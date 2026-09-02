@@ -502,12 +502,12 @@ interface TextEncoderEncodeIntoResult {
  */
 interface TextEncoder extends TextEncoderCommon {
   /** Turns a string into binary data (in the form of a Uint8Array) using UTF-8 encoding. */
-  encode(input?: string): Uint8Array<ArrayBuffer>;
+  encode(input?: string): Uint8Array;
 
   /** Encodes a string into the destination Uint8Array and returns the result of the encoding. */
   encodeInto(
     input: string,
-    dest: Uint8Array<ArrayBufferLike>,
+    dest: Uint8Array,
   ): TextEncoderEncodeIntoResult;
 }
 
@@ -543,7 +543,7 @@ declare var TextDecoderStream: {
 
 /** @category Encoding */
 interface TextEncoderStream extends GenericTransformStream, TextEncoderCommon {
-  readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+  readonly readable: ReadableStream<Uint8Array>;
   readonly writable: WritableStream<string>;
 }
 
@@ -735,9 +735,9 @@ interface Blob {
   readonly size: number;
   readonly type: string;
   arrayBuffer(): Promise<ArrayBuffer>;
-  bytes(): Promise<Uint8Array<ArrayBuffer>>;
+  bytes(): Promise<Uint8Array>;
   slice(start?: number, end?: number, contentType?: string): Blob;
-  stream(): ReadableStream<Uint8Array<ArrayBuffer>>;
+  stream(): ReadableStream<Uint8Array>;
   text(): Promise<string>;
   /** Returns a `ReadableStream<string>` that streams the blob's data decoded
    * as UTF-8 text. */
@@ -854,13 +854,13 @@ interface ReadableStreamBYOBReader extends ReadableStreamGenericReader {
 declare var ReadableStreamBYOBReader: {
   readonly prototype: ReadableStreamBYOBReader;
   new (
-    stream: ReadableStream<Uint8Array<ArrayBuffer>>,
+    stream: ReadableStream<Uint8Array>,
   ): ReadableStreamBYOBReader;
 };
 
 /** @category Streams */
 interface ReadableStreamBYOBRequest {
-  readonly view: Uint8Array<ArrayBuffer> | null;
+  readonly view: Uint8Array | null;
   respond(bytesWritten: number): void;
   respondWithNewView(view: ArrayBufferView): void;
 }
@@ -1069,7 +1069,7 @@ declare var ReadableStream: {
   new (
     underlyingSource: UnderlyingByteSource,
     strategy?: { highWaterMark?: number },
-  ): ReadableStream<Uint8Array<ArrayBuffer>>;
+  ): ReadableStream<Uint8Array>;
   new <R = any>(
     underlyingSource: UnderlyingDefaultSource<R>,
     strategy?: QueuingStrategy<R>,
@@ -1516,7 +1516,7 @@ declare function structuredClone<T = any>(
  * @category Streams
  */
 interface CompressionStream extends GenericTransformStream {
-  readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+  readonly readable: ReadableStream<Uint8Array>;
   readonly writable: WritableStream<BufferSource>;
 }
 
@@ -1563,7 +1563,7 @@ declare var CompressionStream: {
  * @category Streams
  */
 interface DecompressionStream extends GenericTransformStream {
-  readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+  readonly readable: ReadableStream<Uint8Array>;
   readonly writable: WritableStream<BufferSource>;
 }
 
@@ -1620,8 +1620,8 @@ type PredefinedColorSpace = "srgb" | "display-p3";
 
 /** @category Platform */
 type ImageDataArray =
-  | Uint8ClampedArray<ArrayBuffer>
-  | Float16Array<ArrayBuffer>;
+  | Uint8ClampedArray
+  | Float16Array;
 
 /** @category Platform */
 type ImageDataPixelFormat = "rgba-unorm8" | "rgba-float16";
@@ -2123,13 +2123,13 @@ declare var DOMMatrix: {
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/DOMMatrix/fromFloat32Array_static)
    */
-  fromFloat32Array(array32: Float32Array<ArrayBuffer>): DOMMatrix;
+  fromFloat32Array(array32: Float32Array): DOMMatrix;
   /**
    * The **`fromFloat64Array()`** static method of the DOMMatrix interface creates a new DOMMatrix object given an array of double-precision (64-bit) floating-point values.
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/DOMMatrix/fromFloat64Array_static)
    */
-  fromFloat64Array(array64: Float64Array<ArrayBuffer>): DOMMatrix;
+  fromFloat64Array(array64: Float64Array): DOMMatrix;
   /**
    * The **`fromMatrix()`** static method of the DOMMatrix interface creates a new DOMMatrix object given an existing matrix or an object which provides the values for its properties.
    *
@@ -2300,13 +2300,13 @@ interface DOMMatrixReadOnly {
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/DOMMatrixReadOnly/toFloat32Array)
    */
-  toFloat32Array(): Float32Array<ArrayBuffer>;
+  toFloat32Array(): Float32Array;
   /**
    * The **`toFloat64Array()`** method of the DOMMatrixReadOnly interface returns a new Float64Array containing all 16 elements (m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44) which comprise the matrix. The elements are stored into the array as double-precision floating-point numbers in column-major (colexographical access, or "colex") order. (In other words, down the first column from top to bottom, then the second column, and so forth.)
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/DOMMatrixReadOnly/toFloat64Array)
    */
-  toFloat64Array(): Float64Array<ArrayBuffer>;
+  toFloat64Array(): Float64Array;
   /**
    * The **`toJSON()`** method of the DOMMatrixReadOnly interface creates and returns a JSON object. The JSON object includes the 2D matrix elements a through f, the 16 elements of the 4X4 3D matrix, m[1-4][1-4], the boolean is2D property, and the boolean isIdentity property.
    *
@@ -2351,13 +2351,13 @@ declare var DOMMatrixReadOnly: {
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/DOMMatrixReadOnly/fromFloat32Array_static)
    */
-  fromFloat32Array(array32: Float32Array<ArrayBuffer>): DOMMatrixReadOnly;
+  fromFloat32Array(array32: Float32Array): DOMMatrixReadOnly;
   /**
    * The **`fromFloat64Array()`** static method of the DOMMatrixReadOnly interface creates a new DOMMatrixReadOnly object given an array of double-precision (64-bit) floating-point values.
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/DOMMatrixReadOnly/fromFloat64Array_static)
    */
-  fromFloat64Array(array64: Float64Array<ArrayBuffer>): DOMMatrixReadOnly;
+  fromFloat64Array(array64: Float64Array): DOMMatrixReadOnly;
   /**
    * The **`fromMatrix()`** static method of the DOMMatrixReadOnly interface creates a new DOMMatrixReadOnly object given an existing matrix or an object which provides the values for its properties.
    *

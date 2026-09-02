@@ -63,10 +63,24 @@ const SMUDGY_WEB_AUDIO_DTS: &str = include_str!("script_typings/smudgy-web-audio
 /// required — is the single global declaration.
 const SMUDGY_WORKERS_DTS: &str = include_str!("script_typings/smudgy-workers.d.ts");
 
+const SMUDGY_INLINE_DTS: &str = include_str!("script_typings/smudgy-inline.d.ts");
+
+/// Returns the inline-automation ambient bridge for an inline-only generated project source.
+///
+/// The bridge is intentionally absent from [`embedded_language_service_types`], including as
+/// a non-root library. Supplying the declaration only as a scoped project source prevents a
+/// module or package document from opting into inline-only globals with a path reference.
+#[must_use]
+pub const fn language_service_inline_bridge() -> &'static str {
+    SMUDGY_INLINE_DTS
+}
+
 /// The vendored Deno runtime lib (`Deno` namespace + web globals like `fetch`/`Response`),
 /// with the `/// <reference>` directives stripped so they're plain ambient declarations,
 /// and the global `Worker` declarations trimmed — the sibling `smudgy-workers.d.ts`
 /// ([`SMUDGY_WORKERS_DTS`]) is the authoritative, narrower contract for that surface.
+/// Generic typed-array annotations introduced after TypeScript 5.6 are downleveled to
+/// their non-generic equivalents so the embedded 5.6 compiler preserves concrete types.
 /// Materialized to `<server>/.smudgy/types/deno/` (covered by the user tsconfig's
 /// `.smudgy/types/**` include).
 static DENO_LIB: Dir =
@@ -78,9 +92,132 @@ static DENO_LIB: Dir =
 static NODE_TYPES: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/models/script_typings/vendor/node-types");
 
+/// One immutable declaration file exposed to Smudgy's in-process authoring service.
+///
+/// The virtual path is relative to the language service's private root. `is_root`
+/// means TypeScript should include the declaration in every authoring Program; the
+/// remaining files are dependencies reached by triple-slash references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedScriptTypeFile {
+    pub virtual_path: String,
+    pub contents: &'static str,
+    pub is_root: bool,
+}
+
+/// Returns the static, application-aware declaration snapshot for in-app editing.
+///
+/// This is deliberately side-effect-free: it reads only declarations embedded in the
+/// binary and neither materializes the external-editor project nor consults a package
+/// cache. Session-authorized Web Audio and generated installed-package declarations are
+/// excluded until the authoring graph has an explicit capability/package snapshot.
+#[must_use]
+pub fn embedded_language_service_types() -> Vec<EmbeddedScriptTypeFile> {
+    let mut files = vec![
+        EmbeddedScriptTypeFile {
+            virtual_path: "smudgy/smudgy-core.d.ts".to_owned(),
+            contents: SMUDGY_CORE_DTS,
+            is_root: true,
+        },
+        EmbeddedScriptTypeFile {
+            virtual_path: "smudgy/smudgy-params.d.ts".to_owned(),
+            contents: SMUDGY_PARAMS_DTS,
+            is_root: true,
+        },
+        EmbeddedScriptTypeFile {
+            virtual_path: "smudgy/smudgy-mapper.d.ts".to_owned(),
+            contents: SMUDGY_MAPPER_DTS,
+            is_root: true,
+        },
+        EmbeddedScriptTypeFile {
+            virtual_path: "smudgy/smudgy-widgets.d.ts".to_owned(),
+            contents: SMUDGY_WIDGETS_DTS,
+            is_root: true,
+        },
+        EmbeddedScriptTypeFile {
+            virtual_path: "smudgy/smudgy-workers.d.ts".to_owned(),
+            contents: SMUDGY_WORKERS_DTS,
+            is_root: true,
+        },
+    ];
+    // TypeScript resolves `/// <reference lib="deno.ns" />` at the canonical
+    // `/lib.deno.ns.d.ts` name. Keep those names at the virtual root even though
+    // the external-editor materialization remains organized under `types/deno/`.
+    append_embedded_type_dir(&mut files, "", &DENO_LIB, &|_| true);
+    append_embedded_type_dir_filtered(
+        &mut files,
+        "node-types",
+        &NODE_TYPES,
+        &embedded_node_type_is_included,
+        &|path| path == Path::new("@types/node/ts5.6/index.d.ts"),
+    );
+    files.sort_by(|left, right| left.virtual_path.cmp(&right.virtual_path));
+    files
+}
+
+fn embedded_node_type_is_included(path: &Path) -> bool {
+    let path = path.to_string_lossy().replace('\\', "/");
+
+    path != "@types/node/index.d.ts"
+        && path != "@types/node/globals.typedarray.d.ts"
+        && path != "@types/node/buffer.buffer.d.ts"
+        && !path.starts_with("@types/node/ts5.7/")
+        && (!path.starts_with("@types/node/web-globals/")
+            || path == "@types/node/web-globals/timers.d.ts")
+}
+
+fn append_embedded_type_dir(
+    output: &mut Vec<EmbeddedScriptTypeFile>,
+    prefix: &str,
+    directory: &'static Dir<'static>,
+    is_root: &impl Fn(&Path) -> bool,
+) {
+    append_embedded_type_dir_filtered(output, prefix, directory, &|_| true, is_root);
+}
+
+fn append_embedded_type_dir_filtered(
+    output: &mut Vec<EmbeddedScriptTypeFile>,
+    prefix: &str,
+    directory: &'static Dir<'static>,
+    include: &impl Fn(&Path) -> bool,
+    is_root: &impl Fn(&Path) -> bool,
+) {
+    for file in directory.files() {
+        let path = file.path();
+        if !include(path)
+            || !path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"))
+            || !path
+                .file_stem()
+                .map(Path::new)
+                .and_then(Path::extension)
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("d"))
+        {
+            continue;
+        }
+        let relative = path.to_string_lossy().replace('\\', "/");
+        output.push(EmbeddedScriptTypeFile {
+            virtual_path: if prefix.is_empty() {
+                relative
+            } else {
+                format!("{prefix}/{relative}")
+            },
+            contents: file
+                .contents_utf8()
+                .expect("embedded script declarations must be UTF-8"),
+            is_root: is_root(path),
+        });
+    }
+    for child in directory.dirs() {
+        append_embedded_type_dir_filtered(output, prefix, child, include, is_root);
+    }
+}
+
 /// Bumped whenever the vendored Deno lib / `@types/node` change, so the runtime typings are
 /// (re)written only on first run or after a re-vendor — not on every session start.
-const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.5+node-26.0.1+2";
+const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.5+node-26.0.1+3";
 
 const MANAGED_README: &str = "\
 This folder is generated and managed by smudgy. It gives VS Code (and any\n\
@@ -930,8 +1067,15 @@ mod tests {
             "/// <reference no-default-lib=\"true\" />\n\
              /// <reference lib=\"esnext\" />\n\
              interface Event {}\n\
-             interface EventTarget {}\n\
-             interface MessageEvent extends Event { readonly data: any; }\n\
+             interface EventListener { (event: Event): void; }\n\
+             interface EventListenerObject { handleEvent(event: Event): void; }\n\
+             type EventListenerOrEventListenerObject = EventListener | EventListenerObject;\n\
+             interface EventTarget {\n\
+               addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;\n\
+               dispatchEvent(event: Event): boolean;\n\
+               removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void;\n\
+             }\n\
+             interface MessageEvent<T = any> extends Event { readonly data: T; }\n\
              interface ErrorEvent extends Event { readonly message: string; }\n\
              interface URL {}\n\
              type Transferable = ArrayBuffer;\n\
@@ -961,6 +1105,8 @@ mod tests {
              tally.addEventListener(\"messageerror\", (e) => { void e.data; });\n\
              tally.addEventListener(\"error\", (e) => { void e.message; });\n\
              tally.removeEventListener(\"message\", (e) => { void e.data; });\n\
+             const eventTarget: EventTarget = tally;\n\
+             eventTarget.dispatchEvent({} as Event);\n\
              tally.terminate();\n\
              export {};\n"
                 .to_string(),
@@ -2617,6 +2763,428 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn in_memory_language_service_types_are_static_complete_and_capability_safe() {
+        use std::collections::HashSet;
+
+        let files = embedded_language_service_types();
+        let paths = files
+            .iter()
+            .map(|file| file.virtual_path.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(paths.len(), files.len(), "virtual paths must be unique");
+        assert!(paths.contains("smudgy/smudgy-core.d.ts"));
+        assert!(paths.contains("lib.deno.ns.d.ts"));
+        assert!(paths.contains("node-types/@types/node/events.d.ts"));
+        assert!(paths.contains("node-types/@types/node/web-globals/timers.d.ts"));
+        assert!(
+            files.iter().any(|file| {
+                file.virtual_path == "node-types/@types/node/ts5.6/index.d.ts" && file.is_root
+            }),
+            "the embedded TypeScript 5.6 compiler needs the matching Node entry point"
+        );
+        assert!(
+            files
+                .iter()
+                .filter(|file| file.virtual_path.starts_with("lib.deno"))
+                .all(|file| file.is_root),
+            "the vendored Deno references were stripped, so each declaration is a root"
+        );
+        assert!(
+            !files.iter().any(|file| {
+                file.virtual_path.contains("web-audio")
+                    || file.virtual_path.contains("smudgy-inline")
+                    || file.virtual_path.contains("installed-events")
+                    || file.virtual_path.contains("interop-handles")
+            }),
+            "scoped, capability-, and package-dependent declarations need explicit sources"
+        );
+        assert!(
+            !paths.contains("node-types/@types/node/index.d.ts")
+                && !paths.contains("node-types/@types/node/globals.typedarray.d.ts")
+                && !paths.contains("node-types/@types/node/buffer.buffer.d.ts")
+                && !paths
+                    .iter()
+                    .any(|path| path.starts_with("node-types/@types/node/ts5.7/")),
+            "only the TypeScript 5.6-compatible Node declaration entry may be addressable"
+        );
+        assert!(
+            paths.iter().all(|path| {
+                !path.starts_with("node-types/@types/node/web-globals/")
+                    || *path == "node-types/@types/node/web-globals/timers.d.ts"
+            }),
+            "Deno declarations own overlapping web globals; only hybrid timers remain"
+        );
+        assert!(
+            files
+                .iter()
+                .filter(|file| file.virtual_path.starts_with("lib.deno"))
+                .all(|file| {
+                    ![
+                        "Uint8Array<ArrayBuffer>",
+                        "Uint8Array<ArrayBufferLike>",
+                        "Uint8ClampedArray<ArrayBuffer>",
+                        "Float16Array<ArrayBuffer>",
+                        "Float32Array<ArrayBuffer>",
+                        "Float64Array<ArrayBuffer>",
+                        "ArrayBufferView<ArrayBuffer>",
+                    ]
+                    .iter()
+                    .any(|unsupported| file.contents.contains(unsupported))
+                }),
+            "the Deno snapshot must remain valid under the embedded TypeScript 5.6 compiler"
+        );
+        assert_eq!(
+            files.iter().filter(|file| file.is_root).count(),
+            22,
+            "five Smudgy roots + sixteen Deno roots + the TypeScript 5.6 Node root"
+        );
+    }
+
+    #[test]
+    fn in_memory_language_service_bundle_types_runtime_and_inline_surfaces() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use smudgy_script::language_service::{
+            AcknowledgedState, AnalysisContextId, AutomationKind, ClientId, Command,
+            DiagnosticCode, DiagnosticSeverity, DiskRevision, DocumentDescriptor, DocumentId,
+            DocumentKey, DocumentKind, DocumentRef, DocumentResultIdentity, DocumentVersion, Event,
+            EventEnvelope, GraphGeneration, Language, LanguageServiceLibrary, OpenDocument,
+            OpenProject, ProjectId, ProjectScope, ProjectSource, RefreshProject, RequestId,
+        };
+        use smudgy_script::language_service_worker::LanguageServiceHost;
+
+        fn wire<T>(value: u64) -> T
+        where
+            T: TryFrom<u64>,
+            T::Error: std::fmt::Debug,
+        {
+            T::try_from(value).expect("valid test wire value")
+        }
+
+        fn wait_for(
+            host: &mut LanguageServiceHost,
+            predicate: impl Fn(&Event) -> bool,
+        ) -> EventEnvelope {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                for envelope in host.drain_events() {
+                    if let Event::RequestFailed(failure) = &envelope.event {
+                        panic!("language-service request failed: {failure:?}");
+                    }
+                    if predicate(&envelope.event) {
+                        return envelope;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "language-service event timed out"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn descriptor(
+            project: ProjectScope,
+            document_id: DocumentId,
+            uri: &str,
+            kind: DocumentKind,
+            analysis_context: u64,
+        ) -> DocumentDescriptor {
+            DocumentDescriptor {
+                document: DocumentRef {
+                    key: DocumentKey {
+                        project,
+                        document_id,
+                    },
+                    view: None,
+                    version: wire::<DocumentVersion>(1),
+                },
+                uri: uri.to_owned(),
+                language: Language::TypeScript,
+                kind,
+                analysis_context: wire::<AnalysisContextId>(analysis_context),
+                disk_revision: Some(wire::<DiskRevision>(1)),
+            }
+        }
+
+        let libraries = embedded_language_service_types()
+            .into_iter()
+            .map(|file| LanguageServiceLibrary {
+                file_name: file.virtual_path,
+                text: file.contents.into(),
+                is_root: file.is_root,
+            })
+            .collect();
+        let mut host = LanguageServiceHost::try_spawn_with_libraries(libraries)
+            .expect("spawn language service with Smudgy's embedded declarations");
+        let client = host.client();
+        let project = ProjectScope {
+            client_id: wire::<ClientId>(71),
+            project_id: wire::<ProjectId>(72),
+        };
+
+        client
+            .send(Command::OpenProject(OpenProject { project }))
+            .expect("queue project open");
+        wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::ProjectOpened(state))
+                    if state.project == project
+            )
+        });
+
+        let module_id = DocumentId::try_from([73; 16]).expect("non-nil module document ID");
+        let module_descriptor = descriptor(
+            project,
+            module_id,
+            "smudgy-project:///modules/runtime-types.ts",
+            DocumentKind::StandaloneModule,
+            74,
+        );
+        client
+            .send(Command::OpenDocument(OpenDocument {
+                descriptor: module_descriptor,
+                text: concat!(
+                    "/// <reference lib=\"deno.ns\" />\n",
+                    "/// <reference types=\"node\" />\n",
+                    "import { echo } from \"smudgy:core\";\n",
+                    "import { join } from \"node:path\";\n",
+                    "type IsAny<T> = 0 extends (1 & T) ? true : false;\n",
+                    "const denoReadIsAny: IsAny<Awaited<ReturnType<typeof Deno.readFile>>> = false;\n",
+                    "const denoFetchIsAny: IsAny<Awaited<ReturnType<typeof fetch>>> = false;\n",
+                    "void denoReadIsAny; void denoFetchIsAny;\n",
+                    "const timeoutHandle: number = setTimeout(() => {}, 1);\n",
+                    "clearTimeout(timeoutHandle);\n",
+                    "setTimeout(() => {}, 1).ref();\n",
+                    "const immediateHandle = setImmediate(() => {});\n",
+                    "clearImmediate(immediateHandle);\n",
+                    "const worker = new Worker(\"data:text/javascript,export {};\", { type: \"module\" });\n",
+                    "const eventTarget: EventTarget = worker;\n",
+                    "eventTarget.dispatchEvent(new Event(\"probe\"));\n",
+                    "worker.addEventListener(\"message\", (event) => { event.data.toString(); });\n",
+                    "echo(join(Deno.cwd(), \"logs\"));\n",
+                    "const mismatch: number = \"wrong\";\n",
+                    "void mismatch;\n",
+                )
+                .to_owned(),
+            }))
+            .expect("queue runtime-typing document open");
+        let opened = wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state))
+                    if state.document.key.document_id == module_id
+            )
+        });
+        let Event::StateAcknowledged(AcknowledgedState::DocumentOpened(module_state)) =
+            opened.event
+        else {
+            unreachable!();
+        };
+        let module_request = wire::<RequestId>(75);
+        client
+            .send(Command::RequestDiagnostics(
+                smudgy_script::language_service::DocumentRequest {
+                    identity: DocumentResultIdentity {
+                        state: module_state,
+                        request_id: module_request,
+                    },
+                },
+            ))
+            .expect("queue runtime-typing diagnostics");
+        let diagnostics = wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::Diagnostics(result) if result.identity.request_id == module_request
+            )
+        });
+        let Event::Diagnostics(diagnostics) = diagnostics.event else {
+            unreachable!();
+        };
+        assert!(
+            !diagnostics.result.items.iter().any(|item| {
+                matches!(
+                    item.code,
+                    Some(DiagnosticCode::Number(
+                        2304 | 2307 | 2552 | 2580 | 2591 | 2688 | 2726 | 2792
+                    ))
+                ) || item.message.contains("Cannot find name")
+                    || item.message.contains("Cannot find module")
+            }),
+            "smudgy:core, Deno, and node:path must resolve: {:?}",
+            diagnostics.result.items
+        );
+        assert!(
+            diagnostics
+                .result
+                .items
+                .iter()
+                .any(|item| item.code == Some(DiagnosticCode::Number(2322))),
+            "the declaration bundle must preserve ordinary semantic checking"
+        );
+        assert!(
+            diagnostics
+                .result
+                .items
+                .iter()
+                .any(|item| item.code == Some(DiagnosticCode::Number(2339))),
+            "Deno timer handles must not expose Node's ref() API"
+        );
+        assert!(
+            diagnostics
+                .result
+                .items
+                .iter()
+                .any(|item| item.code == Some(DiagnosticCode::Number(18046))),
+            "Worker message payloads must require narrowing before use"
+        );
+        let errors = diagnostics
+            .result
+            .items
+            .iter()
+            .filter(|item| item.severity == DiagnosticSeverity::Error)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors.len(),
+            3,
+            "Deno APIs, hybrid globals, and Worker/EventTarget assignability must otherwise type-check: {:?}",
+            diagnostics.result.items
+        );
+
+        let graph_generation = wire::<GraphGeneration>(2);
+        client
+            .send(Command::RefreshProject(RefreshProject {
+                project,
+                graph_generation,
+                sources: vec![ProjectSource {
+                    document_id: DocumentId::try_from([76; 16])
+                        .expect("non-nil inline-context document ID"),
+                    uri: "smudgy-project:///inline/context.d.ts".to_owned(),
+                    language: Language::TypeScript,
+                    kind: DocumentKind::Generated,
+                    text: language_service_inline_bridge().to_owned(),
+                }],
+            }))
+            .expect("queue inline-context refresh");
+        wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::ProjectRefreshed(state))
+                    if state.project == project && state.graph_generation == graph_generation
+            )
+        });
+
+        let inline_id = DocumentId::try_from([77; 16]).expect("non-nil inline document ID");
+        let inline_descriptor = descriptor(
+            project,
+            inline_id,
+            "smudgy-inline:///aliases/runtime-types.ts",
+            DocumentKind::InlineAutomation {
+                automation_kind: AutomationKind::Alias,
+            },
+            78,
+        );
+        client
+            .send(Command::OpenDocument(OpenDocument {
+                descriptor: inline_descriptor,
+                text: concat!(
+                    "const id = \"shadow\";\n",
+                    "const line = \"shadow\";\n",
+                    "const input = \"shadow\";\n",
+                    "const matches = [\"\", \"capture\"];\n",
+                    "send(`${id}:${line}:${input}:${matches[1]}`);\n",
+                    "void import(\"smudgy:core\").then(({ echo }) => echo(line));\n",
+                    "void import(\"node:path\").then(({ join }) => join(input, \"logs\"));\n",
+                )
+                .to_owned(),
+            }))
+            .expect("queue inline document open");
+        let opened = wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state))
+                    if state.document.key.document_id == inline_id
+            )
+        });
+        let Event::StateAcknowledged(AcknowledgedState::DocumentOpened(inline_state)) =
+            opened.event
+        else {
+            unreachable!();
+        };
+        let inline_request = wire::<RequestId>(79);
+        client
+            .send(Command::RequestDiagnostics(
+                smudgy_script::language_service::DocumentRequest {
+                    identity: DocumentResultIdentity {
+                        state: inline_state,
+                        request_id: inline_request,
+                    },
+                },
+            ))
+            .expect("queue inline diagnostics");
+        let diagnostics = wait_for(&mut host, |event| {
+            matches!(
+                event,
+                Event::Diagnostics(result) if result.identity.request_id == inline_request
+            )
+        });
+        let Event::Diagnostics(diagnostics) = diagnostics.event else {
+            unreachable!();
+        };
+        assert!(
+            !diagnostics
+                .result
+                .items
+                .iter()
+                .any(|item| item.code == Some(DiagnosticCode::Number(2451))),
+            "inline runtime globals must remain locally shadowable"
+        );
+        assert!(
+            diagnostics.result.items.is_empty(),
+            "the scoped inline bridge and supported dynamic imports must type-check: {:?}",
+            diagnostics.result.items
+        );
+
+        host.shutdown()
+            .expect("language-service worker must shut down cleanly");
+    }
+
+    #[test]
+    fn inline_language_service_bridge_covers_every_smudgy_api_member() {
+        use std::collections::BTreeSet;
+
+        let interface = SMUDGY_CORE_DTS
+            .split_once("export interface SmudgyApi {")
+            .expect("SmudgyApi interface")
+            .1
+            .split_once("\n  }")
+            .expect("SmudgyApi interface end")
+            .0;
+        let api_members = interface
+            .lines()
+            .filter_map(|line| {
+                let member = line.trim().strip_prefix("readonly ").unwrap_or(line.trim());
+                if member.is_empty() || member.starts_with(['/', '*']) {
+                    return None;
+                }
+                member
+                    .split(['(', ':'])
+                    .next()
+                    .filter(|name| !name.is_empty())
+            })
+            .collect::<BTreeSet<_>>();
+        let mut bridge_members = language_service_inline_bridge()
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("const "))
+            .filter_map(|declaration| declaration.split_once(':').map(|(name, _)| name))
+            .collect::<BTreeSet<_>>();
+        assert!(bridge_members.remove("matches"));
+        assert_eq!(bridge_members, api_members);
     }
 
     #[test]

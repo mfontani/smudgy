@@ -965,9 +965,13 @@ pub fn run() -> anyhow::Result<()> {
 
     let iced_result = daemon
         .theme(|smudgy: &Smudgy, window_id| {
-            if smudgy.smudgy_windows.contains_key(&window_id) {
+            if smudgy.smudgy_windows.contains_key(&window_id)
+                || smudgy.automations_windows.contains_key(&window_id)
+            {
                 // Palette-aware: re-evaluated per frame, so theme changes in
-                // the Preferences tab apply live.
+                // the Preferences tab apply live. Automations joins the main
+                // windows here so its editor and Smudgy-owned LSP overlays use
+                // one coherent light/dark palette.
                 prefs::app_theme()
             } else {
                 smudgy_theme::secondary()
@@ -1020,6 +1024,11 @@ pub fn run() -> anyhow::Result<()> {
         .run();
 
     log::info!("Application closing");
+
+    // Iced has dropped every Automations window, so all window-scoped language services
+    // have begun their nonblocking teardown. Join their tracked reapers before process exit
+    // so Deno can release each temporary data directory even when the app itself is closing.
+    smudgy_script::language_service_worker::join_language_service_reapers();
 
     #[cfg(not(feature = "web-audio-cpal"))]
     {
@@ -4460,6 +4469,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         // out to every live session (scrollback, span
                         // restyle, runtime separator/prefix/logging).
                         prefs::apply(&settings);
+                        for window in smudgy.automations_windows.values_mut() {
+                            window.sync_code_editor_theme();
+                        }
                         let fan_out: Vec<Task<Message>> = smudgy
                             .sessions
                             .iter()

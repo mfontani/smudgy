@@ -1,6 +1,9 @@
 //! Thin JS/TS scripting runtime for smudgy.
 
 pub mod interop_extract;
+pub mod language_service;
+mod language_service_engine;
+pub mod language_service_worker;
 mod module_loader;
 mod npm_resolver;
 mod package_resolver;

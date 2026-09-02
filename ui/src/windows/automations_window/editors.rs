@@ -11,7 +11,7 @@ use iced::widget::{
     Column, Space, button, checkbox, column, container, pick_list, radio, row, text, text_editor,
     text_input,
 };
-use iced::{Element, Font, Length, Padding};
+use iced::{Element, Font, Length, Padding, Task};
 
 use smudgy_core::models::matchers::{
     self, ArgKind, CmdMode, CommandOutcome, CommandSpec, MatcherColor, MatcherColorChannel,
@@ -30,6 +30,7 @@ use crate::widgets::dropdown::Dropdown;
 use crate::widgets::hotkey_input::HotkeyInput;
 use crate::widgets::wrap_row::wrap_row;
 
+use super::code_editor;
 use super::common;
 use super::highlight;
 use super::keyboard_control::{
@@ -104,15 +105,33 @@ impl AutomationsWindow {
         self.try_it_open = false;
         self.parsing_open = false;
 
-        match &script {
-            Script::Alias(a) => self.seed_action_buffers(a.language, a.script.as_deref()),
-            Script::Trigger(t) => self.seed_action_buffers(t.language, t.script.as_deref()),
+        let editor_task = match &script {
+            Script::Alias(a) => self.seed_action_buffers(
+                a.language,
+                a.script.as_deref(),
+                code_editor::CodeDocument::Alias,
+            ),
+            Script::Trigger(t) => self.seed_action_buffers(
+                t.language,
+                t.script.as_deref(),
+                code_editor::CodeDocument::Trigger,
+            ),
             Script::Hotkey(h) => {
-                self.editor_content =
-                    text_editor::Content::with_text(h.script.as_deref().unwrap_or_default());
+                let text = h.script.as_deref().unwrap_or_default();
+                if h.language == ScriptLang::Plaintext {
+                    self.hotkey_text_content = text_editor::Content::with_text(text);
+                    Task::none()
+                } else {
+                    self.hotkey_text_content = text_editor::Content::new();
+                    self.bind_code_editor(
+                        text,
+                        code_editor::script_language(h.language),
+                        code_editor::CodeDocument::Hotkey,
+                    )
+                }
             }
             Script::Folder(_, _) => return Update::none(),
-        }
+        };
 
         let node = match script {
             Script::Alias(a) => {
@@ -159,8 +178,8 @@ impl AutomationsWindow {
             error: None,
         });
         // The inactive action tab starts with a generated example body.
-        self.refresh_generated_actions();
-        Update::none()
+        let generated_task = self.refresh_generated_actions();
+        Update::with_task(Task::batch([editor_task, generated_task]))
     }
 
     /// Seeds the two action drafts from a stored automation: the stored body
@@ -168,7 +187,12 @@ impl AutomationsWindow {
     /// over — a file-backed body, `script: None`, pins as empty for the same
     /// reason); the other tab starts unpinned so it can carry a generated
     /// example until edited.
-    fn seed_action_buffers(&mut self, language: ScriptLang, body: Option<&str>) {
+    fn seed_action_buffers(
+        &mut self,
+        language: ScriptLang,
+        body: Option<&str>,
+        kind: code_editor::CodeDocument,
+    ) -> Task<Message> {
         self.action_script_lang = if language == ScriptLang::TS {
             ScriptLang::TS
         } else {
@@ -177,21 +201,24 @@ impl AutomationsWindow {
         let stored = body.unwrap_or_default();
         if language == ScriptLang::Plaintext {
             self.send_text_content = text_editor::Content::with_text(stored);
-            self.editor_content = text_editor::Content::new();
             self.action_text_pinned = true;
             self.action_script_pinned = false;
+            self.bind_code_editor(
+                "",
+                code_editor::script_language(self.action_script_lang),
+                kind,
+            )
         } else {
-            self.editor_content = text_editor::Content::with_text(stored);
             self.send_text_content = text_editor::Content::new();
             self.action_script_pinned = true;
             self.action_text_pinned = false;
+            self.bind_code_editor(stored, code_editor::script_language(language), kind)
         }
     }
 
     /// Resets both action drafts for a create pane: unpinned, so they carry
     /// generated example bodies until the user edits one.
     fn reset_action_buffers(&mut self) {
-        self.editor_content = text_editor::Content::new();
         self.send_text_content = text_editor::Content::new();
         self.action_text_pinned = false;
         self.action_script_pinned = false;
@@ -202,7 +229,7 @@ impl AutomationsWindow {
     /// (`matching-logic.md` §8): until the user edits a draft, its example
     /// body tracks the captures, so it can never reference one that doesn't
     /// exist. Any edit pins the draft and ends the tracking.
-    pub(super) fn refresh_generated_actions(&mut self) {
+    pub(super) fn refresh_generated_actions(&mut self) -> Task<Message> {
         let computed = match &self.pane {
             Pane::Editor(EditorState {
                 node: EditNode::Alias(_),
@@ -230,7 +257,7 @@ impl AutomationsWindow {
             _ => None,
         };
         let Some((kind, text_references, script_references)) = computed else {
-            return;
+            return Task::none();
         };
         if !self.action_text_pinned {
             self.send_text_content = text_editor::Content::with_text(&generated_body(
@@ -240,12 +267,26 @@ impl AutomationsWindow {
             ));
         }
         if !self.action_script_pinned {
-            self.editor_content = text_editor::Content::with_text(&generated_body(
+            let generated =
+                generated_body(kind, script_references.first().map(String::as_str), true);
+            let kind = match &self.pane {
+                Pane::Editor(EditorState {
+                    node: EditNode::Alias(_),
+                    ..
+                }) => code_editor::CodeDocument::Alias,
+                Pane::Editor(EditorState {
+                    node: EditNode::Trigger { .. },
+                    ..
+                }) => code_editor::CodeDocument::Trigger,
+                _ => return Task::none(),
+            };
+            return self.bind_code_editor(
+                &generated,
+                code_editor::script_language(self.action_script_lang),
                 kind,
-                script_references.first().map(String::as_str),
-                true,
-            ));
+            );
         }
+        Task::none()
     }
 
     pub(super) fn new_alias(&mut self) -> Update<Message, Event> {
@@ -277,8 +318,7 @@ impl AutomationsWindow {
             }),
             error: None,
         });
-        self.refresh_generated_actions();
-        Update::none()
+        Update::with_task(self.refresh_generated_actions())
     }
 
     pub(super) fn new_trigger(&mut self) -> Update<Message, Event> {
@@ -306,14 +346,13 @@ impl AutomationsWindow {
             },
             error: None,
         });
-        self.refresh_generated_actions();
-        Update::none()
+        Update::with_task(self.refresh_generated_actions())
     }
 
     pub(super) fn new_hotkey(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
-        self.editor_content = text_editor::Content::new();
+        self.hotkey_text_content = text_editor::Content::new();
         self.hotkey_state.clear();
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
@@ -350,9 +389,7 @@ impl AutomationsWindow {
     pub(super) fn new_module(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
-        self.editor_content = text_editor::Content::with_text(
-            "// A local module: shared helpers, private to this profile.\n",
-        );
+        let text = "// A local module: shared helpers, private to this profile.\n";
         self.pane = Pane::Module(ModuleState {
             mode: ModuleMode::Create,
             subpath: String::new(),
@@ -360,7 +397,11 @@ impl AutomationsWindow {
             name: String::new(),
             error: None,
         });
-        Update::none()
+        Update::with_task(self.bind_code_editor(
+            text,
+            code_editor::path_language("new.ts"),
+            code_editor::CodeDocument::StandaloneModule,
+        ))
     }
 
     pub(super) fn open_folder(&mut self, path: String) -> Update<Message, Event> {
@@ -388,7 +429,7 @@ impl AutomationsWindow {
         if let Some(path) = path {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
-                    self.editor_content = text_editor::Content::with_text(&content);
+                    let language = code_editor::path_language(&subpath);
                     self.pane = Pane::Module(ModuleState {
                         mode: ModuleMode::View,
                         subpath,
@@ -396,6 +437,11 @@ impl AutomationsWindow {
                         name: String::new(),
                         error: None,
                     });
+                    return Update::with_task(self.bind_code_editor(
+                        &content,
+                        language,
+                        code_editor::CodeDocument::StandaloneModule,
+                    ));
                 }
                 Err(e) => {
                     self.pane = Pane::Error(Arc::new(vec![crate::i18n::t!(
@@ -421,7 +467,7 @@ impl AutomationsWindow {
     /// Toggle the enable state of the node open in the editor (alias/trigger/
     /// hotkey/folder) — the single enable switch.
     pub(super) fn toggle_open_enabled(&mut self) -> Update<Message, Event> {
-        match &mut self.pane {
+        let original_name = match &mut self.pane {
             Pane::Editor(state) => {
                 let now = match &mut state.node {
                     EditNode::Alias(a) => {
@@ -437,43 +483,134 @@ impl AutomationsWindow {
                         *enabled
                     }
                 };
-                // Enable is a persisted property — save immediately so the change
-                // is live, without requiring a separate Save.
-                self.dirty = true;
-                let _ = now;
-                self.save_open()
+                if state.mode == EditorMode::Create {
+                    self.dirty = true;
+                    return Update::none();
+                }
+                let Some(name) = state.original_name.clone() else {
+                    return Update::none();
+                };
+                (name, now)
             }
-            Pane::Folder(_) => self.toggle_folder_enabled(),
-            _ => Update::none(),
+            Pane::Folder(_) => return self.toggle_folder_enabled(),
+            _ => return Update::none(),
+        };
+        let (name, enabled) = original_name;
+        match self.persist_script_metadata(&name, move |script| match script {
+            Script::Alias(alias) => alias.enabled = enabled,
+            Script::Hotkey(hotkey) => hotkey.enabled = enabled,
+            Script::Trigger(trigger) => trigger.enabled = enabled,
+            Script::Folder(_, _) => {}
+        }) {
+            Ok(update) => update,
+            Err(error) => {
+                if let Pane::Editor(state) = &mut self.pane {
+                    match &mut state.node {
+                        EditNode::Alias(alias) => alias.enabled = !enabled,
+                        EditNode::Hotkey(hotkey) => hotkey.enabled = !enabled,
+                        EditNode::Trigger {
+                            enabled: current, ..
+                        } => *current = !enabled,
+                    }
+                    state.error = Some(error);
+                }
+                Update::none()
+            }
         }
     }
 
     /// Move the open script into `folder` (`None` = top level). In edit mode this
-    /// re-homes and persists immediately — like the enable switch (`save_open`
-    /// rewrites the `package` field via the same path a rename uses). In create
+    /// re-homes and persists immediately without serializing either action draft. In create
     /// mode it only records the choice; it's applied when the user clicks Create.
     /// The palette's "Move to…" group routes here too: the selected script is the
     /// one open in the editor, so this single handler drives both surfaces.
     pub(super) fn set_script_folder(&mut self, folder: Option<String>) -> Update<Message, Event> {
         // Normalize an empty path to top level so a stray "" never becomes a folder.
         let folder = folder.filter(|p| !p.is_empty());
-        let is_edit = match &mut self.pane {
+        let (original_name, previous_folder) = match &mut self.pane {
             Pane::Editor(state) => {
-                match &mut state.node {
-                    EditNode::Alias(a) => a.package = folder,
-                    EditNode::Hotkey(h) => h.package = folder,
-                    EditNode::Trigger { package, .. } => *package = folder,
+                let previous = match &mut state.node {
+                    EditNode::Alias(alias) => std::mem::replace(&mut alias.package, folder.clone()),
+                    EditNode::Hotkey(hotkey) => {
+                        std::mem::replace(&mut hotkey.package, folder.clone())
+                    }
+                    EditNode::Trigger { package, .. } => std::mem::replace(package, folder.clone()),
+                };
+                if state.mode == EditorMode::Create {
+                    self.dirty = true;
+                    return Update::none();
                 }
-                state.mode == EditorMode::Edit
+                (state.original_name.clone(), previous)
             }
             _ => return Update::none(),
         };
-        if is_edit {
-            self.dirty = true;
-            self.save_open()
-        } else {
-            Update::none()
+        let Some(name) = original_name else {
+            return Update::none();
+        };
+        match self.persist_script_metadata(&name, move |script| match script {
+            Script::Alias(alias) => alias.package = folder.clone(),
+            Script::Hotkey(hotkey) => hotkey.package = folder.clone(),
+            Script::Trigger(trigger) => trigger.package = folder,
+            Script::Folder(_, _) => {}
+        }) {
+            Ok(update) => update,
+            Err(error) => {
+                if let Pane::Editor(state) = &mut self.pane {
+                    match &mut state.node {
+                        EditNode::Alias(alias) => alias.package = previous_folder.clone(),
+                        EditNode::Hotkey(hotkey) => hotkey.package = previous_folder.clone(),
+                        EditNode::Trigger { package, .. } => *package = previous_folder,
+                    }
+                    state.error = Some(error);
+                }
+                Update::none()
+            }
         }
+    }
+
+    /// Persists one immediate metadata mutation against the stored script while
+    /// leaving all open authoring drafts and the dirty flag untouched.
+    fn persist_script_metadata(
+        &mut self,
+        name: &str,
+        update: impl FnOnce(&mut Script),
+    ) -> Result<Update<Message, Event>, String> {
+        let key = ScriptKey {
+            folder_name: self.find_script_folder(name),
+            script_name: name.to_owned(),
+        };
+        let Some(mut script) = self.find_script(&key) else {
+            return Err(crate::i18n::t!("editor-script-missing", "name" => name));
+        };
+        update(&mut script);
+        let folder_name = script.folder_name().map(str::to_owned);
+        let previous_scripts = self.scripts.clone();
+        self.remove_script_by_name(name);
+        let folder = match upsert_script_folder(&mut self.scripts, folder_name.as_deref()) {
+            Ok(folder) => folder,
+            Err(error) => {
+                self.scripts = previous_scripts;
+                return Err(error);
+            }
+        };
+        folder.insert(name.to_owned(), script);
+        if let Err(error) = self.serialize_scripts() {
+            self.scripts = previous_scripts;
+            return Err(crate::i18n::t!(
+                "editor-failed-save",
+                "error" => error.to_string()
+            ));
+        }
+        self.selection = Selection::Script(ScriptKey {
+            folder_name,
+            script_name: name.to_owned(),
+        });
+        Ok(Update::new(
+            self.show_toast(crate::i18n::t!("editor-saved", "name" => name)),
+            Some(Event::UserAutomationsChanged {
+                server_name: self.server_name.clone(),
+            }),
+        ))
     }
 
     fn toggle_folder_enabled(&mut self) -> Update<Message, Event> {
@@ -557,7 +694,8 @@ impl AutomationsWindow {
 
         // The body comes from whichever action tab is active: the send-text
         // draft for a Plaintext action, the script draft otherwise. Hotkeys
-        // and modules only ever use the script buffer.
+        // use their dedicated plaintext buffer when applicable. Every JS/TS
+        // body comes from the upstream code editor's authoritative buffer.
         let body = match &self.pane {
             Pane::Editor(EditorState {
                 node: EditNode::Alias(a),
@@ -571,16 +709,58 @@ impl AutomationsWindow {
                     },
                 ..
             }) => self.send_text_content.text(),
-            _ => self.editor_content.text(),
+            Pane::Editor(EditorState {
+                node: EditNode::Hotkey(h),
+                ..
+            }) if h.language == ScriptLang::Plaintext => self.hotkey_text_content.text(),
+            _ => self.code_editor_text(),
         };
-        let body = body.trim_end_matches('\n').to_string();
+        let saved_code = matches!(
+            &self.pane,
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(aliases::AliasDefinition {
+                    language: ScriptLang::JS | ScriptLang::TS,
+                    ..
+                }),
+                ..
+            }) | Pane::Editor(EditorState {
+                node: EditNode::Trigger {
+                    language: ScriptLang::JS | ScriptLang::TS,
+                    ..
+                },
+                ..
+            }) | Pane::Editor(EditorState {
+                node: EditNode::Hotkey(hotkeys::HotkeyDefinition {
+                    language: ScriptLang::JS | ScriptLang::TS,
+                    ..
+                }),
+                ..
+            })
+        );
+        let saved_dual_action = match &self.pane {
+            Pane::Editor(EditorState {
+                node: EditNode::Alias(alias),
+                ..
+            }) => Some((alias.language, code_editor::CodeDocument::Alias)),
+            Pane::Editor(EditorState {
+                node: EditNode::Trigger { language, .. },
+                ..
+            }) => Some((*language, code_editor::CodeDocument::Trigger)),
+            _ => None,
+        };
+        let body = if saved_code {
+            body
+        } else {
+            body.trim_end_matches('\n').to_string()
+        };
+        let persisted_script = persisted_script(body);
         let final_script = match &self.pane {
             Pane::Editor(EditorState { node, .. }) => match node {
                 EditNode::Alias(a) => {
                     let (pattern, matcher) =
                         alias_matcher.expect("computed above for the alias arm");
                     Script::Alias(aliases::AliasDefinition {
-                        script: (!body.is_empty()).then_some(body),
+                        script: persisted_script,
                         pattern,
                         matcher,
                         ..a.clone()
@@ -595,7 +775,7 @@ impl AutomationsWindow {
                         );
                     }
                     Script::Hotkey(hotkeys::HotkeyDefinition {
-                        script: (!body.is_empty()).then_some(body),
+                        script: persisted_script,
                         ..h
                     })
                 }
@@ -612,7 +792,7 @@ impl AutomationsWindow {
                         patterns: None,
                         raw_patterns: None,
                         anti_patterns: None,
-                        script: (!body.is_empty()).then_some(body),
+                        script: persisted_script,
                         package: package.clone(),
                         language: *language,
                         enabled: *enabled,
@@ -676,9 +856,38 @@ impl AutomationsWindow {
         });
         self.dirty = false;
         self.pending_nav = None;
+        if saved_code {
+            self.mark_code_editor_saved();
+        }
+        if self.language_project_context_matches(&code_editor::LanguageProjectContext::Inline) {
+            self.language_project_target_context =
+                Some(code_editor::LanguageProjectContext::Inline);
+            self.refresh_language_project();
+        }
+        // Alias and trigger action tabs are alternative persisted bodies. Once
+        // one is saved, discard the opposite draft so it cannot reappear as
+        // stale user-authored content after another tab switch.
+        let discard_task = match saved_dual_action {
+            Some((ScriptLang::Plaintext, kind)) => {
+                self.action_text_pinned = true;
+                self.action_script_pinned = false;
+                self.bind_code_editor(
+                    "",
+                    code_editor::script_language(self.action_script_lang),
+                    kind,
+                )
+            }
+            Some((ScriptLang::JS | ScriptLang::TS, _)) => {
+                self.send_text_content = text_editor::Content::new();
+                self.action_text_pinned = false;
+                self.action_script_pinned = true;
+                Task::none()
+            }
+            None => Task::none(),
+        };
         let toast = self.show_toast(crate::i18n::t!("editor-saved", "name" => name));
         Update::new(
-            toast,
+            Task::batch([discard_task, toast]),
             Some(Event::UserAutomationsChanged {
                 server_name: self.server_name.clone(),
             }),
@@ -729,6 +938,12 @@ impl AutomationsWindow {
             return Update::none();
         }
         self.dirty = false;
+        self.clear_code_editor();
+        if self.language_project_context_matches(&code_editor::LanguageProjectContext::Inline) {
+            self.language_project_target_context =
+                Some(code_editor::LanguageProjectContext::Inline);
+            self.refresh_language_project();
+        }
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
         let toast = self.show_toast(crate::i18n::t!("editor-deleted", "name" => original));
@@ -868,13 +1083,20 @@ impl AutomationsWindow {
             }) => path.clone(),
             _ => return Update::none(),
         };
-        if let Err(e) = std::fs::write(&path, self.editor_content.text()) {
+        if !self.code_editor_is_modified() {
+            self.dirty = false;
+            self.pending_nav = None;
+            return Update::none();
+        }
+        if let Err(e) = std::fs::write(&path, self.code_editor_text()) {
             return warn_none(
                 crate::i18n::t!("editor-failed-save-module", "error" => e.to_string()),
             );
         }
         self.dirty = false;
         self.pending_nav = None;
+        self.mark_code_editor_saved();
+        self.refresh_language_project();
         let toast = self.show_toast(crate::i18n::t!("editor-module-saved"));
         Update::new(
             toast,
@@ -917,7 +1139,7 @@ impl AutomationsWindow {
             }
             return Update::none();
         }
-        if let Err(e) = std::fs::write(&target, self.editor_content.text()) {
+        if let Err(e) = std::fs::write(&target, self.code_editor_text()) {
             if let Pane::Module(state) = &mut self.pane {
                 state.error =
                     Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
@@ -925,6 +1147,7 @@ impl AutomationsWindow {
             return Update::none();
         }
         self.dirty = false;
+        self.clear_code_editor();
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
         let toast = self.show_toast(crate::i18n::t!("editor-module-created", "name" => name));
@@ -1502,48 +1725,25 @@ impl AutomationsWindow {
                 .min_height(120.0)
                 .into()
         } else {
-            let token = match self.action_script_lang {
-                ScriptLang::TS => "ts",
-                _ => "js",
-            }
-            .to_string();
-            text_editor(&self.editor_content)
-                .highlight_with::<iced::highlighter::Highlighter>(
-                    iced::highlighter::Settings {
-                        theme: iced::highlighter::Theme::SolarizedDark,
-                        token,
-                    },
-                    |h: &iced::highlighter::Highlight, _| h.to_format(),
-                )
-                .font(fonts::GEIST_MONO_VF)
-                .on_action(Message::ScriptEditorAction)
-                .height(Length::Fixed(220.0))
-                .into()
+            self.code_editor_view(220.0)
         };
         column![strip, container(editor).style(common::code_surface_style)]
             .spacing(0.0)
             .into()
     }
 
-    /// The syntax-highlighted code body editor.
+    /// The hotkey body editor. Plaintext keeps the legacy widget; writable
+    /// JavaScript and TypeScript use the upstream code editor.
     fn code_editor<'a>(&'a self, language: ScriptLang) -> Elem<'a> {
-        let token = match language {
-            ScriptLang::JS => "js",
-            ScriptLang::TS => "ts",
-            ScriptLang::Plaintext => "txt",
-        }
-        .to_string();
-        let editor = text_editor(&self.editor_content)
-            .highlight_with::<iced::highlighter::Highlighter>(
-                iced::highlighter::Settings {
-                    theme: iced::highlighter::Theme::SolarizedDark,
-                    token,
-                },
-                |h: &iced::highlighter::Highlight, _| h.to_format(),
-            )
-            .font(fonts::GEIST_MONO_VF)
-            .on_action(Message::ScriptEditorAction)
-            .height(Length::Fixed(220.0));
+        let editor: Elem<'a> = if language == ScriptLang::Plaintext {
+            text_editor(&self.hotkey_text_content)
+                .font(fonts::GEIST_MONO_VF)
+                .on_action(Message::HotkeyTextAction)
+                .height(Length::Fixed(220.0))
+                .into()
+        } else {
+            self.code_editor_view(220.0)
+        };
         column![
             common::section_label(crate::i18n::ts!("editor-script")),
             container(editor).style(common::code_surface_style),
@@ -3031,33 +3231,7 @@ impl AutomationsWindow {
             ));
         }
 
-        let token = state
-            .path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| {
-                if create {
-                    state.name.clone()
-                } else {
-                    state.subpath.clone()
-                }
-            });
-        let token = std::path::Path::new(&token)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("ts")
-            .to_string();
-        let editor = text_editor(&self.editor_content)
-            .highlight_with::<iced::highlighter::Highlighter>(
-                iced::highlighter::Settings {
-                    theme: iced::highlighter::Theme::SolarizedDark,
-                    token,
-                },
-                |h: &iced::highlighter::Highlight, _| h.to_format(),
-            )
-            .font(fonts::GEIST_MONO_VF)
-            .on_action(Message::ScriptEditorAction)
-            .height(Length::Fixed(360.0));
+        let editor = self.code_editor_view(360.0);
         body = body.push(
             column![
                 common::section_label(crate::i18n::ts!("editor-source")),
@@ -5117,5 +5291,39 @@ mod tests {
             Action::Edit(Edit::Paste(Arc::new("b\r\nc\nd".to_string()))),
         );
         assert_eq!(single_line_text(&content), "ab c d");
+    }
+}
+
+/// The inline script an editor body persists as.
+///
+/// A body holding only line breaks is no script at all: persisting it would
+/// replace a file-backed body (`script: None`) with an empty inline one that
+/// shadows the file. Real bodies keep their trailing newline so the saved
+/// text matches the editor buffer exactly.
+fn persisted_script(body: String) -> Option<String> {
+    (!body.trim_end_matches('\n').is_empty()).then_some(body)
+}
+
+#[cfg(test)]
+mod persisted_script_tests {
+    use super::persisted_script;
+
+    #[test]
+    fn line_break_only_bodies_persist_as_no_script() {
+        assert_eq!(persisted_script(String::new()), None);
+        assert_eq!(persisted_script("\n".to_owned()), None);
+        assert_eq!(persisted_script("\n\n\n".to_owned()), None);
+    }
+
+    #[test]
+    fn real_bodies_keep_their_exact_text() {
+        assert_eq!(
+            persisted_script("echo(1);\n".to_owned()).as_deref(),
+            Some("echo(1);\n")
+        );
+        assert_eq!(
+            persisted_script("\necho(1);".to_owned()).as_deref(),
+            Some("\necho(1);")
+        );
     }
 }

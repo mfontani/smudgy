@@ -2081,7 +2081,7 @@ declare namespace Deno {
      * you should not close the file yourself while the stream is still being
      * consumed.
      */
-    readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly readable: ReadableStream<Uint8Array>;
     /** A {@linkcode WritableStream} instance to write the contents of the
      * file. This makes it easy to interoperate with other web streams based
      * APIs.
@@ -2100,7 +2100,7 @@ declare namespace Deno {
      * aborting the stream closes the file automatically, so you should not
      * close the file yourself while the stream is still in use.
      */
-    readonly writable: WritableStream<Uint8Array<ArrayBufferLike>>;
+    readonly writable: WritableStream<Uint8Array>;
     /** Write the contents of the array buffer (`p`) to the file.
      *
      * Resolves to the number of bytes written.
@@ -2589,7 +2589,7 @@ declare namespace Deno {
      */
     close(): void;
     /** A readable stream interface to `stdin`. */
-    readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly readable: ReadableStream<Uint8Array>;
     /**
      * Set TTY to be under raw mode or not. In raw mode, characters are read and
      * returned as is, without being processed. All special processing of
@@ -2667,7 +2667,7 @@ declare namespace Deno {
      */
     close(): void;
     /** A writable stream interface to `stdout`. */
-    readonly writable: WritableStream<Uint8Array<ArrayBufferLike>>;
+    readonly writable: WritableStream<Uint8Array>;
     /**
      * Checks if `stdout` is a TTY (terminal).
      *
@@ -2731,7 +2731,7 @@ declare namespace Deno {
      */
     close(): void;
     /** A writable stream interface to `stderr`. */
-    readonly writable: WritableStream<Uint8Array<ArrayBufferLike>>;
+    readonly writable: WritableStream<Uint8Array>;
     /**
      * Checks if `stderr` is a TTY (terminal).
      *
@@ -3255,7 +3255,7 @@ declare namespace Deno {
   export function readFile(
     path: string | URL,
     options?: ReadFileOptions,
-  ): Promise<Uint8Array<ArrayBuffer>>;
+  ): Promise<Uint8Array>;
 
   /** Synchronously reads and returns the entire contents of a file as an array
    * of bytes. `TextDecoder` can be used to transform the bytes to string if
@@ -3272,7 +3272,7 @@ declare namespace Deno {
    * @tags allow-read
    * @category File System
    */
-  export function readFileSync(path: string | URL): Uint8Array<ArrayBuffer>;
+  export function readFileSync(path: string | URL): Uint8Array;
 
   /** Provides information about a file and is returned by
    * {@linkcode Deno.stat}, {@linkcode Deno.lstat}, {@linkcode Deno.statSync},
@@ -4067,7 +4067,7 @@ declare namespace Deno {
    * @category Subprocess
    */
   export class ChildProcess implements AsyncDisposable {
-    get stdin(): WritableStream<Uint8Array<ArrayBufferLike>>;
+    get stdin(): WritableStream<Uint8Array>;
     get stdout(): SubprocessReadableStream;
     get stderr(): SubprocessReadableStream;
     readonly pid: number;
@@ -4106,7 +4106,7 @@ declare namespace Deno {
    * @category Subprocess
    */
   export interface SubprocessReadableStream
-    extends ReadableStream<Uint8Array<ArrayBuffer>> {
+    extends ReadableStream<Uint8Array> {
     /**
      * Reads the stream to completion. It returns a promise that resolves with
      * an `ArrayBuffer`.
@@ -4116,7 +4116,7 @@ declare namespace Deno {
      * Reads the stream to completion. It returns a promise that resolves with
      * a `Uint8Array`.
      */
-    bytes(): Promise<Uint8Array<ArrayBuffer>>;
+    bytes(): Promise<Uint8Array>;
     /**
      * Reads the stream to completion. It returns a promise that resolves with
      * the result of parsing the body text as JSON.
@@ -4229,9 +4229,9 @@ declare namespace Deno {
    */
   export interface CommandOutput extends CommandStatus {
     /** The buffered output from the child process' `stdout`. */
-    readonly stdout: Uint8Array<ArrayBuffer>;
+    readonly stdout: Uint8Array;
     /** The buffered output from the child process' `stderr`. */
-    readonly stderr: Uint8Array<ArrayBuffer>;
+    readonly stderr: Uint8Array;
   }
 
   /** Spawns a new subprocess, returning a {@linkcode Deno.ChildProcess} handle.
@@ -6330,7 +6330,7 @@ declare namespace Deno {
    * @category FFI
    */
   export type FromNativeType<T extends NativeType = NativeType> = T extends
-    NativeStructType ? Uint8Array<ArrayBuffer>
+    NativeStructType ? Uint8Array
     : T extends NativeNumberType ? T extends NativeU8Enum<infer U> ? U
       : T extends NativeI8Enum<infer U> ? U
       : T extends NativeU16Enum<infer U> ? U
@@ -6355,7 +6355,7 @@ declare namespace Deno {
    */
   export type FromNativeResultType<
     T extends NativeResultType = NativeResultType,
-  > = T extends NativeStructType ? Uint8Array<ArrayBuffer>
+  > = T extends NativeStructType ? Uint8Array
     : T extends NativeNumberType ? T extends NativeU8Enum<infer U> ? U
       : T extends NativeI8Enum<infer U> ? U
       : T extends NativeU16Enum<infer U> ? U

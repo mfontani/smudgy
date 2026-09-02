@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 smudgy_core = { workspace = true }
+smudgy_script = { workspace = true }
 smudgy_cloud = { workspace = true }
 smudgy_theme = { workspace = true }
 smudgy_map_widget = { workspace = true }
@@ -22,6 +23,7 @@ sys-locale = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 iced = { workspace = true }
+iced-code-editor = { workspace = true }
 iced_anim = { workspace = true }
 iced_runtime = { workspace = true }
 # The (patch-crate patched) shaping registry: the terminal font family opts out

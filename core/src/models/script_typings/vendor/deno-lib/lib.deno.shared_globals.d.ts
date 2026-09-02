@@ -525,7 +525,7 @@ interface DOMStringList {
 }
 
 /** @category Platform */
-type BufferSource = ArrayBufferView<ArrayBuffer> | ArrayBuffer;
+type BufferSource = ArrayBufferView | ArrayBuffer;
 
 /** @category Platform */
 type AllowSharedBufferSource = ArrayBufferView | ArrayBufferLike;
