@@ -30,11 +30,11 @@ const ACCOUNT_FILE: &str = "account.json";
 /// home directory.
 const FALLBACK_TOKEN_FILE: &str = ".cloud-session";
 
-/// Keyring service name for release builds (shared by release candidates).
+/// Keyring service name for release and prod-like prerelease builds.
 /// Dev/pre-release builds use a SEPARATE service ([`keyring_service`]), so a dev
 /// client's *entire* keyring — the cloud session token AND every package secret — is
-/// isolated from a release client's, mirroring the dev-aware home dir. A release candidate
-/// shares the release service (it behaves like a release). Isolating at the service (not
+/// isolated from a release client's, mirroring the dev-aware home dir. RC, PTB,
+/// and nightly builds share the release service. Isolating at the service (not
 /// per-slot) keeps every smudgy keyring entry consistent.
 const KEYRING_SERVICE: &str = "smudgy";
 const KEYRING_SERVICE_DEV: &str = "smudgy-dev";
@@ -42,7 +42,7 @@ const KEYRING_SERVICE_DEV: &str = "smudgy-dev";
 /// The keyring service in effect for this build (dev-aware, mirroring the home-dir split in
 /// [`crate::get_smudgy_home`]). Used for the session token AND package secrets, so the whole
 /// keyring is isolated per build channel. Only a [`Dev`](crate::models::settings::BuildChannel::Dev)
-/// build is isolated; releases and release candidates share the `smudgy` service.
+/// build is isolated; releases and prod-like prereleases share the `smudgy` service.
 #[must_use]
 pub fn keyring_service() -> &'static str {
     if crate::models::settings::is_dev_build() {

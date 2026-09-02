@@ -330,6 +330,8 @@ profile-error-delete = Nie udało się usunąć profilu: { $error }
 # Application shell and updates
 window-main-development = Smudgy — WERSJA DEWELOPERSKA
 window-main-release-candidate = Smudgy — KANDYDAT DO WYDANIA { $version }
+window-main-public-test-build = Smudgy — PUBLICZNA WERSJA TESTOWA { $version } — zbudowana { $build }
+window-main-nightly = Smudgy — WERSJA NOCNA { $version } — zbudowana { $build }
 window-automations = automatyzacje Smudgy — { $server }
 toolbar-connect = Połącz
 toolbar-automations = Automatyzacje

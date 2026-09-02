@@ -272,19 +272,15 @@ impl CloudAccount {
     /// dismissable "out of date" banner, whose link opens the download page only
     /// when the user clicks it (there is no autonomous auto-open). It is neither
     /// an auth nor a transient error, so it gets its own arm ahead of the
-    /// auth/offline handling. A release-candidate build suppresses the banner
-    /// outright — see the early return below.
+    /// auth/offline handling. A prod-like prerelease build suppresses the
+    /// banner outright — see the early return below.
     fn mark_upgrade_required(&self) -> Task<Message> {
-        if smudgy_core::models::settings::is_release_candidate() {
-            // A release candidate ships *ahead* of the version it is a candidate
-            // for, so by semver its version sits below that release — a prod 426
-            // would be expected, and telling the tester to "download a newer
-            // version" is wrong (they are deliberately on a pre-release). Swallow
-            // the banner; the cloud call still failed, but no nag is raised. (The
-            // common case never reaches here: an RC's base version sits at or
-            // above the prod floor, which is the previous release.)
+        if smudgy_core::models::settings::is_preview_build() {
+            // A preview build deliberately sits below its eventual release by
+            // semver, so telling its tester to download the current release is
+            // wrong. The cloud call still failed, but no nag is raised.
             log::warn!(
-                "release-candidate build got a 426 from the cloud; suppressing the out-of-date banner"
+                "preview build got a 426 from the cloud; suppressing the out-of-date banner"
             );
             self.mutate(|s| s.busy = false);
             return Task::none();
@@ -302,11 +298,10 @@ impl CloudAccount {
     /// per-version dismissals, and publish the result to the snapshot.
     fn recompute_upgrade_prompt(&self) {
         let advertised = self.client.upgrade_available();
-        // A release candidate never nags about an upgrade: it is itself a
-        // pre-release of an upcoming version, so a prod `x-smudgy-upgrade-available`
-        // pointing at that very release is noise. Suppress regardless of the
-        // dismissal/auto-check state.
-        let show = !smudgy_core::models::settings::is_release_candidate()
+        // A preview never nags about an upgrade: a prod
+        // `x-smudgy-upgrade-available` pointing at its eventual release is
+        // noise. Suppress regardless of the dismissal/auto-check state.
+        let show = !smudgy_core::models::settings::is_preview_build()
             && self.auto_check_for_updates
             && advertised.as_deref().is_some_and(|version| {
                 !self.upgrade_dismissed_session

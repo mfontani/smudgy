@@ -15,7 +15,7 @@ use super::persistence::write_atomic;
 /// can never drift apart. `bin/bump-version.sh` and `assets/installer.iss`
 /// mirror this rule (in Bash and Inno Pascal) and must stay in sync.
 ///
-/// The three channels are distinguished purely by the semver suffix:
+/// The five channels are distinguished purely by the semver suffix:
 /// - [`Release`](BuildChannel::Release) — a clean `X.Y.Z` with no suffix: the
 ///   published build. Prod API, `smudgy/` data.
 /// - [`ReleaseCandidate`](BuildChannel::ReleaseCandidate) — a prerelease whose
@@ -24,6 +24,11 @@ use super::persistence::write_atomic;
 ///   exactly like a `Release` for the API endpoint, data dir, and keyring, and
 ///   raises no upgrade notifications, but stays detectable (this channel, the
 ///   title marker) so a candidate is never mistaken for the published release.
+/// - [`PublicTestBuild`](BuildChannel::PublicTestBuild) and
+///   [`Nightly`](BuildChannel::Nightly) — prereleases beginning with `ptb` or
+///   `nightly` (`0.5.7-ptb`, `0.5.7-ptb37`, `0.5.7-nightly.1`). They inherit
+///   the same prod-like behavior and notification suppression as an RC, while
+///   their title marker includes the build timestamp and Git commit.
 /// - [`Dev`](BuildChannel::Dev) — any other suffixed version (`0.4.0-beta`,
 ///   `0.3.2+ci`): an isolated dev/pre-release build (dev API, `smudgy-dev/`
 ///   data + keyring, script inspector on).
@@ -31,6 +36,8 @@ use super::persistence::write_atomic;
 pub enum BuildChannel {
     Release,
     ReleaseCandidate,
+    PublicTestBuild,
+    Nightly,
     Dev,
 }
 
@@ -41,9 +48,10 @@ pub const fn build_channel() -> BuildChannel {
 }
 
 /// `true` for an isolated dev/pre-release build (the [`BuildChannel::Dev`]
-/// channel): a suffixed version that is *not* a release candidate. Drives the
+/// channel): a suffixed version that is not an RC, PTB, or nightly. Drives the
 /// dev API default, the `smudgy-dev/` data dir and keyring, and the script
-/// inspector. A release candidate is **not** a dev build — see [`build_channel`].
+/// inspector. A prod-like prerelease is **not** a dev build — see
+/// [`build_channel`].
 #[must_use]
 pub const fn is_dev_build() -> bool {
     matches!(build_channel(), BuildChannel::Dev)
@@ -57,15 +65,30 @@ pub const fn is_dev_build() -> bool {
 /// detectable.
 #[must_use]
 pub const fn is_release_candidate() -> bool {
-    version_is_rc(env!("CARGO_PKG_VERSION").as_bytes())
+    matches!(build_channel(), BuildChannel::ReleaseCandidate)
+}
+
+/// `true` for any prod-like prerelease channel: RC, public test build, or
+/// nightly. These builds share the release API, data, and keyring and suppress
+/// upgrade notifications.
+#[must_use]
+pub const fn is_preview_build() -> bool {
+    matches!(
+        build_channel(),
+        BuildChannel::ReleaseCandidate | BuildChannel::PublicTestBuild | BuildChannel::Nightly
+    )
 }
 
 /// Classify a raw semver string's bytes into a [`BuildChannel`]. Pure (no env),
 /// so it is unit-testable with arbitrary versions; the public predicates wrap it
 /// around `CARGO_PKG_VERSION`.
 const fn channel_of(bytes: &[u8]) -> BuildChannel {
-    if version_is_rc(bytes) {
+    if version_has_prerelease_marker(bytes, b"rc") {
         BuildChannel::ReleaseCandidate
+    } else if version_has_prerelease_marker(bytes, b"ptb") {
+        BuildChannel::PublicTestBuild
+    } else if version_has_prerelease_marker(bytes, b"nightly") {
+        BuildChannel::Nightly
     } else if version_has_suffix(bytes) {
         BuildChannel::Dev
     } else {
@@ -86,23 +109,19 @@ const fn version_has_suffix(bytes: &[u8]) -> bool {
     false
 }
 
-/// `true` when the version's prerelease segment begins with an `rc` identifier:
-/// `rc` (case-insensitive) at the start of the prerelease, followed by the end
-/// of that identifier — a digit, `-`, `.`, `+`, or end of string — but never a
-/// letter (so `0.4.0-release` and `0.4.0-rcedar` are *not* release candidates).
-/// Matches `0.4.0-rc1`, `0.3.2-rc-pre-release`, and `0.4.0-rc19-the-final-final`.
+/// `true` when the version's prerelease segment begins with `marker`
+/// (case-insensitive), followed by a digit, `-`, `.`, `+`, or end of string —
+/// but never another letter. For example, marker `rc` matches `0.4.0-rc1` but
+/// not `0.4.0-rcedar`; marker `ptb` matches `0.5.7-ptb37` but not
+/// `0.5.7-ptbeta`.
 ///
-/// Deliberately permissive after `rc`: because `0.3.2-rc-pre-release` must be a
-/// candidate, *any* prerelease that begins with `rc` — including `rc-<free
-/// text>` like `0.4.0-rc-debug` — is treated as one and therefore ships to
-/// **prod** (prod API, the shared `smudgy/` data dir, no upgrade nags). To get
-/// an isolated dev build, name the prerelease so it does **not** start with `rc`
-/// (e.g. `0.4.0-debug`, `0.4.0-beta`). Assumes valid-semver input (prerelease
-/// charset `[0-9A-Za-z.-]`), as enforced upstream by `bin/bump-version.sh` and
-/// Cargo's own `CARGO_PKG_VERSION` parse.
-const fn version_is_rc(bytes: &[u8]) -> bool {
+/// Deliberately permissive after the marker: numbered and decorated builds such
+/// as `rc19`, `ptb37`, and `nightly-2026-09-01` stay in their intended channel.
+/// Assumes valid-semver input (prerelease charset `[0-9A-Za-z.-]`), as enforced
+/// upstream by `bin/bump-version.sh` and Cargo's own `CARGO_PKG_VERSION` parse.
+const fn version_has_prerelease_marker(bytes: &[u8], marker: &[u8]) -> bool {
     // Locate the prerelease segment (first '-'); a `+build` suffix alone never
-    // marks an RC, and a clean `X.Y.Z` has no suffix at all. When there is no
+    // marks a prerelease channel, and a clean `X.Y.Z` has no suffix at all. When there is no
     // '-', the loop leaves `i == bytes.len()`, so `pre` is one past the end and
     // the length guard below returns `false` before any indexing.
     let mut i = 0;
@@ -110,19 +129,24 @@ const fn version_is_rc(bytes: &[u8]) -> bool {
         i += 1;
     }
     let pre = i + 1; // first byte after the '-' (may be len + 1 when no '-')
-    // Need at least the two bytes "rc".
-    if pre + 1 >= bytes.len() {
+    if marker.is_empty() || pre + marker.len() > bytes.len() {
         return false;
     }
-    // `rc` start, case-insensitive (matching literals keeps this a const fn and
-    // sidesteps clippy::manual_ignore_case_cmp on a `to_ascii_lowercase` compare).
-    if !matches!(bytes[pre], b'r' | b'R') || !matches!(bytes[pre + 1], b'c' | b'C') {
-        return false;
+
+    let mut marker_index = 0;
+    while marker_index < marker.len() {
+        let actual = bytes[pre + marker_index];
+        let expected = marker[marker_index];
+        if actual != expected && actual != expected.to_ascii_uppercase() {
+            return false;
+        }
+        marker_index += 1;
     }
-    // The `rc` identifier must end here, not extend into another word.
-    let after = pre + 2;
+
+    // The marker must end here, not extend into another word.
+    let after = pre + marker.len();
     if after >= bytes.len() {
-        return true; // version ends exactly at "...-rc"
+        return true; // version ends exactly at the marker
     }
     let c = bytes[after];
     matches!(c, b'-' | b'.' | b'+') || c.is_ascii_digit()
@@ -130,7 +154,7 @@ const fn version_is_rc(bytes: &[u8]) -> bool {
 
 /// The API base URL used when [`Settings::api_base_url`] is not set. Derived from
 /// the [`build_channel`]: a [`Dev`](BuildChannel::Dev) build defaults to the dev
-/// API; a release or release candidate defaults to prod. Override via
+/// API; a release or prod-like prerelease defaults to prod. Override via
 /// `api_base_url` in settings.json.
 pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
     "https://api.dev.smudgy.org"
@@ -1277,7 +1301,7 @@ mod tests {
 
     #[test]
     fn build_channel_detection() {
-        use BuildChannel::{Dev, Release, ReleaseCandidate};
+        use BuildChannel::{Dev, Nightly, PublicTestBuild, Release, ReleaseCandidate};
 
         // Clean releases and `+build`-only metadata.
         assert_eq!(channel_of(b"0.3.2"), Release);
@@ -1293,25 +1317,35 @@ mod tests {
         assert_eq!(channel_of(b"0.4.0-rc1+ci"), ReleaseCandidate); // rc + build meta
         assert_eq!(channel_of(b"0.4.0-RC1"), ReleaseCandidate); // case-insensitive
 
+        // Public test and nightly builds follow the same marker and boundary
+        // rules as release candidates, including numbered variants.
+        assert_eq!(channel_of(b"0.5.7-ptb"), PublicTestBuild);
+        assert_eq!(channel_of(b"0.5.7-ptb1"), PublicTestBuild);
+        assert_eq!(channel_of(b"0.5.7-ptb37+ci"), PublicTestBuild);
+        assert_eq!(channel_of(b"0.5.7-PTB.2"), PublicTestBuild);
+        assert_eq!(channel_of(b"0.5.7-nightly"), Nightly);
+        assert_eq!(channel_of(b"0.5.7-nightly1"), Nightly);
+        assert_eq!(channel_of(b"0.5.7-NIGHTLY-2026-09-01"), Nightly);
+
         // Dev/pre-release — suffixed, but not an `rc` identifier. The `rc` must
         // not bleed into another word.
         assert_eq!(channel_of(b"0.4.0-beta"), Dev);
         assert_eq!(channel_of(b"0.4.0-alpha.1"), Dev);
         assert_eq!(channel_of(b"0.4.0-release"), Dev);
         assert_eq!(channel_of(b"0.4.0-rcedar"), Dev);
+        assert_eq!(channel_of(b"0.5.7-ptbeta"), Dev);
+        assert_eq!(channel_of(b"0.5.7-nightlyish"), Dev);
 
-        // The public predicates are the two views the call sites use.
-        assert!(version_is_rc(b"0.3.2-rc1"));
-        assert!(!version_is_rc(b"0.3.2"));
-        assert!(!version_is_rc(b"0.4.0-beta"));
+        assert!(version_has_prerelease_marker(b"0.3.2-rc1", b"rc"));
+        assert!(!version_has_prerelease_marker(b"0.3.2", b"rc"));
+        assert!(!version_has_prerelease_marker(b"0.4.0-beta", b"rc"));
     }
 
     #[test]
-    fn release_candidate_is_not_a_dev_build() {
-        // The whole point: an RC inherits release behavior (prod API, `smudgy/`
-        // home, release keyring) precisely because it is *not* a dev build.
-        assert_eq!(channel_of(b"0.3.2-rc1"), BuildChannel::ReleaseCandidate);
-        assert_ne!(channel_of(b"0.3.2-rc1"), BuildChannel::Dev);
+    fn prod_like_prereleases_are_not_dev_builds() {
+        for version in [b"0.3.2-rc1".as_slice(), b"0.5.7-ptb37", b"0.5.7-nightly"] {
+            assert_ne!(channel_of(version), BuildChannel::Dev);
+        }
     }
 
     #[test]

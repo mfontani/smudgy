@@ -2,18 +2,18 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "smudgy"
-#define MyAppVersion "0.5.6"
+#define MyAppVersion "0.5.7-ptb"
 #define MyAppPublisher "walter.dev"
 #define MyAppURL "https://smudgy.org"
 #define MyAppExeName "smudgy.exe"
 
 ; --- Build-channel install identity ------------------------------------------
 ; bin/release.ps1 passes /DSmudgyDevBuild to ISCC for a dev/pre-release build
-; and omits it for a release or release candidate. The channel rule (clean
-; X.Y.Z = release; a prerelease whose first id is `rc` = release candidate; any
-; other -/+ suffix = dev) lives in release.ps1, which derives it from
+; and omits it for a release or prod-like prerelease. The channel rule (clean
+; X.Y.Z = release; a prerelease beginning `rc`, `ptb`, or `nightly` = prod-like;
+; any other -/+ suffix = dev) lives in release.ps1, which derives it from
 ; MyAppVersion above, mirroring core::models::settings::build_channel and
-; bin/bump-version.sh. A release and a release candidate share ONE identity
+; bin/bump-version.sh. A release and its RC/PTB/nightly builds share ONE identity
 ; (same AppId, install dir, display name, and data dir), so they upgrade/clobber
 ; each other; a dev build gets its OWN identity and installs side by side,
 ; matching its separate "smudgy-dev" data dir. A direct Inno-IDE compile
@@ -135,7 +135,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 [Code]
 // The update-check seed (below) must land in the same per-user data dir the app
 // reads, which mirrors core::get_smudgy_home(): a dev/pre-release build under
-// "smudgy-dev", a release or release candidate under "smudgy". The channel is
+// "smudgy-dev", a release or prod-like prerelease under "smudgy". The channel is
 // fixed at compile time by the SmudgyDevBuild define (see the install-identity
 // block at the top of this script), so the seed dir is simply SmudgyDataDirName
 // under {userdocs}.

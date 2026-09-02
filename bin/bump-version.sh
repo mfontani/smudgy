@@ -5,8 +5,10 @@
 #
 # <new-version> is a full semver string: MAJOR.MINOR.PATCH with an optional
 # `-prerelease` and/or `+build` suffix (e.g. 0.3.2, 0.4.0-beta, 0.4.0-rc.1+ci).
+# For convenience, compact PTB/nightly spellings such as `0.5.7ptb37` are
+# accepted and normalized to valid semver (`0.5.7-ptb37`) before files change.
 #
-# The suffix picks one of three build channels (mirrors core's `build_channel`),
+# The suffix picks a build channel (mirrors core's `build_channel`),
 # all derived at compile time from the version — this script does not edit
 # settings.rs:
 #   - clean X.Y.Z              -> release: prod API, smudgy/ data, bare title.
@@ -14,6 +16,9 @@
 #       (prod API, smudgy/ data) but raises no upgrade notifications and is
 #       tagged "RELEASE CANDIDATE <version>" so a tester knows which one they run
 #       (e.g. 0.3.2-rc1, 0.4.0-rc19-the-final-final).
+#   - prerelease starting `ptb` or `nightly` -> prod-like preview: the same API,
+#       data, keyring, installer identity, and notification behavior as an RC;
+#       the title also shows the build time and Git commit when available.
 #   - any other suffix         -> dev/pre-release: dev API, smudgy-dev/ data,
 #       "DEV BUILD" title (e.g. 0.4.0-beta).
 # So bumping the version is all that's needed to retarget a build at a channel.
@@ -41,7 +46,17 @@ if [[ $# -ne 1 ]]; then
     exit 1
 fi
 
-NEW_VERSION="$1"
+REQUESTED_VERSION="$1"
+NEW_VERSION="$REQUESTED_VERSION"
+
+# Cargo package versions must be valid semver, which requires a '-' before a
+# prerelease. Accept the common compact PTB/nightly spelling at this CLI
+# boundary, then store its canonical semver equivalent everywhere.
+COMPACT_PREVIEW_RE='^([0-9]+\.[0-9]+\.[0-9]+)([Pp][Tt][Bb]|[Nn][Ii][Gg][Hh][Tt][Ll][Yy])([0-9][0-9A-Za-z.-]*|[-.][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+if [[ "$NEW_VERSION" =~ $COMPACT_PREVIEW_RE ]]; then
+    NEW_VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+    echo "Normalizing $REQUESTED_VERSION -> $NEW_VERSION (Cargo requires semver prereleases to use '-')"
+fi
 
 # Full semver: X.Y.Z with optional -prerelease and/or +build. POSIX ERE (no
 # non-capturing groups), so groups 1/2 capture the prerelease/build suffixes.
@@ -54,14 +69,20 @@ PRERELEASE="${BASH_REMATCH[1]}"   # includes leading '-', empty if none
 BUILD="${BASH_REMATCH[2]}"        # includes leading '+', empty if none
 
 # Pick the build channel from the suffix (mirrors core's `build_channel`). A
-# prerelease whose first identifier is `rc` is a release candidate (prod-like);
-# the `rc` must end at the first '-', '.', '+', or digit so words like "release"
-# / "rcedar" don't read as a candidate. Any other suffix is dev; a clean X.Y.Z
-# is a prod release.
+# prerelease whose first identifier is `rc`, `ptb`, or `nightly` is prod-like;
+# the marker must end at the first '-', '.', '+', or digit so words like
+# "rcedar" / "ptbeta" don't enter a preview channel. Any other suffix is dev;
+# a clean X.Y.Z is a prod release.
 PRE_ID="${PRERELEASE#-}"          # prerelease without the leading '-', empty if none
 if [[ "$PRE_ID" =~ ^[Rr][Cc]($|[-.+0-9]) ]]; then
     API_BASE_URL="https://api.smudgy.org"
     CHANNEL="release-candidate"
+elif [[ "$PRE_ID" =~ ^[Pp][Tt][Bb]($|[-.+0-9]) ]]; then
+    API_BASE_URL="https://api.smudgy.org"
+    CHANNEL="public-test-build"
+elif [[ "$PRE_ID" =~ ^[Nn][Ii][Gg][Hh][Tt][Ll][Yy]($|[-.+0-9]) ]]; then
+    API_BASE_URL="https://api.smudgy.org"
+    CHANNEL="nightly"
 elif [[ -n "$PRERELEASE" || -n "$BUILD" ]]; then
     API_BASE_URL="https://api.dev.smudgy.org"
     CHANNEL="dev / pre-release"
@@ -136,9 +157,9 @@ echo "  Cargo.lock"
 
 # smudgy-web (separate repo): bump newest_client_version, the soft "upgrade
 # available" nudge ceiling — but ONLY for a clean release. Advertising a
-# dev/pre-release or release-candidate version as "newest" would nudge every
-# prod client toward a pre-release, and a release candidate must raise no
-# upgrade nags at all, so those channels skip the bump. min_client_version is
+# dev/pre-release or preview version as "newest" would nudge every prod client
+# toward a pre-release, and preview channels must raise no upgrade nags at all,
+# so those channels skip the bump. min_client_version is
 # always left alone (the hard 426 gate is rolled out by hand, prod-coordinated).
 SMUDGY_WEB_DIR="${SMUDGY_WEB_DIR:-../smudgy-web}"
 TF_FILE="$SMUDGY_WEB_DIR/terraform/smudgy-web.tf"
