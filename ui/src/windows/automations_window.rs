@@ -78,8 +78,8 @@ fn code_completion_shortcut(
     status: Status,
 ) -> bool {
     status == Status::Ignored
-        && modifiers.command()
-        && matches!(key.as_ref(), keyboard::Key::Character(" "))
+        && modifiers.control()
+        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Space))
 }
 
 fn matcher_truecolor_range(
@@ -395,7 +395,7 @@ pub enum Message {
     ApplyCodeCompletion(code_editor::CompletionSelection),
     /// Synchronizes keyboard reveal state with an exact completion popup's scroll viewport.
     CodeCompletionViewportChanged(code_editor::CompletionViewportTarget),
-    /// Requests completions at the active code-editor caret (Ctrl/Command+Space or button).
+    /// Requests completions at the active code-editor caret (Ctrl+Space or button).
     TriggerCodeCompletion,
     /// Closes host-owned completion and hover overlays without changing source.
     DismissCodeOverlays,
@@ -3122,8 +3122,8 @@ mod tab_traversal_tests {
     }
 
     #[test]
-    fn command_space_requests_completion_only_when_unconsumed() {
-        let space = keyboard::Key::Character(" ".into());
+    fn control_space_requests_completion_only_when_unconsumed() {
+        let space = keyboard::Key::Named(keyboard::key::Named::Space);
         assert!(code_completion_shortcut(
             &space,
             keyboard::Modifiers::CTRL,
