@@ -1611,6 +1611,7 @@ impl Runtime {
                 catalogue_resend_at: None,
                 connection: None,
                 connection_generation: 0,
+                connected_at: None,
                 pending_send_on_connect: None,
                 send_on_connect_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 window_size: Arc::new(std::sync::atomic::AtomicU32::new(
@@ -1686,6 +1687,7 @@ impl Runtime {
                 let old_open_line = std::mem::take(&mut inner.open_line);
                 let old_connection = inner.connection.take();
                 let old_connection_generation = inner.connection_generation;
+                let old_connected_at = inner.connected_at.take();
                 let old_pending_send_on_connect = inner.pending_send_on_connect.take();
                 // The surviving connection's VtProcessor holds a clone of this
                 // exact cell (like the raw-wanted flag below); the rebuilt
@@ -1972,6 +1974,7 @@ impl Runtime {
                     catalogue_resend_at: None,
                     connection: old_connection, // Preserve the connection
                     connection_generation: old_connection_generation,
+                    connected_at: old_connected_at,
                     pending_send_on_connect: old_pending_send_on_connect,
                     send_on_connect_armed: old_send_on_connect_armed,
                     window_size: old_window_size,
@@ -2158,6 +2161,14 @@ struct Inner<'a> {
     /// completion markers carry this id so a late marker from a replaced
     /// socket cannot affect the current connection.
     connection_generation: u64,
+    /// The runtime's own connection clock: the generation whose `Connected`
+    /// was last dispatched, and when. `DisconnectNotice` reads it to word the
+    /// "after …" duration and clears it. Runtime-side on purpose — it measures
+    /// how long the session was live from the user's seat, including the time
+    /// spent working through lines a fast socket had already delivered.
+    /// Session-lifetime like the connection: a reload mid-connection carries it
+    /// over.
+    connected_at: Option<(u64, std::time::Instant)>,
     /// Profile text held until the current connection's first fully processed
     /// inbound packet containing non-empty terminal text.
     pending_send_on_connect: Option<RuntimeAction>,

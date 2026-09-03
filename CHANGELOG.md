@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nightly` use release data and services while identifying their build time and
   source commit in the title bar.
 
+### Changed
+
+- **Disconnect notices report the connection time.** A dropped or closed
+  connection now reads `Connection lost after 01:23:46.1234` or
+  `Disconnected after 01:23:46.1234`. The clock is the session's own: it runs
+  from when the session saw the connection come up until it has finished
+  processing everything the server sent, so a log replayed over a local socket
+  reports the time you spent on it, not how quickly the socket closed.
+
 ## [0.5.6] - 2026-08-30
 
 ### Added
