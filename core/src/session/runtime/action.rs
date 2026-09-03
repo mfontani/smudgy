@@ -678,6 +678,21 @@ pub enum RuntimeAction {
     Disconnected {
         connection_generation: u64,
     },
+    /// The socket task's request for the user-facing teardown notice
+    /// ("Disconnected after …" / "Connection lost after …"), sent right after
+    /// [`Self::Disconnected`]. The connection duration is measured by the
+    /// runtime — from its dispatch of [`Self::Connected`] to its dispatch of
+    /// this action — not by the socket task: a socket that delivers its whole
+    /// stream in a burst (a log replayed over netcat) closes long before the
+    /// runtime has worked through the queued lines, and the time the user
+    /// spent on that connection is the runtime's, not the socket's. `graceful`
+    /// is true for a requested disconnect (the user's, or this socket
+    /// superseded by a new one) and false for every other exit.
+    /// `connection_generation` pairs the notice with its socket's stamp.
+    DisconnectNotice {
+        connection_generation: u64,
+        graceful: bool,
+    },
     /// One inbound GMCP message (`docs/gmcp.md` §3): the dotted message name and the
     /// raw data part exactly as received — unparsed; the dispatch arm parses on the session
     /// thread and writes the `gmcp` store subtree. Enqueued by the connection task at the

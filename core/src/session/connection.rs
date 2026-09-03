@@ -1764,19 +1764,18 @@ impl Connection {
                 }
 
                 // Silently ignore errors here; when a session is closing the runtime may already be gone by the time
-                // we get here
+                // we get here. The notice itself is worded by the runtime, which
+                // owns the connection clock (see `RuntimeAction::DisconnectNotice`).
                 runtime_tx
                     .send(RuntimeAction::Disconnected {
                         connection_generation: generation,
                     })
                     .map(|()| {
-                        let notice = if graceful {
-                            "Disconnected."
-                        } else {
-                            "Connection lost"
-                        };
                         runtime_tx
-                            .send(RuntimeAction::Echo(Arc::new(notice.to_string())))
+                            .send(RuntimeAction::DisconnectNotice {
+                                connection_generation: generation,
+                                graceful,
+                            })
                             .ok();
                     })
                     .ok();
@@ -3083,7 +3082,7 @@ mod tests {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
                     RuntimeAction::Disconnected { .. } => disconnected = true,
-                    RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
+                    RuntimeAction::DisconnectNotice { graceful: true, .. } => {
                         reported_disconnect = true;
                     }
                     _ => {}
@@ -3133,7 +3132,9 @@ mod tests {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
                     RuntimeAction::Disconnected { .. } => disconnected = true,
-                    RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
+                    RuntimeAction::DisconnectNotice {
+                        graceful: false, ..
+                    } => {
                         reported_loss = true;
                     }
                     _ => {}
@@ -3187,7 +3188,9 @@ mod tests {
                         received_line = true;
                     }
                     RuntimeAction::Disconnected { .. } => disconnected = true,
-                    RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
+                    RuntimeAction::DisconnectNotice {
+                        graceful: false, ..
+                    } => {
                         reported_loss = true;
                     }
                     _ => {}
@@ -3248,7 +3251,7 @@ mod tests {
                 let action = runtime_rx.recv().await.expect("runtime action");
                 match action {
                     RuntimeAction::Disconnected { .. } => disconnected = true,
-                    RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
+                    RuntimeAction::DisconnectNotice { graceful: true, .. } => {
                         reported_disconnect = true;
                     }
                     _ => {}

@@ -1351,6 +1351,10 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::Connected => {
+                // Start the runtime's connection clock here, not in the socket
+                // task: the duration the disconnect notice reports is the time
+                // this runtime spent live on the connection.
+                self.connected_at = Some((self.connection_generation, std::time::Instant::now()));
                 if !self
                     .connected
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -1446,6 +1450,39 @@ impl Inner<'_> {
                 } else {
                     Ok(ActionResult::Run(actions))
                 }
+            }
+            RuntimeAction::DisconnectNotice {
+                connection_generation,
+                graceful,
+            } => {
+                // The clock belongs to the socket that started it: a replaced
+                // socket's late notice, arriving after the NEW connection's
+                // `Connected` re-stamped it, reads as a bare notice rather
+                // than claiming the new connection's (tiny) elapsed time.
+                let elapsed = match self.connected_at {
+                    Some((stamped_generation, started))
+                        if stamped_generation == connection_generation =>
+                    {
+                        self.connected_at = None;
+                        Some(started.elapsed())
+                    }
+                    _ => None,
+                };
+                let notice = match (graceful, elapsed) {
+                    (true, Some(elapsed)) => {
+                        format!("Disconnected after {}", format_connection_duration(elapsed))
+                    }
+                    (false, Some(elapsed)) => format!(
+                        "Connection lost after {}",
+                        format_connection_duration(elapsed)
+                    ),
+                    (true, None) => "Disconnected.".to_string(),
+                    (false, None) => "Connection lost".to_string(),
+                };
+                // Same delivery as `Echo`: append without flushing, so the
+                // notice lands behind the connection's last lines in order.
+                self.echo_str_sync(&notice);
+                Ok(ActionResult::None)
             }
             RuntimeAction::GmcpMessage { name, data } => {
                 let effects = self.gmcp.ingest(
@@ -2464,9 +2501,24 @@ impl Inner<'_> {
     }
 }
 
+/// Word a connection duration for the disconnect notice as `HH:MM:SS.ffff`
+/// (four fractional digits — tenths of a millisecond). Hours are not wrapped,
+/// so a connection held across days reads `49:10:03.0000`, never `01:10:03`.
+pub(crate) fn format_connection_duration(elapsed: std::time::Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
+    let tenth_millis = elapsed.subsec_micros() / 100;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{tenth_millis:04}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::format_connection_duration;
 
     use super::{prepare_pane_open, send_link_tooltip};
     use crate::session::SessionId;
@@ -2476,6 +2528,29 @@ mod tests {
     };
     use crate::session::runtime::{IsolateId, RuntimeAction};
     use crate::session::styled_line::LinkTooltipState;
+
+    #[test]
+    fn connection_duration_reads_as_hours_minutes_seconds_and_tenth_millis() {
+        assert_eq!(
+            format_connection_duration(
+                Duration::from_secs(3600 + 23 * 60 + 46) + Duration::from_micros(123_450)
+            ),
+            "01:23:46.1234"
+        );
+        assert_eq!(format_connection_duration(Duration::ZERO), "00:00:00.0000");
+        assert_eq!(
+            format_connection_duration(Duration::from_millis(59_999)),
+            "00:00:59.9990"
+        );
+    }
+
+    #[test]
+    fn connection_duration_does_not_wrap_hours() {
+        assert_eq!(
+            format_connection_duration(Duration::from_secs(49 * 3600 + 10 * 60 + 3)),
+            "49:10:03.0000"
+        );
+    }
 
     #[test]
     fn failed_tooltip_forward_resolves_the_loading_state() {
