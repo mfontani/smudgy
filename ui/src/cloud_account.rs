@@ -13,7 +13,9 @@
 //! window; it reports outcomes upward as events which the daemon feeds back
 //! into this controller (`establish_session`, `sign_out`, …).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use arc_swap::ArcSwap;
 use iced::Task;
@@ -94,6 +96,160 @@ pub struct CloudHandles {
     pub credentials: CredentialSource,
     pub client: CloudApiClient,
     pub base_url: Arc<String>,
+    /// App-lifetime serialization for mutations of one local package. A task keeps its permit
+    /// even if the Automations window that launched it is closed or replaced.
+    pub(crate) package_operations: PackageOperationGate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackageOperationId(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackageOperationKey {
+    server_name: String,
+    package_name: String,
+}
+
+impl PackageOperationKey {
+    fn new(server_name: &str, package_name: &str) -> Self {
+        Self {
+            // Server and package folders live on case-insensitive filesystems on the primary
+            // platform. Treat spelling-only variants as one mutation domain on every platform.
+            server_name: server_name.to_lowercase(),
+            package_name: package_name.to_lowercase(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PackageOperationGateInner {
+    next_id: AtomicU64,
+    in_flight: Mutex<HashMap<PackageOperationKey, PackageOperationId>>,
+}
+
+/// A shared, non-blocking per-package operation gate. Callers never wait while holding the UI
+/// thread: they either reserve the package immediately or explain that another change is active.
+#[derive(Debug, Clone)]
+pub(crate) struct PackageOperationGate(Arc<PackageOperationGateInner>);
+
+impl Default for PackageOperationGate {
+    fn default() -> Self {
+        Self(Arc::new(PackageOperationGateInner {
+            next_id: AtomicU64::new(1),
+            in_flight: Mutex::new(HashMap::new()),
+        }))
+    }
+}
+
+impl PackageOperationGate {
+    fn in_flight(&self) -> MutexGuard<'_, HashMap<PackageOperationKey, PackageOperationId>> {
+        // A panic in unrelated task code must not permanently disable package management. The
+        // map remains structurally valid because mutations happen while the guard is held.
+        self.0
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[must_use]
+    pub(crate) fn try_acquire(
+        &self,
+        server_name: &str,
+        package_name: &str,
+    ) -> Option<PackageOperationPermit> {
+        let key = PackageOperationKey::new(server_name, package_name);
+        let mut in_flight = self.in_flight();
+        if in_flight.contains_key(&key) {
+            return None;
+        }
+        let id = PackageOperationId(self.0.next_id.fetch_add(1, Ordering::Relaxed));
+        in_flight.insert(key.clone(), id);
+        drop(in_flight);
+        Some(PackageOperationPermit {
+            gate: self.clone(),
+            key,
+            id,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn is_busy(&self, server_name: &str, package_name: &str) -> bool {
+        self.in_flight()
+            .contains_key(&PackageOperationKey::new(server_name, package_name))
+    }
+}
+
+/// RAII reservation held by the complete mutation future. Its operation id separately fences the
+/// UI completion because a new operation can start after this permit is released but before an
+/// older completion message is processed.
+#[derive(Debug)]
+pub(crate) struct PackageOperationPermit {
+    gate: PackageOperationGate,
+    key: PackageOperationKey,
+    id: PackageOperationId,
+}
+
+impl PackageOperationPermit {
+    #[must_use]
+    pub(crate) fn id(&self) -> PackageOperationId {
+        self.id
+    }
+
+    /// Transfer this live reservation into the cloneable completion message. The gate remains
+    /// closed until the daemon/window accepts that message, while dropping every message clone
+    /// still releases it automatically.
+    pub(crate) fn into_completion(self) -> PackageOperationCompletion {
+        let id = self.id;
+        PackageOperationCompletion {
+            id,
+            permit: Arc::new(Mutex::new(Some(self))),
+        }
+    }
+}
+
+impl Drop for PackageOperationPermit {
+    fn drop(&mut self) {
+        let mut in_flight = self.gate.in_flight();
+        if in_flight.get(&self.key) == Some(&self.id) {
+            in_flight.remove(&self.key);
+        }
+    }
+}
+
+/// Cloneable ownership handoff from a completed task to its UI message. Explicit `release` closes
+/// the small future/message scheduling gap in which a replacement window could otherwise start a
+/// conflicting operation before the old completion reconciles its durable result.
+#[derive(Clone)]
+pub(crate) struct PackageOperationCompletion {
+    id: PackageOperationId,
+    permit: Arc<Mutex<Option<PackageOperationPermit>>>,
+}
+
+impl std::fmt::Debug for PackageOperationCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackageOperationCompletion")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PackageOperationCompletion {
+    #[must_use]
+    pub(crate) fn id(&self) -> PackageOperationId {
+        self.id
+    }
+
+    pub(crate) fn release(&self) {
+        self.take_permit();
+    }
+
+    pub(crate) fn take_permit(&self) -> Option<PackageOperationPermit> {
+        self.permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 /// Handles pointing at nothing: window unit tests exercise layout and
@@ -107,6 +263,35 @@ pub(crate) fn test_handles() -> CloudHandles {
         credentials: credentials.clone(),
         client: CloudApiClient::new("http://localhost", credentials),
         base_url: Arc::new("http://localhost".to_string()),
+        package_operations: PackageOperationGate::default(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_handles_signed_in(nickname: &str) -> CloudHandles {
+    let credentials =
+        CredentialSource::new(Some(Credential::Session("smudgy_sess_test".to_string())));
+    let created_at = "2026-01-01T00:00:00Z".parse().unwrap();
+    let snapshot = AccountSnapshot {
+        profile: Some(UserProfile {
+            id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+            email: "test@example.invalid".to_string(),
+            nickname: Some(nickname.to_string()),
+            requested_nickname: None,
+            email_verified_at: Some(created_at),
+            nickname_updated_at: None,
+            created_at,
+        }),
+        signed_in: true,
+        email_verified: true,
+        ..AccountSnapshot::default()
+    };
+    CloudHandles {
+        snapshot: AccountHandle(Arc::new(ArcSwap::from_pointee(snapshot))),
+        credentials: credentials.clone(),
+        client: CloudApiClient::new("http://localhost", credentials),
+        base_url: Arc::new("http://localhost".to_string()),
+        package_operations: PackageOperationGate::default(),
     }
 }
 
@@ -131,6 +316,7 @@ pub struct CloudAccount {
     client: CloudApiClient,
     snapshot: Arc<ArcSwap<AccountSnapshot>>,
     base_url: Arc<String>,
+    package_operations: PackageOperationGate,
     /// Soft "upgrade available" prompt dismissed for this session ("Dismiss").
     upgrade_dismissed_session: bool,
     /// Version the prompt was permanently dismissed for ("Dismiss for this
@@ -173,6 +359,7 @@ impl CloudAccount {
             client,
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
             base_url,
+            package_operations: PackageOperationGate::default(),
             upgrade_dismissed_session: false,
             dismissed_upgrade_version: settings.dismissed_upgrade_version.clone(),
             auto_check_for_updates: settings.auto_check_for_updates,
@@ -198,6 +385,7 @@ impl CloudAccount {
             credentials: self.credentials.clone(),
             client: self.client.clone(),
             base_url: self.base_url.clone(),
+            package_operations: self.package_operations.clone(),
         }
     }
 
@@ -500,5 +688,53 @@ impl CloudAccount {
         } else {
             Task::none()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_operation_gate_is_shared_case_insensitive_and_raii() {
+        let handles = test_handles();
+        let replacement_window_handles = handles.clone();
+        let first = handles
+            .package_operations
+            .try_acquire("Example Server", "Mapper")
+            .expect("first operation reserves the package");
+        let first_id = first.id();
+
+        assert!(
+            replacement_window_handles
+                .package_operations
+                .is_busy("example server", "mapper")
+        );
+        assert!(
+            replacement_window_handles
+                .package_operations
+                .try_acquire("EXAMPLE SERVER", "MAPPER")
+                .is_none()
+        );
+        let other = replacement_window_handles
+            .package_operations
+            .try_acquire("Example Server", "Other")
+            .expect("a different package has an independent gate");
+        drop(other);
+
+        let completion = first.into_completion();
+        assert!(
+            replacement_window_handles
+                .package_operations
+                .is_busy("Example Server", "Mapper")
+        );
+        let completion_clone = completion.clone();
+        completion.release();
+        assert!(completion_clone.take_permit().is_none());
+        let next = replacement_window_handles
+            .package_operations
+            .try_acquire("Example Server", "Mapper")
+            .expect("dropping the permit releases the package");
+        assert_ne!(next.id(), first_id);
     }
 }

@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use image::ImageEncoder;
-use smudgy_core::models::server::ServerConfig;
+use smudgy_core::models::server::{Server, ServerCas, ServerConfig, with_server_if_unchanged};
 use url::{Host, Url};
 
 /// Transfer cap for an encoded icon — the MSSP spec's own limit for `ICON`.
@@ -437,19 +437,20 @@ pub fn load_cached_icon(server: &str) -> Option<iced::widget::image::Handle> {
 /// yield `None` — any previously cached icon keeps rendering, and the
 /// unchanged `icon.src` means the next reconcile simply tries again.
 pub async fn fetch_and_cache(
-    server: String,
-    game_host: String,
-    config: ServerConfig,
+    server: Server,
     icon_value: String,
-) -> (String, Option<iced::widget::image::Handle>) {
+) -> (Server, Option<iced::widget::image::Handle>) {
+    let name = server.name.clone();
+    let game_host = server.config.host.clone();
+    let config = server.config.clone();
     let url = match icon_url_policy(&icon_value, &game_host, &config) {
         IconUrlPolicy::AutoFetch(url) => url,
         IconUrlPolicy::NeedsConsent { host } => {
-            log::info!("smudgy icons: {server}: {host} held for a link-trust grant");
+            log::info!("smudgy icons: {name}: {host} held for a link-trust grant");
             return (server, None);
         }
         IconUrlPolicy::Refused(reason) => {
-            log::info!("smudgy icons: {server}: {reason}");
+            log::info!("smudgy icons: {name}: {reason}");
             return (server, None);
         }
     };
@@ -457,28 +458,41 @@ pub async fn fetch_and_cache(
         Ok(body) => match transcode_icon(&body) {
             Ok(artifact) => artifact,
             Err(reason) => {
-                log::warn!("smudgy icons: {server}: {reason}");
+                log::warn!("smudgy icons: {name}: {reason}");
                 return (server, None);
             }
         },
         Err(reason) => {
-            log::warn!("smudgy icons: {server}: {reason}");
+            log::warn!("smudgy icons: {name}: {reason}");
             return (server, None);
         }
     };
-    let Some((png_path, src_path)) = icon_paths(&server) else {
-        return (server, None);
-    };
-    // Artifact first, source marker second: a failure between the two
-    // refetches next time rather than pinning a missing artifact.
-    if let Err(e) = smudgy_core::models::persistence::write_atomic(&png_path, &artifact.png) {
-        log::warn!("smudgy icons: failed to write {}: {e}", png_path.display());
-        return (server, None);
-    }
-    if let Err(e) =
-        smudgy_core::models::persistence::write_atomic(&src_path, icon_value.trim().as_bytes())
-    {
-        log::warn!("smudgy icons: failed to write {}: {e}", src_path.display());
+    let commit = with_server_if_unchanged(&server, |current| {
+        let png_path = current.path.join("icon.png");
+        let src_path = current.path.join("icon.src");
+        // Artifact first, source marker second: a failure between the two
+        // refetches next time rather than pinning a missing artifact.
+        smudgy_core::models::persistence::write_atomic(&png_path, &artifact.png)?;
+        if let Err(error) =
+            smudgy_core::models::persistence::write_atomic(&src_path, icon_value.trim().as_bytes())
+        {
+            log::warn!(
+                "smudgy icons: failed to write source marker {}: {error}",
+                src_path.display()
+            );
+        }
+        Ok(())
+    });
+    match commit {
+        Ok(ServerCas::Applied(())) => {}
+        Ok(ServerCas::StateChanged) => {
+            log::info!("smudgy icons: {name}: discarded a fetched icon because the server changed");
+            return (server, None);
+        }
+        Err(error) => {
+            log::warn!("smudgy icons: {name}: failed to cache icon: {error}");
+            return (server, None);
+        }
     }
     let handle =
         iced::widget::image::Handle::from_rgba(artifact.width, artifact.height, artifact.rgba);

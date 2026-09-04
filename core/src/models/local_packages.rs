@@ -2,11 +2,12 @@
 //! `<smudgy_home>/<server>/packages/<name>/` (per-server, beside `modules/`). The folder
 //! holds a `smudgy.package.json` manifest plus the module files.
 //!
-//! While a local package exists, the session's package provider resolves
-//! `smudgy://<yourhandle>/<name>` to this folder (an npm-link-style override), so you
-//! test it under its real specifier before publishing. Publishing reads the folder and
-//! uploads it (create-or-get namespace, then an immutable version). See
-//! `smudgy/script/PACKAGES.md`.
+//! While a local package exists, the session's package provider resolves every
+//! `smudgy://<owner>/<name>` request with that leaf name to this folder (an npm-link-style
+//! override). Its persistent settings live on a reserved `smudgy://local/<name>` lock row so
+//! mutable local code never inherits trust, consent, or secrets from a same-name published
+//! install. Publishing reads the folder and uploads it (create-or-get namespace, then an
+//! immutable version). See `smudgy/script/PACKAGES.md`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,40 +16,93 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+use smudgy_cloud::cloud_api::UserProfile;
 use smudgy_cloud::{
-    PackageApiClient, PublishDependency, PublishModule, Uuid, highest_satisfying_version,
+    DependencyKind, PackageApiClient, PublishDependency, PublishModule, ResolvedPackageWire, Uuid,
+    highest_satisfying_version,
 };
-use smudgy_script::PackageManifest;
+use smudgy_script::{PackageManifest, SmudgySpecifier};
 
-use crate::get_smudgy_home;
+use crate::models::shared_packages::{
+    self, Cas, LockedPackage, PackageStateTxn, SharedPackageLock,
+};
+use crate::{get_smudgy_home, models::persistence::write_atomic};
 
 const MANIFEST_FILE: &str = "smudgy.package.json";
+/// Durable link from an authored folder to the cloud namespace it published into. Dot-prefixed
+/// so [`collect_modules`] never includes it in a published version.
+const PUBLICATION_BINDING_FILE: &str = ".smudgy-publication.json";
+/// First-publish intent. This is written before `POST /packages`, so a lost response or a
+/// successful namespace claim followed by a failed binding write cannot make the folder appear
+/// unpublished and renameable. A retry under the same account repeats create-or-get, validates the
+/// returned namespace, and replaces this intent with [`PUBLICATION_BINDING_FILE`].
+const PUBLICATION_CLAIM_FILE: &str = ".smudgy-publication-claim.json";
 
-/// The owner segment a local package runs under when there is no account nickname
-/// (signed out): `smudgy://local/<name>`. Signed in, a local folder overrides the
-/// account's own `smudgy://<nickname>/<name>`; signed out there is no nickname, so
-/// this reserved placeholder lets local packages still be addressed, enabled, and
-/// run (sandboxed to their manifest, like any local override). Reserved on the
-/// server so no real account can publish under it and collide.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PublicationClaimIntent {
+    version: u32,
+    account_id: Uuid,
+    account_nickname: String,
+    leaf: String,
+}
+
+/// The owner segment a local package's persistent state lives under: `smudgy://local/<name>`.
+/// Reserved on the server so no real account can publish under it and collide.
 pub const LOCAL_OWNER: &str = "local";
 
 /// The `smudgy:core` ambient declarations, made available to the publish-time `.d.ts`
-/// generator so a package's `import … from "smudgy:core"` resolves while emitting. The
-/// same file the editor sees (`script_typings`).
+/// generator so a package's `import … from "smudgy:core"` resolves while emitting.
 const SMUDGY_CORE_DTS: &str = include_str!("script_typings/smudgy-core.d.ts");
-
-/// The `mapper` ambient declarations (global `Mapper`/`Area`/`Room`/...). Required at
-/// publish time because `smudgy-core.d.ts`'s `mapper` member references the global `Mapper`,
-/// and so a package using `mapper` resolves identically to the editor.
+/// The `mapper` ambient declarations (global `Mapper`/`Area`/`Room`/...).
 const SMUDGY_MAPPER_DTS: &str = include_str!("script_typings/smudgy-mapper.d.ts");
-
-/// The `smudgy:widgets` + `smudgy:widgets/jsx-runtime` ambient declarations, so a package's
-/// `import … from "smudgy:widgets"` resolves and its `.tsx` modules type-check + emit against
-/// the `JSX` namespace at publish time.
+/// The `smudgy:widgets` + `smudgy:widgets/jsx-runtime` ambient declarations.
 const SMUDGY_WIDGETS_DTS: &str = include_str!("script_typings/smudgy-widgets.d.ts");
 /// Package parameter declarations, so packages that read their manifest settings through
 /// `smudgy:params` type-check at publish time as they do in the editor.
 const SMUDGY_PARAMS_DTS: &str = include_str!("script_typings/smudgy-params.d.ts");
+
+fn snapshot_field(hasher: &mut Sha256, tag: &[u8], value: &[u8]) -> Result<()> {
+    let tag_len = u64::try_from(tag.len()).context("snapshot tag is too large")?;
+    let value_len = u64::try_from(value.len()).context("snapshot field is too large")?;
+    hasher.update(tag_len.to_le_bytes());
+    hasher.update(tag);
+    hasher.update(value_len.to_le_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+/// A digest of everything a publish uploads, so the folder can be checked for edits between the
+/// upload's preparation and its irreversible remote commit.
+fn package_snapshot_digest(package: &LocalPackage) -> Result<String> {
+    let mut hasher = Sha256::new();
+    snapshot_field(&mut hasher, b"format", b"smudgy-local-package-snapshot-v4")?;
+    snapshot_field(&mut hasher, b"name", package.name.as_bytes())?;
+    snapshot_field(
+        &mut hasher,
+        b"manifest",
+        &serde_json::to_vec(&package.manifest)?,
+    )?;
+    match &package.readme {
+        Some(readme) => {
+            snapshot_field(&mut hasher, b"readme-present", b"1")?;
+            snapshot_field(&mut hasher, b"readme", readme.as_bytes())?;
+        }
+        None => snapshot_field(&mut hasher, b"readme-present", b"0")?,
+    }
+    snapshot_field(
+        &mut hasher,
+        b"module-count",
+        &u64::try_from(package.modules.len())
+            .context("too many package modules")?
+            .to_le_bytes(),
+    )?;
+    for module in &package.modules {
+        snapshot_field(&mut hasher, b"module-subpath", module.subpath.as_bytes())?;
+        snapshot_field(&mut hasher, b"module-content", &module.content)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 /// What a successful publish reports back: the published version plus the outcome of the
 /// publish-time TypeScript declaration generation. Declaration generation is **best-effort
@@ -69,28 +123,67 @@ pub struct PublishSummary {
     /// surfaced to the author. Empty on a clean typings pass.
     pub typings_warnings: Vec<String>,
     /// What each `smudgy://` dependency locked to this publish: `(specifier, resolved_version)`.
-    /// A publish freezes the whole tree, so the author should be able to see exactly which version
-    /// each dependency pinned — a stale range silently pinning an old version is otherwise invisible.
     pub locked_dependencies: Vec<(String, String)>,
     /// Non-fatal warnings about dependency locking — e.g. a declared range that excludes a *newer*
-    /// published version (most notably the 0.0.x caret footgun, where `^0.0.1`/`0.0.1` can never
-    /// advance past `0.0.1`). Surfaced to the author; never blocks the publish.
+    /// published version (most notably the 0.0.x caret footgun).
     pub dependency_warnings: Vec<String>,
-    /// Non-fatal interop-declaration warnings (interop.md §4): duplicate/aliased handle
-    /// exports, and handles the previously published version declared that this version
-    /// drops — a handle's name is its identity, so a silent rename breaks consumers and
-    /// orphans persisted state. Never blocks the publish.
+    /// Non-fatal interop-declaration warnings (interop.md §4).
     pub interop_warnings: Vec<String>,
+    /// A successful remote publish whose local bookkeeping could not be confirmed at completion.
+    /// The version is already live and must not be retried.
+    pub publication_warnings: Vec<PublicationWarning>,
+}
+
+/// A recoverable publish outcome that needs a precise, localized explanation in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationWarning {
+    /// The final response was lost, but resolving the target version confirmed that its exact
+    /// manifest, README, module hashes, and locked dependencies match this publish request.
+    VersionPresentAfterLostResponse { name: String, version: String },
+    /// Finalize returned a success body that did not identify the requested namespace and version,
+    /// but an independent resolve confirmed the exact immutable payload at the intended target.
+    InconsistentResponseRecovered { name: String, version: String },
+    /// A retry found the exact immutable payload already live.
+    ExistingVersionRecovered { name: String, version: String },
+    /// The cloud version is live, but the local namespace sidecar could not be confirmed.
+    MissingLocalBinding { name: String, version: String },
+    /// The cloud version is live, but reading the namespace sidecar failed.
+    LocalBindingUnverified {
+        name: String,
+        version: String,
+        error: String,
+    },
+    /// The cloud version contains the captured snapshot, but the local folder changed or became
+    /// unreadable while the irreversible remote request was running.
+    LocalSnapshotChanged { name: String, version: String },
+    /// The cloud version is live, but the package-level description could not be updated to match
+    /// the description captured in that version's manifest.
+    DescriptionUpdateFailed {
+        name: String,
+        version: String,
+        error: String,
+    },
+}
+
+/// The cloud namespace permanently associated with one local package folder.
+///
+/// Published package names are immutable. Once this sidecar exists, the local folder cannot be
+/// renamed; authors make a differently-named copy instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicationBinding {
+    pub package_id: Uuid,
+    pub leaf: String,
 }
 const README_FILE: &str = "README.md";
 /// The editor-only `tsconfig.json` a copied ("Make a copy") package carries so VS Code types it
 /// against the server-level smudgy project. It's scaffolding, never package content, so it is
 /// excluded from publishing — treated like a dotfile by [`collect_modules`].
 const TSCONFIG_FILE: &str = "tsconfig.json";
-/// The body written into a copied package's [`TSCONFIG_FILE`]. From `<server>/packages/<name>/`,
-/// `../../tsconfig.json` is the server-level project (`<name>/..` = `packages/`, `packages/..` =
-/// `<server>/`), giving the package the shared compiler options + installed-package `paths`.
+/// The body written into a copied package's [`TSCONFIG_FILE`].
 const PACKAGE_TSCONFIG: &str = "{ \"extends\": \"../../tsconfig.json\" }\n";
+const STARTER_MANIFEST: &str =
+    "{\n  \"version\": \"0.1.0\",\n  \"description\": \"\",\n  \"entry\": \"index.ts\"\n}\n";
+const STARTER_ENTRY: &str = "// smudgy package entry\nexport {};\n";
 /// Directories never published even if present in a package folder — dependency/build cruft
 /// that the exclude-list would otherwise recurse into and ship wholesale.
 const SKIP_DIRS: [&str; 6] = ["node_modules", "target", "dist", "build", "out", "coverage"];
@@ -114,8 +207,35 @@ pub struct LocalModule {
     pub content: Vec<u8>,
 }
 
+/// Result of deleting a local package. Warnings describe settings cleanup that could not finish;
+/// the package is no longer discoverable or runnable even when this list is not empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteLocalPackageSummary {
+    pub warnings: Vec<String>,
+}
+
+/// Result of replacing one authored package file with an exact compare-and-swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalFileWriteOutcome {
+    Saved,
+    /// The file no longer contains the editor's baseline, so nothing was written.
+    Conflict,
+}
+
 fn packages_dir_in(home: &Path, server_name: &str) -> PathBuf {
     home.join(server_name).join("packages")
+}
+
+fn checked_package_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    crate::models::naming::validate_package_name(name).map_err(|error| anyhow!(error))?;
+    Ok(name)
+}
+
+fn checked_module_subpath(subpath: &str) -> Result<&str> {
+    let subpath = subpath.trim();
+    crate::models::naming::validate_module_subpath(subpath).map_err(|error| anyhow!(error))?;
+    Ok(subpath)
 }
 
 /// `<smudgy_home>/<server>/packages/`.
@@ -126,13 +246,387 @@ pub fn packages_dir(server_name: &str) -> Result<PathBuf> {
     Ok(packages_dir_in(&get_smudgy_home()?, server_name))
 }
 
+/// Exact path of one validated local package manifest.
+pub(crate) fn local_manifest_path(server_name: &str, name: &str) -> Result<PathBuf> {
+    let name = checked_package_name(name)?;
+    Ok(packages_dir(server_name)?.join(name).join(MANIFEST_FILE))
+}
+
+/// Runs a local-folder operation under the server's package lock.
+pub(crate) fn with_local_package_transaction<R>(
+    server_name: &str,
+    operation: impl FnOnce(&Path, &PackageStateTxn<'_>) -> Result<R>,
+) -> Result<R> {
+    let home = get_smudgy_home()?;
+    shared_packages::with_local_package_transaction(server_name, |transaction| {
+        operation(&home, transaction)
+    })
+}
+
+fn local_state_specifier(name: &str) -> String {
+    format!("smudgy://{LOCAL_OWNER}/{name}")
+}
+
+fn is_real_directory(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !metadata.file_type().is_symlink()
+}
+
+fn is_real_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+fn real_directory_exists(path: &Path, label: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_real_directory(&metadata) => Ok(true),
+        Ok(_) => bail!("{label} is not a real directory: {}", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn local_package_dir_if_real_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+) -> Result<Option<PathBuf>> {
+    let packages = packages_dir_in(home, server_name);
+    if !real_directory_exists(&packages, "local package root")? {
+        return Ok(None);
+    }
+    let package = packages.join(name);
+    if !real_directory_exists(&package, "local package")? {
+        return Ok(None);
+    }
+    Ok(Some(package))
+}
+
+fn require_local_package_dir_in(home: &Path, server_name: &str, name: &str) -> Result<PathBuf> {
+    local_package_dir_if_real_in(home, server_name, name)?
+        .ok_or_else(|| anyhow!("no local package named {name}"))
+}
+
+fn require_local_manifest(package_dir: &Path, name: &str) -> Result<()> {
+    if !real_directory_exists(package_dir, "local package")? {
+        bail!("no local package named {name}");
+    }
+    let manifest = package_dir.join(MANIFEST_FILE);
+    match fs::symlink_metadata(&manifest) {
+        Ok(metadata) if is_real_file(&metadata) => Ok(()),
+        Ok(_) => bail!("{} is not a file", manifest.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("no local package named {name}")
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect {}", manifest.display())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Publication sidecars
+// ---------------------------------------------------------------------------
+
+fn publication_claim_path_in(home: &Path, server_name: &str, name: &str) -> PathBuf {
+    packages_dir_in(home, server_name)
+        .join(name)
+        .join(PUBLICATION_CLAIM_FILE)
+}
+
+fn read_sidecar_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("parse {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn load_publication_claim_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+) -> Result<Option<PublicationClaimIntent>> {
+    let name = checked_package_name(name)?;
+    let Some(package_dir) = local_package_dir_if_real_in(home, server_name, name)? else {
+        return Ok(None);
+    };
+    let Some(intent) =
+        read_sidecar_json::<PublicationClaimIntent>(&package_dir.join(PUBLICATION_CLAIM_FILE))?
+    else {
+        return Ok(None);
+    };
+    if intent.version != 1 {
+        bail!(
+            "unsupported publication-claim version {} for local package {name}",
+            intent.version
+        );
+    }
+    checked_package_name(&intent.account_nickname)
+        .context("publication claim contains an invalid account nickname")?;
+    checked_package_name(&intent.leaf).context("publication claim contains an invalid leaf")?;
+    if intent.account_id.is_nil() {
+        bail!("publication claim for local package {name} has no account identity");
+    }
+    if !crate::models::naming::names_conflict(name, &intent.leaf) {
+        bail!(
+            "publication claim for local package {name} names a different leaf: {}",
+            intent.leaf
+        );
+    }
+    Ok(Some(intent))
+}
+
+fn ensure_publication_claim_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+    account_id: Uuid,
+    account_nickname: &str,
+) -> Result<PublicationClaimIntent> {
+    let name = checked_package_name(name)?;
+    let account_nickname = checked_package_name(account_nickname)?;
+    if account_id.is_nil() {
+        bail!("cannot publish local package {name} without an account identity");
+    }
+    if let Some(intent) = load_publication_claim_in(home, server_name, name)? {
+        if intent.account_id != account_id {
+            bail!(
+                "local package {name} has an unfinished publication claim for a different account"
+            );
+        }
+        if crate::models::naming::names_conflict(&intent.account_nickname, account_nickname) {
+            return Ok(intent);
+        }
+        // Nicknames can change, but the immutable user UUID is the account authority. Refresh the
+        // descriptive handle so validation and recovery messages use the current coordinate.
+        let refreshed = PublicationClaimIntent {
+            account_nickname: account_nickname.to_string(),
+            ..intent
+        };
+        let json = serde_json::to_vec_pretty(&refreshed)
+            .context("serialize refreshed publication claim")?;
+        let path = publication_claim_path_in(home, server_name, name);
+        write_atomic(&path, &json).with_context(|| format!("write {}", path.display()))?;
+        return Ok(refreshed);
+    }
+
+    let package_dir = require_local_package_dir_in(home, server_name, name)?;
+    require_local_manifest(&package_dir, name)?;
+    let intent = PublicationClaimIntent {
+        version: 1,
+        account_id,
+        account_nickname: account_nickname.to_string(),
+        leaf: name.to_string(),
+    };
+    let json = serde_json::to_vec_pretty(&intent).context("serialize publication claim")?;
+    let path = publication_claim_path_in(home, server_name, name);
+    write_atomic(&path, &json).with_context(|| format!("write {}", path.display()))?;
+    Ok(intent)
+}
+
+fn remove_publication_claim_in(home: &Path, server_name: &str, name: &str) -> Result<()> {
+    let name = checked_package_name(name)?;
+    let Some(package_dir) = local_package_dir_if_real_in(home, server_name, name)? else {
+        return Ok(());
+    };
+    let path = package_dir.join(PUBLICATION_CLAIM_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn remove_publication_claim_if_unchanged_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+    expected: &PublicationClaimIntent,
+) -> Result<bool> {
+    if load_publication_claim_in(home, server_name, name)?.as_ref() != Some(expected) {
+        return Ok(false);
+    }
+    remove_publication_claim_in(home, server_name, name)?;
+    Ok(true)
+}
+
+fn prepare_publication_namespace_state(
+    server_name: &str,
+    name: &str,
+    expected_snapshot: &str,
+    account_id: Uuid,
+    account_nickname: &str,
+) -> Result<(Option<PublicationBinding>, Option<PublicationClaimIntent>)> {
+    with_local_package_transaction(server_name, |home, _| {
+        ensure_local_snapshot_matches_in(home, server_name, name, expected_snapshot)?;
+        let binding = load_publication_binding_in(home, server_name, name)?;
+        let claim = if binding.is_none() {
+            Some(ensure_publication_claim_in(
+                home,
+                server_name,
+                name,
+                account_id,
+                account_nickname,
+            )?)
+        } else {
+            load_publication_claim_in(home, server_name, name)?
+        };
+        Ok((binding, claim))
+    })
+}
+
+fn clear_publication_claim_if_unchanged(
+    server_name: &str,
+    name: &str,
+    expected: &PublicationClaimIntent,
+) -> Result<bool> {
+    with_local_package_transaction(server_name, |home, _| {
+        remove_publication_claim_if_unchanged_in(home, server_name, name, expected)
+    })
+}
+
+fn commit_publication_binding(
+    server_name: &str,
+    name: &str,
+    package_id: Uuid,
+    published_leaf: &str,
+    expected_claim: &PublicationClaimIntent,
+) -> Result<()> {
+    with_local_package_transaction(server_name, |home, _| {
+        save_publication_binding_in(home, server_name, name, package_id, published_leaf)?;
+        let _ = remove_publication_claim_if_unchanged_in(home, server_name, name, expected_claim)?;
+        Ok(())
+    })
+}
+
+fn validate_claimed_namespace(
+    intent: &PublicationClaimIntent,
+    view: &smudgy_cloud::PackageView,
+) -> Result<()> {
+    if view.owner_id != intent.account_id {
+        bail!(
+            "the claimed cloud namespace for local package {} belongs to a different account",
+            intent.leaf
+        );
+    }
+    if !crate::models::naming::names_conflict(&view.name, &intent.leaf) {
+        bail!(
+            "the claimed cloud namespace {} does not match local package {}",
+            view.name,
+            intent.leaf
+        );
+    }
+    Ok(())
+}
+
+/// Reads the cloud-namespace binding for a local package. Older, never-published folders
+/// have no sidecar and return `None`.
+///
+/// # Errors
+/// Returns an error when the package name is invalid, or when an existing sidecar is unreadable,
+/// malformed, or names a different leaf.
+pub fn load_publication_binding(
+    server_name: &str,
+    name: &str,
+) -> Result<Option<PublicationBinding>> {
+    with_local_package_transaction(server_name, |home, _| {
+        load_publication_binding_in(home, server_name, name)
+    })
+}
+
+fn load_publication_binding_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+) -> Result<Option<PublicationBinding>> {
+    let name = checked_package_name(name)?;
+    let Some(package_dir) = local_package_dir_if_real_in(home, server_name, name)? else {
+        return Ok(None);
+    };
+    let Some(binding) =
+        read_sidecar_json::<PublicationBinding>(&package_dir.join(PUBLICATION_BINDING_FILE))?
+    else {
+        return Ok(None);
+    };
+    checked_package_name(&binding.leaf)?;
+    if binding.package_id.is_nil() {
+        bail!("publication binding for local package {name} has no namespace identity");
+    }
+    if !crate::models::naming::names_conflict(name, &binding.leaf) {
+        bail!(
+            "publication binding for local package {name} names a different leaf: {}",
+            binding.leaf
+        );
+    }
+    Ok(Some(binding))
+}
+
+/// Binds an existing local package folder to its published cloud namespace.
+///
+/// This is also the backfill API for folders published before sidecars existed.
+///
+/// # Errors
+/// Returns an error when either leaf is invalid, the published leaf differs from the local folder,
+/// the local package does not exist, or the sidecar cannot be written.
+pub fn save_publication_binding(
+    server_name: &str,
+    local_name: &str,
+    package_id: Uuid,
+    published_leaf: &str,
+) -> Result<()> {
+    with_local_package_transaction(server_name, |home, _| {
+        save_publication_binding_in(home, server_name, local_name, package_id, published_leaf)
+    })
+}
+
+fn save_publication_binding_in(
+    home: &Path,
+    server_name: &str,
+    local_name: &str,
+    package_id: Uuid,
+    published_leaf: &str,
+) -> Result<()> {
+    let local_name = checked_package_name(local_name)?;
+    let published_leaf = checked_package_name(published_leaf)?;
+    if !crate::models::naming::names_conflict(local_name, published_leaf) {
+        bail!("published leaf {published_leaf} does not match local package {local_name}");
+    }
+    if package_id.is_nil() {
+        bail!("published namespace for local package {local_name} has no identity");
+    }
+    let package_dir = require_local_package_dir_in(home, server_name, local_name)?;
+    require_local_manifest(&package_dir, local_name)?;
+    let binding = PublicationBinding {
+        package_id,
+        leaf: published_leaf.to_string(),
+    };
+    if let Some(existing) = load_publication_binding_in(home, server_name, local_name)? {
+        if existing.package_id == binding.package_id
+            && crate::models::naming::names_conflict(&existing.leaf, &binding.leaf)
+        {
+            return Ok(());
+        }
+        bail!("local package {local_name} is already bound to a different cloud namespace");
+    }
+    let json = serde_json::to_vec_pretty(&binding).context("serialize publication binding")?;
+    let path = package_dir.join(PUBLICATION_BINDING_FILE);
+    write_atomic(&path, &json).with_context(|| format!("write {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
 /// Reads one raw file (`subpath` relative to the package dir) from a local package.
 ///
 /// # Errors
 /// Returns an error if the smudgy home can't be resolved or the file can't be read.
 pub fn read_local_file(server_name: &str, name: &str, subpath: &str) -> Result<String> {
-    let path = packages_dir(server_name)?.join(name).join(subpath);
-    fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    with_local_package_transaction(server_name, |home, _| {
+        let name = checked_package_name(name)?;
+        let subpath = checked_module_subpath(subpath)?;
+        let path = require_local_package_dir_in(home, server_name, name)?.join(subpath);
+        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    })
 }
 
 /// Writes one raw file (`subpath` relative to the package dir) into a local package,
@@ -141,52 +635,315 @@ pub fn read_local_file(server_name: &str, name: &str, subpath: &str) -> Result<S
 /// # Errors
 /// Returns an error if the smudgy home can't be resolved or the file can't be written.
 pub fn write_local_file(server_name: &str, name: &str, subpath: &str, content: &str) -> Result<()> {
-    let path = packages_dir(server_name)?.join(name).join(subpath);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+    with_local_package_transaction(server_name, |home, _| {
+        let name = checked_package_name(name)?;
+        let subpath = checked_module_subpath(subpath)?;
+        let path = require_local_package_dir_in(home, server_name, name)?.join(subpath);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        write_atomic(&path, content.as_bytes()).with_context(|| format!("write {}", path.display()))
+    })
 }
 
-/// Deletes a local package directory and all of its files.
+/// Replaces one local-package text file only when it still contains the text the editor opened.
 ///
 /// # Errors
-/// Returns an error if the smudgy home can't be resolved or the directory can't be removed.
-pub fn delete_local_package(server_name: &str, name: &str) -> Result<()> {
-    let dir = packages_dir(server_name)?.join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-    }
-    Ok(())
+/// Returns an error for an invalid name or path, or a failed read or write.
+pub fn write_local_file_if_unchanged(
+    server_name: &str,
+    name: &str,
+    subpath: &str,
+    expected: &str,
+    content: &str,
+) -> Result<LocalFileWriteOutcome> {
+    with_local_package_transaction(server_name, |home, _| {
+        let name = checked_package_name(name)?;
+        let subpath = checked_module_subpath(subpath)?;
+        let path = require_local_package_dir_in(home, server_name, name)?.join(subpath);
+        let current = fs::read_to_string(&path)
+            .with_context(|| format!("read {} before saving", path.display()))?;
+        if current != expected {
+            return Ok(LocalFileWriteOutcome::Conflict);
+        }
+        write_atomic(&path, content.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(LocalFileWriteOutcome::Saved)
+    })
 }
+
+// ---------------------------------------------------------------------------
+// Inventory and governing rows
+// ---------------------------------------------------------------------------
 
 /// Names of the local packages authored for `server_name`.
 ///
 /// # Errors
-/// Returns an error if the smudgy home or packages directory can't be read.
+/// Returns an error if the packages directory can't be read or two folders differ only by
+/// letter case.
 pub fn list_local_packages(server_name: &str) -> Result<Vec<String>> {
-    list_local_packages_in(&get_smudgy_home()?, server_name)
+    with_local_package_transaction(server_name, |home, _| {
+        list_local_packages_in(home, server_name)
+    })
 }
 
-fn list_local_packages_in(home: &Path, server_name: &str) -> Result<Vec<String>> {
+pub(crate) fn list_local_packages_in(home: &Path, server_name: &str) -> Result<Vec<String>> {
     let dir = packages_dir_in(home, server_name);
     let mut names = Vec::new();
-    match fs::read_dir(&dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|t| t.is_dir())
-                    && entry.path().join(MANIFEST_FILE).is_file()
-                    && let Some(name) = entry.file_name().to_str()
-                {
-                    names.push(name.to_string());
+    if !real_directory_exists(&dir, "local package root")? {
+        return Ok(names);
+    }
+    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("inspect {}", entry.path().display()))?;
+        if !is_real_directory(&metadata) || checked_package_name(&name).is_err() {
+            continue;
+        }
+        // The directory itself reserves this leaf. A missing or damaged manifest must make the
+        // local override fail closed rather than let a same-leaf published fallback start.
+        names.push(name);
+    }
+    names.sort();
+    checked_unique_local_names(&names)
+}
+
+fn checked_unique_local_names(local_names: &[String]) -> Result<Vec<String>> {
+    let mut seen = BTreeMap::<String, String>::new();
+    let mut unique = Vec::new();
+    for name in local_names {
+        let folded = name.to_ascii_lowercase();
+        match seen.get(&folded) {
+            Some(existing) if existing != name => {
+                bail!(
+                    "local package folders {existing} and {name} differ only by letter case; rename or remove one before packages can load"
+                );
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(folded, name.clone());
+                unique.push(name.clone());
+            }
+        }
+    }
+    Ok(unique)
+}
+
+/// Validates the distinct local state row and globally unique published fallback invariant.
+fn validate_local_governing_rows(lock: &SharedPackageLock, local_names: &[String]) -> Result<()> {
+    for name in local_names {
+        let mut local_rows = 0;
+        let mut remote_rows = 0;
+        for package in &lock.packages {
+            let specifier = SmudgySpecifier::parse(&package.specifier).map_err(|error| {
+                anyhow!(
+                    "package state contains invalid identity {}: {error}",
+                    package.specifier
+                )
+            })?;
+            if !specifier.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            if specifier.owner.eq_ignore_ascii_case(LOCAL_OWNER) {
+                local_rows += 1;
+            } else {
+                remote_rows += 1;
+            }
+        }
+        if local_rows > 1 {
+            bail!("more than one local state row exists for package {name}");
+        }
+        if remote_rows > 1 {
+            bail!(
+                "more than one published package named {name} is installed; remove the conflicting rows before using the local package"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Adds a governing `smudgy://local/<name>` row for every local name that lacks one.
+///
+/// A new row seeds only activation, update mode, and required-install lineage from one genuinely
+/// remote same-leaf fallback, so a local copy keeps running where the package it replaces ran,
+/// and every package the fallback required now also lists the local row as a requirer, so those
+/// requirements stay effective under the override. Security, parameter values, version
+/// metadata, and provenance start at safe local defaults. With no fallback the row starts
+/// disabled in auto mode. Returns whether anything was added.
+fn materialize_local_governing_rows_in(
+    lock: &mut SharedPackageLock,
+    local_names: &[String],
+) -> Result<bool> {
+    validate_local_governing_rows(lock, local_names)?;
+    let mut additions = Vec::new();
+    for name in local_names {
+        let state_specifier = local_state_specifier(name);
+        let mut remote = None;
+        let mut existing = false;
+        for package in &lock.packages {
+            let Ok(specifier) = SmudgySpecifier::parse(&package.specifier) else {
+                continue;
+            };
+            if !specifier.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            if specifier.owner.eq_ignore_ascii_case(LOCAL_OWNER) {
+                existing = true;
+            } else {
+                remote = Some(package);
+            }
+        }
+        if existing {
+            continue;
+        }
+        let mode = remote.map_or_else(Default::default, |fallback| fallback.mode.clone());
+        let activation = remote.map_or(
+            crate::models::profile_activation::ProfileActivation::None,
+            LockedPackage::activation,
+        );
+        let mut governing = LockedPackage::new(state_specifier, mode);
+        governing.set_activation(activation);
+        if let Some(fallback) = remote {
+            governing.required_by.clone_from(&fallback.required_by);
+        }
+        // A local folder is always an explicit, user-authored root. It may also satisfy a
+        // published fallback's `requires` links, but it must keep its own Settings/activation.
+        governing.installed_as_requirement = false;
+        additions.push((remote.map(|fallback| fallback.specifier.clone()), governing));
+    }
+    let changed = !additions.is_empty();
+    for (fallback, governing) in additions {
+        if let Some(fallback) = fallback {
+            for package in &mut lock.packages {
+                if package.required_by.contains(&fallback) {
+                    package.required_by.insert(governing.specifier.clone());
                 }
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+        lock.packages.push(governing);
     }
-    names.sort();
-    Ok(names)
+    Ok(changed)
+}
+
+/// Ensures every local package leaf has a distinct governing row at `smudgy://local/<name>`.
+///
+/// `canonical_owner` is validated for source compatibility but never owns local persistent
+/// state. Returns `true` when a row was added.
+///
+/// # Errors
+/// Returns an error for an invalid name, contradictory remote state, retired parameter state
+/// that would be inherited, or a lockfile read/write failure.
+pub fn materialize_governing_local_lock_rows(
+    server_name: &str,
+    local_names: &[String],
+    canonical_owner: &str,
+) -> Result<bool> {
+    with_local_package_transaction(server_name, |_, transaction| {
+        materialize_governing_local_lock_rows_in_transaction(
+            transaction,
+            local_names,
+            canonical_owner,
+        )
+    })
+}
+
+pub(crate) fn materialize_governing_local_lock_rows_in_transaction(
+    transaction: &PackageStateTxn<'_>,
+    local_names: &[String],
+    canonical_owner: &str,
+) -> Result<bool> {
+    checked_package_name(canonical_owner)?;
+    let names = checked_unique_local_names(local_names)?;
+    for name in &names {
+        checked_package_name(name)?;
+    }
+    // A row under the account's own name for a leaf that has a local folder is the identity
+    // local packages used before the reserved `local` owner existed. Its settings move to the
+    // local identity before the row does, so an interruption leaves both readable.
+    let legacy =
+        legacy_account_owned_local_rows(&transaction.load_lock()?, &names, canonical_owner);
+    for (from, to) in &legacy {
+        transaction.copy_package_param_state(from, to)?;
+    }
+    let changed = transaction.mutate_lock(|lock| {
+        let migrated = migrate_legacy_account_owned_local_rows_in(lock, &legacy);
+        let inserted = materialize_local_governing_rows_in(lock, &names)?;
+        Ok((migrated || inserted, migrated || inserted))
+    })?;
+    for (from, _) in &legacy {
+        if let Err(error) = transaction.remove_package_param_state(from) {
+            warn!("Deferred cleanup of settings for migrated local package {from}: {error:#}");
+        }
+    }
+    Ok(changed)
+}
+
+/// `(account-owned specifier, local specifier)` for every local name that has no governing row
+/// yet but does have a row under `canonical_owner`, the identity a pre-`local` client gave the
+/// folder. With the reserved owner itself as `canonical_owner` there is nothing to migrate.
+fn legacy_account_owned_local_rows(
+    lock: &SharedPackageLock,
+    local_names: &[String],
+    canonical_owner: &str,
+) -> Vec<(String, String)> {
+    if canonical_owner.eq_ignore_ascii_case(LOCAL_OWNER) {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    for name in local_names {
+        let state_specifier = local_state_specifier(name);
+        if lock.find(&state_specifier).is_some() {
+            continue;
+        }
+        let legacy = lock.packages.iter().find(|package| {
+            SmudgySpecifier::parse(&package.specifier).is_ok_and(|specifier| {
+                specifier.name.eq_ignore_ascii_case(name)
+                    && specifier.owner.eq_ignore_ascii_case(canonical_owner)
+            })
+        });
+        if let Some(legacy) = legacy {
+            pairs.push((legacy.specifier.clone(), state_specifier));
+        }
+    }
+    pairs
+}
+
+/// Moves each legacy account-owned row onto its local identity: trust, consent, activation,
+/// parameter scope, and requirement lineage carry over unchanged; version metadata resets
+/// because the folder, not a published version, is now the source. The account-owned row is
+/// removed rather than kept as a fallback, because it never described a published install.
+/// Returns whether the lock changed.
+fn migrate_legacy_account_owned_local_rows_in(
+    lock: &mut SharedPackageLock,
+    pairs: &[(String, String)],
+) -> bool {
+    let mut changed = false;
+    for (from, to) in pairs {
+        let Some(index) = lock
+            .packages
+            .iter()
+            .position(|package| package.specifier == *from)
+        else {
+            continue;
+        };
+        let mut row = lock.packages.remove(index);
+        row.specifier.clone_from(to);
+        row.last_resolved_version = None;
+        row.integrity = None;
+        row.dismissed_update_version = None;
+        row.installed_as_requirement = false;
+        lock.packages.push(row);
+        for package in &mut lock.packages {
+            if package.required_by.remove(from) {
+                package.required_by.insert(to.clone());
+            }
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// Load a local package (`None` if no folder/manifest exists).
@@ -195,24 +952,38 @@ fn list_local_packages_in(home: &Path, server_name: &str) -> Result<Vec<String>>
 /// Returns an error if the manifest is unreadable or invalid, or a module file can't be
 /// read.
 pub fn load_local_package(server_name: &str, name: &str) -> Result<Option<LocalPackage>> {
-    load_local_package_in(&get_smudgy_home()?, server_name, name)
+    with_local_package_transaction(server_name, |home, _| {
+        load_local_package_in(home, server_name, name)
+    })
 }
 
-fn load_local_package_in(
+pub(crate) fn load_local_package_in(
     home: &Path,
     server_name: &str,
     name: &str,
 ) -> Result<Option<LocalPackage>> {
-    let dir = packages_dir_in(home, server_name).join(name);
-    let manifest_path = dir.join(MANIFEST_FILE);
-    if !manifest_path.is_file() {
+    let name = checked_package_name(name)?;
+    let Some(dir) = local_package_dir_if_real_in(home, server_name, name)? else {
         return Ok(None);
-    }
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("read {}", manifest_path.display()))?;
+    };
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let manifest_text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", manifest_path.display()));
+        }
+    };
     let manifest = PackageManifest::parse(&manifest_text)
         .map_err(|e| anyhow!("invalid {}: {e}", manifest_path.display()))?;
-    let readme = fs::read_to_string(dir.join(README_FILE)).ok();
+    let readme_path = dir.join(README_FILE);
+    let readme = match fs::read_to_string(&readme_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", readme_path.display()));
+        }
+    };
     let mut modules = Vec::new();
     collect_modules(&dir, &dir, &mut modules)?;
     modules.sort_by(|a, b| a.subpath.cmp(&b.subpath));
@@ -228,23 +999,22 @@ fn collect_modules(root: &Path, dir: &Path, out: &mut Vec<LocalModule>) -> Resul
     for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
-        let file_type = entry.file_type()?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
         // Skip dotfiles AND dot-directories (`.git`, `.cache`, `.env`, …) everywhere, plus
-        // well-known dependency/build directories. Without the DIRECTORY guard,
-        // the exclude-list (which only names files) would recurse into `.git/`/`node_modules/`
-        // and publish their contents — a real way to ship `.git/config` secrets + history.
-        // The editor-only `tsconfig.json` is treated like a dotfile too: never published.
+        // well-known dependency/build directories, so their contents are never published.
+        // The editor-only `tsconfig.json` is treated like a dotfile too.
         if file_name.starts_with('.')
             || SKIP_DIRS.contains(&file_name.as_ref())
             || file_name == TSCONFIG_FILE
         {
             continue;
         }
-        if file_type.is_dir() {
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
+        if is_real_directory(&metadata) {
             collect_modules(root, &path, out)?;
-        } else if file_type.is_file() {
+        } else if is_real_file(&metadata) {
             // Everything else is a publishable module (any bytes) EXCEPT the manifest (implied)
             // and the README (published separately as `readme`).
             if file_name == MANIFEST_FILE || file_name == README_FILE {
@@ -262,37 +1032,334 @@ fn collect_modules(root: &Path, dir: &Path, out: &mut Vec<LocalModule>) -> Resul
     Ok(())
 }
 
-/// Scaffold a new local package folder with a starter manifest + `index.ts`.
+// ---------------------------------------------------------------------------
+// Create, copy, rename, delete
+// ---------------------------------------------------------------------------
+
+fn starter_package() -> Result<(PackageManifest, [LocalModule; 1])> {
+    let manifest = PackageManifest::parse(STARTER_MANIFEST).context("parse starter manifest")?;
+    let modules = [LocalModule {
+        subpath: "index.ts".to_string(),
+        content: STARTER_ENTRY.as_bytes().to_vec(),
+    }];
+    Ok((manifest, modules))
+}
+
+/// Scaffold a new local package folder with a starter manifest + `index.ts`, without touching
+/// package state.
 ///
 /// # Errors
 /// Returns an error if the package already exists or the files can't be written.
 pub fn scaffold_local_package(server_name: &str, name: &str) -> Result<()> {
-    scaffold_local_package_in(&get_smudgy_home()?, server_name, name)
+    with_local_package_transaction(server_name, |home, _| {
+        let (manifest, modules) = starter_package()?;
+        let readme = format!("# {name}\n\nDescribe your package here.\n");
+        publish_staged_package(home, server_name, name, &manifest, &modules, Some(&readme))
+            .map(|_| ())
+    })
 }
 
-fn scaffold_local_package_in(home: &Path, server_name: &str, name: &str) -> Result<()> {
-    let dir = packages_dir_in(home, server_name).join(name);
-    if dir.exists() {
-        bail!("a package named {name} already exists");
-    }
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    // The package name is implied by the folder (`name`) — not written into the manifest, so it can
-    // never drift from it. `description` is scaffolded empty for the author to fill in.
-    let manifest =
-        "{\n  \"version\": \"0.1.0\",\n  \"description\": \"\",\n  \"entry\": \"index.ts\"\n}\n";
-    fs::write(dir.join(MANIFEST_FILE), manifest)?;
-    fs::write(
-        dir.join("index.ts"),
-        "// smudgy package entry\nexport {};\n",
-    )?;
+/// Scaffolds a package and creates its governing lock row. This is the UI creation path.
+///
+/// # Errors
+/// Returns an error if the package already exists or the files or lock can't be written.
+pub fn scaffold_local_package_with_state(
+    server_name: &str,
+    name: &str,
+    canonical_owner: &str,
+) -> Result<()> {
+    let (manifest, modules) = starter_package()?;
     let readme = format!("# {name}\n\nDescribe your package here.\n");
-    fs::write(dir.join(README_FILE), readme)?;
-    // Same editor project pointer a copied package gets, so a new package opened standalone in
-    // VS Code types against the server-level smudgy project. Excluded from publish like a dotfile.
-    fs::write(dir.join(TSCONFIG_FILE), PACKAGE_TSCONFIG)
-        .with_context(|| format!("write {}", dir.join(TSCONFIG_FILE).display()))?;
-    Ok(())
+    fork_to_local_with_readme_and_state(
+        server_name,
+        name,
+        &manifest,
+        &modules,
+        Some(&readme),
+        canonical_owner,
+    )
 }
+
+/// Forks a package's files into a NEW local package at `<server>/packages/<new_name>/` and
+/// creates its governing lock row. The identity is the `new_name` folder (the manifest carries
+/// no name). Generated `.d.ts` declaration files are skipped: publishing the fork regenerates
+/// declarations for the same subpaths.
+///
+/// A copy that keeps a published package's leaf name inherits that package's activation, so it
+/// takes over wherever the original ran; a differently named copy starts disabled.
+///
+/// # Errors
+/// Returns an error if a package named `new_name` already exists, the manifest declares
+/// `requires` entries (those need an exact requirement plan), or the files can't be written.
+pub fn fork_to_local_with_readme_and_state(
+    server_name: &str,
+    new_name: &str,
+    source_manifest: &PackageManifest,
+    modules: &[LocalModule],
+    readme: Option<&str>,
+    canonical_owner: &str,
+) -> Result<()> {
+    if !source_manifest.smudgy_requires().is_empty() {
+        bail!(
+            "a copied package with requires entries needs an exact requirement plan before it can be created"
+        );
+    }
+    with_local_package_transaction(server_name, |home, transaction| {
+        checked_package_name(canonical_owner)?;
+        let new_name = checked_package_name(new_name)?;
+        validate_local_governing_rows(&transaction.load_lock()?, &[new_name.to_string()])?;
+        // Settings left under this identity by an earlier package of the same name are adopted.
+        publish_staged_package(
+            home,
+            server_name,
+            new_name,
+            source_manifest,
+            modules,
+            readme,
+        )?;
+        transaction.mutate_lock(|lock| {
+            let inserted = materialize_local_governing_rows_in(lock, &[new_name.to_string()])?;
+            Ok(((), inserted))
+        })
+    })
+}
+
+/// Requirement-aware form of [`fork_to_local_with_readme_and_state`]. Every required root must
+/// already exist in `expected_lock`; creation compare-and-swaps that complete snapshot and writes
+/// the local governing row plus all flattened `required_by` links in one lockfile replacement.
+///
+/// This API intentionally cannot install or upgrade requirements. The UI must resolve the copied
+/// manifest first and obtain consent through the normal install flow for any changed root.
+///
+/// # Errors
+/// Returns an error for an invalid plan or a failed write. A changed lockfile returns
+/// [`Cas::StateChanged`] without creating anything.
+#[allow(clippy::too_many_arguments)]
+pub fn fork_to_local_with_readme_and_existing_requirements_if_unchanged(
+    server_name: &str,
+    new_name: &str,
+    source_manifest: &PackageManifest,
+    modules: &[LocalModule],
+    readme: Option<&str>,
+    canonical_owner: &str,
+    expected_lock: &SharedPackageLock,
+    required_specifiers: &[String],
+) -> Result<Cas> {
+    with_local_package_transaction(server_name, |home, transaction| {
+        checked_package_name(canonical_owner)?;
+        let new_name = checked_package_name(new_name)?;
+        if transaction.load_lock()? != *expected_lock {
+            return Ok(Cas::StateChanged);
+        }
+        let desired_lock = planned_local_create_lock(expected_lock, new_name, required_specifiers)?;
+        // Settings left under this identity by an earlier package of the same name are adopted.
+        publish_staged_package(
+            home,
+            server_name,
+            new_name,
+            source_manifest,
+            modules,
+            readme,
+        )?;
+        transaction.mutate_lock(|lock| {
+            if *lock != *expected_lock {
+                bail!("package state changed while the local copy was being created");
+            }
+            lock.clone_from(&desired_lock);
+            Ok((Cas::Applied, true))
+        })
+    })
+}
+
+/// Builds the lockfile image a requirement-aware local copy commits: the new governing row plus
+/// `required_by` links from every required root to it.
+fn planned_local_create_lock(
+    expected_lock: &SharedPackageLock,
+    name: &str,
+    required_specifiers: &[String],
+) -> Result<SharedPackageLock> {
+    let names = vec![name.to_string()];
+    let mut desired = expected_lock.clone();
+    if !materialize_local_governing_rows_in(&mut desired, &names)? {
+        bail!("local package {name} already has governing state in the copy snapshot");
+    }
+    let root_specifier = local_state_specifier(name);
+    if expected_lock
+        .packages
+        .iter()
+        .any(|package| package.required_by.contains(&root_specifier))
+    {
+        bail!(
+            "package state already contains requirement links for missing local package {root_specifier}"
+        );
+    }
+
+    let mut required = std::collections::BTreeSet::new();
+    for raw in required_specifiers {
+        let parsed = SmudgySpecifier::parse(raw)
+            .map_err(|error| anyhow!("invalid required package identity {raw}: {error}"))?;
+        if parsed.subpath.is_some() || parsed.to_user_specifier() != *raw {
+            bail!("required package identity {raw} must be a canonical package root");
+        }
+        if parsed.name.eq_ignore_ascii_case(name) {
+            bail!("local package {name} cannot require its own leaf name");
+        }
+        if !required.insert(raw.to_ascii_lowercase()) {
+            bail!("required package {raw} is listed more than once");
+        }
+        expected_lock
+            .find(raw)
+            .with_context(|| format!("required package {raw} is not installed"))?;
+        // A local folder governs its leaf for every requested author. A shadowed published
+        // fallback must never receive the new parent's link.
+        if expected_lock
+            .governing_specifier(raw)
+            .is_none_or(|governing| governing != raw)
+        {
+            bail!("required package {raw} is not the governing package for its leaf");
+        }
+    }
+
+    for package in &mut desired.packages {
+        if required.contains(&package.specifier.to_ascii_lowercase()) {
+            package.required_by.insert(root_specifier.clone());
+            package.requirement_lineage_known = true;
+        }
+    }
+    Ok(desired)
+}
+
+/// Writes a complete package folder to a temporary sibling of `packages/` and then renames it
+/// into place, so package discovery never observes a partially written folder.
+fn publish_staged_package(
+    home: &Path,
+    server_name: &str,
+    new_name: &str,
+    source_manifest: &PackageManifest,
+    modules: &[LocalModule],
+    readme: Option<&str>,
+) -> Result<PathBuf> {
+    let new_name = checked_package_name(new_name)?;
+    for module in modules {
+        checked_module_subpath(&module.subpath)?;
+    }
+    let packages = packages_dir_in(home, server_name);
+    fs::create_dir_all(&packages).with_context(|| format!("create {}", packages.display()))?;
+    let dir = packages.join(new_name);
+    if fs::symlink_metadata(&dir).is_ok()
+        || list_local_packages_in(home, server_name)?
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(new_name))
+    {
+        bail!("a package named {new_name} already exists");
+    }
+    // Stage beside `packages/`, not inside it: package discovery scans every child, and must
+    // never observe the temporary directory while it is being populated.
+    let staging_parent = packages
+        .parent()
+        .context("packages directory has no server parent")?;
+    let staging = tempfile::Builder::new()
+        .prefix(".smudgy-fork-")
+        .tempdir_in(staging_parent)
+        .with_context(|| format!("stage local package {new_name}"))?;
+    let staged_dir = staging.path();
+
+    let manifest_json =
+        serde_json::to_string_pretty(source_manifest).context("serialize forked manifest")?;
+    write_atomic(&staged_dir.join(MANIFEST_FILE), manifest_json.as_bytes())
+        .with_context(|| format!("write {MANIFEST_FILE} for {new_name}"))?;
+    if let Some(readme) = readme {
+        write_atomic(&staged_dir.join(README_FILE), readme.as_bytes())
+            .with_context(|| format!("write {README_FILE} for {new_name}"))?;
+    }
+    for module in modules {
+        if is_declaration_file(&module.subpath) {
+            continue;
+        }
+        let subpath = checked_module_subpath(&module.subpath)?;
+        let path = staged_dir.join(subpath.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        write_atomic(&path, &module.content)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    // A copied package is its own editor project: drop a thin `tsconfig.json` pointing at the
+    // server-level smudgy project so VS Code types it. Written last so it wins over any stale
+    // `tsconfig.json` a source might have shipped (it's excluded from publish either way).
+    write_atomic(&staged_dir.join(TSCONFIG_FILE), PACKAGE_TSCONFIG.as_bytes())
+        .with_context(|| format!("write editor configuration for {new_name}"))?;
+
+    fs::rename(staged_dir, &dir)
+        .with_context(|| format!("publish staged local package at {}", dir.display()))?;
+    // The staging directory was moved; keep `tempfile` from trying to remove it.
+    let _ = staging.keep();
+    Ok(dir)
+}
+
+/// Deletes a local package: its governing lock row, its saved settings, and its folder.
+///
+/// # Errors
+/// Returns an error if the package has an unfinished publication claim, its state changed while
+/// the deletion ran, or the folder cannot be removed.
+pub fn delete_local_package(server_name: &str, name: &str) -> Result<DeleteLocalPackageSummary> {
+    with_local_package_transaction(server_name, |home, transaction| {
+        let name = checked_package_name(name)?;
+        if load_publication_claim_in(home, server_name, name)?.is_some() {
+            bail!(
+                "local package {name} has an unfinished publication claim; retry publishing before deleting it"
+            );
+        }
+        let dir = require_local_package_dir_in(home, server_name, name)?;
+        let state_specifier = local_state_specifier(name);
+        let lock = transaction.load_lock()?;
+        validate_local_governing_rows(&lock, &[name.to_string()])?;
+        let mut warnings = Vec::new();
+        if let Some(expected) = lock.find(&state_specifier).cloned() {
+            if !transaction.remove_lock_entry_if_unchanged(&expected)? {
+                bail!(
+                    "local package {name} changed while it was being deleted; no changes were committed"
+                );
+            }
+        }
+        if let Err(error) = transaction.remove_package_param_state(&state_specifier) {
+            warnings.push(format!("saved settings cleanup is incomplete: {error:#}"));
+        }
+        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+        Ok(DeleteLocalPackageSummary { warnings })
+    })
+}
+
+/// Renames a local package folder (`old` → `new`) under `<server>/packages/` together with its
+/// governing state. The manifest carries no name, so the folder name *is* the identity.
+/// Rejects a target that already exists or any package that is bound to a published cloud
+/// namespace; a no-op rename returns `false`.
+///
+/// # Errors
+/// Returns an error if `old` doesn't exist, `new` already exists, the package is published, or
+/// the rename fails.
+pub fn rename_local_package(server_name: &str, old: &str, new: &str) -> Result<bool> {
+    with_local_package_transaction(server_name, |home, transaction| {
+        let old = checked_package_name(old)?;
+        let new = checked_package_name(new)?;
+        if old == new {
+            return Ok(false);
+        }
+        if load_publication_claim_in(home, server_name, old)?.is_some() {
+            bail!(
+                "local package {old} has an unfinished publication claim; retry publishing before renaming it"
+            );
+        }
+        if load_publication_binding_in(home, server_name, old)?.is_some() {
+            bail!("published package {old} cannot be renamed; make a copy with a new name instead");
+        }
+        transaction.rename_local_package_state(old, new)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Publishing
+// ---------------------------------------------------------------------------
 
 /// The media type to publish a module subpath as. Text/code types get a real type; anything
 /// unrecognized is `application/octet-stream` so binaries publish faithfully.
@@ -322,12 +1389,170 @@ fn media_type_for(subpath: &str) -> &'static str {
     }
 }
 
+fn ensure_local_snapshot_matches(server_name: &str, name: &str, expected: &str) -> Result<()> {
+    with_local_package_transaction(server_name, |home, _| {
+        ensure_local_snapshot_matches_in(home, server_name, name, expected)
+    })
+}
+
+fn ensure_local_snapshot_matches_in(
+    home: &Path,
+    server_name: &str,
+    name: &str,
+    expected: &str,
+) -> Result<()> {
+    let current = load_local_package_in(home, server_name, name)?
+        .ok_or_else(|| anyhow!("local package {name} was removed while preparing to publish"))?;
+    if package_snapshot_digest(&current)? != expected {
+        bail!("local package {name} changed while preparing to publish; review it and try again");
+    }
+    Ok(())
+}
+
+fn published_module_fingerprint(module: &PublishModule) -> (String, String, String, i64, bool) {
+    (
+        module.subpath.clone(),
+        format!("{:x}", Sha256::digest(&module.content)),
+        module.media_type.clone(),
+        i64::try_from(module.content.len()).unwrap_or(i64::MAX),
+        module.is_entry,
+    )
+}
+
+struct PublishRequestSnapshot<'a> {
+    package_id: Uuid,
+    owner_nickname: &'a str,
+    package_name: &'a str,
+    version: &'a str,
+    manifest: &'a serde_json::Value,
+    modules: &'a [PublishModule],
+    dependencies: &'a [PublishDependency],
+    readme: Option<&'a str>,
+}
+
+/// Confirms the immutable version state, not merely that its number is occupied. This is the
+/// recovery boundary for a lost finalize response: only an exact match makes retrying unsafe.
+fn resolved_matches_publish_request(
+    resolved: &ResolvedPackageWire,
+    request: &PublishRequestSnapshot<'_>,
+) -> bool {
+    if resolved.package_id != request.package_id
+        || !crate::models::naming::names_conflict(&resolved.owner_nickname, request.owner_nickname)
+        || !crate::models::naming::names_conflict(&resolved.name, request.package_name)
+        || semver::Version::parse(&resolved.version).ok()
+            != semver::Version::parse(request.version).ok()
+        || &resolved.manifest != request.manifest
+        || resolved.readme.as_deref() != request.readme
+    {
+        return false;
+    }
+
+    let mut expected_modules = request
+        .modules
+        .iter()
+        .map(published_module_fingerprint)
+        .collect::<Vec<_>>();
+    expected_modules.sort();
+    let mut actual_modules = resolved
+        .modules
+        .iter()
+        .map(|module| {
+            (
+                module.subpath.clone(),
+                module
+                    .content_hash
+                    .trim_start_matches("sha256-")
+                    .to_ascii_lowercase(),
+                module.media_type.clone(),
+                module.byte_size,
+                module.is_entry,
+            )
+        })
+        .collect::<Vec<_>>();
+    actual_modules.sort();
+    if actual_modules != expected_modules {
+        return false;
+    }
+
+    if resolved
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.kind != DependencyKind::Dependency)
+    {
+        return false;
+    }
+    let mut expected_dependencies = request
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.owner_nickname.to_lowercase(),
+                dependency.name.to_lowercase(),
+                dependency.range.clone(),
+                dependency.resolved_version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_dependencies.sort();
+    let mut actual_dependencies = resolved
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.owner_nickname.to_lowercase(),
+                dependency.name.to_lowercase(),
+                dependency.range.clone(),
+                dependency.resolved_version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual_dependencies.sort();
+    actual_dependencies == expected_dependencies
+}
+
+async fn confirm_ambiguous_publish(
+    client: &PackageApiClient,
+    package_id: Uuid,
+    publisher_nickname: &str,
+    package_name: &str,
+    target_version: &str,
+    request: &PublishRequestSnapshot<'_>,
+    ambiguity: &str,
+) -> Result<(String, DateTime<Utc>)> {
+    let versions = client.list_versions(package_id).await.map_err(|confirm_error| {
+        anyhow!(
+            "{ambiguity}; Smudgy could not confirm the remote result: {confirm_error}. Check the package on the server before you retry"
+        )
+    })?;
+    let Some(confirmed) = versions.into_iter().find(|version| {
+        !version.deleted
+            && semver::Version::parse(&version.version).ok().as_ref()
+                == semver::Version::parse(target_version).ok().as_ref()
+    }) else {
+        return Err(anyhow!(ambiguity.to_string()));
+    };
+    let resolved = client
+        .resolve_package(publisher_nickname, package_name, Some(target_version))
+        .await
+        .map_err(|confirm_error| {
+            anyhow!(
+                "{ambiguity}; the version number is now used, but Smudgy could not verify its content: {confirm_error}. Check the package on the server before you retry"
+            )
+        })?;
+    if !resolved_matches_publish_request(&resolved, request) {
+        bail!(
+            "package version {target_version} is now used, but its content does not match this publish request; review the server version and choose a new version number"
+        );
+    }
+    Ok((confirmed.version, confirmed.published_at))
+}
+
 /// Publish a local package: create-or-get the caller's namespace, then publish an
 /// immutable version from the folder. Bump the manifest `version` to ship an update.
 ///
-/// Package names are owner-scoped on the server (the namespace is `(your owner id, name)`), so a
-/// fork always publishes under *your* handle and can never clobber another author's package — no
-/// client-side rename gate is needed.
+/// The service enforces one published namespace for each package leaf name. A copied package must
+/// therefore be renamed before publish when that leaf is already owned by another account; the
+/// backend remains authoritative and returns a conflict if the name is unavailable.
 ///
 /// # Errors
 /// Returns an error if the package is missing/invalid, or the backend rejects the publish (e.g. a
@@ -336,29 +1561,27 @@ pub async fn publish_local_package(
     client: &PackageApiClient,
     server_name: &str,
     name: &str,
+    publisher: &UserProfile,
 ) -> Result<PublishSummary> {
+    if publisher.id.is_nil() {
+        bail!("the signed-in account has no stable identity; sign in again");
+    }
+    let publisher_nickname = publisher
+        .nickname
+        .as_deref()
+        .context("choose an account nickname before publishing a local package")?;
+    checked_package_name(publisher_nickname)
+        .context("the signed-in account nickname is invalid")?;
+    let publisher_nickname = publisher_nickname.to_string();
+
     let package = load_local_package(server_name, name)?
         .ok_or_else(|| anyhow!("no local package named {name}"))?;
+    let snapshot_digest = package_snapshot_digest(&package)?;
     let entry = package
         .manifest
         .entry
         .clone()
         .unwrap_or_else(|| "index.ts".to_string());
-
-    // The published namespace name is the folder name (`package.name`); the manifest no longer
-    // carries a name, so it can never disagree with the folder. The package description comes from
-    // the manifest — but `create_package` is create-or-get and won't update an existing namespace's
-    // description, so sync it explicitly when the manifest's value has drifted from the server's.
-    let view = client
-        .create_package(&package.name, &package.manifest.description)
-        .await
-        .map_err(|e| anyhow!("create package namespace: {e}"))?;
-    if view.description != package.manifest.description {
-        client
-            .patch_package(view.id, Some(&package.manifest.description), None)
-            .await
-            .map_err(|e| anyhow!("update package description: {e}"))?;
-    }
 
     let authored: Vec<PublishModule> = package
         .modules
@@ -389,10 +1612,6 @@ pub async fn publish_local_package(
     // Publish-time TypeScript declarations (best-effort — a package always publishes even
     // if typings fail). The generated `.d.ts` ride as ordinary, non-entry modules.
     let (dts_modules, typings_warnings) = generate_publish_typings(&package.modules).await;
-    // The author's own files always win: a generated `.d.ts` is dropped when the package
-    // already ships a module at that subpath (a hand-authored declaration). Without this,
-    // a package carrying its own `.d.ts` would publish two modules with the same subpath,
-    // which the server rejects — cancelling the publish.
     let modules = merge_published_modules(authored, dts_modules);
     let typings_generated = modules.len() - authored_count;
 
@@ -412,33 +1631,301 @@ pub async fn publish_local_package(
 
     // Interop-declaration validation + rename diff (interop.md §4) — best-effort and never
     // fatal, like typings.
-    let interop_warnings = interop_publish_warnings(client, &package, &entry).await;
+    let interop_warnings =
+        interop_publish_warnings(client, &package, &entry, &publisher_nickname).await;
 
-    // Ship an optional README.md from the package root (surfaced in discovery + inspect).
-    let readme = fs::read_to_string(packages_dir(server_name)?.join(name).join(README_FILE)).ok();
+    // Everything that can fail without changing cloud state has now completed. Re-read once before
+    // claiming or mutating a namespace so an external edit cannot make this upload a mixed or stale
+    // snapshot under a newly bound folder. No lock is held across a cloud await.
+    let (publication_binding, publication_claim) = prepare_publication_namespace_state(
+        server_name,
+        name,
+        &snapshot_digest,
+        publisher.id,
+        &publisher_nickname,
+    )?;
 
-    let published = client
-        .publish_version(
-            view.id,
-            &package.manifest.version,
-            &manifest_value,
-            &modules,
-            &dependencies,
-            readme.as_deref(),
-        )
+    // The published namespace name is the folder name (`package.name`); the manifest carries no
+    // competing identity. A binding is authoritative. Without one, the claim sidecar lets
+    // create-or-get be repeated after any ambiguous response or binding-write failure without
+    // making the claimed folder appear renameable.
+    let view = if let Some(binding) = &publication_binding {
+        let detail = client
+            .get_package(binding.package_id)
+            .await
+            .map_err(|e| anyhow!("load bound package namespace: {e}"))?;
+        if !detail.viewer_can_admin {
+            bail!(
+                "local package {} is bound to a namespace that this account cannot publish",
+                package.name
+            );
+        }
+        if detail.package.owner_id != publisher.id
+            || detail.package.id != binding.package_id
+            || !crate::models::naming::names_conflict(&detail.package.name, &binding.leaf)
+            || !crate::models::naming::names_conflict(&package.name, &binding.leaf)
+        {
+            bail!(
+                "the publication binding for local package {} does not match its cloud namespace",
+                package.name
+            );
+        }
+        if let Some(intent) = &publication_claim {
+            validate_claimed_namespace(intent, &detail.package)?;
+            if let Err(error) = clear_publication_claim_if_unchanged(server_name, name, intent) {
+                log::warn!(
+                    "The completed publication binding for {} has a redundant claim sidecar that could not be removed: {error:#}",
+                    package.name
+                );
+            }
+        }
+        detail.package
+    } else {
+        let intent = publication_claim
+            .as_ref()
+            .context("first publish has no namespace-claim intent")?;
+        let view = match client
+            .create_package(&package.name, &package.manifest.description)
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                // A name-unavailable response proves this account did not claim the leaf. Other
+                // failures can be ambiguous (including a committed response that could not be
+                // decoded), so retain the intent and require an idempotent retry.
+                if matches!(&error, smudgy_cloud::CloudError::NameUnavailable(_)) {
+                    clear_publication_claim_if_unchanged(server_name, name, intent).context(
+                        "the package name is unavailable, and its local claim could not be cleared",
+                    )?;
+                }
+                return Err(anyhow!("create package namespace: {error}"));
+            }
+        };
+        validate_claimed_namespace(intent, &view)?;
+        commit_publication_binding(server_name, &package.name, view.id, &view.name, intent)
+            .context("save claimed package namespace")?;
+        view
+    };
+
+    let target_version = semver::Version::parse(&package.manifest.version)?.to_string();
+    // The README is part of the same initial snapshot as the manifest and modules.
+    let readme = package.readme.as_deref();
+    let request = PublishRequestSnapshot {
+        package_id: view.id,
+        owner_nickname: &publisher_nickname,
+        package_name: &package.name,
+        version: &target_version,
+        manifest: &manifest_value,
+        modules: &modules,
+        dependencies: &dependencies,
+        readme,
+    };
+    let versions_before = client
+        .list_versions(view.id)
         .await
-        .map_err(|e| anyhow!("publish version {}: {e}", package.manifest.version))?;
+        .map_err(|e| anyhow!("check published package versions: {e}"))?;
+    let existing_version = versions_before.into_iter().find(|version| {
+        semver::Version::parse(&version.version).ok().as_ref()
+            == semver::Version::parse(&target_version).ok().as_ref()
+    });
+
+    let mut publication_warnings = Vec::new();
+    let (published_version, published_at) = if let Some(existing) = existing_version {
+        if existing.deleted {
+            bail!("package version {target_version} was already published and deleted");
+        }
+        let resolved = client
+            .resolve_package(
+                &publisher_nickname,
+                &package.name,
+                Some(&target_version),
+            )
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "package version {target_version} is already present, but Smudgy could not verify its content: {error}. Check the package on the server before you retry"
+                )
+            })?;
+        if !resolved_matches_publish_request(&resolved, &request) {
+            bail!(
+                "package version {target_version} is already used, but its content does not match this publish request; review the server version and choose a new version number"
+            );
+        }
+        publication_warnings.push(PublicationWarning::ExistingVersionRecovered {
+            name: package.name.clone(),
+            version: existing.version.clone(),
+        });
+        (existing.version, existing.published_at)
+    } else {
+        let publish_result = client
+            .publish_version_checked(
+                view.id,
+                &target_version,
+                &manifest_value,
+                &modules,
+                &dependencies,
+                readme,
+                || {
+                    ensure_local_snapshot_matches(server_name, name, &snapshot_digest).map_err(
+                        |error| {
+                            smudgy_cloud::CloudError::InvalidInput(format!(
+                                "the local package changed before the final publish step; no version was published: {error:#}"
+                            ))
+                        },
+                    )
+                },
+            )
+            .await;
+
+        match publish_result {
+            Ok(committed)
+                if committed.package_id == view.id && committed.version == target_version =>
+            {
+                (committed.version, committed.published_at)
+            }
+            Ok(committed) => {
+                // A malformed success body is no safer than a dropped response: finalize may have
+                // committed, but its body cannot identify what committed. Verify the intended
+                // immutable target independently before reporting success or allowing a retry.
+                let ambiguity = format!(
+                    "publish version {target_version}: the server returned an inconsistent success response (namespace {}, version {})",
+                    committed.package_id, committed.version
+                );
+                let confirmed = confirm_ambiguous_publish(
+                    client,
+                    view.id,
+                    &publisher_nickname,
+                    &package.name,
+                    &target_version,
+                    &request,
+                    &ambiguity,
+                )
+                .await?;
+                publication_warnings.push(PublicationWarning::InconsistentResponseRecovered {
+                    name: package.name.clone(),
+                    version: confirmed.0.clone(),
+                });
+                confirmed
+            }
+            Err(error) => {
+                // Finalize is an irreversible remote commit. A dropped response is ambiguous. A
+                // used number alone is not proof: another authorized request can win the race.
+                // Treat this publish as complete only when the resolved immutable payload is an
+                // exact match.
+                let ambiguity = format!("publish version {target_version}: {error}");
+                let confirmed = confirm_ambiguous_publish(
+                    client,
+                    view.id,
+                    &publisher_nickname,
+                    &package.name,
+                    &target_version,
+                    &request,
+                    &ambiguity,
+                )
+                .await?;
+                publication_warnings.push(PublicationWarning::VersionPresentAfterLostResponse {
+                    name: package.name.clone(),
+                    version: confirmed.0.clone(),
+                });
+                confirmed
+            }
+        }
+    };
+
+    // Package metadata is mutable, but the version upload above is irreversible. Update the
+    // description only after the version is confirmed live so a metadata failure cannot make an
+    // unpublished version appear to have been published. Conversely, once the version is live,
+    // report a failed metadata update as recovery work and never return an error that invites the
+    // author to retry the immutable version number.
+    if view.description != package.manifest.description {
+        if let Err(error) = client
+            .patch_package(view.id, Some(&package.manifest.description), None)
+            .await
+        {
+            warn!(
+                "published {}@{}, but its package description could not be updated: {error}",
+                package.name, published_version
+            );
+            publication_warnings.push(PublicationWarning::DescriptionUpdateFailed {
+                name: package.name.clone(),
+                version: published_version.clone(),
+                error: error.to_string(),
+            });
+        }
+    }
+
+    // The upload used the snapshot captured above. A change after the final precondition check can
+    // race the remote request, so make that committed-but-stale result prominent and never report
+    // a failure that invites retrying the immutable version number.
+    let local_snapshot_matches = load_local_package(server_name, name)
+        .and_then(|current| {
+            current
+                .map(|current| package_snapshot_digest(&current))
+                .transpose()
+        })
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(&snapshot_digest);
+    if !local_snapshot_matches {
+        warn!(
+            "published {}@{}, but the local package changed before completion",
+            package.name, published_version
+        );
+        publication_warnings.push(PublicationWarning::LocalSnapshotChanged {
+            name: package.name.clone(),
+            version: published_version.clone(),
+        });
+    }
+
+    // Namespace binding failures after a committed version are recovery work, not publish
+    // failures. Preserve the success result and tell the author not to retry the used number.
+    match load_publication_binding(server_name, name) {
+        Ok(Some(binding))
+            if binding.package_id == view.id
+                && crate::models::naming::names_conflict(&binding.leaf, &package.name) => {}
+        Ok(Some(_)) => {
+            warn!(
+                "published {}@{}, but its local publication binding no longer matches",
+                package.name, published_version
+            );
+            publication_warnings.push(PublicationWarning::LocalBindingUnverified {
+                name: package.name.clone(),
+                version: published_version.clone(),
+                error: "the local publication link does not match the published package"
+                    .to_string(),
+            });
+        }
+        Ok(None) => {
+            publication_warnings.push(PublicationWarning::MissingLocalBinding {
+                name: package.name.clone(),
+                version: published_version.clone(),
+            });
+        }
+        Err(error) => {
+            warn!(
+                "published {}@{}, but its local publication binding could not be verified: {error:#}",
+                package.name, published_version
+            );
+            publication_warnings.push(PublicationWarning::LocalBindingUnverified {
+                name: package.name.clone(),
+                version: published_version.clone(),
+                error: format!("{error:#}"),
+            });
+        }
+    }
 
     Ok(PublishSummary {
-        package_id: published.package_id,
+        package_id: view.id,
         is_public: view.is_public,
-        version: published.version,
-        published_at: published.published_at,
+        version: published_version,
+        published_at,
         typings_generated,
         typings_warnings,
         locked_dependencies,
         dependency_warnings,
         interop_warnings,
+        publication_warnings,
     })
 }
 
@@ -454,6 +1941,7 @@ async fn interop_publish_warnings(
     client: &PackageApiClient,
     package: &LocalPackage,
     entry: &str,
+    publisher_nickname: &str,
 ) -> Vec<String> {
     use smudgy_script::interop_extract::{extract_interop_handles, fold_interop_name};
 
@@ -479,11 +1967,12 @@ async fn interop_publish_warnings(
     }
     warnings.extend(extraction.export_diagnostics.iter().cloned());
 
-    // Rename diff vs the published latest.
-    let Some(owner) = crate::models::auth::load_account().and_then(|a| a.nickname) else {
-        return warnings;
-    };
-    let Ok(previous) = client.resolve_package(&owner, &package.name, None).await else {
+    // Rename diff vs the published latest. Use the immutable profile captured beside this
+    // operation's detached credential; a sign-in change must not switch authors between awaits.
+    let Ok(previous) = client
+        .resolve_package(publisher_nickname, &package.name, None)
+        .await
+    else {
         return warnings;
     };
     let prev_entry = previous
@@ -568,8 +2057,7 @@ fn is_typescript_source(subpath: &str) -> bool {
 /// author's files winning on any subpath collision. A generated `.d.ts` is dropped when the
 /// package already ships a module at that subpath — a hand-authored declaration the author
 /// shipped deliberately — so the published payload never carries two modules with the same
-/// subpath (which the server rejects, cancelling the publish). A generated declaration whose
-/// subpath the author did not provide is appended as-is.
+/// subpath (which the server rejects, cancelling the publish).
 fn merge_published_modules(
     authored: Vec<PublishModule>,
     generated: Vec<PublishModule>,
@@ -738,485 +2226,324 @@ fn excludes_zero_zero_patch(range: &str, resolved: &str) -> bool {
     core.starts_with("0.0.") && resolved.starts_with("0.0.")
 }
 
-/// Fork a package's files into a NEW local package at `<server>/packages/<new_name>/`. The fork
-/// becomes yours (owner = your handle), keeping the source's files verbatim — the identity is the
-/// `new_name` folder (the manifest carries no name). Rejects an existing local package of that
-/// name (the local duplicate-name guard).
-///
-/// `modules` are the source package's files (e.g. a `ResolvedPackage`'s modules mapped to
-/// [`LocalModule`], or another local package's). Generated `.d.ts` declaration files are skipped:
-/// a published package carries them, but publishing the fork regenerates declarations for the same
-/// subpaths, so copying the stale ones would collide on re-publish.
-///
-/// # Errors
-/// Returns an error if a package named `new_name` already exists, or the files can't be
-/// written.
-pub fn fork_to_local(
-    server_name: &str,
-    new_name: &str,
-    source_manifest: &PackageManifest,
-    modules: &[LocalModule],
-) -> Result<()> {
-    fork_to_local_in(
-        &get_smudgy_home()?,
-        server_name,
-        new_name,
-        source_manifest,
-        modules,
-    )
-}
-
-fn fork_to_local_in(
-    home: &Path,
-    server_name: &str,
-    new_name: &str,
-    source_manifest: &PackageManifest,
-    modules: &[LocalModule],
-) -> Result<()> {
-    let dir = packages_dir_in(home, server_name).join(new_name);
-    if dir.exists() {
-        bail!("a package named {new_name} already exists");
-    }
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-
-    // Copied verbatim — the fork's name is its `new_name` folder, not anything in the manifest.
-    let manifest_json =
-        serde_json::to_string_pretty(source_manifest).context("serialize forked manifest")?;
-    fs::write(dir.join(MANIFEST_FILE), manifest_json)?;
-
-    for module in modules {
-        // Generated declarations are regenerated at publish time; copying them collides the stale
-        // copy with the fresh `.d.ts` of the same subpath on the fork's first re-publish.
-        if is_declaration_file(&module.subpath) {
-            continue;
-        }
-        // Subpaths are always forward-slashed + validated; join is in-package.
-        let path = dir.join(module.subpath.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        fs::write(&path, &module.content).with_context(|| format!("write {}", path.display()))?;
-    }
-
-    // A copied package is its own editor project: drop a thin `tsconfig.json` pointing at the
-    // server-level smudgy project so VS Code types it. Written last so it wins over any stale
-    // `tsconfig.json` a source might have shipped (it's excluded from publish either way).
-    fs::write(dir.join(TSCONFIG_FILE), PACKAGE_TSCONFIG)
-        .with_context(|| format!("write {}", dir.join(TSCONFIG_FILE).display()))?;
-    Ok(())
-}
-
-/// Renames a local package folder (`old` → `new`) under `<server>/packages/`. The manifest
-/// carries no name, so the folder name *is* the identity — renaming the folder is the rename.
-/// Rejects an empty new name or a target that already exists; a no-op rename succeeds.
-///
-/// # Errors
-/// Returns an error if the smudgy home can't be resolved, `old` doesn't exist, `new` already
-/// exists, or the rename fails.
-pub fn rename_local_package(server_name: &str, old: &str, new: &str) -> Result<()> {
-    rename_local_package_in(&get_smudgy_home()?, server_name, old, new)
-}
-
-fn rename_local_package_in(home: &Path, server_name: &str, old: &str, new: &str) -> Result<()> {
-    let new = new.trim();
-    if new.is_empty() {
-        bail!("a package name can't be empty");
-    }
-    if new == old {
-        return Ok(());
-    }
-    let packages = packages_dir_in(home, server_name);
-    let from = packages.join(old);
-    let to = packages.join(new);
-    if !from.is_dir() {
-        bail!("no local package named {old}");
-    }
-    if to.exists() {
-        bail!("a package named {new} already exists");
-    }
-    fs::rename(&from, &to).with_context(|| format!("rename {} -> {}", from.display(), to.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_cloud::VersionListItem;
+    use crate::models::profile_activation::ProfileActivation;
+    use crate::models::shared_packages::{UpdateMode, install_package, load_lock};
 
-    #[tokio::test]
-    async fn publish_typings_generates_declarations_for_ts_modules() {
-        let modules = vec![
-            LocalModule {
-                subpath: "util.ts".to_string(),
-                content: b"export function computeRisk(hp: number) { return hp < 100 ? \"high\" : \"low\"; }\n".to_vec(),
-            },
-            LocalModule {
-                subpath: "index.ts".to_string(),
-                content: b"import { computeRisk } from \"./util.ts\";\nexport function describe(hp: number) { return { risk: computeRisk(hp) }; }\n".to_vec(),
-            },
-            // A non-TS file is ignored by the generator.
-            LocalModule {
-                subpath: "data.json".to_string(),
-                content: b"{}".to_vec(),
-            },
-        ];
-
-        let (dts, warnings) = generate_publish_typings(&modules).await;
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-
-        let names: Vec<&str> = dts.iter().map(|m| m.subpath.as_str()).collect();
-        assert!(
-            names.contains(&"index.d.ts"),
-            "missing index.d.ts: {names:?}"
-        );
-        assert!(names.contains(&"util.d.ts"), "missing util.d.ts: {names:?}");
-        assert!(
-            dts.iter().all(|m| !m.is_entry),
-            "generated .d.ts must not be entry"
-        );
-
-        let index = dts.iter().find(|m| m.subpath == "index.d.ts").unwrap();
-        let text = String::from_utf8(index.content.clone()).unwrap();
-        assert!(text.contains("describe(hp: number)"), "got:\n{text}");
+    fn use_temp_smudgy_home() {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "smudgy-local-packages-test-home-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp home");
+            crate::set_smudgy_home(dir.clone());
+            dir
+        });
     }
 
-    #[tokio::test]
-    async fn publish_typings_is_empty_when_no_ts_modules() {
-        let modules = vec![LocalModule {
-            subpath: "readme.txt".to_string(),
-            content: b"hello".to_vec(),
-        }];
-        let (dts, warnings) = generate_publish_typings(&modules).await;
-        assert!(dts.is_empty());
-        assert!(warnings.is_empty());
+    fn test_server(label: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        use_temp_smudgy_home();
+        let name = format!(
+            "lpk-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        fs::create_dir_all(get_smudgy_home().unwrap().join(&name)).unwrap();
+        name
     }
 
-    #[tokio::test]
-    async fn map_widget_manifest_and_publish_typings_are_valid() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
+    fn write_bare_local_folder(server: &str, name: &str) {
+        let dir = get_smudgy_home()
+            .unwrap()
+            .join(server)
             .join("packages")
-            .join("map-widget");
-        let manifest = PackageManifest::parse(
-            &fs::read_to_string(root.join(MANIFEST_FILE)).expect("read map-widget manifest"),
-        )
-        .expect("parse map-widget manifest");
-        assert_eq!(manifest.entry.as_deref(), Some("index.tsx"));
-        assert_eq!(manifest.params.len(), 6);
-
-        let mut modules = Vec::new();
-        collect_modules(&root, &root, &mut modules).expect("collect map-widget modules");
-        let (dts, warnings) = generate_publish_typings(&modules).await;
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        assert!(
-            dts.iter().any(|module| module.subpath == "index.d.ts"),
-            "missing index.d.ts"
-        );
-    }
-
-    fn module(subpath: &str, content: &[u8]) -> PublishModule {
-        PublishModule {
-            subpath: subpath.to_string(),
-            content: content.to_vec(),
-            media_type: media_type_for(subpath).to_string(),
-            is_entry: subpath == "index.ts",
-        }
-    }
-
-    /// A package shipping its own `.d.ts` (e.g. `index.d.ts`) must not collide with the
-    /// publish-time generated declaration of the same subpath: the author's file wins and the
-    /// generated one is dropped, so the payload carries each subpath exactly once. Previously
-    /// this duplicate cancelled the publish (the server rejects duplicate subpaths).
-    #[test]
-    fn merge_drops_generated_dts_colliding_with_authored_modules() {
-        let authored = vec![
-            module("index.ts", b"export const x = 1;"),
-            module("index.d.ts", b"export declare const x: 1;"),
-            module("util.ts", b"export const u = 2;"),
-        ];
-        let generated = vec![
-            module("index.d.ts", b"// generated, must be dropped"),
-            module("util.d.ts", b"// generated, kept"),
-        ];
-
-        let merged = merge_published_modules(authored, generated);
-
-        let mut subpaths: Vec<&str> = merged.iter().map(|m| m.subpath.as_str()).collect();
-        subpaths.sort_unstable();
-        assert_eq!(subpaths, ["index.d.ts", "index.ts", "util.d.ts", "util.ts"]);
-
-        // The hand-authored declaration is preserved; the generated one of the same subpath is gone.
-        let index_dts = merged.iter().find(|m| m.subpath == "index.d.ts").unwrap();
-        assert_eq!(index_dts.content, b"export declare const x: 1;");
-        // A generated declaration the author did not provide is appended as-is.
-        let util_dts = merged.iter().find(|m| m.subpath == "util.d.ts").unwrap();
-        assert_eq!(util_dts.content, b"// generated, kept");
-    }
-
-    fn version_item(version: &str, yanked: bool) -> VersionListItem {
-        VersionListItem {
-            version: version.to_string(),
-            yanked,
-            deleted: false,
-            published_at: "2026-06-20T00:00:00Z".parse().unwrap(),
-        }
-    }
-
-    /// The range -> concrete dep-lock picker: highest satisfying, yanked excluded, and a
-    /// clear no-match for the publish path to surface against the dependency.
-    #[test]
-    fn dep_lock_picks_highest_satisfying_excluding_yanked() {
-        let versions = [
-            version_item("1.2.0", false),
-            version_item("1.3.0", false),
-            version_item("1.4.0", true), // yanked -> excluded
-            version_item("2.0.0", false),
-        ];
-        // `^1.2` collapses to the highest non-yanked `1.x` (1.4.0 is yanked).
-        assert_eq!(
-            highest_satisfying_version(&versions, Some("^1.2"))
-                .unwrap()
-                .as_deref(),
-            Some("1.3.0")
-        );
-        // No published `3.x` -> no match (the publish path turns this into a named error).
-        assert_eq!(
-            highest_satisfying_version(&versions, Some("^3")).unwrap(),
-            None
-        );
-        // No range constraint -> the highest published version overall.
-        assert_eq!(
-            highest_satisfying_version(&versions, None)
-                .unwrap()
-                .as_deref(),
-            Some("2.0.0")
-        );
-    }
-
-    /// The 0.0.x caret footgun detector: a caret/bare `0.0.x` range that resolved to a `0.0.x`
-    /// version is flagged (it can never advance); tilde/comparator ranges and non-0.0.x versions
-    /// are not.
-    #[test]
-    fn flags_only_the_zero_zero_caret_footgun() {
-        assert!(excludes_zero_zero_patch("^0.0.1", "0.0.1"));
-        assert!(excludes_zero_zero_patch("0.0.1", "0.0.1")); // bare == caret under Cargo semver
-        assert!(excludes_zero_zero_patch(" ^0.0.1 ", "0.0.1")); // whitespace-tolerant
-        // Tilde admits higher 0.0.x patches, so it is not the footgun.
-        assert!(!excludes_zero_zero_patch("~0.0.1", "0.0.1"));
-        // A comparator range admits newer releases.
-        assert!(!excludes_zero_zero_patch(">=0.0.1", "0.0.1"));
-        // 0.1.x / 1.x carets advance normally — not the 0.0.x trap.
-        assert!(!excludes_zero_zero_patch("^0.1.0", "0.1.0"));
-        assert!(!excludes_zero_zero_patch("^1.0", "1.0.0"));
+            .join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("smudgy.package.json"), r#"{"version":"0.1.0"}"#).unwrap();
     }
 
     #[test]
-    fn scaffold_then_load_round_trips() {
-        let home = tempfile::tempdir().unwrap();
-        let server = "Arctic";
-        assert!(
-            list_local_packages_in(home.path(), server)
-                .unwrap()
-                .is_empty()
-        );
-
-        scaffold_local_package_in(home.path(), server, "mymapper").unwrap();
-        assert_eq!(
-            list_local_packages_in(home.path(), server).unwrap(),
-            vec!["mymapper"]
-        );
-
-        let pkg = load_local_package_in(home.path(), server, "mymapper")
-            .unwrap()
-            .expect("local package loads");
-        // Identity is the folder name; the scaffold writes no manifest name and an empty description.
-        assert_eq!(pkg.name, "mymapper");
-        assert!(pkg.manifest.description.is_empty());
-        assert_eq!(pkg.manifest.version, "0.1.0");
-        // The editor tsconfig is on disk but not a publishable module — only index.ts is.
-        let tsconfig = packages_dir_in(home.path(), server)
-            .join("mymapper")
-            .join(TSCONFIG_FILE);
-        assert_eq!(fs::read_to_string(&tsconfig).unwrap(), PACKAGE_TSCONFIG);
-        assert_eq!(pkg.modules.len(), 1);
-        assert_eq!(pkg.modules[0].subpath, "index.ts");
-
-        // Re-scaffolding an existing package is rejected.
-        assert!(scaffold_local_package_in(home.path(), server, "mymapper").is_err());
-    }
-
-    #[test]
-    fn loads_nested_modules_with_forward_slash_subpaths() {
-        let home = tempfile::tempdir().unwrap();
-        let server = "Arctic";
-        let dir = packages_dir_in(home.path(), server).join("multi");
-        fs::create_dir_all(dir.join("lib")).unwrap();
-        fs::write(
-            dir.join(MANIFEST_FILE),
-            r#"{ "name": "multi", "version": "1.0.0" }"#,
+    fn legacy_account_owned_row_migrates_onto_the_local_identity() {
+        use crate::models::shared_packages::{
+            LockedPackage, ParamValueScope, ParameterScope, get_param_value_scoped_checked,
+            mutate_lock, package_param_state_exists, save_param_value,
+        };
+        let server = test_server("legacy-migration");
+        write_bare_local_folder(&server, "tools");
+        mutate_lock(&server, |lock| {
+            let mut row = LockedPackage::new("smudgy://developer/tools", UpdateMode::Auto);
+            row.trusted = true;
+            row.parameter_scope = ParameterScope::Profile;
+            row.set_activation(ProfileActivation::Selected {
+                profiles: ["Main".to_string()].into_iter().collect(),
+            });
+            row.last_resolved_version = Some("1.0.0".into());
+            lock.packages.push(row);
+            let mut lib = LockedPackage::new("smudgy://wbk/lib", UpdateMode::Auto);
+            lib.required_by
+                .insert("smudgy://developer/tools".to_string());
+            lib.installed_as_requirement = true;
+            lock.packages.push(lib);
+            Ok(((), true))
+        })
+        .unwrap();
+        save_param_value(
+            &server,
+            "smudgy://developer/tools",
+            "k",
+            serde_json::json!(1),
         )
         .unwrap();
-        fs::write(dir.join("index.ts"), "export {};").unwrap();
-        fs::write(dir.join("lib").join("util.ts"), "export const u = 1;").unwrap();
 
-        let pkg = load_local_package_in(home.path(), server, "multi")
+        assert!(
+            materialize_governing_local_lock_rows(&server, &["tools".to_string()], "developer")
+                .unwrap()
+        );
+
+        let lock = load_lock(&server).unwrap();
+        assert!(lock.find("smudgy://developer/tools").is_none());
+        let local = lock.find("smudgy://local/tools").unwrap();
+        assert!(local.trusted, "trust carries over");
+        assert_eq!(local.parameter_scope, ParameterScope::Profile);
+        assert_eq!(
+            local.activation(),
+            ProfileActivation::Selected {
+                profiles: ["Main".to_string()].into_iter().collect()
+            }
+        );
+        assert_eq!(
+            local.last_resolved_version, None,
+            "the folder is the source now"
+        );
+        let lib = lock.find("smudgy://wbk/lib").unwrap();
+        assert!(lib.required_by.contains("smudgy://local/tools"));
+        assert!(!lib.required_by.contains("smudgy://developer/tools"));
+        assert_eq!(
+            get_param_value_scoped_checked(
+                &server,
+                ParamValueScope::Global,
+                "smudgy://local/tools",
+                "k"
+            )
+            .unwrap(),
+            Some(serde_json::json!(1))
+        );
+        assert!(!package_param_state_exists(&server, "smudgy://developer/tools").unwrap());
+
+        // Idempotent: a second pass finds nothing to migrate and nothing to add.
+        assert!(
+            !materialize_governing_local_lock_rows(&server, &["tools".to_string()], "developer")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn local_copy_of_a_shadowed_root_keeps_its_requirements_effective() {
+        use crate::models::shared_packages::{LockedPackage, mutate_lock};
+        let server = test_server("shadowed-root-requirements");
+        write_bare_local_folder(&server, "app");
+        mutate_lock(&server, |lock| {
+            let mut app = LockedPackage::new("smudgy://wbk/app", UpdateMode::Auto);
+            app.set_activation(ProfileActivation::All);
+            lock.packages.push(app);
+            let mut lib = LockedPackage::new("smudgy://wbk/lib", UpdateMode::Auto);
+            lib.required_by.insert("smudgy://wbk/app".to_string());
+            lib.installed_as_requirement = true;
+            lib.requirement_lineage_known = true;
+            lock.packages.push(lib);
+            Ok(((), true))
+        })
+        .unwrap();
+
+        assert!(
+            materialize_governing_local_lock_rows(&server, &["app".to_string()], LOCAL_OWNER)
+                .unwrap()
+        );
+
+        let lock = load_lock(&server).unwrap();
+        let lib = lock.find("smudgy://wbk/lib").unwrap();
+        assert!(lib.required_by.contains("smudgy://local/app"));
+        assert!(
+            lock.is_effectively_enabled_for("smudgy://wbk/lib", "Main"),
+            "the override inherits the fallback's activation and keeps its requirement running"
+        );
+    }
+
+    #[test]
+    fn creating_a_local_package_adopts_orphaned_settings() {
+        use crate::models::shared_packages::{get_param_value_for_profile, save_param_value};
+        let server = test_server("adopt-orphaned-settings");
+        save_param_value(&server, "smudgy://local/foo", "k", serde_json::json!(7)).unwrap();
+        write_bare_local_folder(&server, "foo");
+
+        assert!(
+            materialize_governing_local_lock_rows(&server, &["foo".to_string()], LOCAL_OWNER)
+                .unwrap()
+        );
+        assert!(
+            load_lock(&server)
+                .unwrap()
+                .find("smudgy://local/foo")
+                .is_some()
+        );
+        assert_eq!(
+            get_param_value_for_profile(&server, "Main", "smudgy://local/foo", "k"),
+            Some(serde_json::json!(7))
+        );
+    }
+
+    #[test]
+    fn scaffold_lists_loads_and_deletes() {
+        let server = test_server("scaffold");
+        scaffold_local_package_with_state(&server, "mine", "wbk").unwrap();
+        assert_eq!(list_local_packages(&server).unwrap(), ["mine"]);
+        let package = load_local_package(&server, "mine").unwrap().unwrap();
+        assert_eq!(package.manifest.version, "0.1.0");
+        assert!(package.readme.unwrap().starts_with("# mine"));
+        assert_eq!(
+            package.modules.len(),
+            1,
+            "tsconfig and README are not modules"
+        );
+        let row = load_lock(&server)
             .unwrap()
+            .find("smudgy://local/mine")
+            .cloned()
             .unwrap();
-        let subpaths: Vec<&str> = pkg.modules.iter().map(|m| m.subpath.as_str()).collect();
-        assert!(subpaths.contains(&"index.ts"));
-        assert!(subpaths.contains(&"lib/util.ts"));
-    }
+        assert_eq!(row.activation(), ProfileActivation::None);
+        assert!(scaffold_local_package_with_state(&server, "MINE", "wbk").is_err());
 
-    #[test]
-    fn collect_modules_skips_cruft_dirs_and_dotfiles() {
-        let home = tempfile::tempdir().unwrap();
-        let server = "Arctic";
-        let dir = packages_dir_in(home.path(), server).join("pkg");
-        fs::create_dir_all(dir.join(".git")).unwrap();
-        fs::create_dir_all(dir.join("node_modules").join("dep")).unwrap();
-        fs::write(
-            dir.join(MANIFEST_FILE),
-            r#"{ "name": "pkg", "version": "1.0.0" }"#,
-        )
-        .unwrap();
-        fs::write(dir.join(README_FILE), "# pkg").unwrap();
-        fs::write(dir.join("index.ts"), "export {};").unwrap();
-        fs::write(dir.join(".env"), "SECRET=1").unwrap();
-        // The editor-only tsconfig is excluded from publish like a dotfile.
-        fs::write(dir.join(TSCONFIG_FILE), PACKAGE_TSCONFIG).unwrap();
-        // Cruft that must NEVER be published as modules:
-        fs::write(
-            dir.join(".git").join("config"),
-            "[remote] url=https://x:tok@h/r",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("node_modules").join("dep").join("index.js"),
-            "module.exports={}",
-        )
-        .unwrap();
-
-        let pkg = load_local_package_in(home.path(), server, "pkg")
-            .unwrap()
-            .unwrap();
-        let subpaths: Vec<&str> = pkg.modules.iter().map(|m| m.subpath.as_str()).collect();
-        // Only the real source module is collected — not .git/config (secrets!), not
-        // node_modules, not the .env dotfile, not the README/manifest, not the editor tsconfig.
+        write_local_file(&server, "mine", "index.ts", "export const x = 1;").unwrap();
         assert_eq!(
-            subpaths,
-            vec!["index.ts"],
-            "only index.ts is a module; got {subpaths:?}"
+            write_local_file_if_unchanged(&server, "mine", "index.ts", "stale", "y").unwrap(),
+            LocalFileWriteOutcome::Conflict
         );
-    }
+        assert_eq!(
+            write_local_file_if_unchanged(&server, "mine", "index.ts", "export const x = 1;", "y")
+                .unwrap(),
+            LocalFileWriteOutcome::Saved
+        );
+        assert_eq!(read_local_file(&server, "mine", "index.ts").unwrap(), "y");
 
-    #[test]
-    fn missing_package_is_none() {
-        let home = tempfile::tempdir().unwrap();
+        let summary = delete_local_package(&server, "mine").unwrap();
+        assert!(summary.warnings.is_empty());
+        assert!(list_local_packages(&server).unwrap().is_empty());
         assert!(
-            load_local_package_in(home.path(), "Arctic", "ghost")
+            load_lock(&server)
                 .unwrap()
+                .find("smudgy://local/mine")
                 .is_none()
         );
     }
 
     #[test]
-    fn rename_local_package_moves_folder() {
-        let home = tempfile::tempdir().unwrap();
-        let server = "Arctic";
-        let manifest = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).unwrap();
-        let modules = vec![LocalModule {
-            subpath: "index.ts".into(),
-            content: "export {};".into(),
-        }];
-        fork_to_local_in(home.path(), server, "boo", &manifest, &modules).unwrap();
-
-        rename_local_package_in(home.path(), server, "boo", "myboo").unwrap();
-        assert!(
-            load_local_package_in(home.path(), server, "boo")
-                .unwrap()
-                .is_none(),
-            "the old name is gone after rename"
-        );
-        let pkg = load_local_package_in(home.path(), server, "myboo")
-            .unwrap()
+    fn a_same_leaf_copy_inherits_the_published_activation() {
+        let server = test_server("takeover");
+        install_package(&server, "smudgy://wbk/mapper", UpdateMode::Auto, true).unwrap();
+        let (manifest, modules) = starter_package().unwrap();
+        fork_to_local_with_readme_and_state(&server, "mapper", &manifest, &modules, None, "wbk")
             .unwrap();
-        assert_eq!(pkg.name, "myboo");
-
-        // Renaming onto an existing name, or from a missing source, is rejected; a no-op is fine.
-        scaffold_local_package_in(home.path(), server, "taken").unwrap();
-        assert!(rename_local_package_in(home.path(), server, "myboo", "taken").is_err());
-        assert!(rename_local_package_in(home.path(), server, "ghost", "whatever").is_err());
-        assert!(rename_local_package_in(home.path(), server, "myboo", "myboo").is_ok());
+        let lock = load_lock(&server).unwrap();
+        let local = lock.find("smudgy://local/mapper").unwrap();
+        assert_eq!(local.activation(), ProfileActivation::All);
+        assert!(
+            lock.find("smudgy://wbk/mapper").is_some(),
+            "the fallback row stays"
+        );
+        assert_eq!(
+            lock.governing_specifier("smudgy://wbk/mapper"),
+            Some("smudgy://local/mapper")
+        );
     }
 
     #[test]
-    fn fork_creates_a_renamed_local_copy() {
-        let home = tempfile::tempdir().unwrap();
-        let server = "Arctic";
-        let manifest = PackageManifest::parse(
-            r#"{ "version": "1.2.0", "description": "A mapper", "entry": "index.ts" }"#,
-        )
-        .unwrap();
-        let modules = vec![
-            LocalModule {
-                subpath: "index.ts".into(),
-                content: "export const x = 1;".into(),
-            },
-            LocalModule {
-                subpath: "lib/util.ts".into(),
-                content: "export const u = 2;".into(),
-            },
-            // A published source package ships generated declarations; the fork must drop them.
-            LocalModule {
-                subpath: "index.d.ts".into(),
-                content: "export declare const x: number;".into(),
-            },
-            LocalModule {
-                subpath: "lib/util.d.ts".into(),
-                content: "export declare const u: number;".into(),
-            },
-        ];
-
-        fork_to_local_in(home.path(), server, "mymapper", &manifest, &modules).unwrap();
-
-        // A copied package carries the thin editor tsconfig pointing two levels up at the server
-        // project — on disk, but excluded from the published module set (treated like a dotfile).
-        let tsconfig = packages_dir_in(home.path(), server)
-            .join("mymapper")
-            .join(TSCONFIG_FILE);
-        assert_eq!(fs::read_to_string(&tsconfig).unwrap(), PACKAGE_TSCONFIG);
-        assert!(PACKAGE_TSCONFIG.contains("../../tsconfig.json"));
-
-        // The fork loads as a local package with the NEW (folder) name + the copied manifest/modules.
-        let pkg = load_local_package_in(home.path(), server, "mymapper")
-            .unwrap()
-            .unwrap();
-        assert_eq!(pkg.name, "mymapper");
-        assert_eq!(pkg.manifest.description, "A mapper");
-        assert_eq!(pkg.manifest.version, "1.2.0");
-        let subpaths: Vec<&str> = pkg.modules.iter().map(|m| m.subpath.as_str()).collect();
-        assert!(subpaths.contains(&"index.ts"));
-        assert!(subpaths.contains(&"lib/util.ts"));
-        // The tsconfig is not a publishable module.
-        assert!(
-            !subpaths.contains(&TSCONFIG_FILE),
-            "tsconfig must be excluded; got {subpaths:?}"
+    fn requirement_aware_copy_links_required_roots_or_reports_stale_state() {
+        let server = test_server("copy-requires");
+        install_package(&server, "smudgy://a/dep", UpdateMode::Auto, true).unwrap();
+        let expected = load_lock(&server).unwrap();
+        let (manifest, modules) = starter_package().unwrap();
+        let required = ["smudgy://a/dep".to_string()];
+        assert_eq!(
+            fork_to_local_with_readme_and_existing_requirements_if_unchanged(
+                &server, "root", &manifest, &modules, None, "wbk", &expected, &required
+            )
+            .unwrap(),
+            Cas::Applied
         );
-        // Generated declarations are not copied — they'd collide with publish-time regeneration.
+        let lock = load_lock(&server).unwrap();
         assert!(
-            !subpaths.iter().any(|s| s.ends_with(".d.ts")),
-            "generated .d.ts must not be copied into the fork; got {subpaths:?}"
+            lock.find("smudgy://a/dep")
+                .unwrap()
+                .required_by
+                .contains("smudgy://local/root")
         );
-        let dir = packages_dir_in(home.path(), server).join("mymapper");
-        assert!(
-            !dir.join("index.d.ts").exists(),
-            "index.d.ts must not be written to disk"
+        assert_eq!(
+            fork_to_local_with_readme_and_existing_requirements_if_unchanged(
+                &server,
+                "other",
+                &manifest,
+                &modules,
+                None,
+                "wbk",
+                &expected,
+                &[]
+            )
+            .unwrap(),
+            Cas::StateChanged
         );
-        assert!(
-            !dir.join("lib").join("util.d.ts").exists(),
-            "lib/util.d.ts must not be written to disk"
-        );
+        assert!(load_local_package(&server, "other").unwrap().is_none());
+    }
 
-        // Forking over an existing name is rejected.
-        assert!(fork_to_local_in(home.path(), server, "mymapper", &manifest, &modules).is_err());
+    #[test]
+    fn rename_moves_folder_and_state_but_not_published_packages() {
+        let server = test_server("rename");
+        scaffold_local_package_with_state(&server, "one", "wbk").unwrap();
+        assert!(rename_local_package(&server, "one", "two").unwrap());
+        assert_eq!(list_local_packages(&server).unwrap(), ["two"]);
+        assert!(
+            load_lock(&server)
+                .unwrap()
+                .find("smudgy://local/two")
+                .is_some()
+        );
+        assert!(!rename_local_package(&server, "two", "two").unwrap());
+
+        save_publication_binding(&server, "two", Uuid::new_v4(), "two").unwrap();
+        assert!(rename_local_package(&server, "two", "three").is_err());
+        assert_eq!(list_local_packages(&server).unwrap(), ["two"]);
+    }
+
+    #[test]
+    fn declaration_detection_and_module_merging() {
+        assert!(is_declaration_file("index.d.ts"));
+        assert!(is_declaration_file("types/util.D.MTS"));
+        assert!(!is_declaration_file("index.ts"));
+        assert!(!is_declaration_file("d.ts.txt"));
+        assert!(is_typescript_source("a.tsx"));
+        assert!(!is_typescript_source("a.d.ts"));
+
+        let module = |subpath: &str| PublishModule {
+            subpath: subpath.into(),
+            content: Vec::new(),
+            media_type: "text/plain".into(),
+            is_entry: false,
+        };
+        let merged = merge_published_modules(
+            vec![module("index.ts"), module("index.d.ts")],
+            vec![module("index.d.ts"), module("util.d.ts")],
+        );
+        let subpaths = merged
+            .iter()
+            .map(|m| m.subpath.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(subpaths, ["index.ts", "index.d.ts", "util.d.ts"]);
+        assert!(excludes_zero_zero_patch("^0.0.1", "0.0.1"));
+        assert!(!excludes_zero_zero_patch(">=0.0.1", "0.0.1"));
     }
 }

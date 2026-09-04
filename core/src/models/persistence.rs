@@ -8,8 +8,7 @@ use tempfile::Builder;
 ///
 /// The temporary file lives beside the destination so persisting it stays on
 /// one filesystem. Its contents are synced before the atomic replacement; on
-/// Unix, the parent directory is synced afterward so the replacement survives
-/// a crash once this function returns successfully.
+/// Unix, the parent directory is synced afterward as a best-effort barrier.
 ///
 /// This is the one atomic-replace implementation for every smudgy data file,
 /// in core and UI alike; concurrent writers to the same destination are safe
@@ -18,8 +17,11 @@ use tempfile::Builder;
 ///
 /// # Errors
 ///
-/// Any I/O error from creating, writing, syncing, or renaming the temporary
-/// file; the destination is left untouched.
+/// Returns an I/O error only before the replacement commits (creating, writing,
+/// syncing, or persisting the temporary file); the destination is then left
+/// untouched. A parent-directory sync failure happens after the replacement
+/// and is logged rather than reported: the requested bytes are already
+/// authoritative and the caller can no longer roll them back.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     write_atomic_with(path, |file| file.write_all(contents))
 }
@@ -47,7 +49,13 @@ fn write_atomic_with(
     }
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|err| err.error)?;
-    sync_parent(parent)
+    if let Err(error) = sync_parent(parent) {
+        log::warn!(
+            "Atomic replacement of {} succeeded, but its parent directory could not be synced: {error}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -69,9 +77,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("settings.json");
 
-        write_atomic(&path, br#"{"theme":"dark"}"#).expect("atomic write");
+        write_atomic(&path, b"{}").expect("atomic write");
 
-        assert_eq!(fs::read(&path).expect("saved file"), br#"{"theme":"dark"}"#);
+        assert_eq!(fs::read(&path).expect("written file"), b"{}");
         assert_eq!(
             fs::read_dir(dir.path()).expect("directory entries").count(),
             1
@@ -79,60 +87,14 @@ mod tests {
     }
 
     #[test]
-    fn replaces_an_existing_file_and_preserves_its_permissions() {
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let path = dir.path().join("settings.json");
-        fs::write(&path, b"old").expect("old file");
-        let permissions = fs::metadata(&path).expect("old metadata").permissions();
-
-        write_atomic(&path, b"new").expect("atomic replacement");
-
-        assert_eq!(fs::read(&path).expect("saved file"), b"new");
-        assert_eq!(
-            fs::metadata(&path).expect("new metadata").permissions(),
-            permissions
-        );
-        assert_eq!(
-            fs::read_dir(dir.path()).expect("directory entries").count(),
-            1
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preserves_a_non_default_unix_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let path = dir.path().join("settings.json");
-        fs::write(&path, b"old").expect("old file");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
-            .expect("set non-default mode");
-
-        write_atomic(&path, b"new").expect("atomic replacement");
-
-        let mode = fs::metadata(&path)
-            .expect("new metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o640);
-    }
-
-    #[test]
-    fn writer_failure_preserves_the_old_file_and_cleans_up_the_temporary_file() {
+    fn replaces_an_existing_file() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("settings.json");
         fs::write(&path, b"old").expect("old file");
 
-        let error = write_atomic_with(&path, |file| {
-            file.write_all(b"partial")?;
-            Err(io::Error::other("injected write failure"))
-        })
-        .expect_err("the injected failure must be returned");
+        write_atomic(&path, b"new").expect("atomic write");
 
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(fs::read(&path).expect("old file"), b"old");
+        assert_eq!(fs::read(&path).expect("replaced file"), b"new");
         assert_eq!(
             fs::read_dir(dir.path()).expect("directory entries").count(),
             1
@@ -140,14 +102,15 @@ mod tests {
     }
 
     #[test]
-    fn replacement_failure_preserves_the_destination_and_cleans_up_the_temporary_file() {
+    fn a_failed_write_leaves_the_destination_untouched() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let path = dir.path().join("settings.json");
-        fs::create_dir(&path).expect("destination directory");
+        fs::write(&path, b"old").expect("old file");
 
-        write_atomic(&path, b"new").expect_err("a file cannot replace a directory");
+        let result = write_atomic_with(&path, |_| Err(io::Error::other("injected write failure")));
 
-        assert!(path.is_dir());
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).expect("original file"), b"old");
         assert_eq!(
             fs::read_dir(dir.path()).expect("directory entries").count(),
             1

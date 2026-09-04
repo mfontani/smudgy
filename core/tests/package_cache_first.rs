@@ -11,7 +11,9 @@
 //! and fails fast. Zero accepted connections across a whole warm-cache start is the
 //! strict form of the offline guarantee; the fallback tests assert the opposite — a
 //! cache gap or a consent mismatch must reach for the network path (and, with the cloud
-//! dead, land on the legacy offline behavior).
+//! dead, land on the legacy offline behavior). The lockfile carries nothing beyond the
+//! staged version and its last verified stamp: a pre-existing install is servable offline
+//! from plain cache metadata.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,7 +90,7 @@ fn sha256_hex(body: &str) -> String {
 
 /// Warm the process-global package cache with a fully offline-servable published
 /// version: its meta (carrying the given locked dep edges) plus the single `index.ts`
-/// code blob. Returns the integrity fingerprint to stage in the lockfile.
+/// code blob. Returns the integrity fingerprint a verified load would stamp into the lockfile.
 fn cache_package(
     owner: &str,
     name: &str,
@@ -109,6 +111,8 @@ fn cache_package(
             subpath: "index.ts".to_string(),
             content_hash: hash,
             media_type: "application/typescript".to_string(),
+            byte_size: index_src.len() as i64,
+            is_entry: true,
         }],
         dependencies: deps.to_vec(),
     };
@@ -120,12 +124,27 @@ fn cache_package(
     integrity
 }
 
+/// Record the consented closure grant on an installed row, as the install flow does.
+fn record_consent(server: &str, specifier: &str, manifest_json: &str) {
+    let permissions = PackageManifest::parse(manifest_json)
+        .expect("valid manifest")
+        .permissions;
+    let lock = shared_packages::load_lock(server).expect("lock loads");
+    let row = lock.find(specifier).expect("installed row");
+    assert!(
+        shared_packages::record_consent_if_unchanged(server, row, &permissions)
+            .expect("record consent"),
+        "the freshly installed row is unchanged"
+    );
+}
+
 fn dep(owner: &str, name: &str, range: &str, version: &str) -> ResolvedDependency {
     ResolvedDependency {
         owner_nickname: owner.to_string(),
         name: name.to_string(),
         range: range.to_string(),
         resolved_version: version.to_string(),
+        kind: smudgy_cloud::DependencyKind::Dependency,
     }
 }
 
@@ -222,14 +241,7 @@ async fn offline_session_start_loads_published_packages_cache_first() {
     let sandbox_spec = "smudgy://arctic/offline-widget";
     shared_packages::install_package(server, sandbox_spec, UpdateMode::Auto, true).unwrap();
     shared_packages::record_resolution(server, sandbox_spec, "1.0.0", &sandbox_integrity).unwrap();
-    shared_packages::record_consent(
-        server,
-        sandbox_spec,
-        &PackageManifest::parse(sandbox_manifest)
-            .expect("valid manifest")
-            .permissions,
-    )
-    .unwrap();
+    record_consent(server, sandbox_spec, sandbox_manifest);
 
     // Trusted: a PINNED install (no prior resolution recorded), so the pin alone
     // determines the version. Runs in the main isolate, allow-all.
@@ -297,12 +309,12 @@ async fn offline_session_start_loads_published_packages_cache_first() {
 }
 
 /// A staged version whose cached closure union EXCEEDS the consented grant must not
-/// ride the disk fast path: the load falls back to the legacy `cap_version` walk — and
-/// with the cloud dead, that walk lands on its legacy offline behavior (serve the
-/// last-resolved version under exactly the permissions already granted). The network
-/// attempt is the proof the fast path declined.
+/// ride the disk fast path. The load falls back to the `cap_version` walk, which tries
+/// the cloud and then reuses the cached metadata to enforce the same permission gate
+/// offline. The package stays blocked until the user grants the added permission; it is
+/// never run with a silently reduced sandbox.
 #[tokio::test]
-async fn staged_version_exceeding_consent_falls_back_to_the_legacy_path() {
+async fn staged_version_exceeding_consent_is_refused_offline() {
     let server = "StagedOverAsk";
     prepare_server(server);
     let cloud = spawn_dead_cloud();
@@ -322,23 +334,25 @@ async fn staged_version_exceeding_consent_falls_back_to_the_legacy_path() {
     let spec = "smudgy://arctic/over-asker";
     shared_packages::install_package(server, spec, UpdateMode::Auto, true).unwrap();
     shared_packages::record_resolution(server, spec, "1.0.0", &integrity).unwrap();
-    let consented = PackageManifest::parse(
+    record_consent(
+        server,
+        spec,
         r#"{ "name": "over-asker", "version": "1.0.0",
              "permissions": { "smudgy": { "session": ["echo"] } } }"#,
-    )
-    .expect("valid manifest")
-    .permissions;
-    shared_packages::record_consent(server, spec, &consented).unwrap();
+    );
 
     let lines = run_session(9902, server, cloud.client()).await;
 
     assert!(
-        has_line(&lines, "OVERASK:LOADED"),
-        "the legacy offline fallback serves the staged version under the old grant: {lines:?}"
+        !has_line(&lines, "OVERASK:LOADED"),
+        "a version that exceeds consent must not run while offline: {lines:?}"
     );
     assert!(
-        !lines.iter().any(|l| l.contains("not loaded")),
-        "the offline fallback does not refuse the load: {lines:?}"
+        has_line(
+            &lines,
+            "available versions need more permissions than you've granted"
+        ),
+        "the session explains why the cached version stayed blocked: {lines:?}"
     );
     assert!(
         cloud.hits() > 0,
@@ -371,14 +385,7 @@ async fn missing_dep_meta_falls_back_to_the_legacy_path() {
     let spec = "smudgy://arctic/gap-root";
     shared_packages::install_package(server, spec, UpdateMode::Auto, true).unwrap();
     shared_packages::record_resolution(server, spec, "1.0.0", &integrity).unwrap();
-    shared_packages::record_consent(
-        server,
-        spec,
-        &PackageManifest::parse(manifest)
-            .expect("valid manifest")
-            .permissions,
-    )
-    .unwrap();
+    record_consent(server, spec, manifest);
 
     let lines = run_session(9903, server, cloud.client()).await;
 

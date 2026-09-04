@@ -16,47 +16,115 @@ use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::Element;
 use crate::theme::builtins;
 
-use smudgy_core::models::profile::{Profile, ProfileConfig, contains_password_token};
+use smudgy_core::models::profile::{
+    Profile, ProfileCas, ProfileConfig, clear_profile_password_if_unchanged,
+    contains_password_token, create_profile_if_server_unchanged, delete_profile_if_unchanged,
+    set_profile_password_if_unchanged, update_profile_if_unchanged,
+};
+use smudgy_core::models::server::Server;
+use smudgy_core::models::server::{self as server_model, ServerCas};
 
 use super::{
-    Message, ProfileCrudAction, ProfileFormField, ProfileName, ServerName, State,
+    AppliedProfileOperation, Message, ProfileCrudAction, ProfileFormField, ProfileOperationAction,
+    ProfileOperationCompletion, ProfileOperationEnvelope, ProfileOperationError,
+    ProfilePasswordAction, ProfilePasswordWarning, ServerName, State, next_profile_operation_id,
     profile_description_input_id, profile_name_input_id, profile_password_input_id,
     profile_send_on_connect_id,
 };
 
 // --- Profile CRUD Async Wrappers ---
 
-pub(super) async fn create_profile_async(
-    server_name: String,
-    profile_name: String,
-    config: smudgy_core::models::profile::ProfileConfig,
-) -> Result<smudgy_core::models::profile::Profile, String> {
-    smudgy_core::models::profile::create_profile(&server_name, &profile_name, config)
-        .map_err(|e| e.to_string())
+pub(super) async fn execute_profile_operation(
+    envelope: ProfileOperationEnvelope,
+) -> ProfileOperationCompletion {
+    let key = envelope.key();
+    let result = execute_profile_operation_inner(&envelope);
+    ProfileOperationCompletion { key, result }
 }
 
-pub(super) async fn update_profile_async(
-    server_name: String,
-    profile_name: String,
-    config: smudgy_core::models::profile::ProfileConfig,
-) -> Result<smudgy_core::models::profile::Profile, String> {
-    smudgy_core::models::profile::update_profile(&server_name, &profile_name, config)
-        .map_err(|e| e.to_string())
+fn execute_profile_operation_inner(
+    envelope: &ProfileOperationEnvelope,
+) -> Result<AppliedProfileOperation, ProfileOperationError> {
+    let failed = |error: anyhow::Error| ProfileOperationError::Failed(error.to_string());
+    let applied = match &envelope.action {
+        ProfileOperationAction::Create {
+            target_name,
+            config,
+        } => {
+            let profile = match create_profile_if_server_unchanged(
+                &envelope.server,
+                target_name,
+                config.clone(),
+            )
+            .map_err(failed)?
+            {
+                ProfileCas::Applied(profile) => profile,
+                ProfileCas::StateChanged => return Err(ProfileOperationError::StateChanged),
+            };
+            let password_warning = apply_password_action(envelope, &profile);
+            AppliedProfileOperation::Created(profile, password_warning)
+        }
+        ProfileOperationAction::Update {
+            expected, config, ..
+        } => {
+            match update_profile_if_unchanged(&envelope.server.name, expected, config.clone())
+                .map_err(failed)?
+            {
+                ProfileCas::Applied(profile) => {
+                    let password_warning = apply_password_action(envelope, &profile);
+                    AppliedProfileOperation::Updated(profile, password_warning)
+                }
+                ProfileCas::StateChanged => return Err(ProfileOperationError::StateChanged),
+            }
+        }
+        ProfileOperationAction::Delete { expected, .. } => {
+            match delete_profile_if_unchanged(&envelope.server.name, expected).map_err(failed)? {
+                ProfileCas::Applied(()) => AppliedProfileOperation::Deleted,
+                ProfileCas::StateChanged => return Err(ProfileOperationError::StateChanged),
+            }
+        }
+    };
+    Ok(applied)
 }
 
-pub(super) async fn delete_profile_async(
-    server_name: String,
-    profile_name: String,
-) -> Result<(ServerName, ProfileName), String> {
-    smudgy_core::models::profile::delete_profile(&server_name, &profile_name)
-        .map(|_| (server_name, profile_name)) // Return tuple on success
-        .map_err(|e| e.to_string())
+fn apply_password_action(
+    envelope: &ProfileOperationEnvelope,
+    profile: &Profile,
+) -> Option<ProfilePasswordWarning> {
+    let result = match &envelope.password {
+        ProfilePasswordAction::Keep => return None,
+        ProfilePasswordAction::Set(password) => {
+            set_profile_password_if_unchanged(&envelope.server.name, profile, password)
+        }
+        ProfilePasswordAction::Clear => {
+            clear_profile_password_if_unchanged(&envelope.server.name, profile)
+        }
+    };
+    match result {
+        Ok(ProfileCas::Applied(())) => None,
+        Ok(ProfileCas::StateChanged) => {
+            warn!(
+                "The profile changed before its captured auto-login password action could be applied"
+            );
+            Some(ProfilePasswordWarning::StateChanged)
+        }
+        Err(error) => {
+            warn!(
+                "Failed to apply the captured auto-login password action for '{}/{}': {error}",
+                envelope.server.name, profile.name
+            );
+            Some(ProfilePasswordWarning::Failed(error.to_string()))
+        }
+    }
 }
 
 // --- Profile Loaders ---
 
-pub(super) async fn load_profiles_async(server_name: String) -> Result<Vec<Profile>, String> {
-    smudgy_core::models::profile::list_profiles(&server_name).map_err(|e| e.to_string())
+pub(super) async fn load_profiles_async(server: Server) -> Result<ServerCas<Vec<Profile>>, String> {
+    server_model::with_server_if_unchanged(&server, |current| {
+        smudgy_core::models::profile::list_profiles(&current.name)
+    })
+    .map_err(|error| error.to_string())
 }
 
 // --- Update Logic ---
@@ -65,11 +133,13 @@ pub(super) async fn load_profiles_async(server_name: String) -> Result<Vec<Profi
 pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
     state.profile_crud_error = None; // Clear previous error
 
-    let server_name = if let Some(name) = state.selected_server.clone() {
-        name
-    } else {
-        warn!("Error: SubmitProfileForm called without a server selected.");
-        state.profile_crud_error = Some(t!("profile-error-no-server"));
+    if state.pending_profile_operation.is_some() {
+        return Task::none();
+    }
+
+    let Some(action) = state.profile_action.clone() else {
+        warn!("Error: SubmitProfileForm called without a profile action set.");
+        state.profile_crud_error = Some(t!("profile-error-action-missing"));
         return Task::none();
     };
 
@@ -84,8 +154,8 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
         return Task::none();
     }
 
-    match state.profile_action.clone() {
-        Some(ProfileCrudAction::Create) => {
+    let (server, operation_action) = match action {
+        ProfileCrudAction::Create { server } => {
             let config = ProfileConfig {
                 caption: state.profile_form_data.description.trim().to_string(),
                 send_on_connect: state.profile_form_send_on_connect_content.text(),
@@ -104,12 +174,15 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
                 state.profile_crud_error = Some(t!("profile-error-name-format"));
                 return Task::none();
             }
-            Task::perform(
-                create_profile_async(server_name, profile_name, config),
-                Message::ProfileCreated,
+            (
+                server,
+                ProfileOperationAction::Create {
+                    target_name: profile_name,
+                    config,
+                },
             )
         }
-        Some(ProfileCrudAction::Edit(original_profile_name)) => {
+        ProfileCrudAction::Edit { server, expected } => {
             let config = ProfileConfig {
                 caption: state.profile_form_data.description.trim().to_string(),
                 send_on_connect: state.profile_form_send_on_connect_content.text(),
@@ -119,22 +192,82 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
                     Some(t!("profile-error-config", "error" => e.to_string()));
                 return Task::none();
             }
-            Task::perform(
-                update_profile_async(server_name, original_profile_name, config),
-                Message::ProfileUpdated,
+            let target_name = expected.name.clone();
+            (
+                server,
+                ProfileOperationAction::Update {
+                    expected,
+                    target_name,
+                    config,
+                },
             )
         }
-        Some(ProfileCrudAction::ConfirmDelete(_)) => {
+        ProfileCrudAction::ConfirmDelete { .. } => {
             warn!("Error: SubmitProfileForm called during ConfirmDelete state.");
             state.profile_crud_error = Some(t!("profile-error-action-delete"));
-            Task::none()
+            return Task::none();
         }
-        None => {
-            warn!("Error: SubmitProfileForm called without a profile action set.");
-            state.profile_crud_error = Some(t!("profile-error-action-missing"));
-            Task::none()
-        }
+    };
+
+    let send_on_connect = match &operation_action {
+        ProfileOperationAction::Create { config, .. }
+        | ProfileOperationAction::Update { config, .. } => &config.send_on_connect,
+        ProfileOperationAction::Delete { .. } => unreachable!("form submit cannot delete"),
+    };
+    let password = captured_password_action(state, send_on_connect);
+    start_profile_operation(state, server, operation_action, password)
+}
+
+pub(super) fn handle_delete_profile(state: &mut State) -> Task<Message> {
+    state.profile_crud_error = None;
+    if state.pending_profile_operation.is_some() {
+        return Task::none();
     }
+    let Some(ProfileCrudAction::ConfirmDelete { server, expected }) = state.profile_action.clone()
+    else {
+        warn!("Error: ConfirmDeleteProfile called without an exact delete target.");
+        state.profile_crud_error = Some(t!("profile-error-delete-no-server"));
+        return Task::none();
+    };
+    let target_name = expected.name.clone();
+    start_profile_operation(
+        state,
+        server,
+        ProfileOperationAction::Delete {
+            expected,
+            target_name,
+        },
+        ProfilePasswordAction::Clear,
+    )
+}
+
+fn captured_password_action(state: &State, send_on_connect: &str) -> ProfilePasswordAction {
+    if !contains_password_token(send_on_connect) {
+        ProfilePasswordAction::Clear
+    } else if state.profile_form_password.trim().is_empty() {
+        ProfilePasswordAction::Keep
+    } else {
+        ProfilePasswordAction::Set(state.profile_form_password.clone())
+    }
+}
+
+fn start_profile_operation(
+    state: &mut State,
+    server: Server,
+    action: ProfileOperationAction,
+    password: ProfilePasswordAction,
+) -> Task<Message> {
+    let envelope = ProfileOperationEnvelope {
+        id: next_profile_operation_id(state),
+        server,
+        action,
+        password,
+        form_revision: state.profile_form_revision,
+    };
+    state.pending_profile_operation = Some(envelope.clone());
+    Task::perform(execute_profile_operation(envelope), |completion| {
+        Message::ProfileOperationFinished(completion)
+    })
 }
 
 // --- View Logic ---
@@ -145,7 +278,7 @@ pub(super) fn view_profile_form<'a>(
     action: &'a ProfileCrudAction,
 ) -> Element<'a, Message> {
     match action {
-        ProfileCrudAction::Create => {
+        ProfileCrudAction::Create { .. } => {
             let name_field = column![
                 field_label(t!("profile-name")),
                 TextInput::new(
@@ -160,15 +293,19 @@ pub(super) fn view_profile_form<'a>(
 
             let save_button = button(text(t!("profile-create")))
                 .style(builtins::button::primary)
-                .padding([8, 18])
-                .on_press(Message::SubmitProfileForm);
+                .padding([8, 18]);
+            let save_button = if state.pending_profile_operation.is_some() {
+                save_button
+            } else {
+                save_button.on_press(Message::SubmitProfileForm)
+            };
             let cancel_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
 
             Column::new()
-                .push(form_title(t!("profile-add"), state))
+                .push(form_title(t!("profile-add"), action.server_name()))
                 .push(name_field)
                 .push(description_field(state))
                 .push(on_connect_field(state))
@@ -177,29 +314,36 @@ pub(super) fn view_profile_form<'a>(
                 .spacing(15)
                 .into()
         }
-        ProfileCrudAction::Edit(name) => {
+        ProfileCrudAction::Edit { expected, .. } => {
             // Name is the profile key (rename isn't supported by the backend), so
             // it is shown read-only.
             let name_field = column![
                 field_label(t!("profile-name")),
-                text(name).size(Pixels(16.0)),
+                text(&expected.name).size(Pixels(16.0)),
             ]
             .spacing(4);
 
             let save_button = button(text(t!("action-save")))
                 .style(builtins::button::primary)
-                .padding([8, 18])
-                .on_press(Message::SubmitProfileForm);
+                .padding([8, 18]);
+            let save_button = if state.pending_profile_operation.is_some() {
+                save_button
+            } else {
+                save_button.on_press(Message::SubmitProfileForm)
+            };
             let cancel_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
-            let delete_button = button(text(t!("profile-delete")))
-                .style(builtins::button::link)
-                .on_press(Message::RequestConfirmDeleteProfile(name.clone()));
+            let delete_button = button(text(t!("profile-delete"))).style(builtins::button::link);
+            let delete_button = if state.pending_profile_operation.is_some() {
+                delete_button
+            } else {
+                delete_button.on_press(Message::RequestConfirmDeleteProfile)
+            };
 
             Column::new()
-                .push(form_title(t!("profile-edit"), state))
+                .push(form_title(t!("profile-edit"), action.server_name()))
                 .push(name_field)
                 .push(description_field(state))
                 .push(on_connect_field(state))
@@ -210,14 +354,18 @@ pub(super) fn view_profile_form<'a>(
                 .spacing(15)
                 .into()
         }
-        ProfileCrudAction::ConfirmDelete(name) => {
+        ProfileCrudAction::ConfirmDelete { expected, .. } => {
             let confirmation_text =
-                text(t!("profile-confirm-delete", "name" => name)).size(Pixels(16.0));
+                text(t!("profile-confirm-delete", "name" => &expected.name)).size(Pixels(16.0));
 
             let confirm_delete_button = button(text(t!("profile-confirm-delete-action")))
                 .style(builtins::button::secondary)
-                .padding([8, 18])
-                .on_press(Message::ConfirmDeleteProfile(name.clone()));
+                .padding([8, 18]);
+            let confirm_delete_button = if state.pending_profile_operation.is_some() {
+                confirm_delete_button
+            } else {
+                confirm_delete_button.on_press(Message::ConfirmDeleteProfile)
+            };
             let cancel_delete_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
@@ -245,8 +393,7 @@ fn field_label(label: String) -> Element<'static, Message> {
 }
 
 /// Form title: `{verb} · {server}`, with the owning server name muted.
-fn form_title<'a>(verb: String, state: &'a State) -> Element<'a, Message> {
-    let server = state.selected_server.as_deref().unwrap_or_default();
+fn form_title(verb: String, server: &str) -> Element<'_, Message> {
     Row::new()
         .push(text(verb).size(Pixels(22.0)))
         .push(
@@ -328,6 +475,14 @@ fn on_connect_field(state: &State) -> Element<'_, Message> {
 /// stored — a "Password saved" chip with Change / Clear actions.
 fn password_control(state: &State) -> Element<'_, Message> {
     if state.profile_form_password_stored && !state.profile_form_password_editing {
+        let clear_button = button(text(t!("profile-password-clear")).size(12))
+            .style(builtins::button::link)
+            .padding([2, 8]);
+        let clear_button = if state.pending_profile_operation.is_some() {
+            clear_button
+        } else {
+            clear_button.on_press(Message::ClearProfilePassword)
+        };
         Row::new()
             .push(
                 text(t!("profile-password-saved"))
@@ -341,12 +496,7 @@ fn password_control(state: &State) -> Element<'_, Message> {
                     .padding([2, 8])
                     .on_press(Message::RequestChangeProfilePassword),
             )
-            .push(
-                button(text(t!("profile-password-clear")).size(12))
-                    .style(builtins::button::link)
-                    .padding([2, 8])
-                    .on_press(Message::ClearProfilePassword),
-            )
+            .push(clear_button)
             .spacing(8)
             .align_y(Alignment::Center)
             .into()
@@ -359,7 +509,7 @@ fn password_control(state: &State) -> Element<'_, Message> {
             )
             .secure(true)
             .id(profile_password_input_id())
-            .on_input(Message::UpdateProfileFormPassword)
+            .on_input(|value| Message::UpdateProfileFormPassword(value.into()))
             .on_submit(Message::SubmitProfileForm),
         ]
         .spacing(4)

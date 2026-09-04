@@ -438,7 +438,9 @@ async fn resolve(
             })
         })
         .collect();
-    // Mirror the server: surface the locked deps in resolve-shape (drop the publish range).
+    // Mirror the server: surface the locked relations in resolve-shape. This mock's
+    // publish endpoint accepts code dependencies only, so each recorded edge is a
+    // `dependency`; dedicated wire tests cover `requires` deserialization.
     let dependencies: Vec<Value> = version
         .dependencies
         .as_array()
@@ -450,6 +452,7 @@ async fn resolve(
                         "name": d["name"],
                         "range": d["range"],
                         "resolved_version": d["resolved_version"],
+                        "kind": "dependency",
                     })
                 })
                 .collect()
@@ -791,6 +794,37 @@ async fn create_publish_resolve_fetch_round_trip() {
     assert_eq!(body, "export const x = 1;");
 }
 
+#[tokio::test]
+async fn pre_finalize_check_stops_the_immutable_version_commit() {
+    let (base_url, _state) = spawn_mock().await;
+    let api = client(&base_url);
+    let package = api
+        .create_package("snapshot-check", "Snapshot check")
+        .await
+        .unwrap();
+    let modules = vec![PublishModule {
+        subpath: "index.ts".to_string(),
+        content: b"export {};".to_vec(),
+        media_type: "application/typescript".to_string(),
+        is_entry: true,
+    }];
+    let manifest = json!({ "version": "1.0.0", "entry": "index.ts" });
+
+    let error = api
+        .publish_version_checked(package.id, "1.0.0", &manifest, &modules, &[], None, || {
+            Err(CloudError::InvalidInput(
+                "local snapshot changed".to_string(),
+            ))
+        })
+        .await
+        .expect_err("the final precondition must stop finalize");
+    assert!(matches!(error, CloudError::InvalidInput(_)));
+    assert!(
+        api.list_versions(package.id).await.unwrap().is_empty(),
+        "uploaded blobs do not make the immutable version visible without finalize"
+    );
+}
+
 /// A logged-out client (no credential) resolves + fetches a public package: the
 /// public read surface omits the auth header rather than short-circuiting with
 /// `Unauthorized`, so cloud-averse users can install and run public packages.
@@ -1057,6 +1091,10 @@ async fn resolve_carries_locked_dependencies() {
     assert_eq!(resolved.dependencies[0].name, "util");
     assert_eq!(resolved.dependencies[0].range, "^1.2");
     assert_eq!(resolved.dependencies[0].resolved_version, "1.4.0");
+    assert_eq!(
+        resolved.dependencies[0].kind,
+        smudgy_cloud::DependencyKind::Dependency
+    );
 }
 
 #[tokio::test]

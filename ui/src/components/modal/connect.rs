@@ -9,9 +9,11 @@ use crate::theme::builtins;
 // Keep core model imports
 use smudgy_core::models::observed::{ObservedServer, ObservedValue};
 use smudgy_core::models::profile::{
-    clear_profile_password, contains_password_token, has_profile_password, set_profile_password,
+    ProfileCas, clear_profile_password_if_unchanged, has_profile_password,
 };
-use smudgy_core::models::server::{link_url_host, load_server, update_server};
+use smudgy_core::models::server::{
+    ServerCas, link_url_host, load_server, update_server_if_unchanged, with_server_if_unchanged,
+};
 use smudgy_core::models::{profile::Profile, server::Server};
 use std::collections::HashMap;
 
@@ -23,10 +25,12 @@ mod server;
 mod tests;
 
 use profile::{
-    delete_profile_async, handle_submit_profile_form, load_profiles_async, view_profile_form,
+    handle_delete_profile, handle_submit_profile_form, load_profiles_async, view_profile_form,
     view_server_details_and_profiles,
 };
-use server::{delete_server_async, handle_submit_server_form, view_server_form, view_server_list};
+use server::{
+    execute_server_operation, handle_submit_server_form, view_server_form, view_server_list,
+};
 
 // --- Module-specific types ---
 
@@ -79,7 +83,7 @@ pub enum Message {
     // Data Loading. (Servers + the first server's profiles are loaded
     // synchronously up front in `State::opening`, so there is no `ServersLoaded`
     // round trip; `ProfilesLoaded` still backs selecting *other* servers.)
-    ProfilesLoaded(ServerName, Result<Vec<Profile>, String>),
+    ProfilesLoaded(u64, Server, Result<ServerCas<Vec<Profile>>, String>),
     // UI Interaction
     SelectServer(ServerName),
     // Handled in `update()` (maps to `Event::CloseModalRequested`); the parent
@@ -93,7 +97,7 @@ pub enum Message {
     RequestCreateServer,
     RequestEditServer(ServerName),
     RequestConfirmDeleteServer(ServerName), // User clicks delete in details view
-    ConfirmDeleteServer(ServerName),        // User confirms deletion
+    ConfirmDeleteServer,                    // User confirms deletion
     // Server Form Interaction
     UpdateServerFormField(ServerFormField, String),
     ToggleServerCompression(bool),
@@ -103,39 +107,35 @@ pub enum Message {
     SubmitServerForm,
     CancelServerForm,
     // Server CRUD Async Results
-    ServerCreated(Result<Server, String>),
-    ServerUpdated(Result<Server, String>),
-    ServerDeleted(Result<ServerName, String>), // Pass back name on success
+    ServerOperationFinished(ServerOperationCompletion),
     // --- Image cache (plan D10: per-server management in the edit pane) ---
-    ImageCacheUsageLoaded(u64, ServerName, u64), // (request id, server, bytes)
-    RequestClearImageCache(ServerName),
-    ImageCacheCleared(ServerName),
+    ImageCacheUsageLoaded(u64, Server, Result<ServerCas<u64>, String>),
+    RequestClearImageCache(Server),
+    ImageCacheCleared(u64, Server, Result<ServerCas<()>, String>),
     // --- Profile CRUD ---
     // UI Actions (act on selected_server)
     RequestCreateProfile,
     RequestEditProfile(ProfileName),
-    RequestConfirmDeleteProfile(ProfileName),
-    ConfirmDeleteProfile(ProfileName),
+    RequestConfirmDeleteProfile,
+    ConfirmDeleteProfile,
     // Form Interaction
     UpdateProfileFormField(ProfileFormField, String),
     UpdateProfileFormSendOnConnect(text_editor::Action),
     SubmitProfileForm,
     CancelProfileForm,
     // Auto-login password ($PASSWORD)
-    UpdateProfileFormPassword(String),
+    UpdateProfileFormPassword(ProfilePasswordInput),
     RequestChangeProfilePassword,
     ClearProfilePassword,
     // Async Results
-    ProfileCreated(Result<smudgy_core::models::profile::Profile, String>),
-    ProfileUpdated(Result<smudgy_core::models::profile::Profile, String>),
-    ProfileDeleted(Result<(ServerName, ProfileName), String>), // Need both names for state update
+    ProfileOperationFinished(ProfileOperationCompletion),
     // --- Observed-metadata band (server-supplied URLs; same trust gate as
     // --- server OSC 8 links, persisting into the same `server.json` grants) ---
     /// An MSSP `ICON` fetch settled: `Some` carries the display handle of the
     /// freshly cached artifact, `None` a refusal/failure (any cached icon
     /// keeps rendering).
-    ServerIconFetched(ServerName, Option<iced::widget::image::Handle>),
-    OpenObservedLink(ServerName, String),
+    ServerIconFetched(Server, Option<iced::widget::image::Handle>),
+    OpenObservedLink(Server, String),
     ObservedLinkGrantHost(bool),
     ObservedLinkGrantServer(bool),
     ObservedLinkProceed,
@@ -156,6 +156,22 @@ pub enum ServerFormField {
 pub enum ProfileFormField {
     Name,
     Description,
+}
+
+/// A password-field edit that stays redacted when an iced message is formatted for diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProfilePasswordInput(String);
+
+impl std::fmt::Debug for ProfilePasswordInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl From<String> for ProfilePasswordInput {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
 }
 
 /// Temporary storage for server form input.
@@ -204,16 +220,254 @@ pub struct ProfileConfigFormData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerCrudAction {
     Create,
-    Edit(ServerName),          // Stores the original name for the update operation
-    ConfirmDelete(ServerName), // Confirmation step before deleting
+    Edit(Server),
+    ConfirmDelete(Server),
+}
+
+/// The exact persistence request submitted by one server form. The task owns a clone; state
+/// retains this copy solely to authenticate its eventual completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ServerOperationEnvelope {
+    id: u64,
+    action: ServerOperationAction,
+    form_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ServerOperationAction {
+    Create {
+        target_name: ServerName,
+        config: smudgy_core::models::server::ServerConfig,
+    },
+    Update {
+        expected: Server,
+        config: smudgy_core::models::server::ServerConfig,
+    },
+    Delete {
+        expected: Server,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ServerOperationKind {
+    Create,
+    Update,
+    Delete,
+}
+
+/// Password-free identity echoed by a background task. Matching the complete key prevents a
+/// delayed or duplicate completion from consuming a newer pending operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ServerOperationKey {
+    id: u64,
+    target_name: ServerName,
+    kind: ServerOperationKind,
+}
+
+impl ServerOperationEnvelope {
+    fn key(&self) -> ServerOperationKey {
+        let (target_name, kind) = match &self.action {
+            ServerOperationAction::Create { target_name, .. } => {
+                (target_name.clone(), ServerOperationKind::Create)
+            }
+            ServerOperationAction::Update { expected, .. } => {
+                (expected.name.clone(), ServerOperationKind::Update)
+            }
+            ServerOperationAction::Delete { expected } => {
+                (expected.name.clone(), ServerOperationKind::Delete)
+            }
+        };
+        ServerOperationKey {
+            id: self.id,
+            target_name,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum AppliedServerOperation {
+    Created(Server),
+    Updated(Server),
+    Deleted,
+}
+
+/// Why a server operation did not apply. The compare-and-swap conflict is typed so its wording is
+/// translated where the completion is displayed rather than on the worker that observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ServerOperationError {
+    /// The stored server no longer matched the snapshot the form was opened from.
+    StateChanged,
+    Failed(String),
+}
+
+impl ServerOperationError {
+    /// The user-facing text for this failure of `action`, before the per-action wrapper.
+    fn localized(&self, action: &ServerOperationAction) -> String {
+        match self {
+            Self::StateChanged => match action {
+                ServerOperationAction::Delete { .. } => t!("server-error-delete-state-changed"),
+                ServerOperationAction::Create { .. } | ServerOperationAction::Update { .. } => {
+                    t!("server-error-state-changed")
+                }
+            },
+            Self::Failed(error) => error.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerOperationCompletion {
+    key: ServerOperationKey,
+    result: Result<AppliedServerOperation, ServerOperationError>,
 }
 
 /// Represents the current profile-related action being performed (if any).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileCrudAction {
-    Create,                     // Assumes context of state.selected_server
-    Edit(ProfileName),          // Assumes context of state.selected_server
-    ConfirmDelete(ProfileName), // Confirmation step before deleting
+    Create { server: Server },
+    Edit { server: Server, expected: Profile },
+    ConfirmDelete { server: Server, expected: Profile },
+}
+
+impl ProfileCrudAction {
+    fn server_name(&self) -> &str {
+        match self {
+            Self::Create { server }
+            | Self::Edit { server, .. }
+            | Self::ConfirmDelete { server, .. } => &server.name,
+        }
+    }
+}
+
+/// The password effect captured with a profile operation. Its custom `Debug` implementation keeps
+/// the credential out of messages, state diagnostics, and test-failure output.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum ProfilePasswordAction {
+    Keep,
+    Set(String),
+    Clear,
+}
+
+impl std::fmt::Debug for ProfilePasswordAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => formatter.write_str("Keep"),
+            Self::Set(_) => formatter.write_str("Set(<redacted>)"),
+            Self::Clear => formatter.write_str("Clear"),
+        }
+    }
+}
+
+/// The exact persistence request submitted by one profile form. The task owns a clone; state
+/// retains this copy solely to authenticate its eventual completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProfileOperationEnvelope {
+    id: u64,
+    server: Server,
+    action: ProfileOperationAction,
+    password: ProfilePasswordAction,
+    form_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProfileOperationAction {
+    Create {
+        target_name: ProfileName,
+        config: smudgy_core::models::profile::ProfileConfig,
+    },
+    Update {
+        expected: Profile,
+        target_name: ProfileName,
+        config: smudgy_core::models::profile::ProfileConfig,
+    },
+    Delete {
+        expected: Profile,
+        target_name: ProfileName,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProfileOperationKind {
+    Create,
+    Update,
+    Delete,
+}
+
+/// Password-free identity echoed by a background task. Matching the complete key prevents a
+/// delayed or duplicate completion from consuming a newer pending operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProfileOperationKey {
+    id: u64,
+    server_name: ServerName,
+    target_name: ProfileName,
+    kind: ProfileOperationKind,
+}
+
+impl ProfileOperationEnvelope {
+    fn key(&self) -> ProfileOperationKey {
+        let (target_name, kind) = match &self.action {
+            ProfileOperationAction::Create { target_name, .. } => {
+                (target_name.clone(), ProfileOperationKind::Create)
+            }
+            ProfileOperationAction::Update { target_name, .. } => {
+                (target_name.clone(), ProfileOperationKind::Update)
+            }
+            ProfileOperationAction::Delete { target_name, .. } => {
+                (target_name.clone(), ProfileOperationKind::Delete)
+            }
+        };
+        ProfileOperationKey {
+            id: self.id,
+            server_name: self.server.name.clone(),
+            target_name,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum AppliedProfileOperation {
+    Created(Profile, Option<ProfilePasswordWarning>),
+    Updated(Profile, Option<ProfilePasswordWarning>),
+    Deleted,
+}
+
+/// A password side effect that failed after the profile configuration had already committed.
+#[derive(Debug, Clone)]
+pub(super) enum ProfilePasswordWarning {
+    StateChanged,
+    Failed(String),
+}
+
+/// Why a profile operation did not apply. The compare-and-swap conflict is typed so its wording is
+/// translated where the completion is displayed rather than on the worker that observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProfileOperationError {
+    /// The stored server (for a create) or profile no longer matched the snapshot the form was
+    /// opened from.
+    StateChanged,
+    Failed(String),
+}
+
+impl ProfileOperationError {
+    /// The user-facing text for this failure of `action`, before the per-action wrapper.
+    fn localized(&self, action: &ProfileOperationAction) -> String {
+        match self {
+            Self::StateChanged => match action {
+                ProfileOperationAction::Create { .. } => t!("profile-error-server-state-changed"),
+                ProfileOperationAction::Update { .. } => t!("profile-error-state-changed"),
+                ProfileOperationAction::Delete { .. } => t!("profile-error-delete-state-changed"),
+            },
+            Self::Failed(error) => error.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileOperationCompletion {
+    key: ProfileOperationKey,
+    result: Result<AppliedProfileOperation, ProfileOperationError>,
 }
 
 /// One observed-metadata link (MSSP `DISCORD`/`WEBSITE`/`CONTACT`) held at
@@ -223,7 +477,7 @@ pub enum ProfileCrudAction {
 #[derive(Debug, Clone)]
 struct ObservedLinkConfirm {
     /// The server whose metadata supplied the URL (and whose grants apply).
-    server: ServerName,
+    server: Server,
     /// The gated URL, opened verbatim on Proceed.
     url: String,
     /// Safe, middle-elided display copy (invisible characters escaped).
@@ -259,6 +513,10 @@ pub struct State {
     selected_server: Option<ServerName>,
     is_loading_servers: bool,
     is_loading_profiles: Option<ServerName>,
+    /// Monotonic identity of the latest profile-list read.
+    profile_load_sequence: u64,
+    /// Exact server snapshot owned by the only profile-list read allowed to update this modal.
+    pending_profile_load: Option<(u64, Server)>,
     // --- Server CRUD State ---
     /// Tracks if we are currently creating or editing a server.
     server_action: Option<ServerCrudAction>,
@@ -266,6 +524,14 @@ pub struct State {
     server_form_data: ServerConfigFormData, // Use Default::default()
     /// Holds any error message related to server CRUD operations.
     server_crud_error: Option<String>,
+    /// Advances whenever the active server form or its contents change. A completion may
+    /// close/reset the form only while this still equals its submit-time snapshot.
+    server_form_revision: u64,
+    /// Monotonic source for server-operation completion keys.
+    server_operation_sequence: u64,
+    /// The one server operation allowed in flight. Its immutable envelope authenticates the
+    /// completion and prevents a second submit from racing the first.
+    pending_server_operation: Option<ServerOperationEnvelope>,
     // --- Profile CRUD State ---
     /// Tracks if we are currently creating or editing a profile.
     profile_action: Option<ProfileCrudAction>,
@@ -285,6 +551,14 @@ pub struct State {
     profile_form_password_stored: bool,
     /// Whether to show the password input (`true`) vs the "saved" chip (`false`).
     profile_form_password_editing: bool,
+    /// Advances whenever the active profile form or its owning server changes. A completion may
+    /// close/reset the form only while this still equals its submit-time snapshot.
+    profile_form_revision: u64,
+    /// Monotonic source for profile-operation completion keys.
+    profile_operation_sequence: u64,
+    /// The one operation allowed in flight. Its immutable envelope authenticates the completion
+    /// and prevents a second submit from racing the first.
+    pending_profile_operation: Option<ProfileOperationEnvelope>,
     /// On-disk bytes of the edited server's cached images (`None` while loading).
     /// Refreshed when the edit form opens and after "Clear image cache".
     image_cache_usage: Option<u64>,
@@ -301,7 +575,21 @@ impl std::fmt::Debug for State {
             .field("servers", &self.servers.len())
             .field("selected_server", &self.selected_server)
             .field("server_action", &self.server_action)
+            .field(
+                "pending_server_operation",
+                &self
+                    .pending_server_operation
+                    .as_ref()
+                    .map(ServerOperationEnvelope::key),
+            )
             .field("profile_action", &self.profile_action)
+            .field(
+                "pending_profile_operation",
+                &self
+                    .pending_profile_operation
+                    .as_ref()
+                    .map(ProfileOperationEnvelope::key),
+            )
             .field("profile_form_password", &"<redacted>")
             .field(
                 "profile_form_password_stored",
@@ -326,25 +614,35 @@ impl State {
         });
         if let Some(first) = servers.first() {
             let name = first.name.clone();
-            let mut profiles =
-                smudgy_core::models::profile::list_profiles(&name).unwrap_or_else(|e| {
-                    warn!("Failed to load profiles for '{name}': {e}");
-                    Vec::new()
-                });
-            profiles.sort_by(|a, b| a.name.cmp(&b.name));
+            let profiles = with_server_if_unchanged(first, |current| {
+                smudgy_core::models::profile::list_profiles(&current.name)
+            });
             state.selected_server = Some(name.clone());
             state
                 .last_sessions
-                .insert(name.clone(), load_last_session_profiles(&name));
-            state.profiles.insert(name, profiles);
+                .insert(name.clone(), load_last_session_profiles(first));
+            match profiles {
+                Ok(ServerCas::Applied(mut profiles)) => {
+                    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+                    state.profiles.insert(name, profiles);
+                }
+                Ok(ServerCas::StateChanged) => warn!(
+                    "Server '{name}' changed while the connect modal was opening; its profiles were not cached"
+                ),
+                Err(error) => warn!("Failed to load profiles for '{name}': {error}"),
+            }
         }
         // The observed sidecars are the same class of small local read; a
         // server without one simply has no entry (and no metadata band).
         state.observed = servers
             .iter()
             .filter_map(|server| {
-                smudgy_core::models::observed::load_observed(&server.name)
-                    .map(|observed| (server.name.clone(), observed))
+                match with_server_if_unchanged(server, |current| {
+                    Ok(smudgy_core::models::observed::load_observed(&current.name))
+                }) {
+                    Ok(ServerCas::Applied(Some(observed))) => Some((server.name.clone(), observed)),
+                    _ => None,
+                }
             })
             .collect();
         // Cached icons likewise (small PNGs of the icon pipeline's own
@@ -353,8 +651,12 @@ impl State {
         state.icons = servers
             .iter()
             .filter_map(|server| {
-                crate::images::server_icon::load_cached_icon(&server.name)
-                    .map(|handle| (server.name.clone(), handle))
+                match with_server_if_unchanged(server, |current| {
+                    Ok(crate::images::server_icon::load_cached_icon(&current.name))
+                }) {
+                    Ok(ServerCas::Applied(Some(handle))) => Some((server.name.clone(), handle)),
+                    _ => None,
+                }
             })
             .collect();
         state.servers = servers;
@@ -391,13 +693,8 @@ impl State {
                 continue;
             }
             tasks.push(Task::perform(
-                server_icon::fetch_and_cache(
-                    server.name.clone(),
-                    server.config.host.clone(),
-                    server.config.clone(),
-                    icon_value,
-                ),
-                |(name, handle)| Message::ServerIconFetched(name, handle),
+                server_icon::fetch_and_cache(server.clone(), icon_value),
+                |(server, handle)| Message::ServerIconFetched(server, handle),
             ));
         }
         Task::batch(tasks)
@@ -407,11 +704,21 @@ impl State {
     /// `SessionEvent::ObservedServerChanged`, so an open modal's metadata
     /// band tracks a live session's writes without file watching.
     pub fn refresh_observed(&mut self, server: &str) {
-        match smudgy_core::models::observed::load_observed(server) {
-            Some(observed) => {
+        let Some(expected) = self
+            .servers
+            .iter()
+            .find(|candidate| candidate.name == server)
+        else {
+            self.observed.remove(server);
+            return;
+        };
+        match with_server_if_unchanged(expected, |current| {
+            Ok(smudgy_core::models::observed::load_observed(&current.name))
+        }) {
+            Ok(ServerCas::Applied(Some(observed))) => {
                 self.observed.insert(server.to_string(), observed);
             }
-            None => {
+            Ok(ServerCas::Applied(None) | ServerCas::StateChanged) | Err(_) => {
                 self.observed.remove(server);
             }
         }
@@ -422,10 +729,17 @@ impl State {
 /// stored profile names in slot order, or `None` when no usable snapshot
 /// exists. A small local read, done synchronously like the rest of the
 /// modal's disk reads.
-fn load_last_session_profiles(server: &ServerName) -> Option<Vec<String>> {
-    let template = crate::workspace::last_session::read(server)?;
-    let profiles = crate::workspace::last_session::profile_names(&template);
-    (!profiles.is_empty()).then_some(profiles)
+fn load_last_session_profiles(server: &Server) -> Option<Vec<String>> {
+    match with_server_if_unchanged(server, |current| {
+        let Some(template) = crate::workspace::last_session::read(&current.name) else {
+            return Ok(None);
+        };
+        let profiles = crate::workspace::last_session::profile_names(&template);
+        Ok((!profiles.is_empty()).then_some(profiles))
+    }) {
+        Ok(ServerCas::Applied(profiles)) => profiles,
+        Ok(ServerCas::StateChanged) | Err(_) => None,
+    }
 }
 
 impl Default for State {
@@ -440,9 +754,14 @@ impl Default for State {
             selected_server: None,
             is_loading_servers: false, // Load triggered by update
             is_loading_profiles: None,
+            profile_load_sequence: 0,
+            pending_profile_load: None,
             server_action: None,
             server_form_data: ServerConfigFormData::default(),
             server_crud_error: None,
+            server_form_revision: 0,
+            server_operation_sequence: 0,
+            pending_server_operation: None,
             profile_action: None,
             profile_form_data: ProfileConfigFormData::default(),
             profile_form_send_on_connect_content: text_editor::Content::with_text(""),
@@ -451,6 +770,9 @@ impl Default for State {
             profile_form_password: String::new(),
             profile_form_password_stored: false,
             profile_form_password_editing: false,
+            profile_form_revision: 0,
+            profile_operation_sequence: 0,
+            pending_profile_operation: None,
             image_cache_usage: None,
             image_cache_usage_request: 0,
         }
@@ -468,16 +790,57 @@ impl State {
     }
 }
 
-// --- Image cache helpers (blocking I/O, run via Task::perform) ---
+// --- Profile-list and image-cache helpers (blocking I/O, run via Task::perform) ---
 
-async fn load_image_cache_usage(server: ServerName) -> (ServerName, u64) {
-    let bytes = crate::images::server_image_cache_usage_bytes(&server);
-    (server, bytes)
+fn start_profile_load(state: &mut State, server: Server) -> Task<Message> {
+    state.profile_load_sequence = state.profile_load_sequence.wrapping_add(1);
+    if state.profile_load_sequence == 0 {
+        state.profile_load_sequence = 1;
+    }
+    let request = state.profile_load_sequence;
+    state.is_loading_profiles = Some(server.name.clone());
+    state.pending_profile_load = Some((request, server.clone()));
+    Task::perform(load_profiles_async(server.clone()), move |result| {
+        Message::ProfilesLoaded(request, server.clone(), result)
+    })
 }
 
-async fn clear_image_cache_async(server: ServerName) -> ServerName {
-    crate::images::clear_server_image_cache(&server);
-    server
+fn cancel_profile_load(state: &mut State) {
+    state.pending_profile_load = None;
+    state.is_loading_profiles = None;
+}
+
+fn cancel_profile_load_for(state: &mut State, server: &Server) {
+    if state
+        .pending_profile_load
+        .as_ref()
+        .is_some_and(|(_, pending)| pending == server)
+    {
+        cancel_profile_load(state);
+    }
+}
+
+fn next_image_cache_request(state: &mut State) -> u64 {
+    state.image_cache_usage_request = state.image_cache_usage_request.wrapping_add(1);
+    if state.image_cache_usage_request == 0 {
+        state.image_cache_usage_request = 1;
+    }
+    state.image_cache_usage_request
+}
+
+async fn load_image_cache_usage(server: Server) -> Result<ServerCas<u64>, String> {
+    with_server_if_unchanged(&server, |current| {
+        Ok(crate::images::server_image_cache_usage_bytes(&current.name))
+    })
+    .map_err(|error| error.to_string())
+}
+
+async fn clear_image_cache_async(server: Server) -> Result<ServerCas<()>, String> {
+    with_server_if_unchanged(&server, |current| {
+        crate::images::clear_server_image_cache(&current.name);
+        Ok(())
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Open a URL in the system browser, detached; a failure is logged, never
@@ -491,6 +854,232 @@ fn open_url_in_browser(url: &str) {
 
 // --- Auto-login password helpers ---
 
+pub(super) fn advance_server_form_revision(state: &mut State) {
+    state.server_form_revision = state.server_form_revision.wrapping_add(1);
+}
+
+fn clear_server_form(state: &mut State) {
+    state.server_action = None;
+    state.server_form_data = ServerConfigFormData::default();
+    state.server_crud_error = None;
+    advance_server_form_revision(state);
+}
+
+pub(super) fn next_server_operation_id(state: &mut State) -> u64 {
+    state.server_operation_sequence = state.server_operation_sequence.wrapping_add(1);
+    if state.server_operation_sequence == 0 {
+        state.server_operation_sequence = 1;
+    }
+    state.server_operation_sequence
+}
+
+#[derive(Debug)]
+enum ServerCacheApplication {
+    Created(Server),
+    Updated(Server),
+    Deleted { expected: Server, removed: bool },
+    Ignored,
+}
+
+fn apply_server_operation_to_cache(
+    state: &mut State,
+    pending: &ServerOperationEnvelope,
+    applied: &AppliedServerOperation,
+) -> ServerCacheApplication {
+    match (&pending.action, applied) {
+        (
+            ServerOperationAction::Create { target_name, .. },
+            AppliedServerOperation::Created(created),
+        ) if created.name == *target_name => {
+            if let Some(current) = state
+                .servers
+                .iter()
+                .find(|server| server.name == created.name)
+            {
+                if current == created {
+                    return ServerCacheApplication::Created(created.clone());
+                }
+                // A same-name server from a different lifetime, or a newer snapshot of this
+                // lifetime, wins over this delayed completion.
+                return ServerCacheApplication::Ignored;
+            }
+            state.servers.push(created.clone());
+            state
+                .servers
+                .sort_by(|left, right| left.name.cmp(&right.name));
+            ServerCacheApplication::Created(created.clone())
+        }
+        (
+            ServerOperationAction::Update { expected, .. },
+            AppliedServerOperation::Updated(updated),
+        ) if updated.name == expected.name => {
+            let Some(current) = state
+                .servers
+                .iter_mut()
+                .find(|server| server.name == expected.name)
+            else {
+                return ServerCacheApplication::Ignored;
+            };
+            if current == expected {
+                *current = updated.clone();
+                ServerCacheApplication::Updated(updated.clone())
+            } else if current == updated {
+                // A list refresh may have observed the successful write before its task replied.
+                ServerCacheApplication::Updated(updated.clone())
+            } else {
+                ServerCacheApplication::Ignored
+            }
+        }
+        (ServerOperationAction::Delete { expected }, AppliedServerOperation::Deleted) => {
+            let removed = state
+                .servers
+                .iter()
+                .position(|server| server == expected)
+                .is_some_and(|index| {
+                    state.servers.remove(index);
+                    true
+                });
+            ServerCacheApplication::Deleted {
+                expected: expected.clone(),
+                removed,
+            }
+        }
+        _ => ServerCacheApplication::Ignored,
+    }
+}
+
+fn handle_server_operation_completion(
+    state: &mut State,
+    completion: ServerOperationCompletion,
+) -> Task<Message> {
+    let Some(pending) = state.pending_server_operation.as_ref() else {
+        warn!("Ignoring a server-operation completion because no operation is pending");
+        return Task::none();
+    };
+    if pending.key() != completion.key {
+        warn!(
+            "Ignoring stale server-operation completion {:?}; pending operation is {:?}",
+            completion.key,
+            pending.key()
+        );
+        return Task::none();
+    }
+
+    let pending = state
+        .pending_server_operation
+        .take()
+        .expect("the matching pending operation was just observed");
+    let form_is_unchanged = state.server_form_revision == pending.form_revision;
+    let result = match completion.result {
+        Ok(applied) => apply_server_operation_to_cache(state, &pending, &applied),
+        Err(error) => {
+            let error = error.localized(&pending.action);
+            warn!("Server operation {:?} failed: {error}", pending.key());
+            if form_is_unchanged {
+                state.server_crud_error = Some(match pending.action {
+                    ServerOperationAction::Create { .. } => {
+                        t!("server-error-create", "error" => &error)
+                    }
+                    ServerOperationAction::Update { .. } => {
+                        t!("server-error-update", "error" => &error)
+                    }
+                    ServerOperationAction::Delete { .. } => {
+                        t!("server-error-delete", "error" => &error)
+                    }
+                });
+            }
+            return Task::none();
+        }
+    };
+
+    match result {
+        ServerCacheApplication::Created(created) if form_is_unchanged => {
+            clear_server_form(state);
+            let name = created.name.clone();
+            state.selected_server = Some(name.clone());
+            let load_task = start_profile_load(state, created.clone());
+
+            state.profile_action = Some(ProfileCrudAction::Create { server: created });
+            state.profile_form_data = ProfileConfigFormData::default();
+            state.profile_form_send_on_connect_content = text_editor::Content::new();
+            state.profile_crud_error = None;
+            state.profile_form_password = String::new();
+            state.profile_form_password_stored = false;
+            state.profile_form_password_editing = true;
+            advance_profile_form_revision(state);
+            Task::batch([load_task, operation::focus(profile_name_input_id())])
+        }
+        ServerCacheApplication::Updated(updated) if form_is_unchanged => {
+            clear_server_form(state);
+            state.selected_server = Some(updated.name);
+            Task::none()
+        }
+        ServerCacheApplication::Deleted { expected, removed } => {
+            if form_is_unchanged {
+                clear_server_form(state);
+            }
+            if !removed {
+                // The list already moved on (most importantly, to a same-name replacement).
+                return Task::none();
+            }
+
+            let name = expected.name.clone();
+            cancel_profile_load_for(state, &expected);
+            state.profiles.remove(&name);
+            state.last_sessions.remove(&name);
+            state.observed.remove(&name);
+            state.icons.remove(&name);
+            if state
+                .link_confirm
+                .as_ref()
+                .is_some_and(|pending| pending.server == expected)
+            {
+                state.link_confirm = None;
+            }
+            if state
+                .pending_profile_operation
+                .as_ref()
+                .is_some_and(|profile_operation| profile_operation.server == expected)
+            {
+                state.pending_profile_operation = None;
+            }
+            if state
+                .profile_action
+                .as_ref()
+                .is_some_and(|action| match action {
+                    ProfileCrudAction::Create { server }
+                    | ProfileCrudAction::Edit { server, .. }
+                    | ProfileCrudAction::ConfirmDelete { server, .. } => server == &expected,
+                })
+            {
+                clear_profile_form(state);
+            }
+
+            if state.selected_server.as_ref() != Some(&name) {
+                return Task::none();
+            }
+            if let Some(first_server) = state.servers.first() {
+                let fallback_server = first_server.clone();
+                let fallback = fallback_server.name.clone();
+                state.selected_server = Some(fallback.clone());
+                start_profile_load(state, fallback_server)
+            } else {
+                state.selected_server = None;
+                cancel_profile_load(state);
+                Task::none()
+            }
+        }
+        ServerCacheApplication::Ignored => {
+            warn!(
+                "Server-operation completion {:?} did not match its immutable request or current cache",
+                pending.key()
+            );
+            Task::none()
+        }
+        ServerCacheApplication::Created(_) | ServerCacheApplication::Updated(_) => Task::none(),
+    }
+}
+
 /// Clears the transient password-form state (buffer + flags). Called whenever a
 /// profile form is closed or submitted.
 fn reset_password_form(state: &mut State) {
@@ -499,36 +1088,178 @@ fn reset_password_form(state: &mut State) {
     state.profile_form_password_editing = false;
 }
 
-/// Keeps the OS keyring in sync with a just-saved profile's auto-login text:
-/// - `$PASSWORD` present and a new password was typed → store it;
-/// - `$PASSWORD` absent → drop any previously-stored password (it can never be
-///   used), so removing the token also forgets the secret.
-///
-/// The buffer is cleared afterward. Best effort — the profile itself already saved,
-/// so a keyring failure is logged rather than surfaced.
-fn persist_profile_password(
-    state: &mut State,
-    server_name: &str,
-    profile_name: &str,
-    send_on_connect: &str,
-) {
-    let result = if !contains_password_token(send_on_connect) {
-        // Token removed → drop any stored password (it can never be used again).
-        clear_profile_password(server_name, profile_name)
-    } else if state.profile_form_password.trim().is_empty() {
-        // Token present but nothing newly typed → keep whatever is already stored.
-        // (Matches the submit-gate check, which also trims, so a whitespace-only
-        // buffer isn't mistakenly stored as the password.)
-        Ok(())
-    } else {
-        set_profile_password(server_name, profile_name, &state.profile_form_password)
-    };
-    if let Err(e) = result {
-        warn!(
-            "Failed to update stored auto-login password for '{server_name}/{profile_name}': {e}"
-        );
-    }
+pub(super) fn advance_profile_form_revision(state: &mut State) {
+    state.profile_form_revision = state.profile_form_revision.wrapping_add(1);
+}
+
+fn clear_profile_form(state: &mut State) {
+    state.profile_action = None;
+    state.profile_form_data = ProfileConfigFormData::default();
+    state.profile_form_send_on_connect_content = text_editor::Content::new();
+    state.profile_crud_error = None;
     reset_password_form(state);
+    advance_profile_form_revision(state);
+}
+
+pub(super) fn next_profile_operation_id(state: &mut State) -> u64 {
+    state.profile_operation_sequence = state.profile_operation_sequence.wrapping_add(1);
+    if state.profile_operation_sequence == 0 {
+        state.profile_operation_sequence = 1;
+    }
+    state.profile_operation_sequence
+}
+
+fn handle_profile_operation_completion(state: &mut State, completion: ProfileOperationCompletion) {
+    let Some(pending) = state.pending_profile_operation.as_ref() else {
+        warn!("Ignoring a profile-operation completion because no operation is pending");
+        return;
+    };
+    if pending.key() != completion.key {
+        warn!(
+            "Ignoring stale profile-operation completion {:?}; pending operation is {:?}",
+            completion.key,
+            pending.key()
+        );
+        return;
+    }
+
+    let pending = state
+        .pending_profile_operation
+        .take()
+        .expect("the matching pending operation was just observed");
+    let form_is_unchanged = state.profile_form_revision == pending.form_revision;
+    match completion.result {
+        Ok(applied) => {
+            // A profile mutation is newer than any list read started for the same exact server.
+            // Cancel that read before updating the cache so its delayed completion cannot replace
+            // this result with an older snapshot.
+            cancel_profile_load_for(state, &pending.server);
+            if !apply_profile_operation_to_cache(state, &pending, &applied) {
+                warn!(
+                    "Profile-operation completion {:?} did not match its immutable request",
+                    pending.key()
+                );
+            }
+            let saved_with_password_warning = match &applied {
+                AppliedProfileOperation::Created(profile, Some(warning))
+                | AppliedProfileOperation::Updated(profile, Some(warning)) => {
+                    let message = match warning {
+                        ProfilePasswordWarning::StateChanged => t!(
+                            "profile-warning-password-state-changed",
+                            "server" => &pending.server.name,
+                            "profile" => &profile.name
+                        ),
+                        ProfilePasswordWarning::Failed(error) => t!(
+                            "profile-warning-password-failed",
+                            "server" => &pending.server.name,
+                            "profile" => &profile.name,
+                            "error" => error
+                        ),
+                    };
+                    if form_is_unchanged {
+                        // The profile configuration is committed. Keep the form open as an edit
+                        // of that exact result, retain any typed password, and let Save retry only
+                        // the password side effect plus an idempotent config write.
+                        state.profile_action = Some(ProfileCrudAction::Edit {
+                            server: pending.server.clone(),
+                            expected: profile.clone(),
+                        });
+                        state.profile_form_data = ProfileConfigFormData {
+                            name: profile.name.clone(),
+                            description: profile.config.caption.clone(),
+                        };
+                        state.profile_form_send_on_connect_content =
+                            text_editor::Content::with_text(&profile.config.send_on_connect);
+                        advance_profile_form_revision(state);
+                    }
+                    // Always surface a partial commit, even if the user opened a different form
+                    // while the operation was pending. The message names the affected profile.
+                    state.profile_crud_error = Some(message);
+                    true
+                }
+                _ => false,
+            };
+            if form_is_unchanged && !saved_with_password_warning {
+                clear_profile_form(state);
+            }
+        }
+        Err(error) => {
+            let error = error.localized(&pending.action);
+            warn!("Profile operation {:?} failed: {error}", pending.key());
+            if form_is_unchanged {
+                state.profile_crud_error = Some(match pending.action {
+                    ProfileOperationAction::Create { .. } => {
+                        t!("profile-error-create", "error" => &error)
+                    }
+                    ProfileOperationAction::Update { .. } => {
+                        t!("profile-error-update", "error" => &error)
+                    }
+                    ProfileOperationAction::Delete { .. } => {
+                        t!("profile-error-delete", "error" => &error)
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn apply_profile_operation_to_cache(
+    state: &mut State,
+    pending: &ProfileOperationEnvelope,
+    applied: &AppliedProfileOperation,
+) -> bool {
+    let profiles = state
+        .profiles
+        .entry(pending.server.name.clone())
+        .or_default();
+    match (&pending.action, applied) {
+        (
+            ProfileOperationAction::Create { target_name, .. },
+            AppliedProfileOperation::Created(created, _),
+        ) if created.name == *target_name => {
+            if let Some(current) = profiles
+                .iter_mut()
+                .find(|profile| profile.name == created.name)
+            {
+                // The cached entry is either this creation or a newer snapshot of the same
+                // profile; either way it wins over this delayed completion.
+                let _ = current;
+                return true;
+            }
+            profiles.push(created.clone());
+            profiles.sort_by(|left, right| left.name.cmp(&right.name));
+            true
+        }
+        (
+            ProfileOperationAction::Update {
+                expected,
+                target_name,
+                ..
+            },
+            AppliedProfileOperation::Updated(updated, _),
+        ) if updated.name == *target_name && expected.name == *target_name => {
+            if let Some(current) = profiles
+                .iter_mut()
+                .find(|profile| profile.name == updated.name)
+                && *current == *expected
+            {
+                *current = updated.clone();
+                profiles.sort_by(|left, right| left.name.cmp(&right.name));
+            }
+            true
+        }
+        (
+            ProfileOperationAction::Delete {
+                expected,
+                target_name,
+            },
+            AppliedProfileOperation::Deleted,
+        ) if expected.name == *target_name => {
+            profiles.retain(|profile| profile != expected);
+            true
+        }
+        _ => false,
+    }
 }
 
 // --- Update Logic ---
@@ -541,53 +1272,69 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
     // Clear server CRUD error on most actions unless explicitly set
     if !matches!(
         message,
-        Message::SubmitServerForm
-            | Message::ServerCreated(_)
-            | Message::ServerUpdated(_)
-            | Message::ServerDeleted(_)
+        Message::SubmitServerForm | Message::ServerOperationFinished(_)
     ) {
         state.server_crud_error = None;
     }
 
     match message {
-        Message::ProfilesLoaded(server_name, Ok(mut profiles)) => {
-            // Add mut for sorting
-            if state.is_loading_profiles.as_ref() == Some(&server_name) {
-                state.is_loading_profiles = None;
+        Message::ProfilesLoaded(request, server, result) => {
+            if state.pending_profile_load.as_ref() != Some(&(request, server.clone())) {
+                warn!(
+                    "Ignoring stale profile-list completion for '{}' (request {request})",
+                    server.name
+                );
+                return (task, event);
             }
-            // Sort profiles by name for consistent display
-            profiles.sort_by(|a, b| a.name.cmp(&b.name));
-            state.profiles.insert(server_name, profiles);
-        }
-        Message::ProfilesLoaded(server_name, Err(e)) => {
-            if state.is_loading_profiles.as_ref() == Some(&server_name) {
-                state.is_loading_profiles = None;
+            cancel_profile_load(state);
+            if !state.servers.iter().any(|current| current == &server) {
+                warn!(
+                    "Ignoring profile-list completion because server '{}' changed in the modal",
+                    server.name
+                );
+                return (task, event);
             }
-            let err_msg = t!(
-                "profiles-error-load",
-                "server" => &server_name,
-                "error" => e.to_string()
-            );
-            warn!("{err_msg}");
-            state.profile_crud_error = Some(err_msg); // Display error to user
+            match result {
+                Ok(ServerCas::Applied(mut profiles)) => {
+                    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+                    state.profiles.insert(server.name, profiles);
+                }
+                Ok(ServerCas::StateChanged) => {
+                    warn!(
+                        "Profile list for '{}' was not applied because the server changed",
+                        server.name
+                    );
+                }
+                Err(error) => {
+                    let err_msg = t!(
+                        "profiles-error-load",
+                        "server" => &server.name,
+                        "error" => error
+                    );
+                    warn!("{err_msg}");
+                    state.profile_crud_error = Some(err_msg);
+                }
+            }
         }
         Message::SelectServer(server_name) => {
             if state.selected_server.as_ref() != Some(&server_name) {
+                clear_server_form(state);
+                clear_profile_form(state);
                 let server_name_clone = server_name.clone();
                 state.selected_server = Some(server_name_clone.clone());
-                state
-                    .last_sessions
-                    .entry(server_name_clone.clone())
-                    .or_insert_with(|| load_last_session_profiles(&server_name_clone));
-                if !state.profiles.contains_key(&server_name_clone) {
-                    state.is_loading_profiles = Some(server_name_clone.clone());
-                    task = Task::perform(
-                        load_profiles_async(server_name_clone.clone()),
-                        move |result| {
-                            let name = server_name_clone.clone();
-                            Message::ProfilesLoaded(name, result)
-                        },
-                    );
+                if let Some(server) = state
+                    .servers
+                    .iter()
+                    .find(|server| server.name == server_name_clone)
+                    .cloned()
+                {
+                    state
+                        .last_sessions
+                        .entry(server_name_clone.clone())
+                        .or_insert_with(|| load_last_session_profiles(&server));
+                    if !state.profiles.contains_key(&server_name_clone) {
+                        task = start_profile_load(state, server);
+                    }
                 }
             }
         }
@@ -596,41 +1343,42 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
         }
         Message::ConnectProfile(server_name, profile_name) => {
             // Cancel any ongoing server CRUD action if user connects
-            state.server_action = None;
-            state.server_form_data = ServerConfigFormData::default();
-            state.server_crud_error = None;
+            clear_server_form(state);
             event = Some(Event::Connect(server_name, profile_name));
         }
         Message::OpenOfflineProfile(server_name, profile_name) => {
             // Same housekeeping as `ConnectProfile`; the parent opens the session
             // without establishing a connection.
-            state.server_action = None;
-            state.server_form_data = ServerConfigFormData::default();
-            state.server_crud_error = None;
+            clear_server_form(state);
             event = Some(Event::OpenOffline(server_name, profile_name));
         }
         Message::RestoreLastSession(server_name) => {
             // Same housekeeping as `ConnectProfile`; the parent drives the
             // full user-restore flow from the server's stored snapshot.
-            state.server_action = None;
-            state.server_form_data = ServerConfigFormData::default();
-            state.server_crud_error = None;
+            clear_server_form(state);
             event = Some(Event::RestoreLastSession(server_name));
         }
         Message::RequestCreateServer => {
             state.server_action = Some(ServerCrudAction::Create);
             state.server_form_data = ServerConfigFormData::default(); // Clear form
             state.server_crud_error = None;
+            advance_server_form_revision(state);
             state.selected_server = None; // De-select server when opening create form
-            state.is_loading_profiles = None; // Cancel profile load
+            cancel_profile_load(state);
             // `+ New Server` is persistent, so it can be pressed while a profile
             // form is open; drop that form so it doesn't resurface on cancel.
-            state.profile_action = None;
+            clear_profile_form(state);
             task = operation::focus(server_name_input_id());
         }
         Message::RequestEditServer(server_name) => {
-            if let Some(server_to_edit) = state.servers.iter().find(|s| s.name == server_name) {
-                state.server_action = Some(ServerCrudAction::Edit(server_name.clone()));
+            if let Some(server_to_edit) = state
+                .servers
+                .iter()
+                .find(|s| s.name == server_name)
+                .cloned()
+            {
+                clear_profile_form(state);
+                state.server_action = Some(ServerCrudAction::Edit(server_to_edit.clone()));
                 state.server_form_data = ServerConfigFormData {
                     name: server_to_edit.name.clone(), // Pre-fill name (though not directly editable usually)
                     host: server_to_edit.config.host.clone(),
@@ -646,14 +1394,17 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     tls_verify: server_to_edit.config.tls_verify,
                 };
                 state.server_crud_error = None;
-                state.is_loading_profiles = None; // Cancel profile load
+                advance_server_form_revision(state);
+                cancel_profile_load(state);
                 // The usage figure loads off-thread (it stats cache files).
                 state.image_cache_usage = None;
-                state.image_cache_usage_request += 1;
-                let request = state.image_cache_usage_request;
+                let request = next_image_cache_request(state);
+                let usage_server = server_to_edit.clone();
                 let usage_task = Task::perform(
-                    load_image_cache_usage(server_name.clone()),
-                    move |(name, bytes)| Message::ImageCacheUsageLoaded(request, name, bytes),
+                    load_image_cache_usage(usage_server.clone()),
+                    move |result| {
+                        Message::ImageCacheUsageLoaded(request, usage_server.clone(), result)
+                    },
                 );
                 state.selected_server = Some(server_name); // Ensure server remains selected
                 // Name isn't editable in edit mode; focus the first editable field.
@@ -663,39 +1414,95 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             }
         }
         Message::RequestConfirmDeleteServer(server_name) => {
-            state.server_action = Some(ServerCrudAction::ConfirmDelete(server_name));
-            state.server_crud_error = None;
-            state.profile_action = None; // Ensure profile form is hidden
+            if state.pending_server_operation.is_some() {
+                warn!("Ignoring server delete request while an operation is pending");
+            } else if let Some(expected) = state
+                .servers
+                .iter()
+                .find(|server| server.name == server_name)
+                .cloned()
+            {
+                state.server_action = Some(ServerCrudAction::ConfirmDelete(expected));
+                state.server_crud_error = None;
+                advance_server_form_revision(state);
+                clear_profile_form(state);
+            } else {
+                warn!("Ignoring a delete request for missing server '{server_name}'");
+            }
         }
-        Message::ConfirmDeleteServer(server_name) => {
-            state.server_crud_error = None;
-            task = Task::perform(delete_server_async(server_name), Message::ServerDeleted);
-            // The state.server_action remains ConfirmDelete until ServerDeleted result arrives.
+        Message::ConfirmDeleteServer => {
+            if state.pending_server_operation.is_some() {
+                warn!("Ignoring server delete because an operation is already pending");
+            } else if let Some(ServerCrudAction::ConfirmDelete(expected)) =
+                state.server_action.clone()
+            {
+                state.server_crud_error = None;
+                let envelope = ServerOperationEnvelope {
+                    id: next_server_operation_id(state),
+                    action: ServerOperationAction::Delete { expected },
+                    form_revision: state.server_form_revision,
+                };
+                state.pending_server_operation = Some(envelope.clone());
+                task = Task::perform(
+                    execute_server_operation(envelope),
+                    Message::ServerOperationFinished,
+                );
+            } else {
+                warn!("Ignoring server delete without an exact confirmation snapshot");
+            }
         }
-        Message::ImageCacheUsageLoaded(request, server_name, bytes) => {
+        Message::ImageCacheUsageLoaded(request, server, result) => {
             // Stale replies are dropped: an older request's answer (slow scan racing a
             // post-clear re-read), or one for a form the user has moved on from.
             if request == state.image_cache_usage_request
-                && matches!(&state.server_action, Some(ServerCrudAction::Edit(name)) if *name == server_name)
+                && matches!(&state.server_action, Some(ServerCrudAction::Edit(expected)) if expected == &server)
             {
-                state.image_cache_usage = Some(bytes);
+                match result {
+                    Ok(ServerCas::Applied(bytes)) => state.image_cache_usage = Some(bytes),
+                    Ok(ServerCas::StateChanged) => warn!(
+                        "Image-cache usage for '{}' was discarded because the server changed",
+                        server.name
+                    ),
+                    Err(error) => warn!(
+                        "Failed to read image-cache usage for '{}': {error}",
+                        server.name
+                    ),
+                }
             }
         }
-        Message::RequestClearImageCache(server_name) => {
-            state.image_cache_usage = None; // shows the pending state
-            task = Task::perform(
-                clear_image_cache_async(server_name),
-                Message::ImageCacheCleared,
-            );
+        Message::RequestClearImageCache(server) => {
+            if matches!(&state.server_action, Some(ServerCrudAction::Edit(expected)) if expected == &server)
+            {
+                state.image_cache_usage = None; // shows the pending state
+                let request = next_image_cache_request(state);
+                task = Task::perform(clear_image_cache_async(server.clone()), move |result| {
+                    Message::ImageCacheCleared(request, server.clone(), result)
+                });
+            }
         }
-        Message::ImageCacheCleared(server_name) => {
-            // Re-read rather than assume zero — a concurrent session may already be
-            // caching again.
-            state.image_cache_usage_request += 1;
-            let request = state.image_cache_usage_request;
-            task = Task::perform(load_image_cache_usage(server_name), move |(name, bytes)| {
-                Message::ImageCacheUsageLoaded(request, name, bytes)
-            });
+        Message::ImageCacheCleared(request, server, result) => {
+            if request != state.image_cache_usage_request
+                || !matches!(&state.server_action, Some(ServerCrudAction::Edit(expected)) if expected == &server)
+            {
+                return (task, event);
+            }
+            match result {
+                Ok(ServerCas::Applied(())) => {
+                    // Re-read rather than assume zero — a concurrent session may already be
+                    // caching again.
+                    let usage_request = next_image_cache_request(state);
+                    task = Task::perform(load_image_cache_usage(server.clone()), move |result| {
+                        Message::ImageCacheUsageLoaded(usage_request, server.clone(), result)
+                    });
+                }
+                Ok(ServerCas::StateChanged) => {
+                    state.server_crud_error = Some(t!("server-error-cache-changed"));
+                }
+                Err(error) => {
+                    state.server_crud_error =
+                        Some(t!("server-error-cache-clear", "error" => error));
+                }
+            }
         }
         Message::UpdateServerFormField(field, value) => {
             // Only update if in Create or Edit mode
@@ -710,6 +1517,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     ServerFormField::Encoding => state.server_form_data.encoding = value,
                 }
                 state.server_crud_error = None; // Clear error when user types
+                advance_server_form_revision(state);
             }
         }
         Message::ToggleServerCompression(value) => {
@@ -718,6 +1526,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
             ) {
                 state.server_form_data.compression = value;
+                advance_server_form_revision(state);
             }
         }
         Message::ToggleServerMccp4Compression(value) => {
@@ -726,6 +1535,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
             ) {
                 state.server_form_data.mccp4_compression = value;
+                advance_server_form_revision(state);
             }
         }
         Message::ToggleServerTls(value) => {
@@ -734,6 +1544,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
             ) {
                 state.server_form_data.tls = value;
+                advance_server_form_revision(state);
             }
         }
         Message::ToggleServerTlsVerify(value) => {
@@ -742,6 +1553,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
             ) {
                 state.server_form_data.tls_verify = value;
+                advance_server_form_revision(state);
             }
         }
         Message::SubmitServerForm => {
@@ -749,145 +1561,30 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
         }
         Message::CancelServerForm => {
             // Clear action, form data, and error regardless of previous state
-            state.server_action = None;
-            state.server_form_data = ServerConfigFormData::default();
-            state.server_crud_error = None;
+            clear_server_form(state);
             // If a server was selected before opening the form (e.g., for Edit or ConfirmDelete),
             // we don't explicitly re-select it here. The user can click it again in the list.
             // This keeps the cancellation logic simple.
         }
-        Message::ServerCreated(result) => {
-            match result {
-                Ok(new_server) => {
-                    state.server_action = None;
-                    state.server_form_data = ServerConfigFormData::default();
-                    state.server_crud_error = None;
-
-                    // Add to list and sort (optional, but good for UI)
-                    state.servers.push(new_server.clone());
-                    state.servers.sort_by(|a, b| a.name.cmp(&b.name));
-
-                    // Select the new server and trigger profile load
-                    let server_name_clone = new_server.name.clone();
-                    state.selected_server = Some(server_name_clone.clone());
-                    state.is_loading_profiles = Some(server_name_clone.clone());
-                    let load_task =
-                        Task::perform(load_profiles_async(server_name_clone.clone()), move |res| {
-                            let name = server_name_clone.clone();
-                            Message::ProfilesLoaded(name, res)
-                        });
-
-                    // "Save & add profile" flows straight into the Add-profile
-                    // form for the new server, removing a navigation step on first
-                    // connect. `ServerCreated` only fires for the create path, so this
-                    // chaining is correct (edit goes through `ServerUpdated`).
-                    state.profile_action = Some(ProfileCrudAction::Create);
-                    state.profile_form_data = ProfileConfigFormData::default();
-                    state.profile_form_send_on_connect_content = text_editor::Content::new();
-                    state.profile_crud_error = None;
-                    state.profile_form_password = String::new();
-                    state.profile_form_password_stored = false;
-                    state.profile_form_password_editing = true;
-
-                    task = Task::batch([load_task, operation::focus(profile_name_input_id())]);
-                }
-                Err(e) => {
-                    state.server_crud_error =
-                        Some(t!("server-error-create", "error" => e.to_string()));
-                }
-            }
-        }
-        Message::ServerUpdated(result) => {
-            match result {
-                Ok(updated_server) => {
-                    state.server_action = None;
-                    state.server_form_data = ServerConfigFormData::default();
-                    state.server_crud_error = None;
-
-                    // Find and update in the list
-                    if let Some(server_in_list) = state
-                        .servers
-                        .iter_mut()
-                        .find(|s| s.name == updated_server.name)
-                    {
-                        *server_in_list = updated_server.clone();
-                    } else {
-                        warn!(
-                            "Error: Updated server '{}' not found in list after update.",
-                            updated_server.name
-                        );
-                    }
-                    state.selected_server = Some(updated_server.name);
-                }
-                Err(e) => {
-                    state.server_crud_error =
-                        Some(t!("server-error-update", "error" => e.to_string()));
-                }
-            }
-        }
-        Message::ServerDeleted(result) => {
-            match result {
-                Ok(deleted_name) => {
-                    state.server_crud_error = None; // Clear any previous error
-                    state.server_action = None; // Ensure action is cleared after successful delete
-
-                    // Remove from server list
-                    state.servers.retain(|s| s.name != deleted_name);
-                    // Remove from profiles map
-                    state.profiles.remove(&deleted_name);
-                    // Its probed last-session offer, observed sidecar copy,
-                    // and icon retire with it (the on-disk files went with the
-                    // server's directory).
-                    state.last_sessions.remove(&deleted_name);
-                    state.observed.remove(&deleted_name);
-                    state.icons.remove(&deleted_name);
-
-                    // If the deleted server was selected, select the first one or none
-                    if state.selected_server.as_ref() == Some(&deleted_name) {
-                        if let Some(first_server) = state.servers.first() {
-                            let server_name_clone = first_server.name.clone();
-                            state.selected_server = Some(server_name_clone.clone());
-                            state.is_loading_profiles = Some(server_name_clone.clone());
-                            task = Task::perform(
-                                load_profiles_async(server_name_clone.clone()),
-                                move |res| {
-                                    let name = server_name_clone.clone();
-                                    Message::ProfilesLoaded(name, res)
-                                },
-                            );
-                        } else {
-                            state.selected_server = None;
-                            state.is_loading_profiles = None;
-                        }
-                    }
-                    // No need to clear server_action etc. as delete happens outside the form flow
-                }
-                Err(e) => {
-                    // Show error, maybe associate with the server if possible?
-                    state.server_crud_error =
-                        Some(t!("server-error-delete", "error" => e.to_string()));
-                    warn!("Failed to delete server: {e}");
-                    // If deletion failed while confirming, reset state back to None
-                    // (or maybe back to Edit if that was the origin? Simpler to just reset)
-                    if matches!(
-                        state.server_action,
-                        Some(ServerCrudAction::ConfirmDelete(_))
-                    ) {
-                        state.server_action = None;
-                    }
-                }
-            }
+        Message::ServerOperationFinished(completion) => {
+            task = handle_server_operation_completion(state, completion);
         }
         Message::RequestCreateProfile => {
-            if state.selected_server.is_some() {
-                state.profile_action = Some(ProfileCrudAction::Create);
+            if let Some(server) = state
+                .selected_server
+                .as_ref()
+                .and_then(|selected| state.servers.iter().find(|server| server.name == *selected))
+                .cloned()
+            {
+                state.profile_action = Some(ProfileCrudAction::Create { server });
                 state.profile_form_data = ProfileConfigFormData::default();
                 state.profile_form_send_on_connect_content = text_editor::Content::new();
                 state.profile_crud_error = None;
                 state.profile_form_password = String::new();
                 state.profile_form_password_stored = false;
                 state.profile_form_password_editing = true;
-                state.server_action = None; // Hide server form
+                advance_profile_form_revision(state);
+                clear_server_form(state);
                 task = operation::focus(profile_name_input_id());
             } else {
                 warn!("Error: Cannot create profile, no server selected.");
@@ -895,13 +1592,23 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
         }
         Message::RequestEditProfile(profile_name) => {
             // Ensure a server is selected first
-            if let Some(server_name) = &state.selected_server {
+            if let Some(server_name) = state.selected_server.clone() {
+                let server = state
+                    .servers
+                    .iter()
+                    .find(|server| server.name == server_name)
+                    .cloned();
                 // Find the profile within the selected server's profile list
-                if let Some(profile_vec) = state.profiles.get(server_name) {
+                if let (Some(server), Some(profile_vec)) =
+                    (server, state.profiles.get(&server_name))
+                {
                     if let Some(profile_to_edit) =
-                        profile_vec.iter().find(|p| p.name == profile_name)
+                        profile_vec.iter().find(|p| p.name == profile_name).cloned()
                     {
-                        state.profile_action = Some(ProfileCrudAction::Edit(profile_name.clone()));
+                        state.profile_action = Some(ProfileCrudAction::Edit {
+                            server,
+                            expected: profile_to_edit.clone(),
+                        });
                         state.profile_form_data = ProfileConfigFormData {
                             name: profile_to_edit.name.clone(), // Pre-fill name for context (won't be editable in form)
                             description: profile_to_edit.config.caption.clone(),
@@ -911,13 +1618,14 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                                 profile_to_edit.config.send_on_connect.as_str(),
                             );
                         state.profile_crud_error = None;
-                        state.server_action = None; // Hide server form if it was open
+                        clear_server_form(state);
                         // Reflect whether a password is already stored for this
                         // profile: show the "saved" chip if so, the input if not.
-                        let stored = has_profile_password(server_name, &profile_name);
+                        let stored = has_profile_password(&server_name, &profile_name);
                         state.profile_form_password = String::new();
                         state.profile_form_password_stored = stored;
                         state.profile_form_password_editing = !stored;
+                        advance_profile_form_revision(state);
                         // Name isn't editable in edit mode; focus the first editable field.
                         task = operation::focus(profile_description_input_id());
                     } else {
@@ -934,25 +1642,19 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 warn!("Error: Cannot edit profile, no server selected.");
             }
         }
-        Message::RequestConfirmDeleteProfile(profile_name) => {
-            state.profile_action = Some(ProfileCrudAction::ConfirmDelete(profile_name));
-            state.profile_crud_error = None;
-        }
-        Message::ConfirmDeleteProfile(profile_name) => {
-            state.profile_crud_error = None;
-            // Let's try calling the async task directly for simplicity.
-            if let Some(server_name) = state.selected_server.clone() {
-                // Use if let for safety
+        Message::RequestConfirmDeleteProfile => {
+            if state.pending_profile_operation.is_some() {
+                warn!("Ignoring profile delete request while an operation is pending");
+            } else if let Some(ProfileCrudAction::Edit { server, expected }) =
+                state.profile_action.clone()
+            {
+                state.profile_action = Some(ProfileCrudAction::ConfirmDelete { server, expected });
                 state.profile_crud_error = None;
-                task = Task::perform(
-                    delete_profile_async(server_name, profile_name),
-                    Message::ProfileDeleted,
-                );
-            } else {
-                warn!("Error: Cannot delete profile, no server selected during confirmation.");
-                state.profile_crud_error = Some(t!("profile-error-delete-no-server"));
-                state.profile_action = None;
+                advance_profile_form_revision(state);
             }
+        }
+        Message::ConfirmDeleteProfile => {
+            task = handle_delete_profile(state);
         }
         Message::UpdateProfileFormField(field, value) => {
             match field {
@@ -960,160 +1662,86 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 ProfileFormField::Description => state.profile_form_data.description = value,
             }
             state.profile_crud_error = None;
+            advance_profile_form_revision(state);
         }
         Message::UpdateProfileFormSendOnConnect(action) => {
             state.profile_form_send_on_connect_content.perform(action);
+            state.profile_crud_error = None;
+            advance_profile_form_revision(state);
         }
         Message::SubmitProfileForm => {
             task = handle_submit_profile_form(state);
         }
         Message::CancelProfileForm => {
-            state.profile_action = None;
-            state.profile_form_data = ProfileConfigFormData::default();
-            state.profile_form_send_on_connect_content = text_editor::Content::new(); // Reset editor content
-            state.profile_crud_error = None;
-            reset_password_form(state);
+            clear_profile_form(state);
         }
         Message::UpdateProfileFormPassword(value) => {
-            state.profile_form_password = value;
+            state.profile_form_password = value.0;
             state.profile_crud_error = None;
+            advance_profile_form_revision(state);
         }
         Message::RequestChangeProfilePassword => {
             // Reveal the input to enter a replacement password.
             state.profile_form_password = String::new();
             state.profile_form_password_editing = true;
+            advance_profile_form_revision(state);
             task = operation::focus(profile_password_input_id());
         }
         Message::ClearProfilePassword => {
             // Drop the stored password now (this is the only destructive action and
             // the user asked for it explicitly), then show the empty input again.
-            if let (Some(server_name), Some(ProfileCrudAction::Edit(profile_name))) =
-                (&state.selected_server, &state.profile_action)
+            if state.pending_profile_operation.is_none()
+                && let Some(ProfileCrudAction::Edit { server, expected }) = &state.profile_action
             {
-                // Clear the stored secret now — this is an explicit user action.
-                let cleared = clear_profile_password(server_name, profile_name);
-                if let Err(e) = cleared {
-                    state.profile_crud_error =
-                        Some(format!("Failed to clear stored password: {e}"));
-                }
-            }
-            state.profile_form_password = String::new();
-            state.profile_form_password_stored = false;
-            state.profile_form_password_editing = true;
-        }
-        Message::ProfileCreated(result) => {
-            match result {
-                Ok(new_profile) => {
-                    if let Some(server_name) = state.selected_server.clone() {
-                        persist_profile_password(
-                            state,
-                            &server_name,
-                            &new_profile.name,
-                            &new_profile.config.send_on_connect,
-                        );
-                    } else {
-                        reset_password_form(state);
+                match clear_profile_password_if_unchanged(&server.name, expected) {
+                    Ok(ProfileCas::Applied(())) => {
+                        state.profile_form_password = String::new();
+                        state.profile_form_password_stored = false;
+                        state.profile_form_password_editing = true;
+                        advance_profile_form_revision(state);
                     }
-                    state.profile_action = None;
-                    state.profile_form_data = ProfileConfigFormData::default();
-                    state.profile_crud_error = None;
-
-                    // Need to find the server name this profile belongs to.
-                    // This relies on the create action having been initiated with a selected server.
-                    // A more robust approach might involve the async task returning the server name.
-                    // For now, assume state.selected_server holds the relevant server.
-                    if let Some(server_name) = &state.selected_server {
-                        if let Some(server_profiles) = state.profiles.get_mut(server_name) {
-                            server_profiles.push(new_profile.clone());
-                            server_profiles.sort_by(|a, b| a.name.cmp(&b.name)); // Sort by name
-                        } else {
-                            warn!(
-                                "Error: Server '{}' not found in profile map after creating profile '{}'",
-                                server_name, new_profile.name
-                            );
-                        }
-                    } else {
-                        warn!("Error: No server selected after profile creation finished.")
+                    Ok(ProfileCas::StateChanged) => {
+                        state.profile_crud_error = Some(t!("profile-error-password-state-changed"));
                     }
-                    // Keep the current server selected
-                }
-                Err(e) => {
-                    state.profile_crud_error =
-                        Some(t!("profile-error-create", "error" => e.to_string()));
+                    Err(error) => {
+                        state.profile_crud_error = Some(t!(
+                            "profile-error-password-clear",
+                            "error" => error.to_string()
+                        ));
+                    }
                 }
             }
         }
-        Message::ProfileUpdated(result) => {
-            match result {
-                Ok(updated_profile) => {
-                    if let Some(server_name) = state.selected_server.clone() {
-                        persist_profile_password(
-                            state,
-                            &server_name,
-                            &updated_profile.name,
-                            &updated_profile.config.send_on_connect,
-                        );
-                    } else {
-                        reset_password_form(state);
-                    }
-                    state.profile_action = None;
-                    state.profile_form_data = ProfileConfigFormData::default();
-                    state.profile_crud_error = None;
-
-                    // Assume state.selected_server holds the relevant server context
-                    if let Some(server_name) = &state.selected_server {
-                        if let Some(server_profiles) = state.profiles.get_mut(server_name) {
-                            if let Some(profile_in_list) = server_profiles
-                                .iter_mut()
-                                .find(|p| p.name == updated_profile.name)
-                            {
-                                *profile_in_list = updated_profile.clone();
-                                server_profiles.sort_by(|a, b| a.name.cmp(&b.name)); // Sort by name
-                            } else {
-                                warn!(
-                                    "Error: Updated profile '{}' not found in list for server '{}'",
-                                    updated_profile.name, server_name
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "Error: Server '{}' not found in profile map after updating profile '{}'",
-                                server_name, updated_profile.name
-                            );
-                        }
-                    } else {
-                        warn!("Error: No server selected after profile update finished.")
-                    }
-                    // Keep the current server selected
-                }
-                Err(e) => {
-                    state.profile_crud_error =
-                        Some(t!("profile-error-update", "error" => e.to_string()));
-                }
-            }
+        Message::ProfileOperationFinished(completion) => {
+            handle_profile_operation_completion(state, completion);
         }
-        Message::ServerIconFetched(server_name, handle) => {
+        Message::ServerIconFetched(server, handle) => {
             // `None` (refusal or failure) keeps whatever was cached before.
-            if let Some(handle) = handle {
-                state.icons.insert(server_name, handle);
+            if let Some(handle) = handle
+                && state.servers.iter().any(|current| current == &server)
+            {
+                state.icons.insert(server.name, handle);
             }
         }
-        Message::OpenObservedLink(server_name, url) => {
+        Message::OpenObservedLink(server, url) => {
             // The same per-server gate a server OSC 8 link passes: a granted
             // host (or a blanket grant) opens directly, anything else is held
             // for the user's verdict. The URL is server-supplied input.
+            if !state.servers.iter().any(|current| current == &server) {
+                warn!(
+                    "Ignoring an observed-link action because server '{}' changed",
+                    server.name
+                );
+                return (task, event);
+            }
             let host = link_url_host(&url);
-            let allowed = state
-                .servers
-                .iter()
-                .find(|s| s.name == server_name)
-                .is_some_and(|s| s.config.allows_server_link(host.as_deref()));
+            let allowed = server.config.allows_server_link(host.as_deref());
             if allowed {
                 open_url_in_browser(&url);
             } else {
                 state.link_confirm = Some(ObservedLinkConfirm {
                     display: observed::safe_url_display(&url),
-                    server: server_name,
+                    server,
                     url,
                     host,
                     grant_host: false,
@@ -1142,73 +1770,47 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     // clobbered by a stale whole-config snapshot; fall back
                     // to the modal's copy if the load fails. The in-memory
                     // copy adopts the result so the gate reflects it now.
-                    let config =
-                        load_server(&pending.server)
-                            .map(|s| s.config)
-                            .ok()
-                            .or_else(|| {
-                                state
-                                    .servers
-                                    .iter()
-                                    .find(|s| s.name == pending.server)
-                                    .map(|s| s.config.clone())
-                            });
-                    if let Some(mut config) = config {
-                        if pending.grant_server {
-                            config.trust_all_links = true;
+                    match load_server(&pending.server.name) {
+                        Ok(current) => {
+                            let mut config = current.config.clone();
+                            if pending.grant_server {
+                                config.trust_all_links = true;
+                            }
+                            if pending.grant_host
+                                && let Some(host) = &pending.host
+                            {
+                                config.grant_link_host(host);
+                            }
+                            match update_server_if_unchanged(&current, config) {
+                                Ok(ServerCas::Applied(updated)) => {
+                                    if let Some(cached) = state
+                                        .servers
+                                        .iter_mut()
+                                        .find(|server| server.name == updated.name)
+                                    {
+                                        *cached = updated;
+                                    }
+                                    // A fresh grant may have unlocked an icon held at the
+                                    // same trust gate (icons and links share the store).
+                                    task = state.icon_refresh_task();
+                                }
+                                Ok(ServerCas::StateChanged) => warn!(
+                                    "Link-trust grant was not saved because server '{}' changed; the user can retry it",
+                                    pending.server.name
+                                ),
+                                Err(error) => warn!(
+                                    "Failed to persist link-trust grants for '{}': {error}",
+                                    pending.server.name
+                                ),
+                            }
                         }
-                        if pending.grant_host
-                            && let Some(host) = &pending.host
-                        {
-                            config.grant_link_host(host);
-                        }
-                        if let Err(e) = update_server(&pending.server, config.clone()) {
-                            warn!(
-                                "Failed to persist link-trust grants for '{}': {e}",
-                                pending.server
-                            );
-                        }
-                        if let Some(server) =
-                            state.servers.iter_mut().find(|s| s.name == pending.server)
-                        {
-                            server.config = config;
-                        }
-                        // A fresh grant may have unlocked an icon held at the
-                        // same trust gate (icons and links share the store).
-                        task = state.icon_refresh_task();
+                        Err(error) => warn!(
+                            "Failed to load server '{}' before saving link trust: {error}",
+                            pending.server.name
+                        ),
                     }
                 }
                 open_url_in_browser(&pending.url);
-            }
-        }
-        Message::ProfileDeleted(result) => {
-            match result {
-                Ok((server_name, deleted_profile_name)) => {
-                    state.profile_crud_error = None;
-                    state.profile_action = None; // Ensure action is cleared after successful delete
-
-                    // Remove from the map
-                    if let Some(server_profiles) = state.profiles.get_mut(&server_name) {
-                        server_profiles.retain(|p| p.name != deleted_profile_name);
-                    } else {
-                        warn!(
-                            "Warning: Server '{server_name}' not found in profile map when handling deletion of profile '{deleted_profile_name}'"
-                        );
-                    }
-                    // If the current server is the one affected, we might want to refresh
-                    // its view, but no need to change selection unless the server itself was deleted.
-                }
-                Err(e) => {
-                    // Show error, maybe associate with the server if possible?
-                    state.profile_crud_error =
-                        Some(t!("profile-error-delete", "error" => e.to_string()));
-                    warn!("Failed to delete profile: {e}");
-                    // Keep the confirmation state active so the user sees the error
-                    // Or maybe reset to Edit state? Let's reset to Edit.
-                    if let Some(ProfileCrudAction::ConfirmDelete(name)) = &state.profile_action {
-                        state.profile_action = Some(ProfileCrudAction::Edit(name.clone()));
-                    }
-                }
             }
         }
     }

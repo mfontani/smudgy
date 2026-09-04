@@ -3,7 +3,7 @@
 
 use iced::alignment::Vertical;
 use iced::gradient::Linear;
-use iced::widget::{column, container, mouse_area, row, text};
+use iced::widget::{Space, button, column, container, mouse_area, row, text};
 use iced::{Background, Border, Color, Gradient, Length, Padding};
 
 use crate::assets::fonts;
@@ -71,6 +71,57 @@ pub fn regular(theme: &Theme) -> text::Style {
     }
 }
 
+/// A quiet text tab with the same active underline used by automation action editors.
+pub fn tab<'a>(
+    label: impl Into<String>,
+    active: bool,
+    message: Message,
+) -> ThemedElement<'a, Message> {
+    let label = label.into();
+    button(
+        column![
+            text(label)
+                .size(13.0)
+                .style(if active { regular } else { muted }),
+            container(Space::new())
+                .height(Length::Fixed(2.0))
+                .width(Length::Fill)
+                .style(move |_theme: &Theme| container::Style {
+                    background: Some(Background::Color(if active {
+                        KIND_PATTERN
+                    } else {
+                        Color::TRANSPARENT
+                    })),
+                    ..Default::default()
+                }),
+        ]
+        .spacing(4.0),
+    )
+    .style(|_theme: &Theme, _status| iced::widget::button::Style {
+        background: None,
+        ..Default::default()
+    })
+    .padding(Padding {
+        top: 4.0,
+        bottom: 0.0,
+        left: 2.0,
+        right: 2.0,
+    })
+    .on_press(message)
+    .into()
+}
+
+/// Add a textual dirty-state marker to a tab label. The marker remains visible without color and
+/// is included in the button's accessible label.
+pub fn unsaved_tab_label(label: impl Into<String>, unsaved: bool) -> String {
+    let label = label.into();
+    if unsaved {
+        crate::i18n::t!("automation-tab-unsaved", "label" => &label)
+    } else {
+        label
+    }
+}
+
 pub fn accent(theme: &Theme) -> text::Style {
     // The accent purple reads dark on the surface; lift it for legible accents.
     let a = theme.styles.general.accent;
@@ -101,6 +152,7 @@ pub fn warning(theme: &Theme) -> text::Style {
 /// The color of a status dot for `status`.
 pub fn status_color(theme: &Theme, status: NodeStatus) -> Color {
     match status {
+        NodeStatus::Neutral => theme.styles.text.normal.scale_alpha(0.65),
         NodeStatus::Ok => theme.styles.text.success,
         NodeStatus::Error => theme.styles.text.error,
         // The theme has no dedicated warn slot; a warm amber reads as "attention, not broken"
@@ -240,6 +292,31 @@ pub fn badge<'a>(label: impl Into<String>) -> ThemedElement<'a, Message> {
 pub fn dep_tag<'a>() -> ThemedElement<'a, Message> {
     container(
         text(crate::i18n::t!("badge-dependency"))
+            .size(9.0)
+            .style(faint),
+    )
+    .padding(Padding {
+        top: 1.0,
+        bottom: 1.0,
+        left: 5.0,
+        right: 5.0,
+    })
+    .style(|theme: &Theme| container::Style {
+        background: None,
+        border: Border {
+            color: theme.styles.general.border,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The small `REQ` tag shown for a package that must run as a separate root.
+pub fn required_tag<'a>() -> ThemedElement<'a, Message> {
+    container(
+        text(crate::i18n::t!("badge-required"))
             .size(9.0)
             .style(faint),
     )
@@ -415,4 +492,17 @@ pub fn top_gradient(highlight: Color, base: Color) -> Background {
             .add_stop(0.06, base)
             .add_stop(1.0, base),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsaved_tab_label;
+
+    #[test]
+    fn ui_audit_unsaved_tab_marker_is_textual_and_keeps_the_tab_name() {
+        assert_eq!(unsaved_tab_label("Source", false), "Source");
+        let marked = unsaved_tab_label("Source", true);
+        assert!(marked.contains("Source"));
+        assert_ne!(marked, "Source");
+    }
 }

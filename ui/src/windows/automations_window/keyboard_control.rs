@@ -246,17 +246,25 @@ where
 
         let pointer_pressed = match event {
             Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
-                cursor.is_over(layout.bounds())
+                Some(cursor.is_over(layout.bounds()))
             }
             Event::Touch(iced::touch::Event::FingerPressed { position, .. }) => {
-                layout.bounds().contains(*position)
+                Some(layout.bounds().contains(*position))
             }
-            _ => false,
+            _ => None,
         };
-        if pointer_pressed {
-            shell.publish((self.on_focus)());
-            shell.capture_event();
-            return;
+        match pointer_pressed {
+            Some(true) => {
+                shell.publish((self.on_focus)());
+                shell.capture_event();
+                return;
+            }
+            // A press anywhere else hands the keyboard to whatever was pressed, the way a text
+            // input gives up its caret: the wrapper must stop swallowing arrow keys for it.
+            Some(false) => {
+                tree.state.downcast_mut::<State>().focused = false;
+            }
+            None => {}
         }
 
         if shell.is_event_captured() {
@@ -533,6 +541,58 @@ mod tests {
         );
         assert!(messages.is_empty());
         assert_eq!(status, iced::event::Status::Ignored);
+    }
+
+    #[test]
+    fn pointer_press_outside_the_wrapper_releases_its_keys() {
+        let id = Id::from("keyboard-control-outside-test".to_string());
+        let content: TestElement<'_> = Space::new().width(40).height(20).into();
+        let mut control = KeyboardControl::new(
+            content,
+            id.clone(),
+            || TestMessage::Focus,
+            |key, repeat| {
+                if matches!(key, Key::Named(Named::ArrowRight)) {
+                    KeyAction::Publish(TestMessage::Select(1))
+                } else {
+                    activation(key, repeat, TestMessage::Activate)
+                }
+            },
+        );
+        let mut tree = Tree::new(&control as &dyn Widget<TestMessage, iced::Theme, ()>);
+        let node = control.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(100.0, 100.0)),
+        );
+        let mut focus = focusable::focus::<()>(id);
+        control.operate(&mut tree, Layout::new(&node), &(), &mut focus);
+
+        let (messages, _) = update(
+            &mut control,
+            &mut tree,
+            &node,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            mouse::Cursor::Available(Point::new(300.0, 300.0)),
+        );
+        assert!(
+            messages.is_empty(),
+            "a press elsewhere is not a focus request"
+        );
+
+        let (messages, status) = update(
+            &mut control,
+            &mut tree,
+            &node,
+            &key_event(Key::Named(Named::ArrowRight), true),
+            mouse::Cursor::Unavailable,
+        );
+        assert!(messages.is_empty());
+        assert_eq!(
+            status,
+            iced::event::Status::Ignored,
+            "arrow keys belong to whatever was pressed"
+        );
     }
 
     #[test]

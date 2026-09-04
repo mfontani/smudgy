@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use anyhow::{Context, Error as AnyError, bail};
+use anyhow::{Error as AnyError, bail};
 use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
@@ -183,6 +183,9 @@ deno_core::extension!(
   options = {
     session_id: SessionId,
     server_name: Arc<String>,
+    profile_name: Arc<String>,
+    local_package_names: Arc<std::collections::HashMap<String, String>>,
+    local_catalog_error: Option<Arc<str>>,
     script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
     spawned_actions: ActionQueue,
     ui_command_producer: Option<crate::session::ui_command::UiCommandProducer>,
@@ -299,6 +302,11 @@ deno_core::extension!(
   state = |state, options| {
     state.put::<SessionId>(options.session_id);
     state.put::<ServerName>(ServerName(options.server_name));
+    state.put::<ProfileName>(ProfileName(options.profile_name));
+    state.put::<LocalPackageInventory>(LocalPackageInventory {
+      names: options.local_package_names,
+      error: options.local_catalog_error,
+    });
     state.put::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>(options.script_functions);
     state.put::<ActionQueue>(options.spawned_actions);
     state.put::<Option<crate::session::ui_command::UiCommandProducer>>(
@@ -663,6 +671,18 @@ struct IsolateInstance(u64);
 /// The session's server name, used to scope package param reads to `<server>/`.
 pub struct ServerName(pub Arc<String>);
 
+/// The current profile name, used to select package parameter values.
+pub struct ProfileName(pub Arc<String>);
+
+/// The immutable local-package inventory captured while this engine generation was planned.
+/// Parameter routing must use the same leaf-name decision as code resolution; consulting the
+/// live filesystem here could expose a dormant published fallback's settings after a local
+/// folder disappears.
+pub struct LocalPackageInventory {
+    names: Arc<std::collections::HashMap<String, String>>,
+    error: Option<Arc<str>>,
+}
+
 /// Read a package's param value by its specifier (`smudgy://owner/name`) and key.
 /// Non-secret values come from `smudgy.params.json`, secrets from the OS keyring.
 /// Returns null when the key is unset.
@@ -691,14 +711,44 @@ fn op_smudgy_param_get(
     #[string] specifier: String,
     #[string] key: String,
 ) -> Option<serde_json::Value> {
-    if !param_read_allowed(&current_isolate(state), &specifier) {
+    let isolate = current_isolate(state);
+    if !param_read_allowed(&isolate, &specifier) {
         return None;
     }
     let server = state.borrow::<ServerName>().0.clone();
-    crate::models::shared_packages::get_param_value(&server, &specifier, &key).or_else(|| {
-        crate::models::shared_packages::load_secret_param(&server, &specifier, &key)
-            .map(serde_json::Value::String)
-    })
+    let profile = state.borrow::<ProfileName>().0.clone();
+    let local_inventory = state.borrow::<LocalPackageInventory>();
+    // An incomplete local inventory makes a sandbox's durable namespace ambiguous. Package
+    // loading fails closed in the provider for the same reason; deny here as a second boundary
+    // (and for test providers) rather than expose any published package's values or secrets.
+    if local_inventory.error.is_some() && !matches!(isolate, IsolateId::Main) {
+        return None;
+    }
+    // Local packages execute under the current public/runtime owner but persist settings only
+    // under the reserved local state coordinate. Rewrite after the isolate authorization check:
+    // a sandbox still proves the runtime identity it actually owns, then reads its isolated local
+    // namespace instead of a same-name published package's values or secrets.
+    let state_specifier = smudgy_script::SmudgySpecifier::parse(&specifier)
+        .ok()
+        .and_then(|parsed| {
+            local_inventory
+                .names
+                .get(&parsed.name.to_ascii_lowercase())
+                .cloned()
+        })
+        .map_or(specifier, |local_name| {
+            format!(
+                "smudgy://{}/{}",
+                crate::models::local_packages::LOCAL_OWNER,
+                local_name
+            )
+        });
+    crate::models::shared_packages::get_param_value_for_profile(
+        &server,
+        &profile,
+        &state_specifier,
+        &key,
+    )
 }
 
 /// Whether the `isolate` making an [`op_smudgy_param_get`] call may read `specifier`'s params.
@@ -772,14 +822,6 @@ impl From<AnyError> for UserAutomationError {
     }
 }
 
-/// Ensure `<server>/<kind>/` exists before a `save_*` (which errors on a missing directory) — a
-/// kind the user has never configured won't have its directory yet.
-fn ensure_automation_dir(server: &str, kind: &str) -> Result<(), AnyError> {
-    let dir = crate::get_smudgy_home()?.join(server).join(kind);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    Ok(())
-}
-
 /// The current session's server name; the persisted automations live under `<server>/`.
 fn op_server_name(state: &OpState) -> String {
     state.borrow::<ServerName>().0.as_str().to_string()
@@ -802,67 +844,55 @@ fn sync_user_automations_for_server(state: &mut OpState, server: &str) {
 /// Upsert `(name, def)` into the per-server alias map, persisting only when it actually changed.
 /// Returns `true` when the saved set changed (a new entry or a different definition).
 fn save_user_alias(server: &str, name: &str, def: AliasDefinition) -> Result<bool, AnyError> {
-    let mut map = crate::models::aliases::load_aliases(server)?;
-    if map.get(name) == Some(&def) {
-        return Ok(false);
-    }
-    map.insert(name.to_string(), def);
-    ensure_automation_dir(server, "aliases")?;
-    crate::models::aliases::save_aliases(server, &map)?;
-    Ok(true)
+    crate::models::automation_transaction::mutate(server, |snapshot| {
+        if snapshot.aliases.get(name) == Some(&def) {
+            return Ok((false, false));
+        }
+        snapshot.aliases.insert(name.to_string(), def);
+        Ok((true, true))
+    })
 }
 
 fn save_user_trigger(server: &str, name: &str, def: TriggerDefinition) -> Result<bool, AnyError> {
-    let mut map = crate::models::triggers::load_triggers(server)?;
-    if map.get(name) == Some(&def) {
-        return Ok(false);
-    }
-    map.insert(name.to_string(), def);
-    ensure_automation_dir(server, "triggers")?;
-    crate::models::triggers::save_triggers(server, &map)?;
-    Ok(true)
+    crate::models::automation_transaction::mutate(server, |snapshot| {
+        if snapshot.triggers.get(name) == Some(&def) {
+            return Ok((false, false));
+        }
+        snapshot.triggers.insert(name.to_string(), def);
+        Ok((true, true))
+    })
 }
 
 fn save_user_hotkey(server: &str, name: &str, def: HotkeyDefinition) -> Result<bool, AnyError> {
-    let mut map = crate::models::hotkeys::load_hotkeys(server)?;
-    if map.get(name) == Some(&def) {
-        return Ok(false);
-    }
-    map.insert(name.to_string(), def);
-    ensure_automation_dir(server, "hotkeys")?;
-    crate::models::hotkeys::save_hotkeys(server, &map)?;
-    Ok(true)
+    crate::models::automation_transaction::mutate(server, |snapshot| {
+        if snapshot.hotkeys.get(name) == Some(&def) {
+            return Ok((false, false));
+        }
+        snapshot.hotkeys.insert(name.to_string(), def);
+        Ok((true, true))
+    })
 }
 
 /// Remove `name` from the per-server map; `true` when an entry was actually removed.
 fn delete_user_alias(server: &str, name: &str) -> Result<bool, AnyError> {
-    let mut map = crate::models::aliases::load_aliases(server)?;
-    if map.remove(name).is_none() {
-        return Ok(false);
-    }
-    ensure_automation_dir(server, "aliases")?;
-    crate::models::aliases::save_aliases(server, &map)?;
-    Ok(true)
+    crate::models::automation_transaction::mutate(server, |snapshot| {
+        let removed = snapshot.aliases.remove(name).is_some();
+        Ok((removed, removed))
+    })
 }
 
 fn delete_user_trigger(server: &str, name: &str) -> Result<bool, AnyError> {
-    let mut map = crate::models::triggers::load_triggers(server)?;
-    if map.remove(name).is_none() {
-        return Ok(false);
-    }
-    ensure_automation_dir(server, "triggers")?;
-    crate::models::triggers::save_triggers(server, &map)?;
-    Ok(true)
+    crate::models::automation_transaction::mutate(server, |snapshot| {
+        let removed = snapshot.triggers.remove(name).is_some();
+        Ok((removed, removed))
+    })
 }
 
 fn delete_user_hotkey(server: &str, name: &str) -> Result<bool, AnyError> {
-    let mut map = crate::models::hotkeys::load_hotkeys(server)?;
-    if map.remove(name).is_none() {
-        return Ok(false);
-    }
-    ensure_automation_dir(server, "hotkeys")?;
-    crate::models::hotkeys::save_hotkeys(server, &map)?;
-    Ok(true)
+    crate::models::automation_transaction::mutate(server, |snapshot| {
+        let removed = snapshot.hotkeys.remove(name).is_some();
+        Ok((removed, removed))
+    })
 }
 
 /// `userAutomations.saveAlias` — create or replace a persisted alias. Returns `true` when the

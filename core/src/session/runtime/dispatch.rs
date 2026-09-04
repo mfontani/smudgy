@@ -120,15 +120,7 @@ impl Inner<'_> {
         let mut observed =
             crate::models::observed::load_observed(self.server_name.as_str()).unwrap_or_default();
         mutate(&mut observed);
-        if let Err(err) =
-            crate::models::observed::save_observed(self.server_name.as_str(), &observed)
-        {
-            warn!(
-                "Failed to persist observed state for '{}': {err:?}",
-                self.server_name
-            );
-            return Ok(observed);
-        }
+        crate::models::observed::save_observed(self.server_name.as_str(), &observed)?;
         self.ui_tx
             .send(TaggedSessionEvent {
                 session_id: self.session_id,
@@ -268,11 +260,21 @@ impl Inner<'_> {
     ) -> Result<ActionResult, anyhow::Error> {
         match action {
             RuntimeAction::SyncUserAutomations => {
-                let desired = crate::session::config::load_user_automations(self.server_name);
-                let actions = crate::session::config::reconcile_automation_actions(
+                let (desired, failures) = crate::session::config::load_user_automations(
+                    self.server_name,
+                    self.profile_name,
+                );
+                // Each category that failed to load is announced in the session before the
+                // reconciliation that reflects its absence, so a vanished alias set is never
+                // silent.
+                let mut actions: Vec<RuntimeAction> = failures
+                    .into_iter()
+                    .map(|message| RuntimeAction::Echo(Arc::new(message)))
+                    .collect();
+                actions.extend(crate::session::config::reconcile_automation_actions(
                     &self.user_automations,
                     &desired,
-                );
+                ));
                 self.user_automations = desired;
                 Ok(ActionResult::Run(actions))
             }
@@ -486,7 +488,7 @@ impl Inner<'_> {
                             ),
                         )),
                         Err(err) => {
-                            warn!("Failed to resolve smudgy home for the raw log: {err:?}");
+                            warn!("Failed to resolve the raw-log path: {err:?}");
                             None
                         }
                     }

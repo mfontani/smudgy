@@ -11,7 +11,7 @@
 //! flow named layouts use. A snapshot is a *template*, not a dump of the
 //! live model: it stores stable descriptors (server/profile names, pane
 //! namespace + folded name) and structural facts (split trees, tab order,
-//! selection), never runtime incarnation ids — `SessionId`, `PaneKey`,
+//! selection), never runtime ids — `SessionId`, `PaneKey`,
 //! `TabId`, `GroupId`, and `window::Id` all restart from scratch each run
 //! and must never reach disk.
 //!

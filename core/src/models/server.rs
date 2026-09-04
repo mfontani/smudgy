@@ -12,6 +12,23 @@ use validator::Validate;
 
 use super::persistence::write_atomic;
 
+/// Result of a server mutation guarded by an exact loaded snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerCas<T> {
+    Applied(T),
+    StateChanged,
+}
+
+fn validate_server_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+        anyhow::bail!(
+            "Invalid server name: '{}'. Use only alphanumeric, underscore, or hyphen.",
+            name
+        );
+    }
+    Ok(())
+}
+
 /// Represents the configuration for a single server connection.
 /// This struct is serialized to/from `server.json` within the server's directory.
 #[derive(Serialize, Deserialize, Debug, Validate, Clone, PartialEq, Eq)]
@@ -198,7 +215,7 @@ pub(crate) fn contains_valid_server(smudgy_dir: &Path) -> bool {
 
     entries.filter_map(std::result::Result::ok).any(|entry| {
         let path = entry.path();
-        path.is_dir()
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
             && path.file_name().and_then(|name| name.to_str()).is_some()
             && load_server_config(&path.join("server.json")).is_ok()
     })
@@ -221,52 +238,47 @@ pub fn list_servers() -> Result<Vec<Server>> {
     match fs::read_dir(&smudgy_dir) {
         Ok(entries) => {
             for entry_result in entries {
-                match entry_result {
-                    Ok(entry) => {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                let config_path = path.join("server.json");
-                                match load_server_config(&config_path) {
-                                    Ok(config) => {
-                                        servers.push(Server {
-                                            name: name.to_string(),
-                                            path: path.clone(),
-                                            config,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        // Log warning: Failed to load server config
-                                        eprintln!(
-                                            "Warning: Skipping server '{name}'. Failed to load config: {e}"
-                                        );
-                                    }
-                                }
-                            } else {
-                                // Log warning: Invalid directory name (not UTF-8)
-                                eprintln!(
-                                    "Warning: Skipping directory with non-UTF8 name: {}",
-                                    path.display()
-                                );
-                            }
-                        }
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        eprintln!("Warning: Failed to read directory entry: {error}");
+                        continue;
                     }
-                    Err(e) => {
-                        // Log warning: Failed to read directory entry
-                        eprintln!("Warning: Failed to read directory entry: {e}");
-                    }
+                };
+                let path = entry.path();
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
                 }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    eprintln!(
+                        "Warning: Skipping directory with non-UTF8 name: {}",
+                        path.display()
+                    );
+                    continue;
+                };
+                if validate_server_name(name).is_err() {
+                    continue;
+                }
+                let config = match load_server_config(&path.join("server.json")) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: Skipping server '{name}'. Failed to load config: {error}"
+                        );
+                        continue;
+                    }
+                };
+                servers.push(Server {
+                    name: name.to_string(),
+                    path,
+                    config,
+                });
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // If the smudgy dir itself doesn't exist yet (first run?), return empty list.
-            // get_smudgy_home() already created it, but read_dir might race?
-            // Or maybe permissions issue. Log warning.
             eprintln!("Warning: Smudgy home directory not found or accessible during scan: {e}");
-            // Returning empty list is fine here.
         }
         Err(e) => {
-            // Other errors reading the main smudgy dir are propagated.
             return Err(e).context(format!(
                 "Failed to read smudgy directory entries at {}",
                 smudgy_dir.to_string_lossy()
@@ -299,14 +311,48 @@ fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
     Ok(config)
 }
 
+fn load_server_for_cas_locked(name: &str) -> Result<Option<Server>> {
+    let path = get_smudgy_home()?.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => load_server(name).map(Some),
+        Ok(_) => anyhow::bail!("server path is not a real directory: {}", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect server path {}", path.display())),
+    }
+}
+
+/// Checks an exact server snapshot while the caller already holds its lifecycle lock.
+pub(crate) fn server_unchanged_locked(expected: &Server) -> Result<bool> {
+    Ok(load_server_for_cas_locked(&expected.name)?.as_ref() == Some(expected))
+}
+
+/// Runs a short operation only while an exact loaded server snapshot is still current.
+///
+/// The server lifecycle lock remains held for the operation, so this is intended for small,
+/// name-keyed reads or side effects such as a UI cache namespace. Network requests and other
+/// long-running work must finish before calling this helper.
+///
+/// # Errors
+/// Returns an error for an invalid name, a server-state read failure, or a failed operation.
+pub fn with_server_if_unchanged<T>(
+    expected: &Server,
+    operation: impl FnOnce(&Server) -> Result<T>,
+) -> Result<ServerCas<T>> {
+    validate_server_name(&expected.name)?;
+    let _lifecycle_guard = super::profile::lifecycle_guard(&expected.name)?;
+    let Some(current) = load_server_for_cas_locked(&expected.name)? else {
+        return Ok(ServerCas::StateChanged);
+    };
+    if current != *expected {
+        return Ok(ServerCas::StateChanged);
+    }
+    operation(&current).map(ServerCas::Applied)
+}
+
 /// Ensures the standard subdirectories exist within a given server directory.
 ///
 /// Creates `profiles`, `aliases`, `hotkeys`, `triggers`, `modules`, and `maps`
 /// directories if they don't already exist.
-///
-/// # Arguments
-///
-/// * `server_path` - The path to the server's root directory.
 ///
 /// # Errors
 ///
@@ -329,11 +375,6 @@ pub fn ensure_server_subdirs(server_path: &Path) -> Result<()> {
 
 /// Creates a new server directory structure and configuration file.
 ///
-/// # Arguments
-///
-/// * `name` - The name for the new server. Must be a valid directory name.
-/// * `config` - The initial `ServerConfig` for the server.
-///
 /// # Errors
 ///
 /// Returns an error if:
@@ -343,23 +384,14 @@ pub fn ensure_server_subdirs(server_path: &Path) -> Result<()> {
 /// * A server with the same name already exists.
 /// * There are filesystem errors during directory or file creation.
 pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
-    // Validate server name (basic validation for now)
-    if name.is_empty() || name.contains(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
-        return Err(anyhow::anyhow!(
-            "Invalid server name: '{}'. Use only alphanumeric, underscore, or hyphen.",
-            name
-        ));
-    }
+    validate_server_name(name)?;
+    let _profile_lifecycle_guard = super::profile::lifecycle_guard(name)?;
 
-    // Validate the provided configuration
     config
         .validate()
         .context(format!("Invalid configuration for server '{name}'"))?;
 
-    let smudgy_dir = get_smudgy_home()?;
-    let server_path = smudgy_dir.join(name);
-
-    // Check if server directory already exists
+    let server_path = get_smudgy_home()?.join(name);
     if server_path.exists() {
         return Err(anyhow::anyhow!(
             "Server '{}' already exists at {:?}",
@@ -368,20 +400,15 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
         ));
     }
 
-    // Create the main server directory
     fs::create_dir(&server_path).context(format!(
         "Failed to create main directory for server '{name}' at {}",
         server_path.display()
     ))?;
-
-    // Ensure standard subdirectories are created
     ensure_server_subdirs(&server_path)?;
 
-    // Write the server.json file
     let config_path = server_path.join("server.json");
     let config_json = serde_json::to_string_pretty(&config)
         .context(format!("Failed to serialize config for server '{name}'"))?;
-
     write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write server.json for server '{name}' at {}",
         config_path.display()
@@ -400,10 +427,6 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
 /// exist (creating them if necessary), loads the `server.json` configuration,
 /// and returns the `Server` struct.
 ///
-/// # Arguments
-///
-/// * `name` - The name of the server to load.
-///
 /// # Errors
 ///
 /// Returns an error if:
@@ -413,15 +436,15 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
 /// * The `server.json` file is missing, cannot be read, or is invalid.
 /// * Any required subdirectories cannot be created.
 pub fn load_server(name: &str) -> Result<Server> {
-    let smudgy_dir = get_smudgy_home()?;
-    let server_path = smudgy_dir.join(name);
+    validate_server_name(name)?;
+    let _profile_lifecycle_guard = super::profile::lifecycle_guard(name)?;
+    let server_path = get_smudgy_home()?.join(name);
 
     if !server_path.exists() {
         return Err(anyhow::anyhow!("Server '{}' not found", name))
             .with_context(|| format!("Looked in directory: {}", server_path.display()));
     }
-
-    if !server_path.is_dir() {
+    if !fs::symlink_metadata(&server_path)?.file_type().is_dir() {
         return Err(anyhow::anyhow!(
             "Path for server '{}' exists but is not a directory: {:?}",
             name,
@@ -429,12 +452,10 @@ pub fn load_server(name: &str) -> Result<Server> {
         ));
     }
 
-    // Ensure standard subdirectories exist
     ensure_server_subdirs(&server_path).context(format!(
         "Failed to ensure subdirectories for server '{name}'"
     ))?;
 
-    // Load the configuration
     let config_path = server_path.join("server.json");
     let config = load_server_config(&config_path)
         .context(format!("Failed to load config for server '{name}'"))?;
@@ -448,14 +469,6 @@ pub fn load_server(name: &str) -> Result<Server> {
 
 /// Updates the configuration of an existing server.
 ///
-/// Finds the server by name, validates the new configuration, and overwrites
-/// the existing `server.json` file.
-///
-/// # Arguments
-///
-/// * `name` - The name of the server to update.
-/// * `new_config` - The `ServerConfig` containing the updated settings.
-///
 /// # Errors
 ///
 /// Returns an error if:
@@ -464,20 +477,18 @@ pub fn load_server(name: &str) -> Result<Server> {
 /// * The `new_config` fails validation.
 /// * The `server.json` file cannot be written.
 pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
-    // Validate the new configuration first
+    validate_server_name(name)?;
     new_config.validate().context(format!(
         "Invalid new configuration provided for server '{name}'"
     ))?;
+    let _profile_lifecycle_guard = super::profile::lifecycle_guard(name)?;
 
-    let smudgy_dir = get_smudgy_home()?;
-    let server_path = smudgy_dir.join(name);
-
-    // Ensure the server directory exists and is a directory
+    let server_path = get_smudgy_home()?.join(name);
     if !server_path.exists() {
         return Err(anyhow::anyhow!("Server '{}' not found for update", name))
             .with_context(|| format!("Looked for directory: {}", server_path.display()));
     }
-    if !server_path.is_dir() {
+    if !fs::symlink_metadata(&server_path)?.file_type().is_dir() {
         return Err(anyhow::anyhow!(
             "Path for server '{}' exists but is not a directory: {:?}",
             name,
@@ -485,68 +496,108 @@ pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
         ));
     }
 
-    // Construct path to server.json
     let config_path = server_path.join("server.json");
-
-    // Serialize the new config
     let config_json = serde_json::to_string_pretty(&new_config).context(format!(
         "Failed to serialize updated config for server '{name}'"
     ))?;
-
-    // Write the new config, overwriting the old one
     write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write updated server.json for server '{name}' at {}",
         config_path.display()
     ))?;
 
-    // Return the server representation with the new config
     Ok(Server {
         name: name.to_string(),
         path: server_path,
-        config: new_config, // Use the validated new_config
+        config: new_config,
     })
+}
+
+/// Updates a server only while its complete loaded snapshot is still current.
+///
+/// A missing or edited server returns [`ServerCas::StateChanged`] and is not modified.
+///
+/// # Errors
+/// Returns an error for an invalid name or a server-state I/O failure.
+pub fn update_server_if_unchanged(
+    expected: &Server,
+    new_config: ServerConfig,
+) -> Result<ServerCas<Server>> {
+    validate_server_name(&expected.name)?;
+    let _lifecycle_guard = super::profile::lifecycle_guard(&expected.name)?;
+    let Some(current) = load_server_for_cas_locked(&expected.name)? else {
+        return Ok(ServerCas::StateChanged);
+    };
+    if current != *expected {
+        return Ok(ServerCas::StateChanged);
+    }
+    update_server(&expected.name, new_config).map(ServerCas::Applied)
 }
 
 /// Deletes a server and all its associated data.
 ///
-/// Finds the server directory by name and removes it recursively.
-/// If the server directory does not exist, the function succeeds silently.
-///
-/// # Arguments
-///
-/// * `name` - The name of the server to delete.
+/// Credentials that live outside the server directory (profile passwords and package secrets)
+/// are removed first, then the directory is removed recursively. If the server directory does
+/// not exist, the function succeeds silently.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// * The smudgy home directory cannot be accessed.
 /// * A file exists with the server name (instead of a directory).
-/// * The directory or its contents cannot be removed due to permissions or other I/O issues.
+/// * Credentials or the directory cannot be removed.
 pub fn delete_server(name: &str) -> Result<()> {
-    let smudgy_dir = get_smudgy_home()?;
-    let server_path = smudgy_dir.join(name);
-
-    if server_path.exists() {
-        // Check if it's actually a directory before attempting recursive delete
-        if !server_path.is_dir() {
-            return Err(anyhow::anyhow!(
-                "Cannot delete server '{}': Path exists but is not a directory: {:?}",
-                name,
-                server_path
-            ));
-        }
-
-        // Recursively remove the directory
-        fs::remove_dir_all(&server_path).context(format!(
-            "Failed to delete directory for server '{name}' at {}",
-            server_path.display()
-        ))?;
-    } else {
-        // Optionally log that the server didn't exist? For now, silent success.
-        println!("Info: Server '{name}' not found for deletion.");
+    validate_server_name(name)?;
+    let _profile_lifecycle_guard = super::profile::lifecycle_guard(name)?;
+    if let Some(current) = load_server_for_cas_locked(name)? {
+        remove_server_locked(&current)?;
     }
-
     Ok(())
+}
+
+fn remove_server_locked(current: &Server) -> Result<()> {
+    // Deterministic credentials live outside the server directory. They must be gone before the
+    // directory is removed; otherwise removing the local index would make an orphaned keyring
+    // entry impossible to identify safely.
+    super::profile::prepare_server_deletion(&current.name)
+        .context("Failed to clear profile credentials before deleting the server")?;
+    super::shared_packages::clear_server_param_secrets(&current.name)
+        .context("Failed to clear package credentials before deleting the server")?;
+    fs::remove_dir_all(&current.path).context(format!(
+        "Failed to delete directory for server '{}' at {}",
+        current.name,
+        current.path.display()
+    ))
+}
+
+/// Deletes only the exact loaded server snapshot in `expected`.
+///
+/// # Errors
+/// Returns an error for an invalid name or a deletion failure.
+pub fn delete_server_if_unchanged(expected: &Server) -> Result<ServerCas<()>> {
+    delete_server_if_unchanged_and_then(expected, || {})
+}
+
+/// Deletes only the exact loaded server snapshot in `expected`, then runs `after_delete` before
+/// releasing the server lifecycle lock.
+///
+/// This is intended for infallible, name-keyed cleanup owned by an embedding layer, such as a UI
+/// cache namespace. The callback runs only after deletion and must be short.
+///
+/// # Errors
+/// Returns an error for an invalid name or a deletion failure.
+pub fn delete_server_if_unchanged_and_then(
+    expected: &Server,
+    after_delete: impl FnOnce(),
+) -> Result<ServerCas<()>> {
+    validate_server_name(&expected.name)?;
+    let _lifecycle_guard = super::profile::lifecycle_guard(&expected.name)?;
+    match load_server_for_cas_locked(&expected.name)? {
+        Some(current) if current != *expected => return Ok(ServerCas::StateChanged),
+        Some(current) => remove_server_locked(&current)?,
+        None => return Ok(ServerCas::StateChanged),
+    }
+    after_delete();
+    Ok(ServerCas::Applied(()))
 }
 
 #[cfg(test)]

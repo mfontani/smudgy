@@ -24,9 +24,9 @@ use iced::{Length, Padding};
 
 use smudgy_core::models::local_packages;
 use smudgy_core::models::shared_packages::{
-    ImportPolicy, IpcEntry, IpcEntryIssue, PackageManifest, PackageParameter, PackagePermissions,
-    ParamKind, ParamOption, SmudgyCapabilities, is_local_transport_net_entry,
-    is_windows_pipe_namespace_entry, running_smudgy_release,
+    self, ImportPolicy, IpcEntry, IpcEntryIssue, LocalManifestCommit, PackageManifest,
+    PackageParameter, PackagePermissions, ParamKind, ParamOption, SmudgyCapabilities,
+    is_local_transport_net_entry, is_windows_pipe_namespace_entry, running_smudgy_release,
 };
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -412,7 +412,7 @@ impl ManifestDraft {
     /// rows. Returns a human-readable message (not a manifest) when the draft can't form a
     /// valid manifest yet — a missing version, a param with no key, or a default that doesn't
     /// parse for its declared type — so nothing is written until it does.
-    fn to_manifest(&self) -> Result<PackageManifest, String> {
+    pub(super) fn to_manifest(&self) -> Result<PackageManifest, String> {
         let version = self.version.trim().to_string();
         if version.is_empty() {
             return Err(crate::i18n::t!("manifest-version-required"));
@@ -1069,6 +1069,9 @@ impl AutomationsWindow {
     /// and the draft re-seeded from the freshly-parsed manifest; on a projection/serialize/write
     /// failure the reason is shown above the form and nothing is written.
     pub(super) fn save_manifest(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy || self.consent_busy || self.consent_prompt.is_some() {
+            return Update::none();
+        }
         let Some(name) = self
             .local_package
             .as_ref()
@@ -1098,19 +1101,96 @@ impl AutomationsWindow {
                 return Update::none();
             }
         };
-        if let Err(e) =
-            local_packages::write_local_file(&self.server_name, &name, "smudgy.package.json", &json)
-        {
+        let Some(expected_manifest) = self.manifest_source_baseline.clone() else {
             if let Some(draft) = self.manifest_draft.as_mut() {
-                draft.error =
-                    Some(crate::i18n::t!("manifest-save-failed", "error" => e.to_string()));
+                draft.error = Some(crate::i18n::t!("manifest-changed-outside"));
             }
             return Update::none();
+        };
+        let requirements_changed = self.local_package.as_deref().is_none_or(|package| {
+            requires_signature(&package.manifest) != requires_signature(&manifest)
+        });
+        let Some(operation) = self.reserve_package_operation(&name, false) else {
+            return Update::none();
+        };
+        if requirements_changed {
+            // `requires` names independently-running roots. Resolve and consent the complete set
+            // before changing the manifest so a Save cannot paint edges that the runtime never
+            // materialized. A removal-only change takes the same helper's synchronous empty-plan
+            // path and needs no confirmation.
+            return self.begin_local_manifest_requirements_save(
+                name,
+                manifest,
+                json,
+                expected_manifest,
+                operation,
+            );
         }
+        let _operation = operation;
+        let root_specifier = self.local_own_spec(&name);
+        match shared_packages::commit_local_manifest(
+            &self.server_name,
+            &name,
+            &root_specifier,
+            &expected_manifest,
+            &json,
+        ) {
+            Ok(LocalManifestCommit::Applied) => {}
+            Ok(LocalManifestCommit::Stale) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(crate::i18n::t!("manifest-changed-outside"));
+                }
+                return Update::none();
+            }
+            Ok(LocalManifestCommit::StateChanged) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(crate::i18n::t!("package-install-plan-changed"));
+                }
+                return Update::none();
+            }
+            Err(e) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(crate::i18n::t!(
+                        "manifest-save-failed",
+                        "error" => e.to_string()
+                    ));
+                }
+                return Update::none();
+            }
+        }
+        self.apply_saved_manifest(&name, manifest);
+        Update::new(
+            self.show_toast(crate::i18n::t!("manifest-saved")),
+            Some(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            }),
+        )
+    }
+
+    /// Mirror a committed manifest into every owned-package view model. The accepted draft stays
+    /// the editor baseline even if the disk copy cannot be re-read as that same manifest.
+    pub(super) fn apply_saved_manifest(&mut self, name: &str, manifest: PackageManifest) {
+        let desired_source = serde_json::to_string_pretty(&manifest)
+            .map(|json| format!("{json}\n"))
+            .ok();
+        let disk_source =
+            local_packages::read_local_file(&self.server_name, name, "smudgy.package.json").ok();
+        let disk_matches = disk_source
+            .as_deref()
+            .and_then(|source| PackageManifest::parse(source).ok())
+            .as_ref()
+            == Some(&manifest);
+        // The commit succeeded, so keep the accepted source as the editor baseline instead of
+        // repainting an unreadable or stale disk snapshot as if the save had rolled back.
+        self.manifest_source_baseline = if disk_matches {
+            disk_source
+        } else {
+            desired_source
+        };
         // Reload from disk so the pane (header version, dependency count) and the draft re-mirror
         // the canonical manifest; the dependency graph is rebuilt in case the deps changed.
-        match local_packages::load_local_package(&self.server_name, &name) {
-            Ok(Some(package)) => {
+        match local_packages::load_local_package(&self.server_name, name) {
+            Ok(Some(package)) if package.manifest == manifest => {
                 self.manifest_draft = Some(ManifestDraft::from_manifest(&package.manifest));
                 self.local_package = Some(Box::new(package));
             }
@@ -1118,10 +1198,10 @@ impl AutomationsWindow {
             // the in-memory package's manifest in step with what we just wrote so the header/meta
             // can't show a stale version while the draft (and disk) hold the new one.
             _ => {
-                if let Some(pkg) = self.local_package.as_deref() {
+                if let Some(package) = self.local_package.as_deref() {
                     self.local_package = Some(Box::new(local_packages::LocalPackage {
                         manifest: manifest.clone(),
-                        ..pkg.clone()
+                        ..package.clone()
                     }));
                 }
                 self.manifest_draft = Some(ManifestDraft::from_manifest(&manifest));
@@ -1132,23 +1212,29 @@ impl AutomationsWindow {
         if let Some(params) = self
             .local_package
             .as_deref()
-            .map(|p| p.manifest.params.clone())
+            .map(|package| package.manifest.params.clone())
         {
-            let spec = self.local_own_spec(&name);
-            self.seed_param_config(spec, params);
+            let specifier = self.local_own_spec(name);
+            self.seed_param_config(specifier, params);
         }
         self.manifest_dirty = false;
-        // A successful save returns to the read-only summary (now showing the saved manifest).
         self.manifest_editing = false;
         self.rebuild_graph();
-        Update::with_task(self.show_toast(crate::i18n::t!("manifest-saved")))
     }
 
     /// Enter the structured editor from the read-only summary, (re)seeding the draft from the
     /// current on-disk manifest so the form starts from exactly what the summary showed.
     pub(super) fn begin_manifest_edit(&mut self) -> Update<Message, Event> {
-        if let Some(package) = self.local_package.as_deref() {
-            self.manifest_draft = Some(ManifestDraft::from_manifest(&package.manifest));
+        let Some(name) = self
+            .local_package
+            .as_deref()
+            .map(|package| package.name.clone())
+        else {
+            return Update::none();
+        };
+        if let Err(error) = self.reload_manifest_draft_from_disk(&name) {
+            self.authoring_feedback = Some(error);
+            return Update::none();
         }
         self.manifest_dirty = false;
         self.manifest_editing = true;
@@ -1159,12 +1245,64 @@ impl AutomationsWindow {
     /// return to the read-only summary.
     pub(super) fn revert_manifest(&mut self) -> Update<Message, Event> {
         if let Some(package) = self.local_package.as_deref() {
-            self.manifest_draft = Some(ManifestDraft::from_manifest(&package.manifest));
+            let name = package.name.clone();
+            let last_good_manifest = package.manifest.clone();
+            if let Err(error) = self.reload_manifest_draft_from_disk(&name) {
+                // A confirmed discard must never leave the abandoned form masquerading as saved.
+                // Keep the last successfully loaded manifest visible, but remove its write
+                // baseline so a later edit must first establish a fresh on-disk snapshot.
+                self.authoring_feedback = Some(error);
+                self.manifest_source_baseline = None;
+                self.manifest_draft = Some(ManifestDraft::from_manifest(&last_good_manifest));
+                self.rebuild_graph();
+            }
         }
         self.manifest_dirty = false;
         self.manifest_editing = false;
         Update::none()
     }
+
+    fn reload_manifest_draft_from_disk(&mut self, name: &str) -> Result<(), String> {
+        let source =
+            local_packages::read_local_file(&self.server_name, name, "smudgy.package.json")
+                .map_err(
+                    |error| crate::i18n::t!("manifest-save-failed", "error" => error.to_string()),
+                )?;
+        let manifest = PackageManifest::parse(&source).map_err(
+            |error| crate::i18n::t!("package-parse-manifest-failed", "error" => error.to_string()),
+        )?;
+        if let Some(package) = self.local_package.as_deref_mut() {
+            package.manifest = manifest.clone();
+        }
+        self.manifest_source_baseline = Some(source);
+        self.manifest_draft = Some(ManifestDraft::from_manifest(&manifest));
+        self.rebuild_graph();
+        Ok(())
+    }
+}
+
+fn requires_signature(manifest: &PackageManifest) -> Vec<(String, String, String)> {
+    let mut signature = manifest
+        .smudgy_requires()
+        .into_iter()
+        .map(|dependency| {
+            let range = dependency.range.unwrap_or_default();
+            let range = if range.trim().is_empty() {
+                String::new()
+            } else {
+                semver::VersionReq::parse(range.trim())
+                    .map_or_else(|_| format!("invalid:{range}"), |range| range.to_string())
+            };
+            (
+                dependency.key.owner.to_ascii_lowercase(),
+                dependency.key.name.to_ascii_lowercase(),
+                range,
+            )
+        })
+        .collect::<Vec<_>>();
+    signature.sort_unstable();
+    signature.dedup();
+    signature
 }
 
 // ============================================================================
@@ -1335,7 +1473,13 @@ impl AutomationsWindow {
         bar = bar.push(
             button(text(crate::i18n::t!("manifest-save")).size(13.0))
                 .style(button_style::primary)
-                .on_press_maybe(self.manifest_dirty.then_some(Message::SaveManifest)),
+                .on_press_maybe(
+                    (self.manifest_dirty
+                        && !self.authoring_busy
+                        && !self.consent_busy
+                        && self.consent_prompt.is_none())
+                    .then_some(Message::SaveManifest),
+                ),
         );
         bar.into()
     }

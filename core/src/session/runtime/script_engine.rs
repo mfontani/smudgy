@@ -127,6 +127,7 @@ impl FunctionId {
 pub struct ScriptEngineParams<'a> {
     pub session_id: SessionId,
     pub server_name: &'a Arc<String>,
+    pub profile_name: &'a Arc<String>,
     pub ui_tx: Sender<TaggedSessionEvent>,
     pub(crate) ui_command_producer: Option<UiCommandProducer>,
     pub spawned_actions: super::ActionQueue,
@@ -301,6 +302,33 @@ struct Isolate {
 struct IsolatePlan {
     main: ModuleSet,
     sandboxed: Vec<String>,
+    /// The one authoritative local-package inventory for this engine generation. Root
+    /// partitioning, package resolution, and parameter state routing must all use this exact map
+    /// so a concurrent folder create/delete cannot change which authority a leaf inherits.
+    local_names: Arc<HashMap<String, String>>,
+    /// Parsed manifests, README files, and module bytes captured under the same package transaction
+    /// as `local_names` and `lock`. This prevents a deleted/recreated leaf from borrowing the old
+    /// generation's trusted-isolate assignment before its first lazy import.
+    local_snapshots: package_provider::LocalSnapshots,
+    /// If the local inventory or its governing rows could not be prepared, package resolution
+    /// fails closed for this generation instead of independently rediscovering the filesystem.
+    local_catalog_error: Option<Arc<str>>,
+    /// The account identity sampled with the local inventory. Local root specifiers, interop
+    /// homes, and provider canonicalization all use this exact owner for the generation.
+    local_owner: String,
+    /// The exact lock snapshot that selected roots, trust boundaries, and profile activation.
+    /// Provider version state and sandbox consent start from this same snapshot; concurrent disk
+    /// edits take effect only after the reload they request.
+    lock: crate::models::shared_packages::SharedPackageLock,
+    /// Fail-closed diagnostics for impossible/legacy duplicate published roots. The service
+    /// guarantees global leaf-name uniqueness, but corrupted or pre-policy lockfiles must not
+    /// pick a winner by file order.
+    conflicts: Vec<String>,
+    /// One session line per unit this plan skipped while everything else loaded: a module
+    /// entry discovery could not read or that collides by letter case, an unreadable module
+    /// inventory, or a local package inventory that could not be prepared. Emitted before any
+    /// module evaluates so a missing unit is never silent.
+    notices: Vec<String>,
     /// Each installed package's interop **home** (`docs/interop.md` §3), derived
     /// from the same lockfile partition as the module sets: trusted → main, untrusted → its
     /// own sandbox. Built *before* any module evaluates so top-level store writes already
@@ -311,6 +339,196 @@ struct IsolatePlan {
     /// static extraction that fed the typings also registers the catalogue's tier-1 declared
     /// index (interop.md §10) without a second parse.
     installed_typings: Vec<crate::models::script_typings::InstalledPackageTypes>,
+}
+
+/// The package-only part of [`IsolatePlan`], split out so the same-leaf fail-closed and
+/// local-override trust rules can be tested without touching the process-wide Smudgy home.
+#[derive(Debug, Default)]
+struct PackageRootPlan {
+    trusted: Vec<String>,
+    sandboxed: Vec<String>,
+    conflicts: Vec<String>,
+    homes: HashMap<(String, String), crate::session::runtime::store::HomeIsolate>,
+}
+
+fn partition_package_roots(
+    lock: &crate::models::shared_packages::SharedPackageLock,
+    local_owner: &str,
+    local_names: &HashMap<String, String>,
+    profile_name: &str,
+) -> PackageRootPlan {
+    let mut plan = PackageRootPlan::default();
+    let mut leaf_order = Vec::new();
+    let mut by_leaf: HashMap<
+        String,
+        Vec<(
+            &crate::models::shared_packages::LockedPackage,
+            SmudgySpecifier,
+        )>,
+    > = HashMap::new();
+    for package in &lock.packages {
+        if let Ok(spec) = SmudgySpecifier::parse(&package.specifier) {
+            let leaf = spec.name.to_ascii_lowercase();
+            if !by_leaf.contains_key(&leaf) {
+                leaf_order.push(leaf.clone());
+            }
+            by_leaf.entry(leaf).or_default().push((package, spec));
+        }
+    }
+
+    // Preserve lockfile order. Package entry evaluation can register automations, so grouping
+    // by leaf must not turn that ordering into HashMap randomness.
+    for leaf in leaf_order {
+        let entries = by_leaf
+            .remove(&leaf)
+            .expect("leaf order is built from the same package groups");
+        let remote_count = entries
+            .iter()
+            .filter(|(_, spec)| {
+                !spec
+                    .owner
+                    .eq_ignore_ascii_case(crate::models::local_packages::LOCAL_OWNER)
+            })
+            .count();
+        if remote_count > 1 {
+            let name = &entries[0].1.name;
+            let message = format!(
+                "[package] {name} was not loaded because more than one published package with this name is installed. Remove the conflicting package entries."
+            );
+            warn!("{message}");
+            plan.conflicts.push(message);
+            continue;
+        }
+        if let Some(local_name) = local_names.get(&leaf) {
+            // The reserved local state row is the only source of activation + trust. The
+            // same-owner published fallback is still a remote row: runtime identity may use the
+            // current nickname, but mutable local code never inherits that published authority.
+            let local_entry = entries
+                .iter()
+                .find(|(_, spec)| {
+                    spec.owner
+                        .eq_ignore_ascii_case(crate::models::local_packages::LOCAL_OWNER)
+                })
+                .map(|(package, _)| *package);
+            let local_effective = local_entry.is_some_and(|package| {
+                lock.is_effectively_enabled_for(&package.specifier, profile_name)
+            });
+            if !local_effective {
+                continue;
+            }
+
+            let specifier = format!("smudgy://{local_owner}/{local_name}");
+            let is_trusted = local_entry.is_some_and(|package| package.trusted);
+            plan.homes.insert(
+                (local_owner.to_ascii_lowercase(), leaf),
+                if is_trusted {
+                    crate::session::runtime::store::HomeIsolate::Main
+                } else {
+                    crate::session::runtime::store::HomeIsolate::OwnSandbox
+                },
+            );
+            if is_trusted {
+                plan.trusted.push(specifier);
+            } else {
+                plan.sandboxed.push(specifier);
+            }
+            continue;
+        }
+
+        let active: Vec<_> = entries
+            .iter()
+            .filter(|(package, _)| {
+                lock.is_effectively_enabled_for(&package.specifier, profile_name)
+            })
+            .collect();
+        if active.len() > 1 {
+            let name = &active[0].1.name;
+            let message = format!(
+                "[package] {name} was not loaded because conflicting package identities are active. Remove the stale package entry."
+            );
+            warn!("{message}");
+            plan.conflicts.push(message);
+            continue;
+        }
+        let Some((package, spec)) = active.first().copied() else {
+            continue;
+        };
+        plan.homes.insert(
+            (
+                spec.owner.to_ascii_lowercase(),
+                spec.name.to_ascii_lowercase(),
+            ),
+            if package.trusted {
+                crate::session::runtime::store::HomeIsolate::Main
+            } else {
+                crate::session::runtime::store::HomeIsolate::OwnSandbox
+            },
+        );
+        if package.trusted {
+            plan.trusted.push(package.specifier.clone());
+        } else {
+            plan.sandboxed.push(package.specifier.clone());
+        }
+    }
+    plan
+}
+
+/// Root selection for a generation whose local package inventory could not be prepared but
+/// whose lockfile is readable.
+///
+/// Published packages keep loading from the lock exactly as they would without any local
+/// folders. Every leaf the lock records as locally governed (a `smudgy://local/<name>` row) is
+/// excluded before partitioning — both its local row and any same-name published fallback —
+/// because loading published code in place of a local override is the escape the local
+/// authority rules forbid. The returned map lists those leaves in the inventory's shape so
+/// package resolution and parameter routing keep failing closed for them (no snapshot exists,
+/// so every reference resolves as an invalid local override), while the returned names feed the
+/// session notice.
+fn partition_published_roots_without_local_inventory(
+    lock: &crate::models::shared_packages::SharedPackageLock,
+    local_owner: &str,
+    profile_name: &str,
+) -> (PackageRootPlan, HashMap<String, String>, Vec<String>) {
+    let mut locally_governed = HashMap::new();
+    for package in &lock.packages {
+        if let Ok(spec) = SmudgySpecifier::parse(&package.specifier)
+            && spec
+                .owner
+                .eq_ignore_ascii_case(crate::models::local_packages::LOCAL_OWNER)
+        {
+            locally_governed.insert(spec.name.to_ascii_lowercase(), spec.name.clone());
+        }
+    }
+    let mut published_only = lock.clone();
+    published_only.packages.retain(|package| {
+        SmudgySpecifier::parse(&package.specifier)
+            .is_ok_and(|spec| !locally_governed.contains_key(&spec.name.to_ascii_lowercase()))
+    });
+    let plan = partition_package_roots(&published_only, local_owner, &HashMap::new(), profile_name);
+    let mut skipped: Vec<String> = locally_governed.values().cloned().collect();
+    skipped.sort_unstable();
+    (plan, locally_governed, skipped)
+}
+
+/// The session notice for a generation that loads published packages without its local
+/// inventory. Names the preparation error and every local package left out.
+fn local_inventory_skipped_notice(error: &str, skipped: &[String]) -> String {
+    let skipped = if skipped.is_empty() {
+        "no local package rows are recorded in the lockfile".to_string()
+    } else {
+        format!("skipped: {}", skipped.join(", "))
+    };
+    format!(
+        "[package] Local packages were not loaded because their isolated settings could not be prepared: {error}. Published packages loaded from the lockfile as usual ({skipped})."
+    )
+}
+
+/// The session notice for a generation that loads no packages at all: the local inventory could
+/// not be prepared and the lockfile itself could not be read either.
+fn packages_unavailable_notice(inventory_error: &str, lock_error: &str) -> String {
+    format!(
+        "[package] No packages were loaded: local package settings could not be prepared ({inventory_error}) and the package lockfile could not be read ({lock_error})."
+    )
 }
 
 pub struct ScriptEngine<'a> {
@@ -416,12 +634,12 @@ impl Drop for ScriptEngine<'_> {
 /// cross-isolate write race. A package whose files aren't cached yet (never resolved on
 /// this machine) is skipped until a later session.
 ///
-/// LOCAL DEV-OVERRIDE: a lock entry under the account's own owner segment whose authored
-/// folder exists at `<server>/packages/<name>/` is typed from that **live source** — the
-/// same shadowing the resolver applies (`PackageProvider::try_local_override`) — never
-/// from the cached published copy, which is the *previous* version of the package. Nothing
-/// is materialized for it (the tsconfig points straight at the folder), so payload types
-/// track the author's edits without a session restart.
+/// LOCAL DEV-OVERRIDE: an authored folder at `<server>/packages/<name>/` shadows every
+/// installed coordinate with the same leaf name, regardless of its requested owner. The
+/// canonical local coordinate and each active requested alias are typed from that **live
+/// source** — the same shadowing the resolver applies — never from a cached published copy.
+/// Nothing is materialized for it (the tsconfig points straight at the folder), so payload
+/// types track the author's edits without a session restart.
 ///
 /// FRESHNESS: because this reads the lock + cache at session start, a package installed
 /// *mid-session* is only typed on the next session start; there is no immediate
@@ -444,32 +662,43 @@ fn materialize_installed_typings(
             return Vec::new();
         }
     };
-    // The owner segment local packages run under (the resolver's `is_local_owner_segment`):
-    // the account nickname when signed in, plus the reserved `local` placeholder always.
-    let account_nickname = crate::models::auth::load_account().and_then(|a| a.nickname);
+    // The canonical owner segment local packages run under: the account nickname when
+    // signed in, otherwise the reserved `local` placeholder.
+    let local_owner = crate::models::auth::load_account()
+        .and_then(|account| account.nickname)
+        .unwrap_or_else(|| crate::models::local_packages::LOCAL_OWNER.to_string());
 
     let mut materialized = Vec::new();
     let mut keep: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    let mut typed_local_coordinates: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     for pkg in &lock.packages {
-        if !pkg.enabled {
+        if matches!(
+            pkg.activation(),
+            crate::models::profile_activation::ProfileActivation::None
+        ) && pkg.required_by.is_empty()
+        {
             continue;
         }
         let Ok(spec) = smudgy_script::SmudgySpecifier::parse(&pkg.specifier) else {
             continue;
         };
 
-        // Local dev-override first, before any version/cache gate: a local entry may have
-        // no `last_resolved_version` at all (authored, never published) and must still be
-        // typed. When the folder loads, it shadows the install unconditionally; when it is
-        // missing or unreadable, fall through to the cached install (resolver parity).
-        if (spec.owner == crate::models::local_packages::LOCAL_OWNER
-            || account_nickname.as_deref() == Some(spec.owner.as_str()))
-            && let Ok(Some(local)) =
-                crate::models::local_packages::load_local_package(server_name, &spec.name)
+        // Local dev-override first, before any owner/version/cache gate: one local leaf
+        // shadows every requested author coordinate. Type both the requested alias (so
+        // authored imports keep editor parity with runtime resolution) and the canonical
+        // local coordinate (the identity under which the runtime actually serves it).
+        if let Ok(Some(local)) =
+            crate::models::local_packages::load_local_package(server_name, &spec.name)
         {
-            if let Some(types) = local_package_types(&spec.owner, &local) {
-                materialized.push(types);
+            for owner in [&spec.owner, &local_owner] {
+                let coordinate = (owner.to_ascii_lowercase(), local.name.to_ascii_lowercase());
+                if typed_local_coordinates.insert(coordinate)
+                    && let Some(types) = local_package_types(owner, &local)
+                {
+                    materialized.push(types);
+                }
             }
             continue;
         }
@@ -682,10 +911,14 @@ impl<'a> ScriptEngine<'a> {
     /// Partition the auto-load set across isolates (`PACKAGE-ISOLATES-SANDBOX.md`): the
     /// server's local module files (`<server>/modules/*.{js,ts,jsx,tsx}`) and any *trusted*
     /// installed packages share the trusted main isolate; each *untrusted* installed package
-    /// becomes its own sandboxed isolate. Trust is the per-profile `LockedPackage::trusted`
+    /// becomes its own sandboxed isolate. Trust is the server-wide `LockedPackage::trusted`
     /// flag (default `false` — sandboxed until the user trusts it). Loading itself is done by
     /// [`ScriptRuntime::load_modules`] into each target isolate.
-    fn build_isolate_plan(server_name: &str, web_audio_available: bool) -> IsolatePlan {
+    fn build_isolate_plan(
+        server_name: &str,
+        profile_name: &str,
+        web_audio_available: bool,
+    ) -> IsolatePlan {
         // Best-effort: refresh the managed VS Code TypeScript project so authors get
         // `smudgy:core` types — plus the `.d.ts` shipped by installed `smudgy://` packages —
         // in their editor. Pure-disk; never blocks session start.
@@ -700,84 +933,159 @@ impl<'a> ScriptEngine<'a> {
             warn!("Failed to write script tsconfig for {server_name}: {e:#}");
         }
 
+        let mut notices = Vec::new();
         let mut local_modules = Vec::new();
-        if let Ok(smudgy_dir) = get_smudgy_home() {
-            let modules_dir = smudgy_dir.join(server_name).join("modules");
-            match fs::read_dir(&modules_dir) {
-                Ok(entries) => {
-                    for entry in entries.flatten() {
-                        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
-                            continue;
-                        }
-                        let file_name = entry.file_name();
-                        let file_name = file_name.to_string_lossy();
-                        if [".js", ".ts", ".jsx", ".tsx"]
-                            .iter()
-                            .any(|ext| file_name.ends_with(ext))
-                        {
-                            match Url::from_file_path(entry.path()) {
-                                Ok(url) => local_modules.push(url),
-                                Err(()) => {
-                                    warn!("Skipping module with non-file path: {file_name}");
-                                }
-                            }
+        match crate::models::modules::load_module_inventory(server_name) {
+            Ok((inventory, settings)) => {
+                for warning in &inventory.warnings {
+                    warn!("{server_name}: {warning}");
+                }
+                notices.extend(inventory.warnings);
+                for file in inventory.files {
+                    if !crate::models::modules::is_script_module(&file.subpath)
+                        || !crate::models::modules::is_enabled_for(
+                            &settings,
+                            &file.subpath,
+                            profile_name,
+                        )
+                    {
+                        continue;
+                    }
+                    match Url::from_file_path(&file.path) {
+                        Ok(url) => local_modules.push(url),
+                        Err(()) => {
+                            let message = format!(
+                                "[module] Skipped {}: its location is not a file path",
+                                file.subpath
+                            );
+                            warn!("{message}");
+                            notices.push(message);
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!(
-                    "Could not read modules directory {}: {e}",
-                    modules_dir.display()
-                ),
+            }
+            Err(error) => {
+                let message = format!(
+                    "[module] No local modules were loaded because the module inventory could not be read: {error:#}"
+                );
+                warn!("{server_name}: {message}");
+                notices.push(message);
             }
         }
 
-        let mut trusted = Vec::new();
-        let mut sandboxed = Vec::new();
-        let mut homes = HashMap::new();
-        match crate::models::shared_packages::load_lock(server_name) {
-            Ok(lock) => {
-                for pkg in lock.packages {
-                    // A disabled install is skipped entirely — neither a trusted nor a sandboxed
-                    // root, so it never loads. Its dependencies still load if an *enabled* package's
-                    // closure needs them (the engine resolves closures from enabled roots), matching
-                    // the hub's dependency-graph "effectively enabled" semantics. The user can
-                    // install + consent, review the code, then enable it (no re-consent) to run.
-                    // It also registers no interop home: nothing runs as it, and a copy of it
-                    // embedded in another package's closure must not write in its name.
-                    if !pkg.enabled {
-                        continue;
-                    }
-                    if let Ok(spec) = SmudgySpecifier::parse(&pkg.specifier) {
-                        homes.insert(
+        let local_owner = crate::models::auth::load_account()
+            .and_then(|account| account.nickname)
+            .unwrap_or_else(|| crate::models::local_packages::LOCAL_OWNER.to_string());
+        // Drop lock rows whose local folder is gone before root selection so a stale row cannot
+        // shadow a valid published fallback until Automations is opened.
+        let reconciliation =
+            crate::models::shared_packages::reconcile_local_installs(server_name).map(|_| ());
+        // A local folder can arrive outside the Automations window (manual copy, sync, older
+        // client). Materialize its isolated governing row at session start too; otherwise the
+        // mutable code could either disappear silently or be evaluated against a published row.
+        // Inventory, materialization, executable bytes, and the lock snapshot share one
+        // cross-process transaction. A delete/recreate after this cut belongs to the next reload;
+        // this generation never combines its new bytes with the predecessor's trust placement.
+        let authority = reconciliation.and_then(|()| {
+            crate::models::local_packages::with_local_package_transaction(
+                server_name,
+                |home, transaction| {
+                    let local_name_list =
+                        crate::models::local_packages::list_local_packages_in(home, server_name)?;
+                    crate::models::local_packages::materialize_governing_local_lock_rows_in_transaction(
+                        transaction,
+                        &local_name_list,
+                        &local_owner,
+                    )?;
+                    let local_names: Arc<HashMap<String, String>> = Arc::new(
+                        local_name_list
+                            .into_iter()
+                            .map(|name| (name.to_ascii_lowercase(), name))
+                            .collect(),
+                    );
+                    let local_snapshots = package_provider::snapshot_local_packages_in(
+                        home,
+                        server_name,
+                        &local_names,
+                    );
+                    let lock = transaction.load_lock()?;
+                    Ok((local_names, local_snapshots, lock))
+                },
+            )
+        });
+        // Degrade per unit: a failed local inventory skips local packages, not the lockfile's
+        // published packages. Only an unreadable lockfile skips every package, and both
+        // outcomes are announced in the session with the actual error.
+        let (local_names, local_snapshots, package_roots, lock, local_catalog_error) =
+            match authority {
+                Err(error) => {
+                    let inventory_error = format!("{error:#}");
+                    warn!(
+                        "Local package inventory for {server_name} could not be prepared: {inventory_error}"
+                    );
+                    match crate::models::shared_packages::load_lock(server_name) {
+                        Ok(lock) => {
+                            let (package_roots, locally_governed, skipped) =
+                                partition_published_roots_without_local_inventory(
+                                    &lock,
+                                    &local_owner,
+                                    profile_name,
+                                );
+                            let message =
+                                local_inventory_skipped_notice(&inventory_error, &skipped);
+                            warn!("{message}");
+                            notices.push(message);
+                            // The locally governed leaves are the whole local inventory of this
+                            // generation and carry no snapshots, so they resolve as invalid
+                            // local overrides everywhere; every other leaf is a plain published
+                            // package. No catalog error is recorded: the published packages'
+                            // resolution and parameter routing are fully determined.
                             (
-                                spec.owner.to_ascii_lowercase(),
-                                spec.name.to_ascii_lowercase(),
-                            ),
-                            if pkg.trusted {
-                                crate::session::runtime::store::HomeIsolate::Main
-                            } else {
-                                crate::session::runtime::store::HomeIsolate::OwnSandbox
-                            },
-                        );
-                    }
-                    if pkg.trusted {
-                        trusted.push(pkg.specifier);
-                    } else {
-                        sandboxed.push(pkg.specifier);
+                                Arc::new(locally_governed),
+                                Rc::new(HashMap::new()),
+                                package_roots,
+                                lock,
+                                None,
+                            )
+                        }
+                        Err(lock_error) => {
+                            let message = packages_unavailable_notice(
+                                &inventory_error,
+                                &format!("{lock_error:#}"),
+                            );
+                            warn!("{message}");
+                            notices.push(message);
+                            (
+                                Arc::new(HashMap::new()),
+                                Rc::new(HashMap::new()),
+                                PackageRootPlan::default(),
+                                crate::models::shared_packages::SharedPackageLock::default(),
+                                Some(Arc::<str>::from(inventory_error)),
+                            )
+                        }
                     }
                 }
-            }
-            Err(e) => warn!("Failed to load package lockfile for {server_name}: {e:#}"),
-        }
+                Ok((local_names, local_snapshots, lock)) => {
+                    let package_roots =
+                        partition_package_roots(&lock, &local_owner, &local_names, profile_name);
+                    (local_names, local_snapshots, package_roots, lock, None)
+                }
+            };
 
         IsolatePlan {
             main: ModuleSet {
                 local_modules,
-                packages: trusted,
+                packages: package_roots.trusted,
             },
-            sandboxed,
-            homes,
+            sandboxed: package_roots.sandboxed,
+            local_names,
+            local_snapshots,
+            local_catalog_error,
+            local_owner,
+            lock,
+            conflicts: package_roots.conflicts,
+            notices,
+            homes: package_roots.homes,
             installed_typings,
         }
     }
@@ -910,30 +1218,49 @@ impl<'a> ScriptEngine<'a> {
     /// own closures (`PACKAGE-ISOLATES-RESOLUTION.md`).
     fn blocked_by_required_params(
         provider: &package_provider::SmudgyPackageProvider,
-        server_name: &str,
+        profile_name: &str,
         ui_tx: &Sender<TaggedSessionEvent>,
         session_id: SessionId,
         emitted_line_count: &std::rc::Weak<Cell<usize>>,
     ) -> std::collections::HashSet<smudgy_script::PackageKey> {
         let mut blocked = std::collections::HashSet::new();
         for (specifier, declared) in provider.installed_params() {
-            let missing = crate::models::shared_packages::missing_required_params(
-                server_name,
-                &specifier,
-                &declared,
-            );
+            let missing = match provider.missing_required_params(&specifier, &declared) {
+                Ok(missing) => missing,
+                Err(error) => {
+                    let package_name = SmudgySpecifier::parse(&specifier)
+                        .map_or_else(|_| specifier.clone(), |spec| spec.name);
+                    Self::emit_session_notice(
+                        ui_tx,
+                        session_id,
+                        emitted_line_count,
+                        &format!(
+                            "[package] {} not loaded for profile {}: package settings are unavailable \u{2014} {error}",
+                            package_name, profile_name,
+                        ),
+                    );
+                    if let Ok(spec) = SmudgySpecifier::parse(&specifier) {
+                        blocked.insert(provider.canonical_key(&spec.package_key()));
+                    }
+                    continue;
+                }
+            };
             if let (false, Ok(spec)) = (missing.is_empty(), SmudgySpecifier::parse(&specifier)) {
                 Self::emit_session_notice(
                     ui_tx,
                     session_id,
                     emitted_line_count,
                     &format!(
-                        "[package] {} not loaded: required param(s) {} are unset \u{2014} configure them in settings",
+                        "[package] {} not loaded for profile {}: required param(s) {} are unset \u{2014} configure them in settings",
                         spec.name,
+                        profile_name,
                         missing.join(", ")
                     ),
                 );
-                blocked.insert(spec.package_key());
+                // The gate reads the package's state row (`smudgy://local/<name>` for a local
+                // package) while the root list names the canonical owner; block by the
+                // canonical key so the prune below matches the root it is meant to drop.
+                blocked.insert(provider.canonical_key(&spec.package_key()));
             }
         }
         blocked
@@ -974,7 +1301,7 @@ impl<'a> ScriptEngine<'a> {
                     emitted_line_count,
                     &format!("[package] {} not loaded \u{2014} {reason}.", spec.name),
                 );
-                blocked.insert(spec.package_key());
+                blocked.insert(provider.canonical_key(&spec.package_key()));
             }
         }
         blocked
@@ -998,6 +1325,7 @@ impl<'a> ScriptEngine<'a> {
         // below borrows *these* rather than `params`, whose fields move into `Self`.
         let session_id = params.session_id;
         let server_name = Arc::clone(params.server_name);
+        let profile_name = Arc::clone(params.profile_name);
         let broadcast_channel =
             crate::session::registry::broadcast_channel_for_server(server_name.as_str());
         let spawned_actions = params.spawned_actions.clone();
@@ -1072,7 +1400,24 @@ impl<'a> ScriptEngine<'a> {
         // which every isolate's ops receive and which must be complete before ANY module
         // evaluates (a trusted package's top-level `set()` passes the home gate only if its
         // entry is already registered).
-        let plan = Self::build_isolate_plan(params.server_name.as_str(), web_audio_available);
+        let plan = Self::build_isolate_plan(
+            params.server_name.as_str(),
+            params.profile_name.as_str(),
+            web_audio_available,
+        );
+        for message in plan.notices.iter().chain(&plan.conflicts) {
+            Self::emit_session_notice(
+                &params.ui_tx,
+                params.session_id,
+                &params.emitted_line_count,
+                message,
+            );
+        }
+        let local_package_names = Arc::clone(&plan.local_names);
+        let local_package_snapshots = Rc::clone(&plan.local_snapshots);
+        let local_catalog_error = plan.local_catalog_error.clone();
+        let local_owner = plan.local_owner.clone();
+        let authority_lock = plan.lock.clone();
         let home_registry: crate::session::runtime::store::HomeRegistry =
             Rc::new(std::cell::RefCell::new(plan.homes));
 
@@ -1192,6 +1537,9 @@ impl<'a> ScriptEngine<'a> {
                     ops::smudgy_ops::init(
                         session_id,
                         Arc::clone(&server_name),
+                        Arc::clone(&profile_name),
+                        Arc::clone(&local_package_names),
+                        local_catalog_error.clone(),
                         script_functions.clone(),
                         spawned_actions.clone(),
                         ui_command_producer.clone(),
@@ -1289,8 +1637,16 @@ impl<'a> ScriptEngine<'a> {
         // fresh resolver per isolate via its factory and skips the solve + auto-update notices
         // (cloud-provider-only). Either way each isolate's own loader compiles the package source
         // into *its* heap.
-        let smudgy_provider =
-            build_package_provider(params.package_client, Arc::clone(params.server_name));
+        let smudgy_provider = build_package_provider(
+            params.package_client,
+            Arc::clone(params.server_name),
+            Arc::clone(params.profile_name),
+            authority_lock.clone(),
+            local_owner,
+            Arc::clone(&local_package_names),
+            local_package_snapshots,
+            local_catalog_error.clone(),
+        );
         // Whether sandboxed isolates have any way to resolve `smudgy://` — a cloud base to fork, or
         // a test override factory. With neither, the untrusted installs can't load (handled below).
         let have_resolver = smudgy_provider.is_some() || params.package_provider_override.is_some();
@@ -1319,7 +1675,7 @@ impl<'a> ScriptEngine<'a> {
             // misconfigured); a notice naming the keys is emitted by the gate.
             let mut blocked = Self::blocked_by_required_params(
                 provider,
-                params.server_name.as_str(),
+                params.profile_name.as_str(),
                 &params.ui_tx,
                 params.session_id,
                 &params.emitted_line_count,
@@ -1350,9 +1706,9 @@ impl<'a> ScriptEngine<'a> {
                     }
                 }
                 main_set.packages.retain(|specifier| {
-                    SmudgySpecifier::parse(specifier)
-                        .ok()
-                        .is_none_or(|spec| !blocked.contains(&spec.package_key()))
+                    SmudgySpecifier::parse(specifier).ok().is_none_or(|spec| {
+                        !blocked.contains(&provider.canonical_key(&spec.package_key()))
+                    })
                 });
             }
         }
@@ -1519,10 +1875,10 @@ impl<'a> ScriptEngine<'a> {
             // the lockfile once here; each install's consent record is looked up below. A `None`
             // (or missing) record yields the empty union → deny-all ("must consent"), and an
             // unaccepted update escalation stays withheld because the consented union still holds
-            // the old set. Best-effort: an unreadable lock degrades to deny-all, the safe default.
-            let consent_lock =
-                crate::models::shared_packages::load_lock(params.server_name.as_str())
-                    .unwrap_or_default();
+            // the old set. This is the same immutable snapshot that chose each root's trust
+            // boundary, so a concurrent lock replacement cannot lend new authority to code that
+            // was already assigned to an isolate.
+            let consent_lock = authority_lock;
             for specifier in sandboxed {
                 let Ok(spec) = SmudgySpecifier::parse(&specifier) else {
                     warn!("Skipping sandboxed package with malformed specifier {specifier}");
@@ -1562,7 +1918,8 @@ impl<'a> ScriptEngine<'a> {
                     // disk (`closure_union_from_cache`); the `cap_version` network walk runs only
                     // when that verification cannot complete or fails. If no
                     // version fits, refuse to load it (the user must review + grant the update). A
-                    // local dev-override (the author's own package) is NOT version-capped — it loads
+                    // local dev-override (any installed coordinate sharing a local leaf) is NOT
+                    // version-capped — it loads
                     // the manifest version on disk — and is sandboxed to that manifest's permissions
                     // (the enforced-grant source below), not allow-all.
                     if provider.is_local_override(&spec.package_key()) {
@@ -1658,7 +2015,7 @@ impl<'a> ScriptEngine<'a> {
                     }
                     let blocked = Self::blocked_by_required_params(
                         provider,
-                        params.server_name.as_str(),
+                        params.profile_name.as_str(),
                         &params.ui_tx,
                         params.session_id,
                         &params.emitted_line_count,
@@ -1670,11 +2027,11 @@ impl<'a> ScriptEngine<'a> {
                 }
 
                 // Resolve the root's version via THIS isolate's provider for its isolate id.
-                let version = match params
+                let resolved_root = match params
                     .tokio_runtime
                     .block_on(async { loader.resolve_package(&spec.package_key(), None).await })
                 {
-                    Ok(pkg) => pkg.resolved_version.clone(),
+                    Ok(pkg) => pkg,
                     Err(e) => {
                         Self::emit_session_notice(
                             &params.ui_tx,
@@ -1685,26 +2042,32 @@ impl<'a> ScriptEngine<'a> {
                         continue;
                     }
                 };
+                let version = resolved_root.resolved_version.clone();
+                let runtime_key = resolved_root.key.clone();
                 let isolate_id = IsolateId::Package {
-                    owner: Arc::from(spec.owner.as_str()),
-                    name: Arc::from(spec.name.as_str()),
+                    owner: Arc::from(runtime_key.owner.as_str()),
+                    name: Arc::from(runtime_key.name.as_str()),
                     version: Arc::from(version.as_str()),
                 };
                 // The enforced grant drives BOTH the smudgy op-capabilities and the deno permission
                 // container below. For a cloud install it's the CONSENTED closure union the user
                 // granted at install, persisted in the lockfile (∅/`None` ⇒ deny-all; an unaccepted
                 // update escalation keeps the OLD set, withholding the new asks). For a local
-                // dev-override — the author's own package under `<server>/packages/` — it's the
-                // package's OWN manifest permissions, read from disk: the manifest IS the grant
-                // table for a local package (no consent record), so the author edits the manifest
-                // and reloads to test the exact sandbox an installer will get. To develop allow-all
+                // dev-override — the canonical local package under `<server>/packages/` — it's the
+                // live local dependency-closure permissions: each local manifest is authoritative,
+                // including locally-resolved code dependencies, and no foreign consent record can
+                // grant local code authority. To develop allow-all
                 // (e.g. for `ffi`/`run`, which a sandbox can never grant) the author *trusts* the
                 // package, which promotes it to the main isolate above and never reaches here.
                 let is_override = pkg_cloud
                     .as_ref()
                     .is_some_and(|provider| provider.is_local_override(&spec.package_key()));
                 let effective = if is_override {
-                    local_manifest_permissions(params.server_name.as_str(), &spec.name)
+                    pkg_cloud
+                        .as_ref()
+                        .map_or_else(PackagePermissions::default, |provider| {
+                            provider.closure_permissions()
+                        })
                 } else {
                     consent_lock
                         .find(&specifier)
@@ -1718,8 +2081,20 @@ impl<'a> ScriptEngine<'a> {
                 // This package's OWN persistent, update-surviving data dir (isolated from other
                 // packages and the shared server root): where its `$DATA` `read`/`write` grants
                 // resolve AND what `getDataDir()` returns. Create it so a `$DATA` write has a parent.
-                let fs_data_dir = sandbox_fs_data_dir(&server_path, &spec.owner, &spec.name);
-                let _ = fs::create_dir_all(&fs_data_dir);
+                let fs_data_dir =
+                    sandbox_fs_data_dir(&server_path, &runtime_key.owner, &runtime_key.name);
+                if let Err(error) = fs::create_dir_all(&fs_data_dir) {
+                    Self::emit_session_notice(
+                        &params.ui_tx,
+                        params.session_id,
+                        &params.emitted_line_count,
+                        &format!(
+                            "[package] {} not loaded \u{2014} its data directory could not be created: {error}",
+                            spec.name
+                        ),
+                    );
+                    continue;
+                }
                 // The sandbox's image policy: its own package identity is seeded eagerly (so
                 // its `@/`/relative asset reads verify) and the fork provider inserts each
                 // DEPENDENCY's identity as the closure resolves during module loading — a
@@ -1728,8 +2103,8 @@ impl<'a> ScriptEngine<'a> {
                 // <Image> srcs exactly as they gate `fetch`/file reads.
                 let image_hosted = smudgy_cloud::image_source::HostedPackages::default();
                 image_hosted.insert(
-                    &spec.owner,
-                    &spec.name,
+                    &runtime_key.owner,
+                    &runtime_key.name,
                     &version,
                     pkg_cloud
                         .as_ref()
@@ -1769,7 +2144,12 @@ impl<'a> ScriptEngine<'a> {
                     };
                 #[cfg(feature = "web-audio")]
                 let mut package_audio_binding = package_audio_binding;
-                let data_dir = sandbox_data_dir(&server_path, &spec.owner, &spec.name, &version);
+                let data_dir = sandbox_data_dir(
+                    &server_path,
+                    &runtime_key.owner,
+                    &runtime_key.name,
+                    &version,
+                );
                 // Sandbox this isolate with a restricted container built from the enforced union
                 // (`PACKAGE-ISOLATES-ENFORCEMENT.md`); `$DATA` in `read`/`write` expands to `fs_data_dir`.
                 let permissions = match build_restricted_container(&effective, &fs_data_dir) {
@@ -1804,7 +2184,11 @@ impl<'a> ScriptEngine<'a> {
                     // Persistent (localStorage) storage keyed by (owner, name) so it survives
                     // this package's own version updates; version-specific cache/node_modules
                     // stay under `data_dir`.
-                    Some(sandbox_storage_dir(&server_path, &spec.owner, &spec.name)),
+                    Some(sandbox_storage_dir(
+                        &server_path,
+                        &runtime_key.owner,
+                        &runtime_key.name,
+                    )),
                     None,
                     // Cloned: `loader` is read again after the load for the stumble check.
                     Some(loader.clone()),
@@ -1841,7 +2225,7 @@ impl<'a> ScriptEngine<'a> {
                 };
                 let set = ModuleSet {
                     local_modules: Vec::new(),
-                    packages: vec![specifier.clone()],
+                    packages: vec![runtime_key.to_user_specifier()],
                 };
                 let load = {
                     // Model B: this sandboxed isolate is the current one while its single
@@ -1901,8 +2285,8 @@ impl<'a> ScriptEngine<'a> {
                         // package until a reload's sweep or an explicit close.
                         {
                             let namespace = super::pane::PaneNamespace::Package {
-                                owner: Arc::from(spec.owner.as_str()),
-                                name: Arc::from(spec.name.as_str()),
+                                owner: Arc::from(runtime_key.owner.as_str()),
+                                name: Arc::from(runtime_key.name.as_str()),
                             };
                             let doomed: Vec<(Arc<str>, super::pane::PaneKey)> = pane_registry
                                 .lock()
@@ -2119,6 +2503,16 @@ impl<'a> ScriptEngine<'a> {
                     );
                 }
             }
+            for provider in std::iter::once(main_provider).chain(sandbox_providers.iter()) {
+                for warning in provider.take_local_override_warnings() {
+                    Self::emit_session_notice(
+                        &params.ui_tx,
+                        params.session_id,
+                        &params.emitted_line_count,
+                        &warning,
+                    );
+                }
+            }
             // A package loaded at ≥2 coexisting versions WITHIN one isolate can collide
             // (double-registered automations, split state). Fork or pin.
             for provider in std::iter::once(main_provider).chain(sandbox_providers.iter()) {
@@ -2164,22 +2558,60 @@ impl<'a> ScriptEngine<'a> {
                 IsolateId::Main => None,
             })
             .collect();
-        if let Ok(lock) = crate::models::shared_packages::load_lock(params.server_name.as_str()) {
-            for pkg in &lock.packages {
-                let Ok(spec) = SmudgySpecifier::parse(&pkg.specifier) else {
-                    continue;
-                };
-                keep_storage_slugs.insert(sandbox_storage_slug(&spec.owner, &spec.name));
-                if let Some(version) = &pkg.last_resolved_version {
-                    keep_isolate_slugs.insert(isolate_slug(&spec.owner, &spec.name, version));
-                }
-                if let crate::models::shared_packages::UpdateMode::Pinned { version } = &pkg.mode {
-                    keep_isolate_slugs.insert(isolate_slug(&spec.owner, &spec.name, version));
+        let mut prune_package_state = || -> anyhow::Result<()> {
+            let lock = crate::models::shared_packages::load_lock(params.server_name.as_str());
+            let local_names =
+                crate::models::local_packages::list_local_packages(params.server_name.as_str());
+            let can_prune_package_state = lock.is_ok() && local_names.is_ok();
+            if let (Ok(lock), Ok(local_names)) = (lock, local_names) {
+                let local_owner = crate::models::auth::load_account()
+                    .and_then(|account| account.nickname)
+                    .unwrap_or_else(|| crate::models::local_packages::LOCAL_OWNER.to_string());
+                let local_names: HashMap<String, String> = local_names
+                    .into_iter()
+                    .map(|name| (name.to_ascii_lowercase(), name))
+                    .collect();
+                for pkg in &lock.packages {
+                    let Ok(spec) = SmudgySpecifier::parse(&pkg.specifier) else {
+                        continue;
+                    };
+                    let (owner, name) = local_names
+                        .get(&spec.name.to_ascii_lowercase())
+                        .map_or((&spec.owner, &spec.name), |local_name| {
+                            (&local_owner, local_name)
+                        });
+                    keep_storage_slugs.insert(sandbox_storage_slug(owner, name));
+                    if let Some(version) = &pkg.last_resolved_version {
+                        keep_isolate_slugs.insert(isolate_slug(owner, name, version));
+                    }
+                    if let crate::models::shared_packages::UpdateMode::Pinned { version } =
+                        &pkg.mode
+                    {
+                        keep_isolate_slugs.insert(isolate_slug(owner, name, version));
+                    }
+                    if owner == &local_owner
+                        && let Ok(Some(local)) = crate::models::local_packages::load_local_package(
+                            params.server_name.as_str(),
+                            name,
+                        )
+                    {
+                        keep_isolate_slugs.insert(isolate_slug(
+                            owner,
+                            name,
+                            &local.manifest.version,
+                        ));
+                    }
                 }
             }
+            if can_prune_package_state {
+                prune_orphan_isolate_dirs(&server_path, &keep_isolate_slugs);
+                prune_orphan_isolate_storage_dirs(&server_path, &keep_storage_slugs);
+            }
+            Ok(())
+        };
+        if let Err(error) = prune_package_state() {
+            warn!("Skipped package-state pruning: {error:#}");
         }
-        prune_orphan_isolate_dirs(&server_path, &keep_isolate_slugs);
-        prune_orphan_isolate_storage_dirs(&server_path, &keep_storage_slugs);
 
         Self {
             session_id: params.session_id,
@@ -3383,19 +3815,6 @@ fn prune_orphan_isolate_storage_dirs(
     }
 }
 
-/// The enforced permission set for a LOCAL dev-override package: its own `smudgy.package.json`
-/// manifest permissions, read from disk. A local package has no consent record — the author edits
-/// the manifest to grant capabilities (the manifest IS the grant table) and reloads to test the
-/// exact sandbox an installer will get. A missing/unreadable manifest yields the empty union
-/// (deny-all), the safe default; the author can trust the package to develop allow-all instead.
-fn local_manifest_permissions(server_name: &str, name: &str) -> PackagePermissions {
-    crate::models::local_packages::load_local_package(server_name, name)
-        .ok()
-        .flatten()
-        .map(|pkg| pkg.manifest.permissions)
-        .unwrap_or_default()
-}
-
 /// Build the restricted [`PermissionsContainer`] for a sandboxed package isolate from its
 /// closure's deno-native permission `union` (`PACKAGE-ISOLATES-ENFORCEMENT.md`). `data_dir`
 /// is the dir the `$DATA` placeholder in `read`/`write` entries expands to — the package's OWN
@@ -3594,6 +4013,173 @@ mod permission_option_tests {
             to_allow_list(vec!["example.com:443".to_string()]),
             Some(vec!["example.com:443".to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+mod package_root_plan_tests {
+    use super::{
+        local_inventory_skipped_notice, packages_unavailable_notice, partition_package_roots,
+        partition_published_roots_without_local_inventory,
+    };
+    use crate::models::{
+        profile_activation::ProfileActivation,
+        shared_packages::{LockedPackage, SharedPackageLock, UpdateMode},
+    };
+    use crate::session::runtime::store::HomeIsolate;
+    use std::collections::HashMap;
+
+    fn active(specifier: &str, trusted: bool) -> LockedPackage {
+        let mut package = LockedPackage::new(specifier, UpdateMode::Auto);
+        package.set_activation(ProfileActivation::All);
+        package.trusted = trusted;
+        package
+    }
+
+    #[test]
+    fn canonical_local_row_controls_trust_and_collapses_shadowed_aliases() {
+        let remote = active("smudgy://publisher/tools", true);
+        let local = active("smudgy://local/tools", false);
+        let lock = SharedPackageLock {
+            packages: vec![remote, local],
+        };
+        let local_names = HashMap::from([("tools".to_string(), "tools".to_string())]);
+
+        let plan = partition_package_roots(&lock, "developer", &local_names, "Main");
+
+        assert!(plan.trusted.is_empty(), "published trust must not transfer");
+        assert_eq!(plan.sandboxed, ["smudgy://developer/tools"]);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            plan.homes.get(&("developer".into(), "tools".into())),
+            Some(&HomeIsolate::OwnSandbox)
+        );
+        assert_eq!(plan.homes.len(), 1, "the remote alias has no separate home");
+    }
+
+    #[test]
+    fn disabled_local_state_ignores_remote_activation_and_requires_lineage() {
+        let mut remote = active("smudgy://publisher/tools", true);
+        let mut local = active("smudgy://local/tools", false);
+        local.set_activation(ProfileActivation::None);
+        let root = active("smudgy://publisher/app", false);
+        let local_names = HashMap::from([("tools".to_string(), "tools".to_string())]);
+
+        let direct_only = SharedPackageLock {
+            packages: vec![remote.clone(), local.clone(), root.clone()],
+        };
+        let direct_plan = partition_package_roots(&direct_only, "developer", &local_names, "Main");
+        assert_eq!(direct_plan.sandboxed, ["smudgy://publisher/app"]);
+        assert!(direct_plan.trusted.is_empty());
+
+        remote.required_by.insert(root.specifier.clone());
+        remote.installed_as_requirement = true;
+        remote.requirement_lineage_known = true;
+        let required = SharedPackageLock {
+            packages: vec![remote, local, root],
+        };
+        let required_plan = partition_package_roots(&required, "developer", &local_names, "Main");
+        assert_eq!(required_plan.sandboxed, ["smudgy://publisher/app"]);
+        assert!(required_plan.trusted.is_empty());
+    }
+
+    #[test]
+    fn duplicate_published_roots_fail_closed_even_when_one_is_inactive() {
+        let mut inactive = active("smudgy://second/tools", false);
+        inactive.set_activation(ProfileActivation::None);
+        let lock = SharedPackageLock {
+            packages: vec![active("smudgy://first/tools", true), inactive],
+        };
+
+        let plan = partition_package_roots(&lock, "developer", &HashMap::new(), "Main");
+
+        assert!(plan.trusted.is_empty());
+        assert!(plan.sandboxed.is_empty());
+        assert!(plan.homes.is_empty());
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.conflicts[0].contains("more than one published package"));
+    }
+
+    #[test]
+    fn local_override_does_not_hide_contradictory_multiple_remote_rows() {
+        let lock = SharedPackageLock {
+            packages: vec![
+                active("smudgy://first/tools", true),
+                active("smudgy://second/tools", false),
+                active("smudgy://local/tools", false),
+            ],
+        };
+        let local_names = HashMap::from([("tools".to_string(), "tools".to_string())]);
+
+        let plan = partition_package_roots(&lock, "developer", &local_names, "Main");
+
+        assert!(plan.trusted.is_empty());
+        assert!(plan.sandboxed.is_empty());
+        assert!(plan.homes.is_empty());
+        assert_eq!(plan.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn empty_local_names_still_yield_published_roots() {
+        let lock = SharedPackageLock {
+            packages: vec![
+                active("smudgy://publisher/app", true),
+                active("smudgy://other/helper", false),
+            ],
+        };
+
+        let plan = partition_package_roots(&lock, "developer", &HashMap::new(), "Main");
+
+        assert_eq!(plan.trusted, ["smudgy://publisher/app"]);
+        assert_eq!(plan.sandboxed, ["smudgy://other/helper"]);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            plan.homes.get(&("publisher".into(), "app".into())),
+            Some(&HomeIsolate::Main)
+        );
+        assert_eq!(
+            plan.homes.get(&("other".into(), "helper".into())),
+            Some(&HomeIsolate::OwnSandbox)
+        );
+    }
+
+    #[test]
+    fn missing_local_inventory_loads_published_roots_and_skips_locally_governed_leaves() {
+        let lock = SharedPackageLock {
+            packages: vec![
+                active("smudgy://publisher/app", true),
+                active("smudgy://publisher/tools", true),
+                active("smudgy://local/tools", false),
+                active("smudgy://local/Scratch", true),
+            ],
+        };
+
+        let (plan, locally_governed, skipped) =
+            partition_published_roots_without_local_inventory(&lock, "developer", "Main");
+
+        assert_eq!(plan.trusted, ["smudgy://publisher/app"]);
+        assert!(plan.sandboxed.is_empty());
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.homes.len(), 1);
+        assert_eq!(skipped, ["Scratch", "tools"]);
+        assert_eq!(
+            locally_governed,
+            HashMap::from([
+                ("tools".to_string(), "tools".to_string()),
+                ("scratch".to_string(), "Scratch".to_string()),
+            ])
+        );
+
+        let notice = local_inventory_skipped_notice("packages directory is unreadable", &skipped);
+        assert!(notice.contains("packages directory is unreadable"));
+        assert!(notice.contains("Local packages were not loaded"));
+        assert!(notice.contains("Published packages loaded"));
+        assert!(notice.contains("Scratch, tools"));
+
+        let notice = packages_unavailable_notice("inventory failed", "lock parse failed");
+        assert!(notice.contains("No packages were loaded"));
+        assert!(notice.contains("inventory failed"));
+        assert!(notice.contains("lockfile could not be read (lock parse failed)"));
     }
 }
 

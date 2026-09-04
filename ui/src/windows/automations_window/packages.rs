@@ -2,30 +2,36 @@
 //! installed packages, owned packages, Discover, and Private & Shared (the caller's own
 //! cloud packages plus packages friends have shared).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use iced::Task;
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, button, column, container, markdown, pick_list, radio, rich_text, row, scrollable,
-    span, text, text_input,
+    Column, button, column, container, markdown, radio, rich_text, row, scrollable, span, text,
+    text_input,
 };
-use iced::{Background, Border, Color, Font, Length, Padding};
+use iced::{Background, Border, Color, Font, Length};
 
-use smudgy_cloud::cloud_api::FriendView;
+use smudgy_cloud::cloud_api::{CloudApiClient, FriendView};
 use smudgy_cloud::package_api::{
     CommentView, PackageApiClient, PackageDetail, PackageGrantView, PackageSearchResult,
     ResolvedPackageWire, SearchCategory, VersionListItem,
 };
-use smudgy_cloud::{CloudError, Uuid};
-use smudgy_core::models::local_packages::{self, LocalModule, LocalPackage};
+use smudgy_cloud::{CloudError, DependencyKind, Uuid};
+use smudgy_core::models::local_packages::{self, LocalModule};
 use smudgy_core::models::naming;
+use smudgy_core::models::package_updates::PackageVersionRef;
+use smudgy_core::models::profile_activation::ProfileActivation;
 use smudgy_core::models::shared_packages::{
-    self, LockedPackage, PackageManifest, PackageParameter, PackagePermissions, ParamKind,
-    SmudgyCapabilities, UpdateMode,
+    self, Cas, LockedPackage, PackageManifest, PackageParamCommit, PackageParamMutation,
+    PackageParameter, PackagePermissions, ParamKind, ParamValueScope, ParameterScope,
+    SharedPackageLock, SmudgyCapabilities, UpdateMode,
 };
 
 use crate::assets::fonts;
+use crate::cloud_account::{
+    PackageOperationCompletion, PackageOperationId, PackageOperationPermit,
+};
 use crate::components::cloud_errors::display_error;
 use crate::theme::builtins::button as button_style;
 use crate::update::Update;
@@ -47,7 +53,10 @@ use super::model::{
     CreatorAutomations, DepEdge, NodeStatus, package_display_name, parse_specifier, specifier_for,
 };
 use super::param_values::{self, ParamTarget, ParamValueEdit, ParamValueState, ScalarEdit};
-use super::{AutomationsWindow, DiscoverScope, Elem, Event, Message, Pane, Selection};
+use super::{
+    AutomationsWindow, DiscoverScope, Elem, Event, InstalledPackageTab, InstalledReadmeState,
+    LocalPackageTab, Message, Pane, Selection,
+};
 
 /// Terminal-like output from the latest publish attempt, keyed to its package so navigating to a
 /// different owned package never shows the wrong command or diagnostics.
@@ -57,19 +66,56 @@ pub(super) struct PublishOutput {
     pub(super) text: String,
 }
 
+/// What the local folder can prove about its cloud publication history. Rename must fail closed:
+/// a transient cloud failure or a damaged durable binding must never make a published name look
+/// editable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PublicationStatus {
+    /// No durable binding exists and cloud history has not been checked in this session.
+    Unknown,
+    /// A signed-in cloud-history check is in progress.
+    Checking,
+    /// Cloud history was checked and this local folder has not published a namespace.
+    Unpublished,
+    /// The local folder is durably (or newly, in this process) bound to this namespace.
+    Bound(Uuid),
+    /// The durable publication record is unreadable or contradicts cloud state.
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProfileChoice {
+    pub(super) key: String,
+    pub(super) label: String,
+}
+
+/// The copy-settings dialog: which package's per-profile values to copy, from which profile,
+/// and the destination the user has picked so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopySettingsPrompt {
+    pub specifier: String,
+    pub source: String,
+    pub destination: Option<String>,
+}
+
+impl std::fmt::Display for ProfileChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
 /// The install-time prompt for a package's required params that aren't yet set.
 #[derive(Debug, Clone)]
 pub struct ParamPrompt {
-    pub specifier: String,
+    /// Exact governing row captured when this prompt was prepared. Submission compares this full
+    /// row under the package-state transaction and writes the values only when it still matches.
+    pub expected_package: LockedPackage,
     pub name: String,
     pub version: String,
     pub params: Vec<PackageParameter>,
     /// In-progress value state per key (a checkbox bool, a dropdown selection, a list of rows…),
     /// seeded empty. See [`param_values`].
     pub values: HashMap<String, ParamValueState>,
-    /// Whether the consent step chose to enable (run) the package — carried so finishing after the
-    /// params are filled honors the same choice.
-    pub enable: bool,
     pub error: Option<String>,
 }
 
@@ -84,6 +130,15 @@ pub struct ParamConfig {
     /// the lock entry's specifier; for a local package its own-handle specifier (`local_own_spec`).
     /// Param storage is keyed by it, matching what the runtime's `smudgy:params` op reads.
     pub specifier: String,
+    /// Exact governing row that authorized the values read into this editor. `None` means the
+    /// authority was unavailable and all mutations must remain disabled.
+    pub expected_package: Option<LockedPackage>,
+    pub parameter_scope: ParameterScope,
+    pub profile_name: String,
+    /// False when the authoritative lock, value file, or secret store could not be read. The
+    /// section remains visible with an error, but never presents writable controls seeded from
+    /// fabricated defaults.
+    pub available: bool,
     /// Every param the package declares, in manifest order.
     pub params: Vec<PackageParameter>,
     /// Value state per key (see [`param_values`]). A non-secret is seeded from its current stored
@@ -108,31 +163,81 @@ impl ParamConfig {
     /// Builds the editor for `specifier`'s `params`, seeding each non-secret value from the on-disk
     /// param store and recording which secrets are already set. Reads the param files once, at
     /// pane-open time (never from `view`).
-    fn seed(server_name: &str, specifier: String, params: Vec<PackageParameter>) -> Self {
+    fn seed(
+        server_name: &str,
+        profile_name: &str,
+        expected_package: LockedPackage,
+        params: Vec<PackageParameter>,
+    ) -> Result<Self, String> {
+        let specifier = expected_package.specifier.clone();
+        let parameter_scope = expected_package.parameter_scope;
+        let scope = match parameter_scope {
+            ParameterScope::Global => ParamValueScope::Global,
+            ParameterScope::Profile => ParamValueScope::Profile(profile_name),
+        };
         let mut values = HashMap::new();
         let mut secret_stored = HashSet::new();
         for param in &params {
             if is_secret_string(param) {
-                if shared_packages::load_secret_param(server_name, &specifier, &param.key).is_some()
+                if shared_packages::load_secret_param_scoped_checked(
+                    server_name,
+                    scope,
+                    &specifier,
+                    &param.key,
+                )
+                .map_err(|error| error.to_string())?
+                .is_some()
                 {
                     secret_stored.insert(param.key.clone());
                 }
                 values.insert(param.key.clone(), ParamValueState::Text(String::new()));
             } else {
-                let stored = shared_packages::get_param_value(server_name, &specifier, &param.key);
+                let stored = shared_packages::get_param_value_scoped_checked(
+                    server_name,
+                    scope,
+                    &specifier,
+                    &param.key,
+                )
+                .map_err(|error| error.to_string())?;
                 values.insert(
                     param.key.clone(),
                     param_values::seed(param, stored.as_ref()),
                 );
             }
         }
-        Self {
+        Ok(Self {
             specifier,
+            expected_package: Some(expected_package),
+            parameter_scope,
+            profile_name: profile_name.to_string(),
+            available: true,
             params,
             values,
             secret_stored,
             touched: HashSet::new(),
             error: None,
+            saved: false,
+        })
+    }
+
+    fn unavailable(
+        specifier: String,
+        parameter_scope: ParameterScope,
+        profile_name: &str,
+        params: Vec<PackageParameter>,
+        error: String,
+    ) -> Self {
+        Self {
+            specifier,
+            expected_package: None,
+            parameter_scope,
+            profile_name: profile_name.to_string(),
+            available: false,
+            params,
+            values: HashMap::new(),
+            secret_stored: HashSet::new(),
+            touched: HashSet::new(),
+            error: Some(error),
             saved: false,
         }
     }
@@ -142,7 +247,7 @@ impl ParamConfig {
 /// strings, so only a `String` param can be one — a (hand-authored) secret of any other kind falls
 /// back to its real value control rather than a misleading secret box. The manifest editor already
 /// gates the `secret` flag to `String`, so this only matters for a malformed manifest.
-fn is_secret_string(param: &PackageParameter) -> bool {
+pub(super) fn is_secret_string(param: &PackageParameter) -> bool {
     param.secret && param.kind == ParamKind::String
 }
 
@@ -168,26 +273,27 @@ enum Persist {
 }
 
 impl Persist {
-    /// Apply this write for `key` under `specifier` on `server_name`, surfacing any failure as a
-    /// display string for the inline error.
-    fn write(&self, server_name: &str, specifier: &str, key: &str) -> Result<(), String> {
-        let result = match self {
-            Persist::Secret(value) => {
-                shared_packages::save_secret_param(server_name, specifier, key, value)
-            }
-            Persist::Value(value) => {
-                shared_packages::save_param_value(server_name, specifier, key, value.clone())
-            }
-            Persist::Clear => shared_packages::clear_param_value(server_name, specifier, key),
-        };
-        result.map_err(|e| e.to_string())
+    fn mutation(&self, key: &str) -> PackageParamMutation {
+        match self {
+            Self::Secret(value) => PackageParamMutation::SetSecret {
+                key: key.to_string(),
+                value: value.clone(),
+            },
+            Self::Value(value) => PackageParamMutation::SetValue {
+                key: key.to_string(),
+                value: value.clone(),
+            },
+            Self::Clear => PackageParamMutation::ClearValue {
+                key: key.to_string(),
+            },
+        }
     }
 }
 
 /// A secure text-input field row for a secret parameter, emitting a scalar text edit on `target`.
 /// Secrets are write-only (never read back into the box), so this is rendered here rather than by
 /// [`param_values::view`]. `clear` appends a Clear button when present (the config editor only).
-fn secret_field_row<'a>(
+pub(super) fn secret_field_row<'a>(
     param: &'a PackageParameter,
     state: Option<&'a ParamValueState>,
     target: ParamTarget,
@@ -228,47 +334,61 @@ fn secret_field_row<'a>(
     field.into()
 }
 
-/// How "Edit a copy" settled the fork's enabled state, so [`AutomationsWindow::fork_finished`]
-/// can phrase its toast truthfully. A fork **mirrors the source's enabled state**.
+/// How "Edit a copy" settled the local copy's runtime state, so
+/// [`AutomationsWindow::fork_finished`] can describe the result precisely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkActivation {
-    /// The source was enabled and the fork occupies a DISTINCT specifier slot: the fork was
-    /// enabled and the original source install removed from the lockfile (the name handoff — the
-    /// local fork supersedes it, so it isn't left as a stale second identity for the same leaf name).
-    TookOver,
-    /// The source was enabled and the fork shares the source's specifier (a self-fork keeping
-    /// the leaf name): the single install was enabled — nothing separate was disabled.
-    Mirrored,
-    /// The fork was left disabled (the source was disabled): an inspect-only local copy until the
-    /// author enables it.
-    Inactive,
-}
-
-/// Decide how a fork's enabled state settles. `activate` is whether the source was enabled;
-/// `fork_is_self` is whether the fork shares the source's specifier (a self-fork keeping the
-/// leaf name). Pure so the "mirror the source's enabled state, but don't re-disable a shared
-/// slot" rule is unit-tested without a live lockfile.
-fn fork_activation(activate: bool, fork_is_self: bool) -> ForkActivation {
-    match (activate, fork_is_self) {
-        (false, _) => ForkActivation::Inactive,
-        (true, true) => ForkActivation::Mirrored,
-        (true, false) => ForkActivation::TookOver,
-    }
+    /// The copy keeps the leaf name and therefore becomes the canonical implementation of the
+    /// already-installed package. Its remote lock row remains available as the delete fallback.
+    OverrideActive,
+    /// As [`Self::OverrideActive`], but the installed fallback was disabled everywhere, so no
+    /// running session changes when the local implementation becomes canonical.
+    OverrideInactive,
+    /// The copy uses a different leaf name. With no package of that name already installed, its
+    /// newly materialized local row starts disabled.
+    Independent,
 }
 
 /// Outcome of an async cloud check over account-owned installs — `delete_owned`'s post-delete
 /// check of the deleted package's own entry, or the installed-list sweep over folder-less
 /// entries. Drives [`AutomationsWindow::stale_account_installs_checked`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaleInstallCheck {
     /// Nothing is published under the checked name(s): the stale entries were removed from the
     /// lockfile, so the installed list must refresh.
-    Pruned,
-    /// A published copy exists for a parked (temporarily disabled) entry: it was re-enabled so
-    /// the published package takes over from the deleted working copy.
-    Restored,
+    Pruned(Vec<String>),
     /// The check couldn't decide (cloud unreachable) or nothing needed doing.
     Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateComparisonApply {
+    Current,
+    ConsentChanged,
+    Stale,
+}
+
+/// Generation fence for owned-package cloud state. Opening a package, refreshing after publish,
+/// or starting a sharing mutation advances it; late results from an older load or mutation cannot
+/// repaint the same package after a newer operation has begun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShareSeq(u64);
+
+impl ShareSeq {
+    pub fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+/// Exact account identity attached to authenticated read results. The window-local epoch handles
+/// refreshes; this fence also closes the daemon-turn gap between a credential/account swap and the
+/// queued `AccountChanged` refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountReadFence {
+    account_epoch: u64,
+    credential_generation: u64,
+    user_id: Option<Uuid>,
+    signed_in: bool,
 }
 
 /// A monotonic generation token for an in-flight install resolve (the stale-result guard). A
@@ -303,6 +423,39 @@ impl DetailSeq {
     }
 }
 
+/// Generation token for one complete installed-package graph resolve. Reloading the lockfile
+/// advances it, so a response from an older package/version snapshot cannot rewrite the current
+/// graph or its persisted `required_by` closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GraphSeq(u64);
+
+impl GraphSeq {
+    pub fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+/// Generation for the selected Discover package and its viewer-specific reads/mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscoverSeq(u64);
+
+impl DiscoverSeq {
+    pub fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+/// Generation for public Discover result searches, so a slower old query cannot replace a newer
+/// query or scope selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscoverSearchSeq(u64);
+
+impl DiscoverSearchSeq {
+    pub fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
 /// The manage-pane detail-load payload ([`Message::InstalledDetailLoaded`]): the freshly
 /// resolved wire package, its pinnable (non-deleted) version list, the closure permission
 /// union, the closure `min_smudgy_version` floor, and best-effort cloud rating metadata.
@@ -313,6 +466,53 @@ pub type InstalledDetail = (
     shared_packages::SmudgyVersionFloor,
     Option<PackageDetail>,
 );
+
+/// Latest-registry comparison kept separate from [`InstalledDetail`], whose resolved package is
+/// always the staged/running version used by About and Source.
+#[derive(Debug, Clone)]
+pub struct InstalledLatestComparison {
+    pub version: String,
+    pub permissions: PackagePermissions,
+    pub floor: shared_packages::SmudgyVersionFloor,
+    /// The offered manifest adds or changes independent `requires` roots. Such a version is held
+    /// until the full install planner checks ranges, consent, and materialization.
+    pub requirements_changed: bool,
+}
+
+/// Whether a consent prompt creates a new install or changes an existing root's version policy.
+#[derive(Debug, Clone)]
+pub enum ConsentOperation {
+    Install,
+    Update {
+        mode: UpdateMode,
+        activation: ProfileActivation,
+    },
+    LocalManifest {
+        name: String,
+        manifest: Box<PackageManifest>,
+        json: String,
+        expected_manifest: String,
+        activation: ProfileActivation,
+    },
+}
+
+/// Final action after all newly-required parameter prompts have been handled.
+#[derive(Debug, Clone)]
+pub(super) enum PackageChangeKind {
+    Install,
+    Update,
+    Manifest,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PackageChangeFinalize {
+    pub(super) specifier: String,
+    pub(super) activation: ProfileActivation,
+    pub(super) kind: PackageChangeKind,
+    /// Replaces the success toast when the change committed but a follow-up step (such as
+    /// reading the required-parameter state) failed.
+    pub(super) warning: Option<String>,
+}
 
 /// The outcome of resolving a package for install: the identity plus the things the
 /// install-consent flow needs — the **closure** permission union (what the sandboxed isolate
@@ -330,6 +530,9 @@ pub struct InstallResolution {
     /// on Grant. Computed by walking the dependency closure (mirrors the engine's `solve_closure`).
     pub permissions: PackagePermissions,
     pub params: Vec<PackageParameter>,
+    /// Exact published import-closure coordinates that must be prefetched before this accepted
+    /// root can be committed. The root itself is implicit in `specifier` + `version`.
+    pub closure: Vec<PackageVersionRef>,
     /// The `requires`-closure walked transitively from this root: each required top-level root,
     /// whether it is already installed/satisfied, its own permission closure, and its missing
     /// required params. Empty when the package requires nothing.
@@ -342,6 +545,14 @@ pub struct InstallResolution {
     /// smudgy — the engine would refuse it at every load. Carries the
     /// [`SmudgyVersionFloor::refusal`](shared_packages::SmudgyVersionFloor::refusal) reason.
     pub needs_smudgy: Option<String>,
+    /// A required root or its manifest could not be resolved. `requires` is mandatory, so this is
+    /// a blocking error rather than a best-effort omission.
+    pub required_unavailable: Option<String>,
+    /// Exact durable package state used to build this resolution. Consent is valid only while
+    /// both snapshots still match; otherwise local shadows, activation, and dependency edges may
+    /// no longer be the ones the user reviewed.
+    pub expected_lock: SharedPackageLock,
+    pub expected_local_manifests: HashMap<String, PackageManifest>,
 }
 
 /// One required root surfaced by the `requires`-closure walk — a `smudgy://owner/name` that must
@@ -359,6 +570,9 @@ pub struct RequiredRoot {
     pub permissions: PackagePermissions,
     /// The root's declared params (so a Grant can chain the required-params prompt for it too).
     pub params: Vec<PackageParameter>,
+    /// Exact published import-closure coordinates to prefetch if this required root is newly
+    /// installed or upgraded. The required root itself is implicit.
+    pub closure: Vec<PackageVersionRef>,
     /// Whether a satisfying root is **already installed** — then it is reused as-is (never
     /// downgraded, never re-consented) and only surfaces as an informational line, not an install.
     pub already_satisfied: bool,
@@ -373,6 +587,9 @@ pub struct RequiredRoot {
 /// writes nothing.
 #[derive(Debug, Clone)]
 pub struct ConsentPrompt {
+    /// Account and credential that resolved every cloud-backed part of this prompt. A prompt is
+    /// invalid as soon as the singleton receives an account change.
+    pub account_fence: AccountReadFence,
     pub specifier: String,
     pub owner: String,
     pub name: String,
@@ -382,6 +599,9 @@ pub struct ConsentPrompt {
     /// The root manifest's params — carried so a Grant can chain straight into the
     /// required-params prompt without a second resolve.
     pub params: Vec<PackageParameter>,
+    /// Exact published import-closure coordinates for the chosen remote root. Empty for a local
+    /// manifest operation, whose live files are not package-cache content.
+    pub closure: Vec<PackageVersionRef>,
     /// The transitively-walked `requires`-closure: the required top-level roots co-installed with
     /// this package (`script/REQUIRED-PACKAGES.md`). A single grant covers the whole set; on Grant
     /// each not-already-satisfied root is installed via `install_required_package` and consented.
@@ -392,7 +612,76 @@ pub struct ConsentPrompt {
     /// A version-floor refusal: when set, Install is disabled and this message explains which
     /// package requires a newer smudgy than this one.
     pub needs_smudgy: Option<String>,
+    /// A mandatory required package could not be resolved or read.
+    pub required_unavailable: Option<String>,
+    pub expected_lock: SharedPackageLock,
+    pub expected_local_manifests: HashMap<String, PackageManifest>,
+    pub operation: ConsentOperation,
     pub error: Option<String>,
+}
+
+/// Proof that every published module in a consented change is present in the package cache, so
+/// the committed lock rows can load without touching the network.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreparedConsentCache;
+
+#[derive(Debug, Clone)]
+struct ConsentCacheTarget {
+    specifier: String,
+    version: String,
+    closure: Vec<PackageVersionRef>,
+}
+
+async fn prepare_consent_cache(
+    client: PackageApiClient,
+    root: Option<ConsentCacheTarget>,
+    required: Vec<ConsentCacheTarget>,
+) -> Result<PreparedConsentCache, String> {
+    if root.is_none() && required.is_empty() {
+        return Ok(PreparedConsentCache);
+    }
+    let cache =
+        PackageCache::new().map_err(|error| format!("package cache unavailable: {error}"))?;
+    for target in root.iter().chain(required.iter()) {
+        prefetch_closure(&client, &cache, target).await?;
+    }
+    Ok(PreparedConsentCache)
+}
+
+async fn prefetch_closure(
+    client: &PackageApiClient,
+    cache: &PackageCache,
+    target: &ConsentCacheTarget,
+) -> Result<(), String> {
+    let (owner, name) = parse_specifier(&target.specifier)
+        .ok_or_else(|| format!("not a package specifier: {}", target.specifier))?;
+    let mut nodes = Vec::with_capacity(target.closure.len() + 1);
+    nodes.push(PackageVersionRef {
+        owner,
+        name,
+        version: target.version.clone(),
+    });
+    nodes.extend(target.closure.iter().cloned());
+
+    let mut fetched = HashSet::new();
+    for node in nodes {
+        if !fetched.insert((
+            node.owner.to_ascii_lowercase(),
+            node.name.to_ascii_lowercase(),
+            node.version.clone(),
+        )) {
+            continue;
+        }
+        crate::package_update_checker::prefetch_version(
+            client,
+            cache,
+            &node.owner,
+            &node.name,
+            &node.version,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// The update re-prompt (`PACKAGE-ISOLATES-CONSENT-TRUST.md`): a freshly-resolved version
@@ -410,13 +699,26 @@ pub struct UpdateDelta {
     pub current_version: Option<String>,
     /// The per-field additions over the consented baseline (`PackagePermissions::added_since`).
     pub added: PackagePermissions,
-    /// The full new closure union — recorded as the new `consented_permissions` on Grant.
-    pub new_union: PackagePermissions,
     /// Why the resolved version can't run on this smudgy (its closure's `min_smudgy_version`
     /// floor refusal), when the version floor — rather than permissions — holds the update
     /// back. The card then explains the floor and offers no grant (granting wouldn't help;
     /// only updating smudgy or pinning an older version would).
     pub needs_smudgy: Option<String>,
+    /// The offered version changes the set or ranges of independently-running required roots.
+    pub requirements_changed: bool,
+}
+
+/// The update mode a granted delta card resolves under. Granting keeps the package's current
+/// policy: a pinned install re-pins to the exact version the card was built from (the staged
+/// version whose closure grew), while an Auto install keeps following the latest. Granting must
+/// never silently drop a pin.
+pub(super) fn update_grant_mode(open: &LockedPackage, delta: &UpdateDelta) -> UpdateMode {
+    match &open.mode {
+        UpdateMode::Pinned { .. } => UpdateMode::Pinned {
+            version: delta.version.clone(),
+        },
+        UpdateMode::Auto => UpdateMode::Auto,
+    }
 }
 
 /// Largest module body the installed-package source browser will fetch and render as text. Real
@@ -425,17 +727,7 @@ pub struct UpdateDelta {
 /// blob at 10 MiB, so this is the UI-side, not the only, bound. Enforced twice: as a pre-fetch
 /// gate on the wire `byte_size` (skip the download) and again on the actual fetched length (so a
 /// missing/under-reported `byte_size` can't sneak a huge body through).
-const SOURCE_PREVIEW_CAP_BYTES: u64 = 1024 * 1024;
-
-/// The two tabs of the installed-package "README & source" area. README is the rendered,
-/// publisher-supplied markdown shown full-width; Source is the file-list + on-demand source
-/// browser. Defaults to README so the user reviews the description before enabling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InstalledFileTab {
-    #[default]
-    Readme,
-    Source,
-}
+pub(super) const SOURCE_PREVIEW_CAP_BYTES: u64 = 1024 * 1024;
 
 /// One installed-package module's render state in the source browser. The body is fetched on
 /// demand (and integrity-checked against its `content_hash`) the first time the file is selected,
@@ -448,8 +740,14 @@ pub enum FilePreview {
     /// Valid UTF-8 source, ready to display. `bidi` flags the presence of Unicode
     /// bidirectional/invisible control characters (the "Trojan Source" class, CVE-2021-42574) so
     /// the view can warn that the rendered order may not match what actually executes.
-    Text { source: String, bidi: bool },
-    /// Detected as binary (contains a NUL byte or isn't valid UTF-8) — shown as a placeholder.
+    Text {
+        source: String,
+        bidi: bool,
+        /// The executable source contained NUL bytes. They are rendered visibly as `␀` and the
+        /// pane warns that the display is an escaped audit view.
+        nul: bool,
+    },
+    /// Detected as binary (isn't valid UTF-8) — shown as a placeholder.
     Binary { size: u64 },
     /// Above [`SOURCE_PREVIEW_CAP_BYTES`] — shown as a placeholder; not rendered as text.
     TooLarge { size: u64 },
@@ -470,22 +768,22 @@ fn has_deceptive_unicode(s: &str) -> bool {
 
 /// Classify fetched module bytes for the source browser. The declared media type is
 /// publisher-controlled, so it is *not* trusted to decide text-vs-binary here — the bytes do:
-/// content above the cap is "too large", content with a NUL byte or invalid UTF-8 is "binary",
-/// and everything else is decoded source. This means a binary blob is never rendered as mojibake,
-/// and a genuine source file a malicious author mislabeled as an image is still shown to the
-/// auditor.
-fn classify_source(bytes: Vec<u8>) -> FilePreview {
+/// content above the cap is "too large" and invalid UTF-8 is "binary". Valid UTF-8 containing NUL
+/// remains auditable because runtime accepts it: each NUL is rendered visibly as `␀` with a warning
+/// instead of hiding potentially executable source behind a binary placeholder.
+pub(super) fn classify_source(bytes: Vec<u8>) -> FilePreview {
     let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if size > SOURCE_PREVIEW_CAP_BYTES {
         return FilePreview::TooLarge { size };
     }
-    if bytes.contains(&0) {
-        return FilePreview::Binary { size };
-    }
     match String::from_utf8(bytes) {
-        Ok(source) => {
+        Ok(mut source) => {
             let bidi = has_deceptive_unicode(&source);
-            FilePreview::Text { source, bidi }
+            let nul = source.contains('\0');
+            if nul {
+                source = source.replace('\0', "␀");
+            }
+            FilePreview::Text { source, bidi, nul }
         }
         Err(_) => FilePreview::Binary { size },
     }
@@ -493,7 +791,7 @@ fn classify_source(bytes: Vec<u8>) -> FilePreview {
 
 /// Human-readable byte size for source-browser placeholders ("1.4 KB", "2.0 MB"). Integer math
 /// only (no float casts), so it stays clippy-pedantic clean and can't overflow for any `u64`.
-fn human_size(bytes: u64) -> String {
+pub(super) fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     let (unit, div) = if bytes >= MB {
@@ -508,26 +806,64 @@ fn human_size(bytes: u64) -> String {
     format!("{}.{} {}", bytes / div, tenth, unit)
 }
 
+/// Reads every local package manifest as one complete shadow-resolution snapshot. A listed folder
+/// with an unreadable or missing manifest is uncertainty, not permission to resolve its remote
+/// namesake, so callers must stop rather than silently omit it.
+fn load_local_manifest_snapshot(
+    server_name: &str,
+) -> Result<HashMap<String, PackageManifest>, String> {
+    let names =
+        local_packages::list_local_packages(server_name).map_err(|error| error.to_string())?;
+    load_local_manifest_snapshot_for_names(server_name, &names)
+}
+
+fn load_local_manifest_snapshot_for_names(
+    server_name: &str,
+    names: &[String],
+) -> Result<HashMap<String, PackageManifest>, String> {
+    let mut manifests = HashMap::with_capacity(names.len());
+    for name in names {
+        let package = local_packages::load_local_package(server_name, name)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| crate::i18n::t!("package-local-not-found", "name" => name))?;
+        let specifier = specifier_for(local_packages::LOCAL_OWNER, &package.name);
+        if manifests.insert(specifier, package.manifest).is_some() {
+            return Err(crate::i18n::t!(
+                "package-local-state-unavailable",
+                "error" => crate::i18n::t!("package-copy-name-exists", "name" => name)
+            ));
+        }
+    }
+    Ok(manifests)
+}
+
 /// Resolves a package and folds the **whole dependency-closure** permission union, mirroring the
 /// engine's `SmudgyPackageProvider::solve_closure`: every distinct `(owner, name, version)` in the
 /// closure contributes its `manifest.permissions` (`PACKAGE-ISOLATES-ENFORCEMENT.md`). The
 /// sandboxed isolate is granted exactly this union (recorded as `consented_permissions`), so
 /// the consent window must show — and consent must record — the closure union, not just the root
-/// manifest. Best-effort, like the engine: a dependency that fails to resolve is skipped rather
-/// than aborting (its perms simply don't fold in). Dedups by `(owner, name, version)` so diamonds
-/// and cycles terminate.
+/// manifest. Every dependency must resolve: skipping one could hide its transitive code or
+/// permission requests from both the consent prompt and the cache-authority ledger. Dedups by
+/// `(owner, name, version)` so diamonds and cycles terminate.
 async fn resolve_install_closure(
     client: &PackageApiClient,
     owner: &str,
     name: &str,
     pinned: Option<&str>,
     installed: &[LockedPackage],
+    local_manifests: &HashMap<String, PackageManifest>,
 ) -> Result<InstallResolution, CloudError> {
+    let expected_lock = SharedPackageLock {
+        packages: installed.to_vec(),
+    };
+    let expected_local_manifests = local_manifests.clone();
     let root = client.resolve_package(owner, name, pinned).await?;
-    let (permissions, floor) = closure_permission_union(client, &root).await;
-    let params = serde_json::from_value::<PackageManifest>(root.manifest.clone())
-        .map(|manifest| manifest.params)
-        .unwrap_or_default();
+    let ResolvedImportClosure {
+        permissions,
+        floor,
+        closure: import_closure,
+    } = closure_permission_union(client, &root).await?;
+    let params = resolved_manifest_checked(&root)?.params;
     let specifier = specifier_for(&root.owner_nickname, &root.name);
     // A closure floored above this smudgy blocks the install up front — the engine would
     // refuse it at every load. The requires walk is skipped; nothing co-installs anyway.
@@ -539,14 +875,19 @@ async fn resolve_install_closure(
             version: root.version,
             permissions,
             params,
+            closure: import_closure,
             required_roots: Vec::new(),
             conflict: None,
             needs_smudgy: Some(reason),
+            required_unavailable: None,
+            expected_lock,
+            expected_local_manifests,
         });
     }
     // Walk this root's `requires`-closure transitively — the required top-level roots co-installed
     // alongside it and any peer-conflict or version-floor refusal.
-    let closure = resolve_required_closure(client, &root, installed).await;
+    let required_closure =
+        resolve_required_closure(client, &root, installed, local_manifests).await;
     Ok(InstallResolution {
         specifier,
         owner: root.owner_nickname,
@@ -554,9 +895,13 @@ async fn resolve_install_closure(
         version: root.version,
         permissions,
         params,
-        required_roots: closure.roots,
-        conflict: closure.conflict,
-        needs_smudgy: closure.needs_smudgy,
+        closure: import_closure,
+        required_roots: required_closure.roots,
+        conflict: required_closure.conflict,
+        needs_smudgy: required_closure.needs_smudgy,
+        required_unavailable: required_closure.unavailable,
+        expected_lock,
+        expected_local_manifests,
     })
 }
 
@@ -567,6 +912,8 @@ struct RequiredClosure {
     /// A required root's closure declares a `min_smudgy_version` above this smudgy — the
     /// whole install is refused (the grant is all-or-nothing and the root couldn't load).
     needs_smudgy: Option<String>,
+    /// A mandatory root could not be resolved/read, so installation must stop.
+    unavailable: Option<String>,
 }
 
 /// Why [`plan_required_root`] refused the whole install — each variant lands in its own
@@ -576,6 +923,8 @@ enum RequiredRefusal {
     Conflict(String),
     /// The required root's closure is floored above this smudgy.
     NeedsSmudgy(String),
+    /// Registry/cache access or manifest parsing failed for a mandatory required root.
+    Unavailable(String),
 }
 
 /// Walks `root`'s `requires` **transitively** (`script/REQUIRED-PACKAGES.md`): for each
@@ -587,115 +936,254 @@ enum RequiredRefusal {
 /// when one exists; if no version satisfies all, the whole install is **refused** (`conflict` set,
 /// `script/REQUIRED-PACKAGES.md`).
 ///
-/// Best-effort like the rest of the install path: a required root that fails to resolve is skipped
-/// (it can't be co-installed if the registry won't return it) rather than aborting the user's
-/// install of the root they actually asked for.
+/// Every required root is mandatory. Resolution or manifest failures stop the install and are
+/// surfaced through [`RequiredClosure::unavailable`].
 async fn resolve_required_closure(
     client: &PackageApiClient,
     root: &ResolvedPackageWire,
     installed: &[LockedPackage],
+    local_manifests: &HashMap<String, PackageManifest>,
 ) -> RequiredClosure {
-    let root_key = (root.owner_nickname.clone(), root.name.clone());
-    // Requirer ranges gathered per required (owner, name): every range any package in the closure
-    // (or already installed) declares for it, so a single satisfying version can be sought.
-    let mut requirer_ranges: HashMap<(String, String), Vec<RequirerRange>> = HashMap::new();
-    // Seed with the ranges every *already-installed* package declares for its required roots, so an
-    // existing requirer's pin is honored when picking/keeping a shared version (one root per
-    // library). Resolving each installed package's manifest is best-effort.
-    for pkg in installed {
-        let Some((pkg_owner, pkg_name)) = parse_specifier(&pkg.specifier) else {
-            continue;
-        };
-        let pinned = pkg.pinned_version().map(str::to_string);
-        let Ok(wire) = client
-            .resolve_package(&pkg_owner, &pkg_name, pinned.as_deref())
-            .await
-        else {
-            continue;
-        };
-        let Ok(manifest) = serde_json::from_value::<PackageManifest>(wire.manifest.clone()) else {
-            continue;
-        };
-        for req in manifest.smudgy_requires() {
-            requirer_ranges
-                .entry((req.key.owner.clone(), req.key.name.clone()))
-                .or_default()
-                .push(RequirerRange {
-                    requirer: package_display_name(&pkg.specifier).to_string(),
-                    range: req.range.clone(),
-                });
+    let root_edges = match manifest_requires_checked(root) {
+        Ok(edges) => canonical_required_edges(edges, local_manifests),
+        Err(message) => {
+            return RequiredClosure {
+                roots: Vec::new(),
+                conflict: None,
+                needs_smudgy: None,
+                unavailable: Some(message),
+            };
         }
-        // `req` above is a `smudgy_script::PackageDependency`; consumed inline so the type is
-        // never named here.
-    }
+    };
+    resolve_required_closure_from_edges(
+        client,
+        &root.owner_nickname,
+        &root.name,
+        &root.version,
+        root_edges,
+        installed,
+        local_manifests,
+    )
+    .await
+}
 
+/// Fixed-point `requires` planner shared by remote installation/version changes and local manifest
+/// saves. The root itself can be remote or the reserved local state identity; only its identity,
+/// version, and already-parsed outgoing edges participate in peer-range planning.
+async fn resolve_required_closure_from_edges(
+    client: &PackageApiClient,
+    root_owner: &str,
+    root_name: &str,
+    root_version: &str,
+    root_edges: Vec<RequiresEdge>,
+    installed: &[LockedPackage],
+    local_manifests: &HashMap<String, PackageManifest>,
+) -> RequiredClosure {
+    let root_key = canonical_required_key(root_owner, root_name, local_manifests);
     let mut closure = RequiredClosure {
         roots: Vec::new(),
         conflict: None,
         needs_smudgy: None,
+        unavailable: None,
     };
-    // Required roots already turned into a `RequiredRoot`, keyed by (owner, name), so a diamond in
-    // the requires graph yields one entry.
-    let mut emitted: HashSet<(String, String)> = HashSet::new();
-    // Every package whose `requires` have been walked (the cycle seen-set), seeded with the root.
-    let mut walked: HashSet<(String, String)> = HashSet::new();
-    walked.insert(root_key.clone());
 
-    // The requires edges still to walk: (the requiring package's display name, the required edge).
-    let mut frontier: Vec<(String, RequiresEdge)> = manifest_requires(root)
-        .into_iter()
-        .map(|edge| (root.name.clone(), edge))
-        .collect();
-
-    while let Some((requirer, edge)) = frontier.pop() {
-        let key = (edge.owner.clone(), edge.name.clone());
-        // Record this edge's range for the conflict computation.
-        requirer_ranges
-            .entry(key.clone())
-            .or_default()
-            .push(RequirerRange {
-                requirer: requirer.clone(),
-                range: edge.range.clone(),
-            });
-        // A back-edge to something already walked (including the root) is already accounted for.
-        if walked.contains(&key) {
+    // Constraints from packages that already exist are fixed for this planning run. A local folder
+    // owns its leaf, so its dormant remote fallback contributes neither a manifest nor a second
+    // identity. This is also where impossible multiple-remote-author leaf state fails closed.
+    let local_leaves = local_manifests
+        .keys()
+        .map(|specifier| package_display_name(specifier).to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut fixed_ranges: BTreeMap<RequiredKey, Vec<RequirerRange>> = BTreeMap::new();
+    let mut remote_owner_by_leaf: BTreeMap<String, String> = BTreeMap::new();
+    if !local_leaves.contains(&root_name.to_ascii_lowercase()) {
+        remote_owner_by_leaf.insert(
+            root_name.to_ascii_lowercase(),
+            root_owner.to_ascii_lowercase(),
+        );
+    }
+    let mut local_manifests_seen = HashSet::new();
+    for package in installed {
+        let Some((owner, name)) = parse_specifier(&package.specifier) else {
+            continue;
+        };
+        let leaf = name.to_ascii_lowercase();
+        let is_local_state =
+            owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER) && local_leaves.contains(&leaf);
+        if local_leaves.contains(&leaf) && !is_local_state {
             continue;
         }
-        if !emitted.insert(key.clone()) {
-            // Already turned into a RequiredRoot via another edge (a diamond) — its requires were
-            // walked then; only its range (recorded above) still matters.
-            continue;
-        }
-        walked.insert(key.clone());
-
-        let ranges = requirer_ranges.get(&key).cloned().unwrap_or_default();
-        match plan_required_root(client, &edge.owner, &edge.name, &ranges, installed).await {
-            Ok(Some((wire, plan_root))) => {
-                // Recurse into the required root's own requires.
-                for sub in manifest_requires(&wire) {
-                    frontier.push((wire.name.clone(), sub));
-                }
-                closure.roots.push(plan_root);
-            }
-            Ok(None) => {
-                // Resolve failed — skip it (best-effort); the user's chosen root still installs.
-            }
-            Err(refusal) => {
-                // A refusal blocks the whole install; the first one found stops the walk
-                // with a clear message routed to its matching consent-card banner.
-                match refusal {
-                    RequiredRefusal::Conflict(message) => closure.conflict = Some(message),
-                    RequiredRefusal::NeedsSmudgy(message) => closure.needs_smudgy = Some(message),
-                }
+        if !is_local_state {
+            if let Some(existing) = remote_owner_by_leaf.insert(leaf.clone(), owner.clone())
+                && !existing.eq_ignore_ascii_case(&owner)
+            {
+                closure.unavailable = Some(crate::i18n::t!(
+                    "package-remote-leaf-conflict",
+                    "name" => &name
+                ));
                 return closure;
             }
         }
+        let manifest = if let Some(manifest) = local_manifests.get(&package.specifier) {
+            local_manifests_seen.insert(package.specifier.clone());
+            manifest.clone()
+        } else {
+            let staged = package.staged_version().map(str::to_string);
+            let wire = match client
+                .resolve_package(&owner, &name, staged.as_deref())
+                .await
+            {
+                Ok(wire) => wire,
+                Err(error) => {
+                    closure.unavailable = Some(crate::i18n::t!(
+                        "package-requirer-unavailable",
+                        "name" => package_display_name(&package.specifier),
+                        "error" => error.to_string()
+                    ));
+                    return closure;
+                }
+            };
+            match serde_json::from_value::<PackageManifest>(wire.manifest) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    closure.unavailable = Some(crate::i18n::t!(
+                        "package-required-manifest-invalid",
+                        "name" => package_display_name(&package.specifier),
+                        "error" => error.to_string()
+                    ));
+                    return closure;
+                }
+            }
+        };
+        add_required_ranges(
+            &mut fixed_ranges,
+            package_display_name(&package.specifier),
+            canonical_required_edges(manifest_requires_from_manifest(&manifest), local_manifests),
+        );
     }
+    // A newly-created local folder may not have reached lock materialization yet. It still governs
+    // the leaf and its own `requires` constraints must participate.
+    for (specifier, manifest) in local_manifests {
+        if local_manifests_seen.contains(specifier) {
+            continue;
+        }
+        add_required_ranges(
+            &mut fixed_ranges,
+            package_display_name(specifier),
+            canonical_required_edges(manifest_requires_from_manifest(manifest), local_manifests),
+        );
+    }
+
+    let mut planned: BTreeMap<RequiredKey, PlannedRequired> = BTreeMap::new();
+    const MAX_FIXED_POINT_PASSES: usize = 64;
+    for _ in 0..MAX_FIXED_POINT_PASSES {
+        let reachable = reachable_required_keys(&root_edges, &planned);
+        let mut ranges = fixed_ranges.clone();
+        add_required_ranges(&mut ranges, root_name, root_edges.clone());
+        for (key, plan) in &planned {
+            if reachable.contains(key) {
+                add_required_ranges(&mut ranges, &plan.root.name, plan.edges.clone());
+            }
+        }
+
+        for (owner, name) in ranges.keys() {
+            if owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER) {
+                continue;
+            }
+            if let Some(existing) = remote_owner_by_leaf.insert(name.clone(), owner.clone())
+                && !existing.eq_ignore_ascii_case(owner)
+            {
+                closure.unavailable = Some(crate::i18n::t!(
+                    "package-remote-leaf-conflict",
+                    "name" => name
+                ));
+                return closure;
+            }
+        }
+
+        // A cycle/back-edge can constrain the selected root itself. It cannot be silently skipped
+        // merely because the root was the initial seen node.
+        if let Some(root_ranges) = ranges.get(&root_key) {
+            let root_version = match semver::Version::parse(root_version) {
+                Ok(version) => version,
+                Err(error) => {
+                    closure.unavailable = Some(crate::i18n::t!(
+                        "package-required-root-version-invalid",
+                        "name" => root_name,
+                        "error" => error.to_string()
+                    ));
+                    return closure;
+                }
+            };
+            if !root_ranges
+                .iter()
+                .all(|range| range_admits(range.range.as_deref(), &root_version))
+            {
+                closure.conflict = Some(conflict_message(root_name, root_ranges));
+                return closure;
+            }
+        }
+
+        let mut changed = false;
+        for key in &reachable {
+            if key == &root_key {
+                continue;
+            }
+            let key_ranges = ranges.get(key).cloned().unwrap_or_default();
+            let next = if let Some(manifest) = local_manifest_for_key(key, local_manifests) {
+                match planned_local_required(key, manifest, local_manifests) {
+                    Ok(plan) => plan,
+                    Err(refusal) => {
+                        apply_required_refusal(&mut closure, refusal);
+                        return closure;
+                    }
+                }
+            } else {
+                match plan_required_root(client, &key.0, &key.1, &key_ranges, installed).await {
+                    Ok((wire, root)) => {
+                        let edges = match manifest_requires_checked(&wire) {
+                            Ok(edges) => canonical_required_edges(edges, local_manifests),
+                            Err(message) => {
+                                closure.unavailable = Some(message);
+                                return closure;
+                            }
+                        };
+                        PlannedRequired { root, edges }
+                    }
+                    Err(refusal) => {
+                        apply_required_refusal(&mut closure, refusal);
+                        return closure;
+                    }
+                }
+            };
+            let differs = planned.get(key).is_none_or(|current| {
+                current.root.version != next.root.version || current.edges != next.edges
+            });
+            if differs {
+                planned.insert(key.clone(), next);
+                changed = true;
+            }
+        }
+        let before = planned.len();
+        planned.retain(|key, _| reachable.contains(key));
+        changed |= planned.len() != before;
+        if !changed {
+            closure.roots = reachable
+                .into_iter()
+                .filter(|key| key != &root_key)
+                .filter_map(|key| planned.remove(&key).map(|plan| plan.root))
+                .collect();
+            return closure;
+        }
+    }
+
+    closure.unavailable = Some(crate::i18n::t!("package-required-graph-unstable"));
     closure
 }
 
 /// One `requires` edge flattened to plain strings — the required library's owner/name and its
 /// declared range — so the closure walk never names a `smudgy_script` type in `ui`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RequiresEdge {
     owner: String,
     name: String,
@@ -704,28 +1192,221 @@ struct RequiresEdge {
 
 /// One requirer's declared range for a required library — the requirer's display name (for the
 /// refusal message) and the raw range (`None`/empty = bare, satisfied by any version).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RequirerRange {
     requirer: String,
     range: Option<String>,
 }
 
-/// The `requires` of an already-resolved package, flattened to plain-string [`RequiresEdge`]s
-/// (empty if it declares none or the manifest doesn't parse).
-fn manifest_requires(wire: &ResolvedPackageWire) -> Vec<RequiresEdge> {
+#[derive(Debug, Clone)]
+struct PlannedRequired {
+    root: RequiredRoot,
+    edges: Vec<RequiresEdge>,
+}
+
+type RequiredKey = (String, String);
+
+fn normalized_required_key(owner: &str, name: &str) -> RequiredKey {
+    (owner.to_ascii_lowercase(), name.to_ascii_lowercase())
+}
+
+fn local_required_key(
+    name: &str,
+    local_manifests: &HashMap<String, PackageManifest>,
+) -> Option<RequiredKey> {
+    local_manifests.keys().find_map(|specifier| {
+        let (owner, local_name) = parse_specifier(specifier)?;
+        naming::names_conflict(&local_name, name)
+            .then(|| normalized_required_key(&owner, &local_name))
+    })
+}
+
+fn canonical_required_key(
+    owner: &str,
+    name: &str,
+    local_manifests: &HashMap<String, PackageManifest>,
+) -> RequiredKey {
+    local_required_key(name, local_manifests)
+        .unwrap_or_else(|| normalized_required_key(owner, name))
+}
+
+fn canonical_required_edges(
+    edges: Vec<RequiresEdge>,
+    local_manifests: &HashMap<String, PackageManifest>,
+) -> Vec<RequiresEdge> {
+    let mut edges = edges
+        .into_iter()
+        .map(|mut edge| {
+            let (owner, name) = canonical_required_key(&edge.owner, &edge.name, local_manifests);
+            edge.owner = owner;
+            edge.name = name;
+            edge
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        (&left.owner, &left.name, &left.range).cmp(&(&right.owner, &right.name, &right.range))
+    });
+    edges
+}
+
+fn manifest_requires_from_manifest(manifest: &PackageManifest) -> Vec<RequiresEdge> {
+    manifest
+        .smudgy_requires()
+        .into_iter()
+        .map(|dependency| RequiresEdge {
+            owner: dependency.key.owner,
+            name: dependency.key.name,
+            range: dependency.range,
+        })
+        .collect()
+}
+
+fn local_manifest_for_key<'a>(
+    key: &RequiredKey,
+    local_manifests: &'a HashMap<String, PackageManifest>,
+) -> Option<&'a PackageManifest> {
+    local_manifests.iter().find_map(|(specifier, manifest)| {
+        let (owner, name) = parse_specifier(specifier)?;
+        (normalized_required_key(&owner, &name) == *key).then_some(manifest)
+    })
+}
+
+fn add_required_ranges(
+    ranges: &mut BTreeMap<RequiredKey, Vec<RequirerRange>>,
+    requirer: &str,
+    edges: Vec<RequiresEdge>,
+) {
+    for edge in edges {
+        let entry = ranges
+            .entry(normalized_required_key(&edge.owner, &edge.name))
+            .or_default();
+        let range = RequirerRange {
+            requirer: requirer.to_string(),
+            range: edge.range,
+        };
+        if !entry.contains(&range) {
+            entry.push(range);
+        }
+    }
+}
+
+fn reachable_required_keys(
+    root_edges: &[RequiresEdge],
+    planned: &BTreeMap<RequiredKey, PlannedRequired>,
+) -> BTreeSet<RequiredKey> {
+    let mut frontier = root_edges
+        .iter()
+        .map(|edge| normalized_required_key(&edge.owner, &edge.name))
+        .collect::<Vec<_>>();
+    let mut reachable = BTreeSet::new();
+    while let Some(key) = frontier.pop() {
+        if !reachable.insert(key.clone()) {
+            continue;
+        }
+        if let Some(plan) = planned.get(&key) {
+            frontier.extend(
+                plan.edges
+                    .iter()
+                    .map(|edge| normalized_required_key(&edge.owner, &edge.name)),
+            );
+        }
+    }
+    reachable
+}
+
+fn planned_local_required(
+    key: &RequiredKey,
+    manifest: &PackageManifest,
+    local_manifests: &HashMap<String, PackageManifest>,
+) -> Result<PlannedRequired, RequiredRefusal> {
+    let mut floor = shared_packages::SmudgyVersionFloor::default();
+    floor.fold(&key.1, manifest.min_smudgy_version.as_deref());
+    if let Some(reason) = floor.refusal(&shared_packages::running_smudgy_release()) {
+        return Err(RequiredRefusal::NeedsSmudgy(reason));
+    }
+    Ok(PlannedRequired {
+        root: RequiredRoot {
+            specifier: specifier_for(&key.0, &key.1),
+            name: key.1.clone(),
+            version: manifest.version.clone(),
+            permissions: manifest.permissions.clone(),
+            params: manifest.params.clone(),
+            closure: Vec::new(),
+            already_satisfied: true,
+            is_upgrade: false,
+        },
+        edges: canonical_required_edges(manifest_requires_from_manifest(manifest), local_manifests),
+    })
+}
+
+fn apply_required_refusal(closure: &mut RequiredClosure, refusal: RequiredRefusal) {
+    match refusal {
+        RequiredRefusal::Conflict(message) => closure.conflict = Some(message),
+        RequiredRefusal::NeedsSmudgy(message) => closure.needs_smudgy = Some(message),
+        RequiredRefusal::Unavailable(message) => closure.unavailable = Some(message),
+    }
+}
+
+/// Canonical comparison key for the independent roots declared by one resolved version. Resolved
+/// versions are intentionally excluded: the declaration (target + accepted range) is the contract;
+/// a registry re-resolution within the same range does not itself change what the package requires.
+fn resolved_requires_signature(wire: &ResolvedPackageWire) -> Vec<(String, String, String)> {
+    let mut signature = wire
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Requires)
+        .map(|dependency| {
+            let range = dependency.range.trim();
+            let range = if range.is_empty() {
+                String::new()
+            } else {
+                semver::VersionReq::parse(range)
+                    .map_or_else(|_| format!("invalid:{range}"), |range| range.to_string())
+            };
+            (
+                dependency.owner_nickname.to_ascii_lowercase(),
+                dependency.name.to_ascii_lowercase(),
+                range,
+            )
+        })
+        .collect::<Vec<_>>();
+    signature.sort_unstable();
+    signature.dedup();
+    signature
+}
+
+/// Strict variant used by installation. A malformed manifest cannot be treated as "requires
+/// nothing" because that would let a package install without mandatory runtime roots.
+fn manifest_requires_checked(wire: &ResolvedPackageWire) -> Result<Vec<RequiresEdge>, String> {
     serde_json::from_value::<PackageManifest>(wire.manifest.clone())
         .map(|manifest| {
             manifest
                 .smudgy_requires()
                 .into_iter()
-                .map(|dep| RequiresEdge {
-                    owner: dep.key.owner,
-                    name: dep.key.name,
-                    range: dep.range,
+                .map(|dependency| RequiresEdge {
+                    owner: dependency.key.owner,
+                    name: dependency.key.name,
+                    range: dependency.range,
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .map_err(|error| {
+            crate::i18n::t!(
+                "package-required-manifest-invalid",
+                "name" => &wire.name,
+                "error" => error.to_string()
+            )
+        })
+}
+
+fn resolved_manifest_checked(wire: &ResolvedPackageWire) -> Result<PackageManifest, CloudError> {
+    serde_json::from_value(wire.manifest.clone()).map_err(|error| {
+        CloudError::SerializationError(crate::i18n::t!(
+            "package-required-manifest-invalid",
+            "name" => &wire.name,
+            "error" => error.to_string()
+        ))
+    })
 }
 
 /// Applies the peer-conflict policy to one required library and produces its install plan, or a
@@ -739,31 +1420,31 @@ fn manifest_requires(wire: &ResolvedPackageWire) -> Vec<RequiresEdge> {
 ///   an existing install) to it.
 /// - If no version satisfies all ranges, refuse with `X needs name ^2 but Y needs name ^1`.
 ///
-/// Returns `Ok(None)` when the library can't be resolved at all (best-effort skip). Range matching
-/// uses `semver::VersionReq`, the same mechanism as the resolution engine (`package_solver.rs`).
+/// A resolution/network/manifest failure is an [`RequiredRefusal::Unavailable`]: `requires` is a
+/// mandatory runtime relationship and can never be silently omitted. Range matching uses
+/// `semver::VersionReq`, the same mechanism as the resolution engine (`package_solver.rs`).
 async fn plan_required_root(
     client: &PackageApiClient,
     owner: &str,
     name: &str,
     ranges: &[RequirerRange],
     installed: &[LockedPackage],
-) -> Result<Option<(ResolvedPackageWire, RequiredRoot)>, RequiredRefusal> {
+) -> Result<(ResolvedPackageWire, RequiredRoot), RequiredRefusal> {
     let specifier = specifier_for(owner, name);
     let entry = installed.iter().find(|p| p.specifier == specifier);
-    // The installed version, if any: the recorded resolution, or — for a root installed earlier in
-    // THIS window session (resolution is recorded only on session load, so the lockfile entry has
-    // no `last_resolved_version` yet) — its current resolved version. Without this fallback a
-    // just-installed root reads as not-installed and gets falsely re-offered for co-install.
+    // The installed version, if any: an explicit pin wins over the previous resolution. An Auto
+    // entry reuses its staged immutable version; only a never-resolved entry needs discovery.
     let existing = if let Some(p) = entry {
-        if let Some(version) = p.last_resolved_version.clone() {
-            Some(version)
+        if let Some(version) = p.staged_version() {
+            Some(version.to_string())
         } else {
-            let pinned = p.pinned_version().map(str::to_string);
-            client
-                .resolve_package(owner, name, pinned.as_deref())
-                .await
-                .ok()
-                .map(|w| w.version)
+            Some(
+                client
+                    .resolve_package(owner, name, None)
+                    .await
+                    .map_err(|error| required_unavailable(name, &error))?
+                    .version,
+            )
         }
     } else {
         None
@@ -776,31 +1457,43 @@ async fn plan_required_root(
             .iter()
             .all(|r| range_admits(r.range.as_deref(), &parsed))
     {
-        let Ok(wire) = client.resolve_package(owner, name, Some(version)).await else {
-            return Ok(None);
-        };
+        let wire = client
+            .resolve_package(owner, name, Some(version))
+            .await
+            .map_err(|error| required_unavailable(name, &error))?;
         let root = required_root_from(&wire, client, true, false).await?;
-        return Ok(Some((wire, root)));
+        return Ok((wire, root));
     }
 
     // Otherwise seek a single published version satisfying every requirer's range.
-    let Ok(latest) = client.resolve_package(owner, name, None).await else {
-        return Ok(None);
-    };
-    let Ok(versions) = client.list_versions(latest.package_id).await else {
-        return Ok(None);
-    };
+    let latest = client
+        .resolve_package(owner, name, None)
+        .await
+        .map_err(|error| required_unavailable(name, &error))?;
+    let versions = client
+        .list_versions(latest.package_id)
+        .await
+        .map_err(|error| required_unavailable(name, &error))?;
     let Some(target) = highest_version_satisfying_all(&versions, ranges) else {
         return Err(RequiredRefusal::Conflict(conflict_message(name, ranges)));
     };
-    let Ok(wire) = client.resolve_package(owner, name, Some(&target)).await else {
-        return Ok(None);
-    };
+    let wire = client
+        .resolve_package(owner, name, Some(&target))
+        .await
+        .map_err(|error| required_unavailable(name, &error))?;
     // Installed (the lockfile has it) but its version doesn't satisfy every range → an upgrade, even
     // if `existing` couldn't be resolved to a concrete version above.
     let is_upgrade = entry.is_some();
     let root = required_root_from(&wire, client, false, is_upgrade).await?;
-    Ok(Some((wire, root)))
+    Ok((wire, root))
+}
+
+fn required_unavailable(name: &str, error: &CloudError) -> RequiredRefusal {
+    RequiredRefusal::Unavailable(crate::i18n::t!(
+        "package-required-unavailable",
+        "name" => name,
+        "error" => error.to_string()
+    ))
 }
 
 /// Build a [`RequiredRoot`] from a resolved required package, folding its own closure permission
@@ -814,19 +1507,26 @@ async fn required_root_from(
     already_satisfied: bool,
     is_upgrade: bool,
 ) -> Result<RequiredRoot, RequiredRefusal> {
-    let (permissions, floor) = closure_permission_union(client, wire).await;
+    let ResolvedImportClosure {
+        permissions,
+        floor,
+        closure,
+    } = closure_permission_union(client, wire)
+        .await
+        .map_err(|error| required_unavailable(&wire.name, &error))?;
     if let Some(reason) = floor.refusal(&shared_packages::running_smudgy_release()) {
         return Err(RequiredRefusal::NeedsSmudgy(reason));
     }
-    let params = serde_json::from_value::<PackageManifest>(wire.manifest.clone())
-        .map(|manifest| manifest.params)
-        .unwrap_or_default();
+    let params = resolved_manifest_checked(wire)
+        .map_err(|error| required_unavailable(&wire.name, &error))?
+        .params;
     Ok(RequiredRoot {
         specifier: specifier_for(&wire.owner_nickname, &wire.name),
         name: wire.name.clone(),
         version: wire.version.clone(),
         permissions,
         params,
+        closure,
         already_satisfied,
         is_upgrade,
     })
@@ -871,39 +1571,6 @@ fn highest_version_satisfying_all(
     best.map(|v| v.to_string())
 }
 
-/// Resolves each installed package's manifest and builds the `requires_of` map
-/// `SharedPackageLock::orphaned_by_removal` consumes: specifier → the specifiers it `requires`.
-/// Best-effort — an installed package that fails to resolve contributes no edges (it just can't
-/// keep anything alive), so an orphan sweep is conservative rather than wrong. Only `requires`
-/// edges count toward orphan retention; `dependencies` are imported into the importer's isolate and
-/// don't create a top-level root (`script/REQUIRED-PACKAGES.md`).
-async fn resolve_requires_of(
-    client: &PackageApiClient,
-    installed: &[LockedPackage],
-) -> HashMap<String, Vec<String>> {
-    let mut requires_of: HashMap<String, Vec<String>> = HashMap::new();
-    for pkg in installed {
-        let Some((owner, name)) = parse_specifier(&pkg.specifier) else {
-            continue;
-        };
-        let pinned = pkg.pinned_version().map(str::to_string);
-        let Ok(wire) = client
-            .resolve_package(&owner, &name, pinned.as_deref())
-            .await
-        else {
-            continue;
-        };
-        let requires: Vec<String> = manifest_requires(&wire)
-            .into_iter()
-            .map(|edge| specifier_for(&edge.owner, &edge.name))
-            .collect();
-        if !requires.is_empty() {
-            requires_of.insert(pkg.specifier.clone(), requires);
-        }
-    }
-    requires_of
-}
-
 /// The peer-conflict refusal message: `autoloot needs arctic-prompt ^2 but mapper needs ^1`. Names
 /// the two requirers whose ranges can't both be met (the first pair of distinct constrained ranges).
 fn conflict_message(name: &str, ranges: &[RequirerRange]) -> String {
@@ -935,26 +1602,35 @@ fn conflict_message(name: &str, ranges: &[RequirerRange]) -> String {
 /// Folds the whole dependency-closure permission union and `min_smudgy_version` floor starting
 /// from an already-resolved `root`, mirroring the engine's `solve_closure` /
 /// `closure_union_for`: every distinct `(owner, name, version)` contributes its
-/// `manifest.permissions` and its declared floor. Best-effort (a dep that fails to resolve is
-/// skipped) and dedups by `(owner, name, version)` so diamonds and cycles terminate. Each dep
-/// is resolved at its locked `resolved_version`.
+/// `manifest.permissions` and its declared floor. A missing or malformed node fails the walk so an
+/// install can never grant or cache only a prefix of the executable closure. Dedups by `(owner,
+/// name, version)` so diamonds and cycles terminate. Each dep is resolved at its locked
+/// `resolved_version`.
+struct ResolvedImportClosure {
+    permissions: PackagePermissions,
+    floor: shared_packages::SmudgyVersionFloor,
+    closure: Vec<PackageVersionRef>,
+}
+
 async fn closure_permission_union(
     client: &PackageApiClient,
     root: &ResolvedPackageWire,
-) -> (PackagePermissions, shared_packages::SmudgyVersionFloor) {
+) -> Result<ResolvedImportClosure, CloudError> {
     let mut union = PackagePermissions::default();
     let mut floor = shared_packages::SmudgyVersionFloor::default();
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let mut closure = Vec::new();
     // (owner, name, resolved_version) of closure nodes still to fold; the root is folded inline.
     let mut stack: Vec<(String, String, String)> = Vec::new();
 
     let fold = |wire: &ResolvedPackageWire,
                 union: &mut PackagePermissions,
-                floor: &mut shared_packages::SmudgyVersionFloor| {
-        if let Ok(manifest) = serde_json::from_value::<PackageManifest>(wire.manifest.clone()) {
-            union.merge(&manifest.permissions);
-            floor.fold(&wire.name, manifest.min_smudgy_version.as_deref());
-        }
+                floor: &mut shared_packages::SmudgyVersionFloor|
+     -> Result<(), CloudError> {
+        let manifest = resolved_manifest_checked(wire)?;
+        union.merge(&manifest.permissions);
+        floor.fold(&wire.name, manifest.min_smudgy_version.as_deref());
+        Ok(())
     };
 
     seen.insert((
@@ -962,8 +1638,12 @@ async fn closure_permission_union(
         root.name.clone(),
         root.version.clone(),
     ));
-    fold(root, &mut union, &mut floor);
-    for dep in &root.dependencies {
+    fold(root, &mut union, &mut floor)?;
+    for dep in root
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Dependency)
+    {
         stack.push((
             dep.owner_nickname.clone(),
             dep.name.clone(),
@@ -974,15 +1654,20 @@ async fn closure_permission_union(
         if !seen.insert((dep_owner.clone(), dep_name.clone(), dep_version.clone())) {
             continue;
         }
-        // Resolve the dep at its locked version; a failure is non-fatal (engine parity).
-        let Ok(wire) = client
+        closure.push(PackageVersionRef {
+            owner: dep_owner.clone(),
+            name: dep_name.clone(),
+            version: dep_version.clone(),
+        });
+        let wire = client
             .resolve_package(&dep_owner, &dep_name, Some(&dep_version))
-            .await
-        else {
-            continue;
-        };
-        fold(&wire, &mut union, &mut floor);
-        for dep in &wire.dependencies {
+            .await?;
+        fold(&wire, &mut union, &mut floor)?;
+        for dep in wire
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.kind == DependencyKind::Dependency)
+        {
             stack.push((
                 dep.owner_nickname.clone(),
                 dep.name.clone(),
@@ -990,7 +1675,11 @@ async fn closure_permission_union(
             ));
         }
     }
-    (union, floor)
+    Ok(ResolvedImportClosure {
+        permissions: union,
+        floor,
+        closure,
+    })
 }
 
 /// The combined `send` / `send-direct` "cannot do" line — shown only when NEITHER is granted (if
@@ -1059,7 +1748,7 @@ fn smudgy_cannot_lines(caps: &SmudgyCapabilities) -> Vec<String> {
 
 /// One-line summary of a fully-sandboxed package with no granted access — the calm "nothing to
 /// worry about" register, shown wherever the consented union is empty.
-fn sandbox_summary() -> &'static str {
+pub(super) fn sandbox_summary() -> &'static str {
     crate::i18n::ts!("permission-sandbox-summary")
 }
 
@@ -1140,7 +1829,7 @@ fn permission_cannot_lines(perms: &PackagePermissions) -> Vec<String> {
 /// Whether the owned package's manifest version can be published. Drives the Publish
 /// button's enabled state and the explanation banner (the semver-fluent UX).
 #[derive(Debug, Clone)]
-enum PublishVerdict {
+pub(super) enum PublishVerdict {
     /// Valid, unused semver — publishing is allowed.
     Ready,
     /// `manifest.version` isn't a publishable semver (unparseable or carries build
@@ -1156,7 +1845,7 @@ enum PublishVerdict {
 /// server is the source of truth; this mirrors its rule so the UI can pre-empt the 409
 /// and explain why Publish is disabled. Comparison is canonical-vs-canonical, matching
 /// the server's reservation key.
-fn publish_verdict(version: &str, published: &[VersionListItem]) -> PublishVerdict {
+pub(super) fn publish_verdict(version: &str, published: &[VersionListItem]) -> PublishVerdict {
     let Ok(parsed) = semver::Version::parse(version) else {
         return PublishVerdict::Invalid(crate::i18n::t!(
             "package-version-invalid-semver",
@@ -1178,34 +1867,740 @@ fn publish_verdict(version: &str, published: &[VersionListItem]) -> PublishVerdi
 // ============================================================================
 
 impl AutomationsWindow {
+    pub(super) fn account_read_fence(&self) -> AccountReadFence {
+        let snapshot = self.cloud.snapshot.get();
+        AccountReadFence {
+            account_epoch: self.account_epoch,
+            credential_generation: self.cloud.credentials.generation(),
+            user_id: snapshot.profile.as_ref().map(|profile| profile.id),
+            signed_in: snapshot.signed_in,
+        }
+    }
+
+    /// Captures one credential generation and returns a source that cannot switch principals
+    /// between awaits. The accompanying fence also includes the account snapshot epoch.
+    fn frozen_cloud_credentials(&self) -> (AccountReadFence, smudgy_cloud::CredentialSource) {
+        let (credential_generation, credentials) = self.cloud.credentials.freeze();
+        let snapshot = self.cloud.snapshot.get();
+        let fence = AccountReadFence {
+            account_epoch: self.account_epoch,
+            credential_generation,
+            user_id: snapshot.profile.as_ref().map(|profile| profile.id),
+            signed_in: snapshot.signed_in,
+        };
+        (fence, credentials)
+    }
+
+    fn frozen_package_client(&self) -> (AccountReadFence, PackageApiClient) {
+        let (fence, credentials) = self.frozen_cloud_credentials();
+        (
+            fence,
+            PackageApiClient::new(self.cloud.base_url.as_str(), credentials),
+        )
+    }
+
+    pub(super) fn account_read_is_current(&self, fence: AccountReadFence) -> bool {
+        self.account_read_fence() == fence
+    }
+
+    pub(super) fn set_open_package_activation(
+        &mut self,
+        activation: ProfileActivation,
+    ) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        if !self.profile_inventory_complete
+            && matches!(&activation, ProfileActivation::Selected { .. })
+        {
+            self.manage_feedback = Some(crate::i18n::t!("activation-profile-inventory-error"));
+            return Update::none();
+        }
+        let requested_specifier = match &self.pane {
+            Pane::InstalledPackage => self
+                .installed_open
+                .as_deref()
+                .map(|package| package.specifier.clone()),
+            Pane::OwnedPackage => self
+                .local_package
+                .as_ref()
+                .map(|package| self.local_own_spec(&package.name)),
+            _ => None,
+        };
+        let Some(requested_specifier) = requested_specifier else {
+            return Update::none();
+        };
+        let installed_pane = matches!(self.pane, Pane::InstalledPackage);
+        let specifier = self.governing_specifier(&requested_specifier);
+
+        let expected_package = self
+            .installed_packages
+            .iter()
+            .find(|package| package.specifier == specifier)
+            .cloned();
+        let inserting_governing_row =
+            matches!(self.pane, Pane::OwnedPackage) && expected_package.is_none();
+        // A local same-leaf package is canonical. Its fallback remote row is deliberately left
+        // unchanged so deleting the local folder restores the user's previous remote activation.
+        // If reconciliation has not materialized the local governing row yet, create that row and
+        // its requested activation in one write.
+        let outcome = if inserting_governing_row {
+            shared_packages::install_package_with_activation_if_unchanged(
+                &self.server_name,
+                &specifier,
+                UpdateMode::Auto,
+                activation,
+            )
+        } else {
+            let Some(expected_package) = expected_package.as_ref() else {
+                self.manage_feedback = Some(crate::i18n::t!("package-settings-state-changed"));
+                return Update::with_task(Task::batch([
+                    Task::done(Message::LoadLocalPackages),
+                    Task::done(Message::LoadInstalledPackages),
+                ]));
+            };
+            shared_packages::set_governing_activation_if_unchanged(
+                &self.server_name,
+                &requested_specifier,
+                expected_package,
+                activation,
+            )
+        };
+        match outcome {
+            Ok(Cas::Applied) => {}
+            Ok(Cas::StateChanged) => {
+                self.refresh_local_shadow_after_authoritative_mutation();
+                if let Err(message) = self.reload_package_lock_snapshot() {
+                    if matches!(self.pane, Pane::OwnedPackage) {
+                        self.authoring_feedback = Some(message);
+                    } else {
+                        self.manage_feedback = Some(message);
+                    }
+                } else {
+                    let message = crate::i18n::t!("package-settings-state-changed");
+                    if matches!(self.pane, Pane::OwnedPackage) {
+                        self.authoring_feedback = Some(message);
+                    } else {
+                        self.manage_feedback = Some(message);
+                    }
+                }
+                return Update::with_task(Task::batch([
+                    Task::done(Message::LoadLocalPackages),
+                    Task::done(Message::LoadInstalledPackages),
+                ]));
+            }
+            Err(error) => {
+                if installed_pane {
+                    self.refresh_local_shadow_after_authoritative_mutation();
+                }
+                let message = error.to_string();
+                if matches!(self.pane, Pane::OwnedPackage) {
+                    self.authoring_feedback = Some(message);
+                } else {
+                    self.manage_feedback = Some(message);
+                }
+                if inserting_governing_row {
+                    return Update::new(
+                        Task::done(Message::LoadInstalledPackages),
+                        Some(Event::ScriptsChanged {
+                            server_name: self.server_name.clone(),
+                        }),
+                    );
+                }
+                return Update::none();
+            }
+        }
+        if installed_pane {
+            self.refresh_local_shadow_after_authoritative_mutation();
+        }
+
+        if let Err(message) = self.reload_package_lock_snapshot() {
+            if matches!(self.pane, Pane::OwnedPackage) {
+                self.authoring_feedback = Some(message);
+            } else {
+                self.manage_feedback = Some(message);
+            }
+        }
+        Update::with_event(Event::ScriptsChanged {
+            server_name: self.server_name.clone(),
+        })
+    }
+
+    pub(super) fn set_open_parameter_scope(
+        &mut self,
+        target: ParameterScope,
+    ) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            return self.fail_config(error);
+        }
+        if !self.profile_inventory_complete {
+            return self.fail_config(crate::i18n::t!("activation-profile-inventory-error"));
+        }
+        let Some(config) = self.param_config.as_ref() else {
+            return Update::none();
+        };
+        if !config.available {
+            return Update::none();
+        }
+        if config.parameter_scope == target {
+            if target == ParameterScope::Profile {
+                self.confirm_global_parameter_source = false;
+            }
+            return Update::none();
+        }
+        if target == ParameterScope::Global {
+            match self.profile_param_values_are_equal(&config.specifier, &config.params) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.confirm_global_parameter_source = true;
+                    return Update::none();
+                }
+                Err(error) => {
+                    if let Some(config) = self.param_config.as_mut() {
+                        config.available = false;
+                        config.error = Some(error);
+                        config.saved = false;
+                    }
+                    return Update::none();
+                }
+            }
+        }
+        self.confirm_global_parameter_source = false;
+        self.commit_open_parameter_scope(target)
+    }
+
+    pub(super) fn confirm_global_parameter_source(&mut self) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.confirm_global_parameter_source = false;
+            return self.fail_config(error);
+        }
+        if !self.profile_inventory_complete {
+            self.confirm_global_parameter_source = false;
+            return self.fail_config(crate::i18n::t!("activation-profile-inventory-error"));
+        }
+        if !self.confirm_global_parameter_source {
+            return Update::none();
+        }
+        self.confirm_global_parameter_source = false;
+        self.commit_open_parameter_scope(ParameterScope::Global)
+    }
+
+    /// Open the copy-settings dialog for the parameter editor's current profile. Only a package in
+    /// per-profile scope with an editable, current configuration can copy.
+    pub(super) fn open_copy_settings(&mut self) -> Update<Message, Event> {
+        let Some(config) = self.param_config.as_ref() else {
+            return Update::none();
+        };
+        if !self.param_config_edit_available(config)
+            || config.parameter_scope != ParameterScope::Profile
+            || self.profile_names.len() < 2
+        {
+            return Update::none();
+        }
+        self.copy_settings_prompt = Some(CopySettingsPrompt {
+            specifier: config.specifier.clone(),
+            source: config.profile_name.clone(),
+            destination: None,
+        });
+        Update::none()
+    }
+
+    pub(super) fn select_copy_settings_destination(
+        &mut self,
+        profile_name: String,
+    ) -> Update<Message, Event> {
+        if let Some(prompt) = self.copy_settings_prompt.as_mut()
+            && profile_name != prompt.source
+            && self.profile_names.contains(&profile_name)
+        {
+            prompt.destination = Some(profile_name);
+        }
+        Update::none()
+    }
+
+    pub(super) fn cancel_copy_settings(&mut self) -> Update<Message, Event> {
+        self.copy_settings_prompt = None;
+        Update::none()
+    }
+
+    /// Copy every declared value and secret of the open package from the dialog's source profile
+    /// to its destination, replacing the destination's values, and reload a session running the
+    /// destination profile.
+    pub(super) fn confirm_copy_settings(&mut self) -> Update<Message, Event> {
+        let Some(prompt) = self.copy_settings_prompt.take() else {
+            return Update::none();
+        };
+        let Some(destination) = prompt.destination else {
+            return Update::none();
+        };
+        let Some((expected, params)) = self
+            .param_config
+            .as_ref()
+            .filter(|config| {
+                config.specifier == prompt.specifier
+                    && config.profile_name == prompt.source
+                    && self.param_config_edit_available(config)
+            })
+            .and_then(|config| {
+                config
+                    .expected_package
+                    .clone()
+                    .map(|expected| (expected, config.params.clone()))
+            })
+        else {
+            return Update::none();
+        };
+        match shared_packages::copy_profile_param_values_if_unchanged(
+            &self.server_name,
+            &expected,
+            &params,
+            &prompt.source,
+            &destination,
+        ) {
+            Ok(PackageParamCommit::Applied) => {}
+            Ok(PackageParamCommit::StateChanged) => {
+                return self.fail_config_parameter_state_changed();
+            }
+            Err(error) => {
+                return self.fail_config(crate::i18n::t!(
+                    "package-settings-copy-failed",
+                    "error" => error.to_string()
+                ));
+            }
+        }
+        let label = super::editors::activation_profile_label(
+            &destination,
+            &self.profile_names,
+            &self.profile_captions,
+        );
+        let event = self
+            .configuration_change_affects_running(&prompt.specifier, Some(&destination))
+            .then(|| Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            });
+        Update::new(
+            self.show_toast(crate::i18n::t!("package-settings-copied", "profile" => &label)),
+            event,
+        )
+    }
+
+    /// The copy-settings dialog over the whole window: a backdrop that cancels, and a card with
+    /// the destination picker and Cancel/Copy actions. Copy is offered only once a destination is
+    /// chosen.
+    pub(super) fn view_copy_settings_modal<'a>(
+        &'a self,
+        prompt: &'a CopySettingsPrompt,
+    ) -> Elem<'a> {
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::space::vertical())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|theme: &crate::theme::Theme| container::Style {
+                    background: Some(Background::Color(theme.styles.general.overlay_background)),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::CancelCopySettings);
+
+        let source_label = super::editors::activation_profile_label(
+            &prompt.source,
+            &self.profile_names,
+            &self.profile_captions,
+        );
+        let choices = self
+            .profile_names
+            .iter()
+            .filter(|profile| **profile != prompt.source)
+            .map(|profile| ProfileChoice {
+                key: profile.clone(),
+                label: super::editors::activation_profile_label(
+                    profile,
+                    &self.profile_names,
+                    &self.profile_captions,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let selected = choices
+            .iter()
+            .find(|choice| Some(&choice.key) == prompt.destination.as_ref())
+            .cloned();
+        let card = container(
+            column![
+                text(crate::i18n::t!("package-copy-settings-title")).size(14.0),
+                text(crate::i18n::t!(
+                    "package-copy-settings-help",
+                    "profile" => &source_label
+                ))
+                .size(12.0)
+                .style(common::muted),
+                row![
+                    text(crate::i18n::t!("package-copy-settings-destination"))
+                        .size(12.0)
+                        .style(common::muted),
+                    iced::widget::pick_list(choices, selected, |choice| {
+                        Message::SelectCopySettingsDestination(choice.key)
+                    })
+                    .placeholder(crate::i18n::ts!("package-copy-settings-choose")),
+                ]
+                .spacing(10.0)
+                .align_y(Vertical::Center),
+                row![
+                    iced::widget::space::horizontal(),
+                    button(text(crate::i18n::t!("action-cancel")).size(12.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::CancelCopySettings),
+                    button(text(crate::i18n::t!("action-copy")).size(12.0))
+                        .style(button_style::primary)
+                        .on_press_maybe(
+                            prompt
+                                .destination
+                                .is_some()
+                                .then_some(Message::ConfirmCopySettings)
+                        ),
+                ]
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+            ]
+            .spacing(10.0),
+        )
+        .padding(16.0)
+        .width(Length::Fixed(420.0))
+        .style(common::card_style);
+        let centered = container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(Vertical::Center);
+        iced::widget::stack![backdrop, centered]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Compare the complete stored profile values without displaying secret contents. A global
+    /// source can be selected automatically only when every profile is identical.
+    fn profile_param_values_are_equal(
+        &self,
+        specifier: &str,
+        params: &[PackageParameter],
+    ) -> Result<bool, String> {
+        if !self.profile_inventory_complete {
+            return Ok(false);
+        }
+        let profiles = if self.profile_names.is_empty() {
+            vec![self.profile_name.as_str()]
+        } else {
+            self.profile_names.iter().map(String::as_str).collect()
+        };
+        let mut first = None;
+        for profile in profiles {
+            let mut signature = Vec::with_capacity(params.len());
+            for param in params {
+                let entry = if is_secret_string(param) {
+                    (
+                        param.key.clone(),
+                        None,
+                        shared_packages::load_secret_param_scoped_checked(
+                            &self.server_name,
+                            ParamValueScope::Profile(profile),
+                            specifier,
+                            &param.key,
+                        )
+                        .map_err(|error| {
+                            crate::i18n::t!(
+                                "package-settings-read-unavailable",
+                                "error" => error.to_string()
+                            )
+                        })?,
+                    )
+                } else {
+                    (
+                        param.key.clone(),
+                        shared_packages::get_param_value_scoped_checked(
+                            &self.server_name,
+                            ParamValueScope::Profile(profile),
+                            specifier,
+                            &param.key,
+                        )
+                        .map_err(|error| {
+                            crate::i18n::t!(
+                                "package-settings-read-unavailable",
+                                "error" => error.to_string()
+                            )
+                        })?,
+                        None,
+                    )
+                };
+                signature.push(entry);
+            }
+            if let Some(first) = &first {
+                if first != &signature {
+                    return Ok(false);
+                }
+            } else {
+                first = Some(signature);
+            }
+        }
+        Ok(true)
+    }
+
+    fn commit_open_parameter_scope(&mut self, target: ParameterScope) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            return self.fail_config(error);
+        }
+        if !self.profile_inventory_complete {
+            return self.fail_config(crate::i18n::t!("activation-profile-inventory-error"));
+        }
+        let Some(config) = self.param_config.as_ref() else {
+            return Update::none();
+        };
+        if !config.available {
+            return Update::none();
+        }
+        let specifier = config.specifier.clone();
+        let params = config.params.clone();
+        let Some(expected_package) = config.expected_package.clone() else {
+            return self.fail_config(crate::i18n::t!("package-settings-read-unavailable-generic"));
+        };
+        let mut known_profiles: BTreeSet<String> = self.profile_names.iter().cloned().collect();
+        if known_profiles.is_empty() {
+            known_profiles.insert(self.profile_name.clone());
+        }
+        let source_profile =
+            matches!(target, ParameterScope::Global).then_some(self.parameter_profile.as_str());
+        match shared_packages::migrate_parameter_scope_if_unchanged(
+            &self.server_name,
+            &expected_package,
+            target,
+            source_profile,
+            &known_profiles,
+            &params,
+        ) {
+            Ok(PackageParamCommit::Applied) => {}
+            Ok(PackageParamCommit::StateChanged) => {
+                return self.fail_config_parameter_state_changed();
+            }
+            Err(error) => {
+                return self.fail_config(crate::i18n::t!(
+                    "package-settings-save-failed",
+                    "error" => error.to_string()
+                ));
+            }
+        }
+
+        if let Err(message) = self.reload_package_lock_snapshot() {
+            if let Some(config) = self.param_config.as_mut() {
+                config.available = false;
+                config.error = Some(message);
+                config.saved = false;
+            }
+            return Update::with_event(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            });
+        }
+        self.seed_param_config(specifier.clone(), params);
+        let event = self
+            .configuration_change_affects_running(&specifier, None)
+            .then(|| Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            });
+        let task = self.show_toast(crate::i18n::t!("package-parameter-scope-updated"));
+        Update::new(task, event)
+    }
+
+    pub(super) fn select_parameter_profile(
+        &mut self,
+        profile_name: String,
+    ) -> Update<Message, Event> {
+        if !self.package_state_available()
+            || !self.profile_inventory_complete
+            || !self.profile_names.contains(&profile_name)
+        {
+            return Update::none();
+        }
+        let Some(config) = self.param_config.as_ref() else {
+            return Update::none();
+        };
+        if !config.available {
+            return Update::none();
+        }
+        let specifier = config.specifier.clone();
+        let params = config.params.clone();
+        self.parameter_profile = profile_name;
+        self.seed_param_config(specifier, params);
+        Update::none()
+    }
+
+    /// Whether parameter state for `specifier` can affect running code. `profile` limits the test
+    /// to one profile; `None` covers a global/scope change and therefore checks every profile.
+    /// Both imported dependencies and separately-running `requires` roots count: changing either
+    /// can alter an enabled parent's behavior.
+    fn configuration_change_affects_running(&self, specifier: &str, profile: Option<&str>) -> bool {
+        // A global value or scope change can affect any same-server session. If profile discovery
+        // is incomplete, conservatively reload them all rather than leave an undiscovered profile
+        // running stale parameter state.
+        if profile.is_none() && !self.profile_inventory_complete {
+            return true;
+        }
+        let mut profiles = match profile {
+            Some(profile) => vec![profile.to_string()],
+            None => self.profile_names.clone(),
+        };
+        if profiles.is_empty() {
+            profiles.push(self.profile_name.clone());
+        }
+        profiles.into_iter().any(|profile| {
+            let mut visited = HashSet::new();
+            self.package_used_in_profile(specifier, &profile, &mut visited)
+        })
+    }
+
+    /// Whether replacing all providers of `leaf` with a new local folder changes any running
+    /// root/import path. This covers pure transitive dependencies that have no lock row of their
+    /// own, as well as a differently named copy that happens to shadow another live leaf.
+    fn leaf_change_affects_running(&self, leaf: &str) -> bool {
+        let mut candidates = self
+            .installed_packages
+            .iter()
+            .map(|package| package.specifier.clone())
+            .chain(self.graph.requires.keys().cloned())
+            .chain(
+                self.graph
+                    .requires
+                    .values()
+                    .flatten()
+                    .map(|edge| edge.specifier.clone()),
+            )
+            .filter(|specifier| naming::names_conflict(package_display_name(specifier), leaf))
+            .collect::<HashSet<_>>();
+        if let Some(open) = self.installed_open.as_deref()
+            && naming::names_conflict(package_display_name(&open.specifier), leaf)
+        {
+            candidates.insert(open.specifier.clone());
+        }
+        candidates
+            .iter()
+            .any(|specifier| self.configuration_change_affects_running(specifier, None))
+    }
+
+    fn package_used_in_profile(
+        &self,
+        specifier: &str,
+        profile: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        let canonical = if let Some(name) = specifier.strip_prefix("local:") {
+            self.local_own_spec(name)
+        } else {
+            self.governing_specifier(specifier)
+        };
+        if !visited.insert(canonical.clone()) {
+            return false;
+        }
+        let lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
+        };
+        if lock.is_effectively_enabled_for(&canonical, profile) {
+            return true;
+        }
+        self.graph.requires.iter().any(|(parent, edges)| {
+            edges.iter().any(|edge| {
+                if edge.kind != DependencyKind::Dependency
+                    || self.governing_specifier(&edge.specifier) != canonical
+                {
+                    return false;
+                }
+                let mut branch = visited.clone();
+                self.package_used_in_profile(parent, profile, &mut branch)
+            })
+        })
+    }
+
+    /// A local folder is authoritative for its leaf name across every owner. Remote lock rows with
+    /// that leaf are dormant fallbacks and must never contribute graph metadata while the folder
+    /// exists.
+    fn has_local_override_for(&self, specifier: &str) -> bool {
+        let leaf = package_display_name(specifier);
+        self.local_packages
+            .iter()
+            .any(|name| naming::names_conflict(name, leaf))
+    }
+
     /// Rebuilds the direct/owned sets from the current lists, preserving the
     /// async-resolved `requires`/`resolved` maps and the user's enable intent.
     pub(super) fn rebuild_graph(&mut self) {
         self.graph.direct.clear();
         self.graph.owned.clear();
         for pkg in &self.installed_packages {
-            self.graph.direct.insert(pkg.specifier.clone());
+            let dormant_fallback = self.has_local_override_for(&pkg.specifier)
+                && parse_specifier(&pkg.specifier).is_some_and(|(owner, _)| {
+                    !owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER)
+                });
+            if dormant_fallback {
+                continue;
+            }
+            if pkg.has_direct_activation() {
+                self.graph.direct.insert(pkg.specifier.clone());
+            }
+            for parent in &pkg.required_by {
+                // A published parent's relationship set belongs to its dormant fallback. The
+                // local replacement gets its own explicit `smudgy://local/...` links from its
+                // manifest, so the two closures cannot accidentally merge.
+                if self.governing_specifier(parent) != *parent {
+                    continue;
+                }
+                let edges = self.graph.requires.entry(parent.clone()).or_default();
+                if !edges.iter().any(|edge| edge.specifier == pkg.specifier) {
+                    edges.push(DepEdge {
+                        specifier: pkg.specifier.clone(),
+                        range: "*".to_string(),
+                        kind: DependencyKind::Requires,
+                    });
+                }
+            }
             // Seed the enable intent from the persisted lockfile flag (the engine's source of
             // truth), so a package installed "don't enable" — or toggled off — shows disabled and
             // is held out of execution until enabled.
-            self.graph.intent.insert(pkg.specifier.clone(), pkg.enabled);
+            self.graph.intent.insert(
+                pkg.specifier.clone(),
+                pkg.is_enabled_for(&self.profile_name),
+            );
             if let Some(v) = &pkg.last_resolved_version {
                 self.graph.resolved.insert(pkg.specifier.clone(), v.clone());
             }
         }
-        // Owned (local) packages: pull their declared deps from the manifest.
+        // Local packages: attach their manifest edges to the same canonical lock-row identity that
+        // carries activation. They are author-owned, but no longer unconditionally enabled.
         for name in self.local_packages.clone() {
-            let spec = format!("local:{name}");
-            self.graph.owned.insert(spec.clone());
+            let spec = self.local_own_spec(&name);
             if let Ok(Some(pkg)) = local_packages::load_local_package(&self.server_name, &name) {
                 let edges = pkg
                     .manifest
-                    .dependencies
-                    .iter()
-                    .map(|d| DepEdge {
-                        specifier: d.clone(),
-                        range: String::new(),
+                    .smudgy_dependencies()
+                    .into_iter()
+                    .map(|dependency| {
+                        let requested = specifier_for(&dependency.key.owner, &dependency.key.name);
+                        DepEdge {
+                            specifier: self.governing_specifier(&requested),
+                            range: dependency.range.unwrap_or_default(),
+                            kind: DependencyKind::Dependency,
+                        }
                     })
+                    .chain(
+                        pkg.manifest
+                            .smudgy_requires()
+                            .into_iter()
+                            .map(|dependency| {
+                                let requested =
+                                    specifier_for(&dependency.key.owner, &dependency.key.name);
+                                DepEdge {
+                                    specifier: self.governing_specifier(&requested),
+                                    range: dependency.range.unwrap_or_default(),
+                                    kind: DependencyKind::Requires,
+                                }
+                            }),
+                    )
                     .collect();
                 self.graph.requires.insert(spec, edges);
             }
@@ -1213,32 +2608,42 @@ impl AutomationsWindow {
     }
 
     /// Resolves each installed package once to populate its `requires` edges
-    /// (best-effort; failures leave the tree flat). Resolution is public, so the dependency
-    /// graph fills in for installed public packages whether or not an account is signed in.
+    /// (best-effort; failures leave the tree flat). A frozen credential is still required because
+    /// installed private packages may be visible to only one account.
     pub(super) fn resolve_graph_deps(&self) -> Task<Message> {
         let mut tasks = Vec::new();
+        let seq = self.graph_seq;
         for pkg in &self.installed_packages {
-            if self.graph.requires.contains_key(&pkg.specifier) {
+            if self.has_local_override_for(&pkg.specifier) {
                 continue;
             }
             let Some((owner, name)) = parse_specifier(&pkg.specifier) else {
                 continue;
             };
             let spec = pkg.specifier.clone();
-            let pinned = pkg.pinned_version().map(str::to_string);
-            let client = self.package_client();
+            let staged = pkg.staged_version().map(str::to_string);
+            let expected_staged = staged.clone();
+            let (account_fence, client) = self.frozen_package_client();
             tasks.push(Task::perform(
                 async move {
                     let resolved = client
-                        .resolve_package(&owner, &name, pinned.as_deref())
+                        .resolve_package(&owner, &name, staged.as_deref())
                         .await?;
                     // Fold the newest resolvable version's closure union too, so the tree can flag
                     // an update that's blocked because it needs more permissions than were granted.
                     // (The version floor isn't surfaced in the graph; the manage pane covers it.)
-                    let (union, _floor) = closure_permission_union(&client, &resolved).await;
-                    Ok::<_, CloudError>((resolved, union))
+                    let closure = closure_permission_union(&client, &resolved).await?;
+                    Ok::<_, CloudError>((resolved, closure.permissions))
                 },
-                move |result| Message::InstalledResolvedForGraph(spec.clone(), result),
+                move |result| {
+                    Message::InstalledResolvedForGraph(
+                        seq,
+                        account_fence,
+                        spec.clone(),
+                        expected_staged.clone(),
+                        result,
+                    )
+                },
             ));
         }
         Task::batch(tasks)
@@ -1246,25 +2651,72 @@ impl AutomationsWindow {
 
     pub(super) fn installed_resolved_for_graph(
         &mut self,
+        seq: GraphSeq,
+        account_fence: AccountReadFence,
         spec: &str,
+        expected_staged: Option<&str>,
         result: Result<(ResolvedPackageWire, PackagePermissions), CloudError>,
     ) -> Update<Message, Event> {
+        if seq != self.graph_seq
+            || !self.account_read_is_current(account_fence)
+            || self.has_local_override_for(spec)
+            || self
+                .installed_packages
+                .iter()
+                .find(|package| package.specifier == spec)
+                .map(|package| package.staged_version())
+                != Some(expected_staged)
+        {
+            return Update::none();
+        }
         if let Ok((resolved, union)) = result {
-            self.graph
-                .resolved
-                .insert(spec.to_string(), resolved.version.clone());
+            let required_specifiers = resolved
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.kind == DependencyKind::Requires)
+                .map(|dependency| specifier_for(&dependency.owner_nickname, &dependency.name))
+                .collect::<Vec<_>>();
             let edges = resolved
                 .dependencies
                 .iter()
-                .map(|d| DepEdge {
-                    specifier: specifier_for(&d.owner_nickname, &d.name),
-                    range: d.range.clone(),
+                .map(|d| {
+                    let requested = specifier_for(&d.owner_nickname, &d.name);
+                    DepEdge {
+                        specifier: self.governing_specifier(&requested),
+                        range: d.range.clone(),
+                        kind: d.kind,
+                    }
                 })
                 .collect();
+            let installed_requirements = required_specifiers
+                .iter()
+                .flat_map(|dependency| self.required_state_specifiers(dependency))
+                .collect::<Vec<_>>();
+            let links_changed = match shared_packages::set_required_closure_if_staged_unchanged(
+                &self.server_name,
+                spec,
+                expected_staged,
+                &installed_requirements,
+            ) {
+                Ok(shared_packages::RequiredClosureCommit::Changed) => true,
+                Ok(shared_packages::RequiredClosureCommit::Unchanged) => false,
+                Ok(shared_packages::RequiredClosureCommit::Stale) => {
+                    self.graph_seq.bump();
+                    return Update::with_task(Task::done(Message::LoadInstalledPackages));
+                }
+                Err(error) => {
+                    log::warn!("Failed to persist package dependency links for {spec}: {error:#}");
+                    return Update::none();
+                }
+            };
+            self.graph
+                .resolved
+                .insert(spec.to_string(), resolved.version.clone());
             self.graph.requires.insert(spec.to_string(), edges);
             for dep in &resolved.dependencies {
+                let requested = specifier_for(&dep.owner_nickname, &dep.name);
                 self.graph.resolved.insert(
-                    specifier_for(&dep.owner_nickname, &dep.name),
+                    self.governing_specifier(&requested),
                     dep.resolved_version.clone(),
                 );
             }
@@ -1284,182 +2736,15 @@ impl AutomationsWindow {
             } else {
                 self.blocked_updates.remove(spec);
             }
+            if links_changed {
+                return Update::with_event(Event::ScriptsChanged {
+                    server_name: self.server_name.clone(),
+                });
+            }
+        } else {
+            self.blocked_updates.remove(spec);
         }
         Update::none()
-    }
-
-    pub(super) fn toggle_package_enabled(&mut self, spec: String) -> Update<Message, Event> {
-        if !self.graph.controllable(&spec) {
-            return Update::none();
-        }
-        let before = self.effective_set();
-        let cur = self.graph.intent.get(&spec).copied().unwrap_or(false);
-        let new_enabled = !cur;
-        // Persist the flag for installed (lockfile) packages so the engine honors it on reload;
-        // owned/derived nodes keep the in-memory-only behavior. A persist failure aborts the toggle.
-        let is_installed_pkg = self.installed_packages.iter().any(|p| p.specifier == spec);
-        if is_installed_pkg
-            && let Err(e) = shared_packages::set_enabled(&self.server_name, &spec, new_enabled)
-        {
-            self.manage_feedback = Some(crate::i18n::t!(
-                "package-enable-state-failed",
-                "error" => e.to_string()
-            ));
-            return Update::none();
-        }
-        self.graph.intent.insert(spec.clone(), new_enabled);
-        if let Some(pkg) = self
-            .installed_packages
-            .iter_mut()
-            .find(|p| p.specifier == spec)
-        {
-            pkg.enabled = new_enabled;
-        }
-        let after = self.effective_set();
-        let name = package_display_name(&spec).to_string();
-
-        let toast = if cur {
-            // Turning off: deps that turned off as a result.
-            let dropped: Vec<String> = before
-                .difference(&after)
-                .filter(|s| **s != spec)
-                .map(|s| package_display_name(s).to_string())
-                .collect();
-            if dropped.is_empty() {
-                crate::i18n::t!("package-disabled-name", "name" => &name)
-            } else {
-                format!(
-                    "Disabled {name} + {} (no longer required).",
-                    dropped.join(", ")
-                )
-            }
-        } else {
-            let added: Vec<String> = after
-                .difference(&before)
-                .filter(|s| **s != spec)
-                .map(|s| package_display_name(s).to_string())
-                .collect();
-            if added.is_empty() {
-                crate::i18n::t!("package-enabled-name", "name" => &name)
-            } else {
-                crate::i18n::t!(
-                    "package-enabled-with-deps",
-                    "name" => &name,
-                    "dependencies" => added.join(", ")
-                )
-            }
-        };
-        // Reload the live session so the engine re-partitions (loads/drops the package now) — only
-        // for installed packages, whose enabled flag the engine reads. No reconnect needed.
-        let event = is_installed_pkg.then(|| Event::ScriptsChanged {
-            server_name: self.server_name.clone(),
-        });
-        Update::new(self.show_toast(toast), event)
-    }
-
-    /// Make `target_spec` the active member of a same-name group: enable it (installing its own
-    /// specifier first if it's a local that isn't in the lockfile yet) and disable every sibling.
-    /// This is the fork radio-handoff lifted to the navigator, so the user can switch which
-    /// same-named package is live without re-forking. Reloads the live session.
-    pub(super) fn set_active_member(
-        &mut self,
-        target_spec: String,
-        siblings: Vec<String>,
-    ) -> Update<Message, Event> {
-        let in_lock = self
-            .installed_packages
-            .iter()
-            .any(|p| p.specifier == target_spec);
-        let result = if in_lock {
-            shared_packages::set_enabled(&self.server_name, &target_spec, true)
-        } else {
-            shared_packages::install_package(
-                &self.server_name,
-                &target_spec,
-                UpdateMode::Auto,
-                true,
-            )
-        };
-        if let Err(e) = result {
-            return Update::with_task(self.show_toast(crate::i18n::t!(
-                "package-switch-failed",
-                "error" => e.to_string()
-            )));
-        }
-        for sib in &siblings {
-            if sib != &target_spec {
-                let _ = shared_packages::set_enabled(&self.server_name, sib, false);
-            }
-        }
-        let toast = self.show_toast(format!(
-            "Switched to {}.",
-            package_display_name(&target_spec)
-        ));
-        Update::new(
-            Task::batch([
-                Task::done(Message::LoadInstalledPackages),
-                Task::done(Message::LoadLocalPackages),
-                toast,
-            ]),
-            Some(Event::ScriptsChanged {
-                server_name: self.server_name.clone(),
-            }),
-        )
-    }
-
-    /// Enable/disable a lone (non-colliding) local package from the tree. A local "runs" iff there
-    /// is an enabled lockfile install of its own `smudgy://<you>/<name>` specifier, so enabling
-    /// installs+enables it and disabling clears the flag (the folder stays on disk).
-    pub(super) fn toggle_local_enabled(&mut self, name: String) -> Update<Message, Event> {
-        let own_spec = self.local_own_spec(&name);
-        let active = self.graph.effectively_enabled(&own_spec);
-        let in_lock = self
-            .installed_packages
-            .iter()
-            .any(|p| p.specifier == own_spec);
-        let result = if active {
-            shared_packages::set_enabled(&self.server_name, &own_spec, false)
-        } else if in_lock {
-            shared_packages::set_enabled(&self.server_name, &own_spec, true)
-        } else {
-            shared_packages::install_package(&self.server_name, &own_spec, UpdateMode::Auto, true)
-        };
-        if let Err(e) = result {
-            return Update::with_task(self.show_toast(crate::i18n::t!(
-                "package-update-failed",
-                "name" => &name,
-                "error" => e.to_string()
-            )));
-        }
-        let toast = self.show_toast(format!(
-            "{} {name}.",
-            if active { "Disabled" } else { "Enabled" }
-        ));
-        Update::new(
-            Task::batch([
-                Task::done(Message::LoadInstalledPackages),
-                Task::done(Message::LoadLocalPackages),
-                toast,
-            ]),
-            Some(Event::ScriptsChanged {
-                server_name: self.server_name.clone(),
-            }),
-        )
-    }
-
-    fn effective_set(&self) -> HashSet<String> {
-        let mut set = HashSet::new();
-        for spec in self.graph.direct.iter().chain(self.graph.owned.iter()) {
-            if self.graph.effectively_enabled(spec) {
-                set.insert(spec.clone());
-            }
-            for edge in self.graph.requires.get(spec).into_iter().flatten() {
-                if self.graph.effectively_enabled(&edge.specifier) {
-                    set.insert(edge.specifier.clone());
-                }
-            }
-        }
-        set
     }
 }
 
@@ -1469,6 +2754,9 @@ impl AutomationsWindow {
 
 impl AutomationsWindow {
     pub(super) fn open_installed_package(&mut self, specifier: String) -> Update<Message, Event> {
+        if let Some(local_name) = self.local_override_name(&specifier).map(str::to_string) {
+            return self.open_owned_package(local_name);
+        }
         let selection = Selection::InstalledPackage(specifier.clone());
         self.open_installed_package_with_selection(specifier, selection)
     }
@@ -1481,11 +2769,25 @@ impl AutomationsWindow {
         parent: String,
         specifier: String,
     ) -> Update<Message, Event> {
+        if let Some(local_name) = self.local_override_name(&specifier).map(str::to_string) {
+            return self.open_owned_package(local_name);
+        }
         let selection = Selection::Dependency {
             parent,
             spec: specifier.clone(),
         };
         self.open_installed_package_with_selection(specifier, selection)
+    }
+
+    pub(super) fn selected_dependency_kind(&self) -> Option<DependencyKind> {
+        let Selection::Dependency { parent, spec } = &self.selection else {
+            return None;
+        };
+        self.graph
+            .requires
+            .get(parent)
+            .and_then(|edges| edges.iter().find(|edge| edge.specifier == *spec))
+            .map(|edge| edge.kind)
     }
 
     fn open_installed_package_with_selection(
@@ -1495,22 +2797,18 @@ impl AutomationsWindow {
     ) -> Update<Message, Event> {
         self.clear_selection();
         self.installed_detail = None;
+        self.installed_readme = InstalledReadmeState::Loading;
         // Drop the prior package's rating so the meta row doesn't flash the previous package's
         // stars/installs during this package's async detail load; repopulated when the resolve lands.
         self.installed_rating = None;
         self.installed_versions.clear();
         self.installed_selected_file = None;
-        // Default to the README tab so the user reviews the description before enabling.
-        self.installed_file_tab = InstalledFileTab::Readme;
+        self.installed_package_tab = InstalledPackageTab::About;
+        self.parameter_profile.clone_from(&self.profile_name);
         // Bound the content-addressed source cache to the open package's files. Late fetches from a
         // prior package would only ever re-insert their own (hash-verified) bytes, so this is for
         // memory, not correctness.
         self.installed_source.clear();
-        // Drop the prior package's README so the audit pane shows a clean "No README." placeholder
-        // during this package's async detail load rather than flashing the previously-viewed
-        // package's description (`local_readme` is shared with the owned pane and only repopulated
-        // when the resolve below lands).
-        self.local_readme = None;
         self.manage_feedback = None;
         self.selection = selection;
         let locked = self
@@ -1577,55 +2875,119 @@ impl AutomationsWindow {
 
     fn load_installed_detail(&mut self, specifier: &str) -> Update<Message, Event> {
         let Some((owner, name)) = parse_specifier(specifier) else {
+            self.installed_readme =
+                InstalledReadmeState::Failed(crate::i18n::t!("package-detail-not-loaded"));
             return Update::none();
         };
-        let pinned = self
+        // The primary detail and Source panes audit the version the runtime is actually staged to
+        // load. Auto mode may have a newer registry version, but showing that code here would make
+        // a blocked update look like the currently running package. Update comparison is handled
+        // separately by the graph/update pipeline.
+        let staged = self
             .installed_packages
             .iter()
             .find(|p| p.specifier == specifier)
-            .and_then(|p| p.pinned_version().map(str::to_string));
-        let client = self.package_client();
+            .and_then(|p| p.staged_version().map(str::to_string))
+            .or_else(|| self.graph.resolved.get(specifier).cloned());
+        let compare_latest = self
+            .installed_packages
+            .iter()
+            .find(|package| package.specifier == specifier)
+            .is_some_and(|package| matches!(package.mode, UpdateMode::Auto));
+        let (account_fence, client) = self.frozen_package_client();
+        let latest_client = client.clone();
         self.manage_busy = true;
         self.manage_feedback = None;
+        self.installed_readme = InstalledReadmeState::Loading;
+        self.update_delta = None;
         // Tag this load with the current detail generation; a result that arrives after the user has
         // moved on (opened another package, navigated away, uninstalled, or re-resolved) carries a
         // stale token and is discarded in `installed_detail_loaded`.
         let seq = self.detail_seq;
-        Update::with_task(Task::perform(
+        let staged_for_detail = staged.clone();
+        let latest_owner = owner.clone();
+        let latest_name = name.clone();
+        let staged_for_latest = staged.clone();
+        let detail_task = Task::perform(
             async move {
                 let resolved = client
-                    .resolve_package(&owner, &name, pinned.as_deref())
+                    .resolve_package(&owner, &name, staged_for_detail.as_deref())
                     .await?;
                 // Fold the closure union too, so the manage pane can detect an update that adds
                 // permission asks beyond the consented baseline (delta re-prompt), and the
                 // version floor, so it can explain a version held back by `min_smudgy_version`.
-                let (permissions, floor) = closure_permission_union(&client, &resolved).await;
+                let closure = closure_permission_union(&client, &resolved).await?;
                 let versions = client.list_versions(resolved.package_id).await?;
                 // Best-effort cloud metadata (rating average/count, install count) for the meta row.
                 // Public read, so it works logged out; a failure just leaves the rating UI hidden
                 // rather than failing the whole detail load.
                 let rating = client.get_package(resolved.package_id).await.ok();
-                // Exclude hard-deleted numbers: their content is gone (would resolve 404),
-                // so they must never be offered as a pin target. (Yanked stays — it's still
-                // resolvable by an exact pin.)
+                // A yanked version is valid only when this install is already pinned to it.
+                // Do not offer unrelated yanked versions as new pin targets. Hard-deleted
+                // versions have no content and are never valid targets.
                 Ok((
                     resolved,
                     versions
                         .into_iter()
-                        .filter(|v| !v.deleted)
+                        .filter(|version| {
+                            !version.deleted
+                                && (!version.yanked
+                                    || staged_for_detail.as_deref()
+                                        == Some(version.version.as_str()))
+                        })
                         .map(|v| v.version)
                         .collect(),
-                    permissions,
-                    floor,
+                    closure.permissions,
+                    closure.floor,
                     rating,
                 ))
             },
-            move |result| Message::InstalledDetailLoaded(seq, Box::new(result)),
-        ))
+            move |result| Message::InstalledDetailLoaded(seq, account_fence, Box::new(result)),
+        );
+        if !compare_latest {
+            return Update::with_task(detail_task);
+        }
+
+        // Auto mode needs a second, independently fenced probe. It drives only the update/floor
+        // card; it never replaces the staged detail, README, dependency graph, parameters, or
+        // Source modules above.
+        let latest_task = Task::perform(
+            async move {
+                let resolved = latest_client
+                    .resolve_package(&latest_owner, &latest_name, None)
+                    .await?;
+                let latest_requirements = resolved_requires_signature(&resolved);
+                let requirements_changed = if latest_requirements.is_empty()
+                    || staged_for_latest.as_deref() == Some(resolved.version.as_str())
+                {
+                    false
+                } else if let Some(staged) = staged_for_latest.as_deref() {
+                    latest_client
+                        .resolve_package(&latest_owner, &latest_name, Some(staged))
+                        .await
+                        .map(|current| resolved_requires_signature(&current) != latest_requirements)
+                        // A non-empty offered requirement set without a readable baseline must be
+                        // reviewed. Failing open here would let a new independent root bypass the
+                        // planner merely because the old metadata was temporarily unavailable.
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+                let closure = closure_permission_union(&latest_client, &resolved).await?;
+                Ok::<_, CloudError>(InstalledLatestComparison {
+                    version: resolved.version,
+                    permissions: closure.permissions,
+                    floor: closure.floor,
+                    requirements_changed,
+                })
+            },
+            move |result| Message::InstalledLatestCompared(seq, account_fence, result),
+        );
+        Update::with_task(Task::batch([detail_task, latest_task]))
     }
 
     /// Select a module file in the Source tab and start loading its source. This is for actual
-    /// modules only; the rendered metadata README lives in its own tab (`installed_file_tab`), so a
+    /// modules only; the rendered metadata README lives in About, so a
     /// module that happens to be named `README.md` still routes here and has its real source fetched.
     pub(super) fn select_installed_file(&mut self, subpath: String) -> Update<Message, Event> {
         self.installed_selected_file = Some(subpath);
@@ -1677,7 +3039,7 @@ impl AutomationsWindow {
         }
         let url = module.content_url.clone();
         let fetch_hash = hash.clone();
-        let client = self.package_client();
+        let (account_fence, client) = self.frozen_package_client();
         self.installed_source
             .insert(hash.clone(), FilePreview::Loading);
         Update::with_task(Task::perform(
@@ -1691,6 +3053,7 @@ impl AutomationsWindow {
             },
             move |result| Message::InstalledSourceLoaded {
                 hash: hash.clone(),
+                account_fence,
                 result,
             },
         ))
@@ -1699,8 +3062,12 @@ impl AutomationsWindow {
     pub(super) fn installed_source_loaded(
         &mut self,
         hash: String,
+        account_fence: AccountReadFence,
         result: Result<FilePreview, CloudError>,
     ) -> Update<Message, Event> {
+        if !self.account_read_is_current(account_fence) {
+            return Update::none();
+        }
         let preview = result.unwrap_or_else(|e| FilePreview::Error(display_error(&e)));
         self.installed_source.insert(hash, preview);
         Update::none()
@@ -1709,6 +3076,7 @@ impl AutomationsWindow {
     pub(super) fn installed_detail_loaded(
         &mut self,
         seq: DetailSeq,
+        account_fence: AccountReadFence,
         result: Result<InstalledDetail, CloudError>,
     ) -> Update<Message, Event> {
         // Discard a superseded load: the open package changed (another package opened, navigation,
@@ -1716,12 +3084,15 @@ impl AutomationsWindow {
         // `manage_busy` leaves the newer in-flight load's spinner intact, and — critically — keeps
         // the silent shrink-branch `record_consent` below from firing for a package that is no
         // longer open (it would otherwise rewrite consent for the wrong, superseded package).
-        if seq != self.detail_seq {
+        if seq != self.detail_seq || !self.account_read_is_current(account_fence) {
             return Update::none();
         }
         self.manage_busy = false;
+        self.consent_busy = false;
         match result {
             Ok((resolved, versions, permissions, floor, rating)) => {
+                let mut side_tasks = Vec::new();
+                let mut scripts_changed = false;
                 // Cloud rating/install metadata for the meta row (best-effort; `None` just hides it).
                 self.installed_rating = rating.map(Box::new);
                 // Always track the resolved version's README (the pane defaults to it so the user
@@ -1729,97 +3100,66 @@ impl AutomationsWindow {
                 // the current selection — keeps it in sync across a re-resolve: otherwise a pin/update
                 // change while a source file is selected would leave the README sub-tab showing the
                 // previous version's text under the new version's header.
-                self.local_readme = resolved.readme.as_deref().map(markdown::Content::parse);
+                self.installed_readme = InstalledReadmeState::Loaded(
+                    resolved.readme.as_deref().map(markdown::Content::parse),
+                );
                 // Feed the dependency graph (and the blocked-update flag, via the closure union).
-                if let Some(spec) = self.installed_open.as_ref().map(|p| p.specifier.clone()) {
-                    self.installed_resolved_for_graph(
+                if let Some((spec, staged)) = self.installed_open.as_ref().map(|package| {
+                    (
+                        package.specifier.clone(),
+                        package.staged_version().map(str::to_string),
+                    )
+                }) {
+                    let graph_update = self.installed_resolved_for_graph(
+                        self.graph_seq,
+                        account_fence,
                         &spec,
+                        staged.as_deref(),
                         Ok((resolved.clone(), permissions.clone())),
                     );
+                    scripts_changed |= graph_update.event.is_some();
+                    side_tasks.push(graph_update.task);
                 }
-                // Update re-prompt: compare this freshly-resolved version's closure union
-                // against the consented baseline. A trusted package runs allow-all, so consent is
-                // moot — neither path applies.
-                self.update_delta = None;
-                let open_info = self
+                // Pinned installs compare this exact staged version. Auto installs use the
+                // separate latest probe so a late staged-detail response cannot overwrite the
+                // newest update/floor card.
+                if self
                     .installed_open
                     .as_deref()
-                    .filter(|open| !open.trusted)
-                    .map(|open| {
-                        (
-                            open.specifier.clone(),
-                            open.consented_permissions.clone().unwrap_or_default(),
-                            open.last_resolved_version.clone(),
-                        )
-                    });
-                // A resolved version whose closure floor is above this smudgy is refused or
-                // held back by the engine no matter what is granted, so the version card
-                // takes precedence over any permission delta — and, unlike the delta, it
-                // applies to TRUSTED installs too (no grant is involved, only the floor).
-                let floored = floor.refusal(&shared_packages::running_smudgy_release());
-                if let Some(reason) = floored {
-                    if let Some(open) = self.installed_open.as_deref() {
-                        self.update_delta = Some(UpdateDelta {
-                            specifier: open.specifier.clone(),
-                            name: package_display_name(&open.specifier).to_string(),
-                            version: resolved.version.clone(),
-                            current_version: open.last_resolved_version.clone(),
-                            added: PackagePermissions::default(),
-                            new_union: permissions,
-                            needs_smudgy: Some(reason),
-                        });
-                    }
-                } else if let Some((spec, baseline, current_version)) = open_info {
-                    let added = permissions.added_since(&baseline);
-                    if added.is_empty() {
-                        // No new asks. If the union actually SHRANK (a previously-consented entry
-                        // is gone), silently adopt the smaller union (auto-accept) so the
-                        // consented baseline tracks the manifest and never over-grants; the engine
-                        // keeps enforcing the consented union, so this only ever narrows access.
-                        let removed = baseline.added_since(&permissions);
-                        if !removed.is_empty()
-                            && shared_packages::record_consent(
-                                &self.server_name,
-                                &spec,
-                                &permissions,
-                            )
-                            .is_ok()
-                        {
-                            if let Some(pkg) = self
-                                .installed_packages
-                                .iter_mut()
-                                .find(|p| p.specifier == spec)
-                            {
-                                pkg.consented_permissions = Some(permissions.clone());
-                            }
-                            if let Some(open) = &mut self.installed_open {
-                                open.consented_permissions = Some(permissions.clone());
-                            }
+                    .is_some_and(|open| matches!(open.mode, UpdateMode::Pinned { .. }))
+                {
+                    match self.apply_update_comparison(
+                        resolved.version.clone(),
+                        permissions,
+                        floor,
+                        false,
+                    ) {
+                        UpdateComparisonApply::Current => {}
+                        UpdateComparisonApply::ConsentChanged => scripts_changed = true,
+                        UpdateComparisonApply::Stale => {
+                            let refresh = self.refresh_stale_installed_detail();
+                            side_tasks.push(refresh.task);
+                            return Update::new(
+                                Task::batch(side_tasks),
+                                refresh.event.or_else(|| {
+                                    scripts_changed.then_some(Event::ScriptsChanged {
+                                        server_name: self.server_name.clone(),
+                                    })
+                                }),
+                            );
                         }
-                    } else {
-                        // New asks beyond the consented set — surface the delta. Until the user
-                        // accepts, the engine keeps enforcing the OLD consented union, withholding
-                        // the new asks.
-                        self.update_delta = Some(UpdateDelta {
-                            specifier: spec.clone(),
-                            name: package_display_name(&spec).to_string(),
-                            version: resolved.version.clone(),
-                            current_version,
-                            added,
-                            new_union: permissions,
-                            needs_smudgy: None,
-                        });
                     }
                 }
                 // Seed the inline "Settings" editor from the resolved version's declared params
                 // (re-seeded on every resolve, so a version that adds/removes params stays in step).
-                // A dependency-reference view configures nothing of its own, so it's left unseeded.
+                // An imported dependency runs in its parent's isolate and has no independent
+                // settings. A `requires` target is a separate root and keeps its own parameters.
                 let params = serde_json::from_value::<PackageManifest>(resolved.manifest.clone())
                     .map(|manifest| manifest.params)
                     .unwrap_or_default();
                 self.installed_detail = Some(Box::new(resolved));
                 self.installed_versions = versions;
-                if matches!(self.selection, Selection::Dependency { .. }) {
+                if self.selected_dependency_kind() == Some(DependencyKind::Dependency) {
                     self.param_config = None;
                 } else if let Some(spec) = self.installed_open.as_ref().map(|p| p.specifier.clone())
                 {
@@ -1828,13 +3168,180 @@ impl AutomationsWindow {
                 // A re-resolve (e.g. a version-pin change) can swap the module set out from under a
                 // still-selected file, changing its content hash. Re-fetch the open file so the
                 // source pane tracks the version now shown instead of stalling on "Fetching…".
-                self.ensure_selected_source()
+                let source_update = self.ensure_selected_source();
+                side_tasks.push(source_update.task);
+                Update::new(
+                    Task::batch(side_tasks),
+                    if scripts_changed {
+                        Some(Event::ScriptsChanged {
+                            server_name: self.server_name.clone(),
+                        })
+                    } else {
+                        source_update.event
+                    },
+                )
             }
             Err(e) => {
-                self.manage_feedback = Some(display_error(&e));
+                let error = display_error(&e);
+                self.installed_readme = InstalledReadmeState::Failed(error.clone());
+                self.manage_feedback = Some(error);
                 Update::none()
             }
         }
+    }
+
+    pub(super) fn installed_latest_compared(
+        &mut self,
+        seq: DetailSeq,
+        account_fence: AccountReadFence,
+        result: Result<InstalledLatestComparison, CloudError>,
+    ) -> Update<Message, Event> {
+        if seq != self.detail_seq || !self.account_read_is_current(account_fence) {
+            return Update::none();
+        }
+        if let Ok(comparison) = result {
+            match self.apply_update_comparison(
+                comparison.version,
+                comparison.permissions,
+                comparison.floor,
+                comparison.requirements_changed,
+            ) {
+                UpdateComparisonApply::Stale => return self.refresh_stale_installed_detail(),
+                UpdateComparisonApply::ConsentChanged => {
+                    return Update::with_event(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    });
+                }
+                UpdateComparisonApply::Current => {}
+            }
+        }
+        Update::none()
+    }
+
+    fn refresh_stale_installed_detail(&mut self) -> Update<Message, Event> {
+        let Some(specifier) = self
+            .installed_open
+            .as_deref()
+            .map(|package| package.specifier.clone())
+        else {
+            return Update::none();
+        };
+        let lock = match shared_packages::load_lock(&self.server_name) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.manage_feedback = Some(error.to_string());
+                return Update::none();
+            }
+        };
+        self.installed_packages = lock.packages;
+        self.rebuild_graph();
+        let Some(current) = self
+            .installed_packages
+            .iter()
+            .find(|package| package.specifier == specifier)
+            .cloned()
+        else {
+            self.clear_selection();
+            self.selection = Selection::Dashboard;
+            self.pane = Pane::Dashboard;
+            return Update::none();
+        };
+        self.installed_open = Some(Box::new(current));
+        self.detail_seq.bump();
+        self.load_installed_detail(&specifier)
+    }
+
+    /// Compare one candidate version with the open package's consent and client-version floor.
+    /// This mutates only the update card/consent baseline; the candidate never becomes pane Source
+    /// truth until the normal staged-version pipeline advances the lock.
+    fn apply_update_comparison(
+        &mut self,
+        version: String,
+        permissions: PackagePermissions,
+        floor: shared_packages::SmudgyVersionFloor,
+        requirements_changed: bool,
+    ) -> UpdateComparisonApply {
+        let Some(open) = self.installed_open.as_deref() else {
+            return UpdateComparisonApply::Current;
+        };
+        let expected = open.clone();
+        let specifier = open.specifier.clone();
+        let current_version = open.last_resolved_version.clone();
+
+        // A version floor applies to trusted packages too: no permission grant can make an
+        // incompatible build run.
+        if let Some(reason) = floor.refusal(&shared_packages::running_smudgy_release()) {
+            self.update_delta = Some(UpdateDelta {
+                name: package_display_name(&specifier).to_string(),
+                specifier,
+                version,
+                current_version,
+                added: PackagePermissions::default(),
+                needs_smudgy: Some(reason),
+                requirements_changed,
+            });
+            return UpdateComparisonApply::Current;
+        }
+        if requirements_changed {
+            let baseline = open.consented_permissions.clone().unwrap_or_default();
+            self.update_delta = Some(UpdateDelta {
+                name: package_display_name(&specifier).to_string(),
+                specifier,
+                version,
+                current_version,
+                added: permissions.added_since(&baseline),
+                needs_smudgy: None,
+                requirements_changed: true,
+            });
+            return UpdateComparisonApply::Current;
+        }
+        if open.trusted {
+            self.update_delta = None;
+            return UpdateComparisonApply::Current;
+        }
+
+        let baseline = open.consented_permissions.clone().unwrap_or_default();
+        let added = permissions.added_since(&baseline);
+        if !added.is_empty() {
+            self.update_delta = Some(UpdateDelta {
+                name: package_display_name(&specifier).to_string(),
+                specifier,
+                version,
+                current_version,
+                added,
+                needs_smudgy: None,
+                requirements_changed: false,
+            });
+            return UpdateComparisonApply::Current;
+        }
+
+        self.update_delta = None;
+        // Consent may narrow automatically, but never grows without an explicit grant.
+        let removed = baseline.added_since(&permissions);
+        if !removed.is_empty() {
+            match shared_packages::record_consent_if_unchanged(
+                &self.server_name,
+                &expected,
+                &permissions,
+            ) {
+                Ok(true) => {
+                    if let Some(package) = self
+                        .installed_packages
+                        .iter_mut()
+                        .find(|package| package.specifier == specifier)
+                    {
+                        package.consented_permissions = Some(permissions.clone());
+                    }
+                    if let Some(open) = &mut self.installed_open {
+                        open.consented_permissions = Some(permissions);
+                    }
+                    return UpdateComparisonApply::ConsentChanged;
+                }
+                Ok(false) => return UpdateComparisonApply::Stale,
+                Err(error) => self.manage_feedback = Some(error.to_string()),
+            }
+        }
+        UpdateComparisonApply::Current
     }
 
     /// Sets the caller's 1–5 star rating for the open installed cloud package. The package id comes
@@ -1845,17 +3352,36 @@ impl AutomationsWindow {
             return Update::none();
         };
         let package_id = detail.package_id;
-        let client = self.package_client();
+        let detail_seq = self.detail_seq;
+        let (account_fence, client) = self.frozen_package_client();
         Update::with_task(Task::perform(
             async move { client.rate_package(package_id, stars).await },
-            Message::InstalledRatingUpdated,
+            move |result| Message::InstalledRatingUpdated {
+                detail_seq,
+                package_id,
+                account_fence,
+                result,
+            },
         ))
     }
 
     pub(super) fn installed_rating_updated(
         &mut self,
+        detail_seq: DetailSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
         result: Result<PackageDetail, CloudError>,
     ) -> Update<Message, Event> {
+        if detail_seq != self.detail_seq
+            || !self.account_read_is_current(account_fence)
+            || self
+                .installed_detail
+                .as_deref()
+                .map(|detail| detail.package_id)
+                != Some(package_id)
+        {
+            return Update::none();
+        }
         match result {
             // The server returns the fresh rating average/count, so the meta row updates in place.
             Ok(detail) => self.installed_rating = Some(Box::new(detail)),
@@ -1865,103 +3391,314 @@ impl AutomationsWindow {
     }
 
     pub(super) fn set_installed_update_mode(&mut self, mode: UpdateMode) -> Update<Message, Event> {
-        let Some(specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        let Some(open) = self.installed_open.as_deref() else {
             return Update::none();
         };
-        if let Err(e) =
-            shared_packages::set_update_mode(&self.server_name, &specifier, mode.clone())
-        {
-            self.manage_feedback = Some(crate::i18n::t!(
-                "package-update-mode-failed",
-                "error" => e.to_string()
-            ));
+        if open.mode == mode {
             return Update::none();
         }
-        if let Some(pkg) = self
-            .installed_packages
-            .iter_mut()
-            .find(|p| p.specifier == specifier)
+        let expected = open.clone();
+
+        // Pinning the version already staged changes policy only; no code, permissions, or required
+        // roots move, so it does not need another consent round trip.
+        if let UpdateMode::Pinned { version } = &mode
+            && open.staged_version() == Some(version.as_str())
         {
-            pkg.mode = mode.clone();
+            return self.persist_installed_update_mode(&expected, mode);
         }
-        if let Some(open) = &mut self.installed_open {
-            open.mode = mode;
-        }
-        // Re-resolving supersedes any still-in-flight detail load for this package: bump the
-        // generation so the prior load's late result is discarded and only this re-resolve applies.
-        self.detail_seq.bump();
-        let reload = self.load_installed_detail(&specifier);
-        Update::new(
-            reload.task,
-            Some(Event::ScriptsChanged {
-                server_name: self.server_name.clone(),
-            }),
-        )
+
+        // Every actual version movement goes through the same closure/requirements planner as an
+        // install. A version picker must not bypass peer constraints or materialization merely
+        // because the user selected an exact pin.
+        self.begin_installed_version_change(mode)
     }
 
-    /// Begin the uninstall flow: open the confirmation and, in the background, compute the apt-style
-    /// orphan set (the auto-installed required roots nothing else would need once this package is
-    /// removed). The confirmation shows immediately; the orphan list fills in when the resolve lands
-    /// (`UninstallOrphansComputed`). Resolving the installed packages' `requires` is what lets
-    /// `SharedPackageLock::orphaned_by_removal` run (`script/REQUIRED-PACKAGES.md`).
-    pub(super) fn request_uninstall(&mut self) -> Update<Message, Event> {
-        self.confirm_uninstall = true;
-        self.uninstall_orphans.clear();
-        self.uninstall_breaks.clear();
-        let Some(specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
+    fn persist_installed_update_mode(
+        &mut self,
+        expected: &LockedPackage,
+        mode: UpdateMode,
+    ) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        match shared_packages::set_update_mode_if_unchanged(
+            &self.server_name,
+            expected,
+            mode.clone(),
+        ) {
+            Ok(Cas::Applied) => {}
+            Ok(Cas::StateChanged) => {
+                if let Err(message) = self.reload_package_lock_snapshot() {
+                    self.manage_feedback = Some(message);
+                    return Update::none();
+                }
+                self.refresh_local_shadow_after_authoritative_mutation();
+                if self.installed_open.is_none() {
+                    return Update::with_task(Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]));
+                }
+                self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+                return self.begin_installed_version_change(mode);
+            }
+            Err(e) => {
+                self.refresh_local_shadow_after_authoritative_mutation();
+                self.manage_feedback = Some(crate::i18n::t!(
+                    "package-update-mode-failed",
+                    "error" => e.to_string()
+                ));
+                return Update::none();
+            }
+        }
+        if let Err(message) = self.reload_package_lock_snapshot() {
+            self.manage_feedback = Some(message);
+            return Update::none();
+        }
+        // Only the policy changed, but the pane's update comparison depends on it (Auto probes
+        // the latest version; a pin compares the exact staged one), so re-open the row from the
+        // committed lock rather than leaving a card that was built for the previous mode.
+        self.refresh_stale_installed_detail()
+    }
+
+    fn begin_installed_version_change(&mut self, mode: UpdateMode) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        let Some(open) = self.installed_open.as_deref().cloned() else {
             return Update::none();
         };
-        let client = self.package_client();
-        let installed = self.installed_packages.clone();
+        let specifier = open.specifier.clone();
+        if self.governing_specifier(&specifier) != specifier {
+            self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+            return Update::none();
+        }
+        let Some((owner, name)) = parse_specifier(&specifier) else {
+            return Update::none();
+        };
+        let (expected_lock, local_manifests) = match self.load_consent_resolution_state() {
+            Ok(state) => state,
+            Err(error) => {
+                self.manage_feedback = Some(error);
+                return Update::none();
+            }
+        };
+        if expected_lock.find(&specifier) != Some(&open) {
+            self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+            return Update::with_task(Task::done(Message::LoadInstalledPackages));
+        }
+        if local_manifests.keys().any(|local_specifier| {
+            naming::names_conflict(package_display_name(local_specifier), &name)
+        }) {
+            self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+            return Update::with_task(Task::batch([
+                Task::done(Message::LoadLocalPackages),
+                Task::done(Message::LoadInstalledPackages),
+            ]));
+        }
+        let pinned = match &mode {
+            UpdateMode::Auto => None,
+            UpdateMode::Pinned { version } => Some(version.clone()),
+        };
+        let installed = expected_lock.packages;
+        let (account_fence, client) = self.frozen_package_client();
+        self.manage_busy = true;
+        self.manage_feedback = None;
+        self.detail_seq.bump();
+        let seq = self.detail_seq;
         Update::with_task(Task::perform(
             async move {
-                let requires_of = resolve_requires_of(&client, &installed).await;
-                let lock = shared_packages::SharedPackageLock {
-                    packages: installed,
-                };
-                let plan = lock.plan_removal(&specifier, &requires_of);
-                (plan.breaks, plan.orphans)
+                resolve_install_closure(
+                    &client,
+                    &owner,
+                    &name,
+                    pinned.as_deref(),
+                    &installed,
+                    &local_manifests,
+                )
+                .await
             },
-            |(breaks, orphans)| Message::UninstallPlanComputed { breaks, orphans },
+            move |result| {
+                Message::InstalledVersionChangeResolved(seq, account_fence, mode.clone(), result)
+            },
         ))
     }
 
-    pub(super) fn uninstall_installed(&mut self) -> Update<Message, Event> {
+    pub(super) fn installed_version_change_resolved(
+        &mut self,
+        seq: DetailSeq,
+        account_fence: AccountReadFence,
+        mode: UpdateMode,
+        result: Result<InstallResolution, CloudError>,
+    ) -> Update<Message, Event> {
+        if seq != self.detail_seq || !self.account_read_is_current(account_fence) {
+            return Update::none();
+        }
+        self.manage_busy = false;
+        match result {
+            Ok(resolution)
+                if self
+                    .installed_open
+                    .as_deref()
+                    .is_some_and(|open| open.specifier == resolution.specifier) =>
+            {
+                if let Err(error) = self.validate_consent_snapshot(
+                    &resolution.expected_lock,
+                    &resolution.expected_local_manifests,
+                ) {
+                    self.manage_feedback = Some(error);
+                    return Update::with_task(Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]));
+                }
+                let activation = self
+                    .installed_open
+                    .as_deref()
+                    .map(LockedPackage::activation)
+                    .unwrap_or(ProfileActivation::None);
+                self.update_delta = None;
+                self.install_seq.bump();
+                self.consent_prompt = Some(ConsentPrompt {
+                    account_fence,
+                    specifier: resolution.specifier,
+                    owner: resolution.owner,
+                    name: resolution.name,
+                    version: resolution.version,
+                    permissions: resolution.permissions,
+                    params: resolution.params,
+                    closure: resolution.closure,
+                    required_roots: resolution.required_roots,
+                    conflict: resolution.conflict,
+                    needs_smudgy: resolution.needs_smudgy,
+                    required_unavailable: resolution.required_unavailable,
+                    expected_lock: resolution.expected_lock,
+                    expected_local_manifests: resolution.expected_local_manifests,
+                    operation: ConsentOperation::Update { mode, activation },
+                    error: None,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Beginning the change fenced the pane's detail load. If that load never landed,
+                // reload it so the pane is not left loading forever; the failure stays visible
+                // (the reload clears feedback, so it is set afterwards).
+                let reload = if self.installed_detail.is_none() {
+                    self.refresh_stale_installed_detail()
+                } else {
+                    Update::none()
+                };
+                self.manage_feedback = Some(display_error(&error));
+                return reload;
+            }
+        }
+        Update::none()
+    }
+
+    /// Begin the uninstall flow from one authoritative lock snapshot. Durable flattened
+    /// `required_by` links provide the apt-style impact immediately; the same snapshot becomes the
+    /// confirmation's optimistic concurrency token.
+    pub(super) fn request_uninstall(&mut self) -> Update<Message, Event> {
+        self.confirm_uninstall = false;
+        self.uninstall_expected_lock = None;
+        self.uninstall_orphans.clear();
+        self.uninstall_breaks.clear();
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
         let Some(specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
             return Update::none();
         };
-        // Computed before the lockfile entry is dropped: if an enabled package still requires this
-        // one, removing the standalone install leaves it resolved as a dependency, so the toast
-        // says "removed the standalone install" rather than "uninstalled" (which would read as a
-        // no-op since the package is still there).
-        let survives = !self.graph.enabled_dependents(&specifier).is_empty();
-        if let Err(e) = shared_packages::uninstall_package(&self.server_name, &specifier) {
-            self.manage_feedback = Some(crate::i18n::t!(
-                "package-uninstall-failed",
-                "error" => e.to_string()
-            ));
+        let lock = match shared_packages::load_lock(&self.server_name) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.manage_feedback = Some(crate::i18n::t!(
+                    "package-uninstall-failed",
+                    "error" => error.to_string()
+                ));
+                return Update::none();
+            }
+        };
+        let Some(target) = lock.find(&specifier) else {
+            self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+            return Update::with_task(Task::done(Message::LoadInstalledPackages));
+        };
+        if !target.has_direct_activation() {
+            self.manage_feedback = Some(crate::i18n::t!("package-required-managed"));
             return Update::none();
         }
-        // Also remove the dependents that `require` this package (forced — they'd break without it)
-        // and the orphaned auto-installed roots the user didn't keep (apt-style; never silent). A
-        // failure on one is surfaced but doesn't abort — the chosen package is already gone.
-        let breaks = std::mem::take(&mut self.uninstall_breaks);
-        let orphans = std::mem::take(&mut self.uninstall_orphans);
-        let mut also_removed: Vec<String> = Vec::new();
-        for spec in breaks.iter().chain(orphans.iter()) {
-            match shared_packages::uninstall_package(&self.server_name, spec) {
-                Ok(()) => also_removed.push(package_display_name(spec).to_string()),
-                Err(e) => {
-                    self.manage_feedback = Some(crate::i18n::t!(
-                        "package-partial-remove-failed",
-                        "removed" => package_display_name(&specifier),
-                        "failed" => package_display_name(spec),
-                        "error" => e.to_string()
-                    ));
-                }
-            }
+        if target.required_by.is_empty() {
+            let plan = lock.plan_removal_from_links(&specifier);
+            self.uninstall_breaks = plan.breaks;
+            self.uninstall_orphans = plan.orphans;
         }
+        self.uninstall_expected_lock = Some(lock);
+        self.confirm_uninstall = true;
+        Update::none()
+    }
+
+    pub(super) fn uninstall_installed(&mut self) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        let Some(specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
+            return Update::none();
+        };
+        let Some(expected) = self.uninstall_expected_lock.as_ref() else {
+            self.confirm_uninstall = false;
+            self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+            return Update::none();
+        };
+        let remove_orphans = !self.uninstall_orphans.is_empty();
+        let outcome = match shared_packages::commit_uninstall_if_unchanged(
+            &self.server_name,
+            expected,
+            &specifier,
+            remove_orphans,
+        ) {
+            Ok(shared_packages::UninstallCommit::Stale) => {
+                self.confirm_uninstall = false;
+                self.uninstall_expected_lock = None;
+                self.uninstall_breaks.clear();
+                self.uninstall_orphans.clear();
+                self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
+                self.graph_seq.bump();
+                return Update::with_task(Task::done(Message::LoadInstalledPackages));
+            }
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.manage_feedback = Some(crate::i18n::t!(
+                    "package-uninstall-failed",
+                    "error" => error.to_string()
+                ));
+                return Update::none();
+            }
+        };
+        let (survives, also_removed) = match outcome {
+            shared_packages::UninstallCommit::DirectInstallRemoved => (true, Vec::new()),
+            shared_packages::UninstallCommit::PackagesRemoved(removed) => (
+                false,
+                removed
+                    .into_iter()
+                    .filter(|removed| removed != &specifier)
+                    .map(|removed| package_display_name(&removed).to_string())
+                    .collect(),
+            ),
+            shared_packages::UninstallCommit::Stale => unreachable!("handled above"),
+        };
         self.confirm_uninstall = false;
+        self.uninstall_expected_lock = None;
+        self.uninstall_breaks.clear();
+        self.uninstall_orphans.clear();
+        self.graph_seq.bump();
         // The package is gone: discard any in-flight detail load for it so its late result can't
         // repaint the (now-closed) pane or record consent for the removed package.
         self.detail_seq.bump();
@@ -1990,172 +3727,371 @@ impl AutomationsWindow {
         )
     }
 
+    pub(super) fn start_fork_package(&mut self) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        let Some(source) = self.installed_open.as_deref() else {
+            self.manage_feedback = Some(crate::i18n::t!("package-no-selection"));
+            return Update::none();
+        };
+        self.fork_source_specifier = Some(source.specifier.clone());
+        self.fork_name = Some(package_display_name(&source.specifier).to_string());
+        self.manage_feedback = None;
+        Update::none()
+    }
+
+    pub(super) fn fork_draft_is_for_open_package(&self) -> bool {
+        self.installed_open.as_deref().is_some_and(|package| {
+            self.fork_source_specifier.as_deref() == Some(package.specifier.as_str())
+                && self.fork_name.is_some()
+        })
+    }
+
+    pub(super) fn open_fork_name(&self) -> Option<&str> {
+        self.fork_draft_is_for_open_package()
+            .then(|| self.fork_name.as_deref())
+            .flatten()
+    }
+
+    pub(super) fn clear_fork_draft(&mut self) {
+        self.fork_name = None;
+        self.fork_source_specifier = None;
+    }
+
+    pub(super) fn installed_detail_ready_for_copy(&self) -> bool {
+        self.installed_detail.is_some() && self.installed_readme.is_loaded()
+    }
+
     pub(super) fn fork_installed(&mut self) -> Update<Message, Event> {
-        let Some(source_specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone())
+        if self.manage_busy {
+            return Update::none();
+        }
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        let Some(source_specifier) = self
+            .installed_open
+            .as_deref()
+            .map(|package| package.specifier.clone())
         else {
-            self.manage_feedback = Some("No package selected.".to_string());
+            self.manage_feedback = Some(crate::i18n::t!("package-no-selection"));
             return Update::none();
         };
         let Some(resolved) = self.installed_detail.clone() else {
             self.manage_feedback = Some(crate::i18n::t!("package-detail-not-loaded"));
             return Update::none();
         };
+        let Some(new_name) = self.open_fork_name().map(str::trim).map(str::to_string) else {
+            return Update::none();
+        };
+        if let Err(message) = naming::validate_package_name(&new_name) {
+            self.manage_feedback = Some(message);
+            return Update::none();
+        }
+        if self
+            .local_packages
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&new_name))
+        {
+            self.manage_feedback = Some(crate::i18n::t!(
+                "package-copy-name-exists",
+                "name" => &new_name
+            ));
+            return Update::none();
+        }
+        let manifest: PackageManifest = match serde_json::from_value(resolved.manifest.clone()) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.manage_feedback = Some(crate::i18n::t!(
+                    "package-parse-manifest-failed",
+                    "error" => error.to_string()
+                ));
+                return Update::none();
+            }
+        };
+        // A local copy is a new independent root. If its manifest declares `requires`, resolve the
+        // complete closure from an exact package-state snapshot now. Creation accepts only roots
+        // that are already installed; anything that needs a new grant stays in the normal install
+        // flow instead of being silently introduced by "Edit a copy".
+        let requirement_context = if manifest.smudgy_requires().is_empty() {
+            None
+        } else {
+            let (expected_lock, mut local_manifests) = match self.load_consent_resolution_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    self.manage_feedback = Some(error);
+                    return Update::none();
+                }
+            };
+            let local_specifier = specifier_for(local_packages::LOCAL_OWNER, &new_name);
+            local_manifests.insert(local_specifier, manifest.clone());
+            let root_edges = canonical_required_edges(
+                manifest_requires_from_manifest(&manifest),
+                &local_manifests,
+            );
+            Some((expected_lock, local_manifests, root_edges))
+        };
+        let Some(operation) = self
+            .cloud
+            .package_operations
+            .try_acquire(&self.server_name, &new_name)
+        else {
+            self.manage_feedback = Some(crate::i18n::t!("package-operation-in-progress"));
+            return Update::none();
+        };
+        let operation_id = operation.id();
 
-        // Keep the source's leaf name; de-dup only if a local package of that name already exists.
-        let source_leaf = package_display_name(&source_specifier).to_string();
-        let new_name = self.derive_fork_name(&source_leaf);
+        // A local leaf is the canonical implementation of that leaf. If a published install with
+        // the requested destination name exists, its row stays as the fallback while the new local
+        // row inherits its activation/update mode. With no matching row, the copy starts disabled.
+        let canonical_owner = self
+            .cloud
+            .snapshot
+            .get()
+            .nickname_text()
+            .unwrap_or_else(|| smudgy_core::models::local_packages::LOCAL_OWNER.to_string());
 
-        // The fork mirrors the source's enabled state: an enabled source yields an active fork,
-        // a disabled one stays an inspect-only copy. The fork runs under its own-handle specifier
-        // (`local_own_spec`): the account nickname when signed in, else the reserved `local`
-        // owner — the same identity the enable toggle uses, so activation works signed out too.
-        let source_enabled = shared_packages::load_lock(&self.server_name)
-            .ok()
-            .and_then(|lock| lock.find(&source_specifier).map(|p| p.enabled))
-            .unwrap_or(true);
-        let fork_specifier = self.local_own_spec(&new_name);
-        let activate = source_enabled;
-
-        let client = self.package_client();
+        let (_, client) = self.frozen_package_client();
         let server = self.server_name.clone();
+        let result_source = source_specifier;
+        let result_destination = new_name.clone();
+        let result_origin = self.selection.clone();
+        let result_origin_revision = self.selection_revision;
         self.manage_busy = true;
-        self.manage_feedback = Some(format!(
-            "Copying to a local package \u{201c}{new_name}\u{201d}\u{2026}"
-        ));
+        self.fork_operation = Some(operation_id);
+        self.manage_feedback = Some(crate::i18n::t!("package-copying-local", "name" => &new_name));
         Update::with_task(Task::perform(
             async move {
-                // The content-addressed cache is truth for bodies it holds (they were
-                // hash-verified when written), so a fork serves cache hits without
-                // touching the network and fetches only the misses.
-                let cache = PackageCache::new().ok();
-                let mut modules = Vec::new();
-                for module in &resolved.modules {
-                    // Raw bytes either way, so a fork copies binary modules faithfully too.
-                    let body = match cached_fork_body(cache.as_ref(), &module.content_hash) {
-                        Some(body) => body,
-                        None => client
-                            .fetch_module_bytes(&module.content_url, &module.content_hash)
-                            .await
-                            .map_err(|e| e.to_string())?,
+                let result = async {
+                    let requirement_plan = if let Some((
+                        expected_lock,
+                        local_manifests,
+                        root_edges,
+                    )) = requirement_context
+                    {
+                        let closure = resolve_required_closure_from_edges(
+                            &client,
+                            local_packages::LOCAL_OWNER,
+                            &new_name,
+                            &manifest.version,
+                            root_edges,
+                            &expected_lock.packages,
+                            &local_manifests,
+                        )
+                        .await;
+                        if let Some(error) = closure
+                            .conflict
+                            .or(closure.needs_smudgy)
+                            .or(closure.unavailable)
+                        {
+                            return Err(error);
+                        }
+                        if closure.roots.iter().any(|root| !root.already_satisfied) {
+                            return Err(crate::i18n::t!("package-copy-requirements-not-ready"));
+                        }
+                        let required_specifiers = closure
+                            .roots
+                            .into_iter()
+                            .map(|root| root.specifier)
+                            .collect::<Vec<_>>();
+                        Some((expected_lock, required_specifiers))
+                    } else {
+                        None
                     };
-                    modules.push(LocalModule {
-                        subpath: module.subpath.clone(),
-                        content: body,
-                    });
-                }
-                let manifest: PackageManifest = serde_json::from_value(resolved.manifest.clone())
-                    .map_err(
-                    |e| crate::i18n::t!("package-parse-manifest-failed", "error" => e.to_string()),
-                )?;
-                local_packages::fork_to_local(&server, &new_name, &manifest, &modules)
-                    .map_err(|e| e.to_string())?;
-                // Carry the source's README into the fork (resolve includes it), so a forked
-                // package isn't left without one.
-                if let Some(readme) = resolved.readme.as_deref() {
-                    local_packages::write_local_file(&server, &new_name, "README.md", readme)
-                        .map_err(|e| e.to_string())?;
-                }
-                // Mirror the source's enabled state. A self-fork keeping the leaf name shares the
-                // source's specifier slot (now resolving to the local folder), so installing it
-                // enabled IS the mirror — the old unconditional "disable the source" step would
-                // re-disable that single entry, the bug that left a self-fork disabled.
-                let fork_is_self = fork_specifier == source_specifier;
-                let activation = fork_activation(activate, fork_is_self);
-                if !matches!(activation, ForkActivation::Inactive) {
-                    shared_packages::install_package(
-                        &server,
-                        &fork_specifier,
-                        UpdateMode::Auto,
-                        true,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if matches!(activation, ForkActivation::TookOver) {
-                        // Distinct slot: the local fork supersedes the original install, so remove
-                        // the original from the lockfile entirely. (Merely disabling it left a stale
-                        // entry that resurfaced — at its persisted older version — when the local
-                        // copy was later deleted, and lingered as a second resolvable identity for
-                        // the same leaf name.)
-                        shared_packages::uninstall_package(&server, &source_specifier)
-                            .map_err(|e| e.to_string())?;
+                    // The content-addressed cache is truth for bodies it holds (they were
+                    // hash-verified when written), so a fork serves cache hits without
+                    // touching the network and fetches only the misses.
+                    let cache = PackageCache::new().ok();
+                    let mut modules = Vec::new();
+                    for module in &resolved.modules {
+                        // Raw bytes either way, so a fork copies binary modules faithfully too.
+                        let body = match cached_fork_body(cache.as_ref(), &module.content_hash) {
+                            Some(body) => body,
+                            None => client
+                                .fetch_module_bytes(&module.content_url, &module.content_hash)
+                                .await
+                                .map_err(|e| e.to_string())?,
+                        };
+                        modules.push(LocalModule {
+                            subpath: module.subpath.clone(),
+                            content: body,
+                        });
                     }
+                    match requirement_plan {
+                        Some((expected_lock, required_specifiers)) => {
+                            // The requirement plan was reviewed against a lock snapshot; if it
+                            // changed first, nothing was written and the copy must be re-planned.
+                            match local_packages::fork_to_local_with_readme_and_existing_requirements_if_unchanged(
+                                &server,
+                                &new_name,
+                                &manifest,
+                                &modules,
+                                resolved.readme.as_deref(),
+                                &canonical_owner,
+                                &expected_lock,
+                                &required_specifiers,
+                            )
+                            .map_err(|e| e.to_string())?
+                            {
+                                Cas::Applied => {}
+                                Cas::StateChanged => {
+                                    return Err(crate::i18n::t!("package-install-plan-changed"));
+                                }
+                            }
+                        }
+                        None => local_packages::fork_to_local_with_readme_and_state(
+                            &server,
+                            &new_name,
+                            &manifest,
+                            &modules,
+                            resolved.readme.as_deref(),
+                            &canonical_owner,
+                        )
+                        .map_err(|e| e.to_string())?,
+                    }
+                    Ok::<_, String>(new_name)
                 }
-                Ok((new_name, activation))
+                .await;
+                (operation.into_completion(), result)
             },
-            Message::ForkFinished,
+            move |(completion, result)| Message::ForkFinished {
+                source_specifier: result_source.clone(),
+                destination_name: result_destination.clone(),
+                operation_id,
+                completion,
+                origin: result_origin.clone(),
+                origin_revision: result_origin_revision,
+                result,
+            },
         ))
     }
 
-    /// Keeps the source's leaf name, de-duping against existing local packages only on a
-    /// collision (`boo`, then `boo-2`, `boo-3`, …), case-folded like the filesystem.
-    fn derive_fork_name(&self, source_leaf: &str) -> String {
-        let taken = |candidate: &str| {
-            self.local_packages
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(candidate))
-        };
-        if !taken(source_leaf) {
-            return source_leaf.to_string();
+    /// Describes a completed fork from the current package graph. The cloud download can take
+    /// long enough for activation to change, so callers must classify from current state rather
+    /// than retaining the state that existed when the fork started.
+    fn current_fork_activation_feedback(&mut self, name: &str) -> (String, String) {
+        if let Ok(lock) = shared_packages::load_lock(&self.server_name) {
+            self.installed_packages = lock.packages;
+            self.rebuild_graph();
         }
-        let mut i = 2;
-        loop {
-            let candidate = format!("{source_leaf}-{i}");
-            if !taken(&candidate) {
-                return candidate;
-            }
-            i += 1;
+        let local_specifier = specifier_for(local_packages::LOCAL_OWNER, name);
+        let destination_referenced = self
+            .installed_packages
+            .iter()
+            .filter(|package| package.specifier != local_specifier)
+            .map(|package| package.specifier.as_str())
+            .chain(
+                self.graph
+                    .requires
+                    .keys()
+                    .filter(|specifier| specifier.as_str() != local_specifier)
+                    .map(String::as_str),
+            )
+            .chain(
+                self.graph
+                    .requires
+                    .values()
+                    .flatten()
+                    .map(|edge| edge.specifier.as_str()),
+            )
+            .any(|specifier| naming::names_conflict(package_display_name(specifier), name));
+        let activation = if self.leaf_change_affects_running(name) {
+            ForkActivation::OverrideActive
+        } else if destination_referenced {
+            ForkActivation::OverrideInactive
+        } else {
+            ForkActivation::Independent
+        };
+        match activation {
+            ForkActivation::OverrideActive => (
+                crate::i18n::t!("package-fork-took-over", "name" => name),
+                crate::i18n::t!("package-fork-took-over-toast", "name" => name),
+            ),
+            ForkActivation::OverrideInactive => (
+                crate::i18n::t!("package-fork-mirrored", "name" => name),
+                crate::i18n::t!("package-fork-mirrored-toast", "name" => name),
+            ),
+            ForkActivation::Independent => (
+                crate::i18n::t!("package-fork-inactive", "name" => name),
+                crate::i18n::t!("package-fork-inactive-toast", "name" => name),
+            ),
         }
     }
 
     pub(super) fn fork_finished(
         &mut self,
-        result: Result<(String, ForkActivation), String>,
+        source_specifier: &str,
+        destination_name: &str,
+        operation_id: PackageOperationId,
+        origin: &Selection,
+        origin_revision: u64,
+        result: Result<String, String>,
     ) -> Update<Message, Event> {
-        self.manage_busy = false;
+        let owns_operation = self.fork_operation == Some(operation_id);
+        let present_result = owns_operation
+            && self.pending_nav.is_none()
+            && !self.has_content_draft()
+            && self.rename_buffer.is_none()
+            && self.selection == *origin
+            && self.selection_revision == origin_revision
+            && self
+                .installed_open
+                .as_deref()
+                .is_some_and(|package| package.specifier == source_specifier)
+            && self.fork_source_specifier.as_deref() == Some(source_specifier)
+            && self
+                .fork_name
+                .as_deref()
+                .is_some_and(|name| name.trim() == destination_name);
+        if owns_operation {
+            self.fork_operation = None;
+            self.manage_busy = false;
+        }
         match result {
-            Ok((name, activation)) => {
-                let (feedback, toast) = match activation {
-                    ForkActivation::TookOver => (
-                        crate::i18n::t!("package-fork-took-over", "name" => &name),
-                        crate::i18n::t!("package-fork-took-over-toast", "name" => &name),
-                    ),
-                    ForkActivation::Mirrored => (
-                        format!(
-                            "Editing a copy named \u{201c}{name}\u{201d} — your local copy is now active."
-                        ),
-                        format!("Now editing {name}."),
-                    ),
-                    ForkActivation::Inactive => (
-                        crate::i18n::t!("package-fork-inactive", "name" => &name),
-                        crate::i18n::t!("package-fork-inactive-toast", "name" => &name),
-                    ),
-                };
-                self.manage_feedback = Some(feedback);
-                let toast = self.show_toast(toast);
-                let tasks = vec![
+            Ok(name) => {
+                let (feedback, toast) = self.current_fork_activation_feedback(&name);
+                if owns_operation {
+                    self.clear_fork_draft();
+                }
+                let mut tasks = vec![
                     Task::done(Message::LoadLocalPackages),
                     Task::done(Message::LoadInstalledPackages),
-                    Task::done(Message::SelectOwnedPackage(name)),
-                    toast,
                 ];
-                // An active fork (took over or mirrored) changed the enabled set — reload the
-                // running session. An inactive fork only wrote a folder, so no reload is needed.
-                if matches!(activation, ForkActivation::Inactive) {
-                    Update::with_task(Task::batch(tasks))
-                } else {
-                    Update::new(
-                        Task::batch(tasks),
-                        Some(Event::ScriptsChanged {
-                            server_name: self.server_name.clone(),
-                        }),
-                    )
+                if present_result {
+                    let opened = self.open_owned_package(name);
+                    self.authoring_feedback = Some(feedback);
+                    tasks.extend([opened.task, self.show_toast(toast)]);
                 }
+                // Reload conservatively after every committed fork. An apparently disabled copy
+                // can still replace an imported same-leaf package in another active root.
+                Update::new(
+                    Task::batch(tasks),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                )
             }
             Err(e) => {
-                self.manage_feedback = Some(crate::i18n::t!(
-                    "package-fork-failed",
-                    "error" => e.to_string()
-                ));
-                Update::none()
+                if present_result {
+                    self.manage_feedback = Some(crate::i18n::t!(
+                        "package-fork-failed",
+                        "error" => e.to_string()
+                    ));
+                }
+                // An error can occur after the final directory becomes visible but before its
+                // state can be classified. Reconcile both views and runtime conservatively.
+                Update::new(
+                    Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                )
             }
         }
     }
@@ -2171,9 +4107,10 @@ impl AutomationsWindow {
         let dir = match local_packages::packages_dir(&self.server_name) {
             Ok(dir) => dir.join(&name),
             Err(e) => {
-                return Update::with_task(
-                    self.show_toast(format!("Couldn't locate the folder: {e}")),
-                );
+                return Update::with_task(self.show_toast(crate::i18n::t!(
+                    "package-folder-locate-failed",
+                    "error" => e.to_string()
+                )));
             }
         };
         if !dir.exists() {
@@ -2189,68 +4126,109 @@ impl AutomationsWindow {
     }
 
     pub(super) fn start_rename_owned(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
+        if !matches!(&self.publication_status, PublicationStatus::Unpublished) {
+            self.authoring_feedback =
+                Some(crate::i18n::t!("package-rename-publication-not-confirmed"));
+            return Update::none();
+        }
         if let Some(package) = self.local_package.as_deref() {
+            if self
+                .cloud
+                .package_operations
+                .is_busy(&self.server_name, &package.name)
+            {
+                self.authoring_feedback = Some(crate::i18n::t!("package-operation-in-progress"));
+                return Update::none();
+            }
+            self.rename_source_name = Some(package.name.clone());
             self.rename_buffer = Some(package.name.clone());
             self.authoring_feedback = None;
         }
         Update::none()
     }
 
+    pub(super) fn rename_draft_is_for_open_package(&self) -> bool {
+        self.local_package.as_deref().is_some_and(|package| {
+            self.rename_source_name.as_deref() == Some(package.name.as_str())
+                && self.rename_buffer.is_some()
+        })
+    }
+
+    pub(super) fn open_rename_buffer(&self) -> Option<&str> {
+        self.rename_draft_is_for_open_package()
+            .then(|| self.rename_buffer.as_deref())
+            .flatten()
+    }
+
+    pub(super) fn clear_rename_draft(&mut self) {
+        self.rename_buffer = None;
+        self.rename_source_name = None;
+    }
+
     /// Commits the inline rename: rename the folder (+ its fork sidecar), then migrate any lockfile
     /// install of its `smudgy://<you>/<name>` specifier so an active local package keeps resolving
     /// under its new name. Renaming a fork off the source's name is also what unblocks publishing.
     pub(super) fn commit_rename_owned(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
+        if let Some(error) = self.package_state_error() {
+            self.authoring_feedback = Some(error);
+            return Update::none();
+        }
+        if !matches!(&self.publication_status, PublicationStatus::Unpublished) {
+            self.authoring_feedback =
+                Some(crate::i18n::t!("package-rename-publication-not-confirmed"));
+            return Update::none();
+        }
         if self.dirty || self.manifest_dirty {
             self.authoring_feedback = Some(crate::i18n::t!("package-save-before-rename"));
+            return Update::none();
+        }
+        let Some(old_name) = self.local_package.as_deref().map(|p| p.name.clone()) else {
+            return Update::none();
+        };
+        if self.rename_source_name.as_deref() != Some(old_name.as_str()) {
             return Update::none();
         }
         let Some(new_name) = self.rename_buffer.as_ref().map(|s| s.trim().to_string()) else {
             return Update::none();
         };
-        let Some(old_name) = self.local_package.as_deref().map(|p| p.name.clone()) else {
-            self.rename_buffer = None;
-            return Update::none();
-        };
         if new_name == old_name {
-            self.rename_buffer = None;
+            self.clear_rename_draft();
             return Update::none();
         }
         if let Err(message) = naming::validate_package_name(&new_name) {
             self.authoring_feedback = Some(message);
             return Update::none();
         }
-        if let Err(e) =
-            local_packages::rename_local_package(&self.server_name, &old_name, &new_name)
-        {
-            self.authoring_feedback = Some(format!("Rename failed: {e}"));
+        let Some(_operation) = self.reserve_package_operation(&old_name, false) else {
             return Update::none();
-        }
+        };
+        let session_changed =
+            match local_packages::rename_local_package(&self.server_name, &old_name, &new_name) {
+                Ok(changed) => changed,
+                Err(e) => {
+                    self.authoring_feedback = Some(crate::i18n::t!(
+                        "package-rename-failed",
+                        "error" => e.to_string()
+                    ));
+                    return Update::new(
+                        Task::batch([
+                            Task::done(Message::LoadLocalPackages),
+                            Task::done(Message::LoadInstalledPackages),
+                        ]),
+                        Some(Event::ScriptsChanged {
+                            server_name: self.server_name.clone(),
+                        }),
+                    );
+                }
+            };
 
-        // Migrate the lockfile install if this local package was active under its own specifier (a
-        // fork that took over, or any enabled local package), so the engine keeps resolving it.
-        // The entry's owner segment depends on the sign-in state it was created under — the
-        // account nickname, or the reserved `local` placeholder when signed out — so both forms
-        // are migrated.
-        let mut session_changed = false;
-        let mut owners = vec![local_packages::LOCAL_OWNER.to_string()];
-        if let Some(nick) = self.cloud.snapshot.get().nickname_text() {
-            owners.push(nick);
-        }
-        for owner in owners {
-            let old_spec = specifier_for(&owner, &old_name);
-            let new_spec = specifier_for(&owner, &new_name);
-            let migrate = shared_packages::load_lock(&self.server_name)
-                .ok()
-                .and_then(|lock| lock.find(&old_spec).map(|p| (p.mode.clone(), p.enabled)));
-            if let Some((mode, enabled)) = migrate {
-                let _ =
-                    shared_packages::install_package(&self.server_name, &new_spec, mode, enabled);
-                let _ = shared_packages::uninstall_package(&self.server_name, &old_spec);
-                session_changed = true;
-            }
-        }
-
-        self.rename_buffer = None;
+        self.clear_rename_draft();
         self.authoring_feedback = None;
         let toast = self.show_toast(crate::i18n::t!(
             "package-renamed",
@@ -2277,6 +4255,10 @@ impl AutomationsWindow {
     // ---- trust toggle ------------------------------------------------------
 
     pub(super) fn request_trust(&mut self) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
         self.confirm_trust = true;
         Update::none()
     }
@@ -2291,27 +4273,46 @@ impl AutomationsWindow {
     /// consented union. Either way it takes effect on the next session reload — there is no live
     /// isolate migration — so the toast says so rather than implying an instant change.
     pub(super) fn set_trusted(&mut self, trusted: bool) -> Update<Message, Event> {
-        let Some(specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        let Some(expected_package) = self.installed_open.as_deref().cloned() else {
             return Update::none();
         };
+        let specifier = expected_package.specifier.clone();
         self.confirm_trust = false;
-        if let Err(e) = shared_packages::set_trusted(&self.server_name, &specifier, trusted) {
-            self.manage_feedback = Some(crate::i18n::t!(
-                "package-trust-update-failed",
-                "error" => e.to_string()
-            ));
-            return Update::none();
+        match shared_packages::set_governing_trusted_if_unchanged(
+            &self.server_name,
+            &specifier,
+            &expected_package,
+            trusted,
+        ) {
+            Ok(Cas::Applied) => {}
+            Ok(Cas::StateChanged) => {
+                self.refresh_local_shadow_after_authoritative_mutation();
+                if let Err(message) = self.reload_package_lock_snapshot() {
+                    self.manage_feedback = Some(message);
+                } else {
+                    self.manage_feedback = Some(crate::i18n::t!("package-settings-state-changed"));
+                }
+                return Update::with_task(Task::batch([
+                    Task::done(Message::LoadLocalPackages),
+                    Task::done(Message::LoadInstalledPackages),
+                ]));
+            }
+            Err(e) => {
+                self.refresh_local_shadow_after_authoritative_mutation();
+                self.manage_feedback = Some(crate::i18n::t!(
+                    "package-trust-update-failed",
+                    "error" => e.to_string()
+                ));
+                return Update::none();
+            }
         }
-        // Mirror the flip into the in-memory copies so the pane reflects it immediately.
-        if let Some(pkg) = self
-            .installed_packages
-            .iter_mut()
-            .find(|p| p.specifier == specifier)
-        {
-            pkg.trusted = trusted;
-        }
-        if let Some(open) = &mut self.installed_open {
-            open.trusted = trusted;
+        self.refresh_local_shadow_after_authoritative_mutation();
+        if let Err(message) = self.reload_package_lock_snapshot() {
+            self.manage_feedback = Some(message);
         }
         // A trusted package runs allow-all, so any pending update delta is moot.
         if trusted {
@@ -2337,6 +4338,7 @@ impl AutomationsWindow {
     /// local package the manifest IS the grant table, so this is the "grant capabilities" affordance.
     pub(super) fn edit_owned_capabilities(&mut self) -> Update<Message, Event> {
         let update = self.begin_manifest_edit();
+        self.local_package_tab = LocalPackageTab::Manifest;
         self.manifest_tab = ManifestTab::Capabilities;
         update
     }
@@ -2347,38 +4349,94 @@ impl AutomationsWindow {
     /// it; disabling returns it to its manifest-scoped sandbox. Reloads the live session.
     pub(super) fn set_local_unsandboxed(&mut self, unsandboxed: bool) -> Update<Message, Event> {
         self.confirm_trust = false;
+        if let Some(error) = self.package_state_error() {
+            self.authoring_feedback = Some(error);
+            return Update::none();
+        }
         let Some(name) = self.local_package.as_ref().map(|p| p.name.clone()) else {
             return Update::none();
         };
         let own_spec = self.local_own_spec(&name);
-        let in_lock = self
+        let mut expected_package = self
             .installed_packages
             .iter()
-            .any(|p| p.specifier == own_spec);
-        let result = if unsandboxed {
-            // Ensure it's installed + enabled, then trust it (allow-all on the main isolate).
-            if in_lock {
-                shared_packages::set_enabled(&self.server_name, &own_spec, true)
-            } else {
-                shared_packages::install_package(
-                    &self.server_name,
-                    &own_spec,
-                    UpdateMode::Auto,
-                    true,
-                )
+            .find(|package| package.specifier == own_spec)
+            .cloned();
+        let in_lock = expected_package.is_some();
+        if unsandboxed && !in_lock {
+            // Materialize the disabled governing row before changing trust.
+            match shared_packages::install_package_with_activation(
+                &self.server_name,
+                &own_spec,
+                UpdateMode::Auto,
+                ProfileActivation::None,
+            ) {
+                Ok(()) => {}
+                Err(e) => {
+                    return Update::new(
+                        Task::batch([
+                            Task::done(Message::LoadInstalledPackages),
+                            Task::done(Message::LoadLocalPackages),
+                            self.show_toast(crate::i18n::t!(
+                                "package-update-failed",
+                                "name" => &name,
+                                "error" => e.to_string()
+                            )),
+                        ]),
+                        Some(Event::ScriptsChanged {
+                            server_name: self.server_name.clone(),
+                        }),
+                    );
+                }
             }
-            .and_then(|()| shared_packages::set_trusted(&self.server_name, &own_spec, true))
-        } else if in_lock {
-            shared_packages::set_trusted(&self.server_name, &own_spec, false)
-        } else {
-            Ok(())
-        };
-        if let Err(e) = result {
-            return Update::with_task(self.show_toast(crate::i18n::t!(
-                "package-update-failed",
-                "name" => &name,
-                "error" => e.to_string()
-            )));
+            if let Err(message) = self.reload_package_lock_snapshot() {
+                self.authoring_feedback = Some(message);
+                return Update::with_task(Task::batch([
+                    Task::done(Message::LoadInstalledPackages),
+                    Task::done(Message::LoadLocalPackages),
+                ]));
+            }
+            expected_package = self
+                .installed_packages
+                .iter()
+                .find(|package| package.specifier == own_spec)
+                .cloned();
+        }
+        if in_lock || unsandboxed {
+            let Some(expected_package) = expected_package.as_ref() else {
+                self.authoring_feedback = Some(crate::i18n::t!("package-settings-state-changed"));
+                return Update::with_task(Task::batch([
+                    Task::done(Message::LoadInstalledPackages),
+                    Task::done(Message::LoadLocalPackages),
+                ]));
+            };
+            match shared_packages::set_governing_trusted_if_unchanged(
+                &self.server_name,
+                &own_spec,
+                expected_package,
+                unsandboxed,
+            ) {
+                Ok(Cas::Applied) => {}
+                Ok(Cas::StateChanged) => {
+                    if let Err(message) = self.reload_package_lock_snapshot() {
+                        self.authoring_feedback = Some(message);
+                    } else {
+                        self.authoring_feedback =
+                            Some(crate::i18n::t!("package-settings-state-changed"));
+                    }
+                    return Update::with_task(Task::batch([
+                        Task::done(Message::LoadInstalledPackages),
+                        Task::done(Message::LoadLocalPackages),
+                    ]));
+                }
+                Err(e) => {
+                    return Update::with_task(self.show_toast(crate::i18n::t!(
+                        "package-update-failed",
+                        "name" => &name,
+                        "error" => e.to_string()
+                    )));
+                }
+            }
         }
         let toast = self.show_toast(if unsandboxed {
             crate::i18n::t!("package-local-unsandboxed-toast", "name" => &name)
@@ -2399,47 +4457,26 @@ impl AutomationsWindow {
 
     // ---- update re-prompt --------------------------------------------------
 
-    /// Grant & update: adopt the new closure union as the consented baseline. The package is
-    /// already installed, so `record_consent` updates the existing lock entry. Takes effect on the
-    /// next reload (the engine reads the consented union at session start).
+    /// Review an offered update through the complete install planner. Permission additions and
+    /// changed `requires` roots share this path so neither can bypass range checks, required-root
+    /// consent, exact version staging, or atomic lockfile commit.
     pub(super) fn grant_update(&mut self) -> Update<Message, Event> {
-        let Some(delta) = self.update_delta.take() else {
+        let Some(delta) = self.update_delta.as_ref() else {
             return Update::none();
         };
         // A version-floor hold-back has no grant (its card offers only dismissal): consenting
         // wouldn't load the held-back version, so don't rewrite the baseline.
         if delta.needs_smudgy.is_some() {
-            self.update_delta = Some(delta);
             return Update::none();
         }
-        if let Err(e) =
-            shared_packages::record_consent(&self.server_name, &delta.specifier, &delta.new_union)
-        {
-            self.manage_feedback = Some(crate::i18n::t!(
-                "package-consent-record-failed",
-                "error" => e.to_string()
-            ));
-            // Re-show the delta so the user can retry.
-            self.update_delta = Some(delta);
+        let Some(open) = self.installed_open.as_deref() else {
+            return Update::none();
+        };
+        if open.specifier != delta.specifier {
             return Update::none();
         }
-        if let Some(pkg) = self
-            .installed_packages
-            .iter_mut()
-            .find(|p| p.specifier == delta.specifier)
-        {
-            pkg.consented_permissions = Some(delta.new_union.clone());
-        }
-        if let Some(open) = &mut self.installed_open {
-            open.consented_permissions = Some(delta.new_union);
-        }
-        let toast = self.show_toast(format!("Updated permissions for {}", delta.name));
-        Update::new(
-            toast,
-            Some(Event::ScriptsChanged {
-                server_name: self.server_name.clone(),
-            }),
-        )
+        let mode = update_grant_mode(open, delta);
+        self.begin_installed_version_change(mode)
     }
 
     pub(super) fn dismiss_update(&mut self) -> Update<Message, Event> {
@@ -2455,29 +4492,283 @@ impl AutomationsWindow {
 // ============================================================================
 
 impl AutomationsWindow {
+    /// Resolve a local manifest's new independent-root set before writing the file. Removing every
+    /// requirement is a synchronous empty-plan commit; additions/range changes open the same
+    /// all-or-nothing consent card used by installs and version changes.
+    pub(super) fn begin_local_manifest_requirements_save(
+        &mut self,
+        name: String,
+        manifest: PackageManifest,
+        json: String,
+        expected_manifest: String,
+        operation: PackageOperationPermit,
+    ) -> Update<Message, Event> {
+        if !self
+            .local_package
+            .as_deref()
+            .is_some_and(|package| package.name == name)
+        {
+            if let Some(draft) = self.manifest_draft.as_mut() {
+                draft.error = Some(crate::i18n::t!("manifest-changed-outside"));
+            }
+            return Update::none();
+        }
+        match local_packages::read_local_file(&self.server_name, &name, "smudgy.package.json") {
+            Ok(current) if current == expected_manifest => {}
+            Ok(_) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(crate::i18n::t!("manifest-changed-outside"));
+                }
+                return Update::none();
+            }
+            Err(error) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(crate::i18n::t!(
+                        "manifest-save-failed",
+                        "error" => error.to_string()
+                    ));
+                }
+                return Update::none();
+            }
+        }
+        let root_specifier = self.local_own_spec(&name);
+        let materialized = local_packages::materialize_governing_local_lock_rows(
+            &self.server_name,
+            std::slice::from_ref(&name),
+            local_packages::LOCAL_OWNER,
+        );
+        if let Err(error) = materialized {
+            if let Some(draft) = self.manifest_draft.as_mut() {
+                draft.error = Some(crate::i18n::t!(
+                    "manifest-save-failed",
+                    "error" => error.to_string()
+                ));
+            }
+            return Update::none();
+        }
+        let (expected_lock, expected_local_manifests) = match self.load_consent_resolution_state() {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(error);
+                }
+                return Update::none();
+            }
+        };
+        let Some(activation) = expected_lock
+            .find(&root_specifier)
+            .map(LockedPackage::activation)
+        else {
+            if let Some(draft) = self.manifest_draft.as_mut() {
+                draft.error = Some(crate::i18n::t!("package-install-plan-changed"));
+            }
+            return Update::with_task(Task::done(Message::LoadInstalledPackages));
+        };
+
+        if manifest.smudgy_requires().is_empty() {
+            let result = shared_packages::commit_local_manifest_with_requirements_if_unchanged(
+                &self.server_name,
+                &name,
+                &root_specifier,
+                &expected_manifest,
+                &json,
+                &expected_lock,
+                &[],
+            );
+            match result {
+                Ok(shared_packages::LocalManifestCommit::Applied) => {}
+                Ok(shared_packages::LocalManifestCommit::Stale) => {
+                    if let Some(draft) = self.manifest_draft.as_mut() {
+                        draft.error = Some(crate::i18n::t!("manifest-changed-outside"));
+                    }
+                    return Update::none();
+                }
+                Ok(shared_packages::LocalManifestCommit::StateChanged) => {
+                    if let Some(draft) = self.manifest_draft.as_mut() {
+                        draft.error = Some(crate::i18n::t!("package-install-plan-changed"));
+                    }
+                    return Update::with_task(Task::done(Message::LoadInstalledPackages));
+                }
+                Err(error) => {
+                    if let Some(draft) = self.manifest_draft.as_mut() {
+                        draft.error = Some(crate::i18n::t!(
+                            "manifest-save-failed",
+                            "error" => error.to_string()
+                        ));
+                    }
+                    return Update::none();
+                }
+            }
+            self.apply_saved_manifest(&name, manifest);
+            self.package_change_finalize = Some(PackageChangeFinalize {
+                specifier: root_specifier,
+                activation,
+                kind: PackageChangeKind::Manifest,
+                warning: None,
+            });
+            return self.finalize_package_change();
+        }
+
+        let mut local_manifests = expected_local_manifests.clone();
+        local_manifests.insert(root_specifier.clone(), manifest.clone());
+        let root_edges =
+            canonical_required_edges(manifest_requires_from_manifest(&manifest), &local_manifests);
+        let installed = self.installed_packages.clone();
+        let (account_fence, client) = self.frozen_package_client();
+        let version = manifest.version.clone();
+        let permissions = manifest.permissions.clone();
+        self.install_seq.bump();
+        let seq = self.install_seq;
+        let operation_id = operation.id();
+        self.authoring_busy = true;
+        self.authoring_operation = Some(operation_id);
+        Update::with_task(Task::perform(
+            async move {
+                let closure = resolve_required_closure_from_edges(
+                    &client,
+                    local_packages::LOCAL_OWNER,
+                    &name,
+                    &version,
+                    root_edges,
+                    &installed,
+                    &local_manifests,
+                )
+                .await;
+                let result = Ok::<_, String>(ConsentPrompt {
+                    account_fence,
+                    specifier: root_specifier,
+                    owner: crate::i18n::t!("package-local-publisher"),
+                    name: name.clone(),
+                    version,
+                    permissions,
+                    params: Vec::new(),
+                    closure: Vec::new(),
+                    required_roots: closure.roots,
+                    conflict: closure.conflict,
+                    needs_smudgy: closure.needs_smudgy,
+                    required_unavailable: closure.unavailable,
+                    expected_lock,
+                    expected_local_manifests,
+                    operation: ConsentOperation::LocalManifest {
+                        name,
+                        manifest: Box::new(manifest),
+                        json,
+                        expected_manifest,
+                        activation,
+                    },
+                    error: None,
+                });
+                (operation.into_completion(), result)
+            },
+            move |(completion, result)| Message::LocalManifestRequirementsResolved {
+                seq,
+                account_fence,
+                completion,
+                result,
+            },
+        ))
+    }
+
+    pub(super) fn local_manifest_requirements_resolved(
+        &mut self,
+        seq: InstallSeq,
+        account_fence: AccountReadFence,
+        completion: PackageOperationCompletion,
+        result: Result<ConsentPrompt, String>,
+    ) -> Update<Message, Event> {
+        let operation_id = completion.id();
+        let Some(operation) = completion.take_permit() else {
+            return Update::none();
+        };
+        if seq != self.install_seq
+            || !self.account_read_is_current(account_fence)
+            || self.authoring_operation != Some(operation_id)
+        {
+            return Update::none();
+        }
+        self.authoring_operation = None;
+        self.authoring_busy = false;
+        self.consent_busy = false;
+        match result {
+            Ok(prompt) => {
+                if let Err(error) = self.validate_consent_snapshot(
+                    &prompt.expected_lock,
+                    &prompt.expected_local_manifests,
+                ) {
+                    if let Some(draft) = self.manifest_draft.as_mut() {
+                        draft.error = Some(error);
+                    }
+                    return Update::with_task(Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]));
+                }
+                let (name, expected_json) = match &prompt.operation {
+                    ConsentOperation::LocalManifest { name, json, .. } => (name, json),
+                    _ => return Update::none(),
+                };
+                let still_open = self
+                    .local_package
+                    .as_deref()
+                    .is_some_and(|package| package.name == *name);
+                let current_json = self
+                    .manifest_draft
+                    .as_ref()
+                    .and_then(|draft| draft.to_manifest().ok())
+                    .and_then(|manifest| serde_json::to_string_pretty(&manifest).ok())
+                    .map(|json| format!("{json}\n"));
+                if still_open && current_json.as_deref() == Some(expected_json.as_str()) {
+                    self.manifest_operation = Some(operation);
+                    self.consent_prompt = Some(prompt);
+                }
+            }
+            Err(error) => {
+                if let Some(draft) = self.manifest_draft.as_mut() {
+                    draft.error = Some(error);
+                }
+            }
+        }
+        Update::none()
+    }
+
     pub(super) fn new_package(&mut self) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            return Update::with_task(self.show_toast(error));
+        }
         self.clear_selection();
         self.selection = Selection::None;
         self.pane = Pane::NewPackage {
             name: String::new(),
             error: None,
         };
+        self.local_package_tab = LocalPackageTab::Manifest;
         Update::none()
     }
 
     pub(super) fn open_owned_package(&mut self, name: String) -> Update<Message, Event> {
         self.clear_selection();
         self.owned_selected_file = None;
+        self.owned_source_baseline = None;
         self.authoring_feedback = None;
         self.share_package_id = None;
+        self.publication_status = PublicationStatus::Unknown;
+        self.share_is_public = false;
         self.share_friends.clear();
         self.share_grants.clear();
         self.share_versions.clear();
         self.share_busy = false;
         self.share_feedback = None;
+        self.local_package_tab = LocalPackageTab::About;
+        self.parameter_profile.clone_from(&self.profile_name);
         self.selection = Selection::OwnedPackage(name.clone());
         match local_packages::load_local_package(&self.server_name, &name) {
             Ok(Some(package)) => {
+                self.manifest_source_baseline = local_packages::read_local_file(
+                    &self.server_name,
+                    &name,
+                    "smudgy.package.json",
+                )
+                .ok();
                 self.local_readme = package.readme.as_deref().map(markdown::Content::parse);
                 self.manifest_draft = Some(ManifestDraft::from_manifest(&package.manifest));
                 self.manifest_dirty = false;
@@ -2489,10 +4780,33 @@ impl AutomationsWindow {
                 self.local_package = Some(Box::new(package));
                 self.pane = Pane::OwnedPackage;
                 self.seed_param_config(spec, params);
+
+                match local_packages::load_publication_binding(&self.server_name, &name) {
+                    Ok(Some(binding)) => {
+                        self.share_package_id = Some(binding.package_id);
+                        self.publication_status = PublicationStatus::Bound(binding.package_id);
+                    }
+                    Ok(None) => {
+                        self.publication_status = if self.signed_in() {
+                            PublicationStatus::Checking
+                        } else {
+                            PublicationStatus::Unknown
+                        };
+                    }
+                    Err(error) => {
+                        let message = crate::i18n::t!(
+                            "package-publication-record-invalid",
+                            "error" => error.to_string()
+                        );
+                        self.publication_status = PublicationStatus::Invalid(message.clone());
+                        self.authoring_feedback = Some(message);
+                    }
+                }
             }
             Ok(None) => {
-                self.pane = Pane::Error(std::sync::Arc::new(vec![format!(
-                    "Package '{name}' not found"
+                self.pane = Pane::Error(std::sync::Arc::new(vec![crate::i18n::t!(
+                    "package-local-not-found",
+                    "name" => &name
                 )]));
                 return Update::none();
             }
@@ -2514,7 +4828,7 @@ impl AutomationsWindow {
             self.refresh_language_project();
         }
         // Load the cloud share state (if published + signed in).
-        if !self.signed_in() {
+        if !self.signed_in() || matches!(&self.publication_status, PublicationStatus::Invalid(_)) {
             return Update::none();
         }
         Update::with_task(self.load_owned_share(name))
@@ -2524,16 +4838,21 @@ impl AutomationsWindow {
     /// as opening the pane so the new version, first-publish sharing controls, and visibility all
     /// repaint from server truth as soon as the upload completes.
     pub(super) fn load_owned_share(&mut self, name: String) -> Task<Message> {
+        self.share_seq.bump();
+        let seq = self.share_seq;
+        let account_epoch = self.account_epoch;
+        let (account_fence, frozen_credentials) = self.frozen_cloud_credentials();
         self.share_busy = true;
-        let pkg_client = self.package_client();
-        let cloud_client = self.cloud.client.clone();
+        let pkg_client =
+            PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials.clone());
+        let cloud_client = CloudApiClient::new(self.cloud.base_url.as_str(), frozen_credentials);
         let result_name = name.clone();
         Task::perform(
             async move {
                 let mine = pkg_client.list_my_packages().await?;
                 let detail = mine
                     .into_iter()
-                    .find(|p| p.package.name == name)
+                    .find(|p| naming::names_conflict(&p.package.name, &name))
                     .ok_or(CloudError::NotFoundOrNoAccess)?;
                 let id = detail.package.id;
                 let is_public = detail.package.is_public;
@@ -2543,6 +4862,9 @@ impl AutomationsWindow {
                 Ok((id, is_public, friends, grants, versions))
             },
             move |result| Message::OwnedShareLoaded {
+                account_epoch,
+                account_fence,
+                seq,
                 name: result_name.clone(),
                 result,
             },
@@ -2552,6 +4874,7 @@ impl AutomationsWindow {
     #[allow(clippy::type_complexity)]
     pub(super) fn owned_share_loaded(
         &mut self,
+        seq: ShareSeq,
         name: &str,
         result: Result<
             (
@@ -2564,38 +4887,136 @@ impl AutomationsWindow {
             CloudError,
         >,
     ) -> Update<Message, Event> {
-        if !matches!(&self.selection, Selection::OwnedPackage(open) if open == name) {
+        if seq != self.share_seq
+            || !matches!(&self.selection, Selection::OwnedPackage(open) if open == name)
+        {
             return Update::none();
         }
         self.share_busy = false;
         match result {
             Ok((id, is_public, friends, grants, versions)) => {
+                if let PublicationStatus::Bound(bound_id) = &self.publication_status
+                    && *bound_id != id
+                {
+                    let message = crate::i18n::t!(
+                        "package-publication-record-conflict",
+                        "local" => bound_id.to_string(),
+                        "cloud" => id.to_string()
+                    );
+                    self.publication_status = PublicationStatus::Invalid(message.clone());
+                    self.share_feedback = Some(message);
+                    return Update::none();
+                }
+                // Backfill folders published before durable publication bindings existed. A
+                // failed write cannot undo a successful cloud lookup; keep the name locked in
+                // this process and explain that the local record still needs repair.
+                if !matches!(&self.publication_status, PublicationStatus::Bound(_))
+                    && let Err(error) =
+                        local_packages::save_publication_binding(&self.server_name, name, id, name)
+                {
+                    self.share_feedback = Some(crate::i18n::t!(
+                        "package-publication-record-save-failed",
+                        "error" => error.to_string()
+                    ));
+                }
                 self.share_package_id = Some(id);
+                self.publication_status = PublicationStatus::Bound(id);
                 self.share_is_public = is_public;
                 self.share_friends = friends;
                 self.share_grants = grants;
                 self.share_versions = versions;
             }
             // A not-yet-published package simply has no cloud state.
-            Err(CloudError::NotFoundOrNoAccess) => {}
-            Err(e) => self.share_feedback = Some(display_error(&e)),
+            Err(CloudError::NotFoundOrNoAccess) => {
+                if matches!(
+                    self.publication_status,
+                    PublicationStatus::Checking | PublicationStatus::Unknown
+                ) {
+                    self.share_package_id = None;
+                    self.publication_status = PublicationStatus::Unpublished;
+                    self.share_is_public = false;
+                    self.share_friends.clear();
+                    self.share_grants.clear();
+                    self.share_versions.clear();
+                } else if matches!(&self.publication_status, PublicationStatus::Bound(_)) {
+                    self.share_feedback =
+                        Some(crate::i18n::t!("package-published-state-unavailable"));
+                }
+            }
+            Err(e) => {
+                // Preserve Unknown/Bound/Invalid. A transient error must not unlock rename.
+                self.share_feedback = Some(display_error(&e));
+            }
         }
         Update::none()
+    }
+
+    /// Reconcile an old singleton's completed cloud mutation without navigating or replacing an
+    /// unrelated package pane. Publication bindings are local authority for rename safety, so read
+    /// that record even when the user changed accounts while the old task was running.
+    pub(super) fn refresh_owned_share_if_open(
+        &mut self,
+        server_name: &str,
+        name: &str,
+    ) -> Update<Message, Event> {
+        if self.server_name != server_name
+            || !matches!(&self.selection, Selection::OwnedPackage(open) if open == name)
+            || self.cloud.package_operations.is_busy(server_name, name)
+        {
+            return Update::none();
+        }
+        match local_packages::load_publication_binding(server_name, name) {
+            Ok(Some(binding)) => {
+                self.publication_status = PublicationStatus::Bound(binding.package_id);
+                self.share_package_id = Some(binding.package_id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let message = crate::i18n::t!(
+                    "package-publication-record-invalid",
+                    "error" => error.to_string()
+                );
+                self.publication_status = PublicationStatus::Invalid(message.clone());
+                self.share_feedback = Some(message);
+                return Update::none();
+            }
+        }
+        if self.signed_in() {
+            Update::with_task(self.load_owned_share(name.to_string()))
+        } else {
+            Update::none()
+        }
     }
 
     pub(super) fn select_owned_file(&mut self, subpath: String) -> Update<Message, Event> {
         let Some(name) = self.local_package.as_ref().map(|p| p.name.clone()) else {
             return Update::none();
         };
-        if subpath == "README.md" {
-            self.clear_code_editor();
-            self.owned_selected_file = None;
-            return Update::none();
+        if let Some(module) = self.local_package.as_deref().and_then(|package| {
+            package
+                .modules
+                .iter()
+                .find(|module| module.subpath == subpath)
+        }) {
+            let size = u64::try_from(module.content.len()).unwrap_or(u64::MAX);
+            if size > SOURCE_PREVIEW_CAP_BYTES
+                || module.content.contains(&0)
+                || std::str::from_utf8(&module.content).is_err()
+            {
+                self.dirty = false;
+                self.owned_selected_file = Some(subpath);
+                self.owned_source_baseline = None;
+                self.authoring_feedback = None;
+                self.clear_code_editor();
+                return Update::none();
+            }
         }
         match local_packages::read_local_file(&self.server_name, &name, &subpath) {
             Ok(content) => {
                 self.dirty = false;
+                self.authoring_feedback = None;
                 self.owned_selected_file = Some(subpath.clone());
+                self.owned_source_baseline = Some(content.clone());
                 return Update::with_task(self.bind_code_editor(
                     &content,
                     code_editor::path_language(&subpath),
@@ -2614,6 +5035,9 @@ impl AutomationsWindow {
     }
 
     pub(super) fn save_owned_file(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy {
+            return Update::none();
+        }
         let (name, subpath) = match (
             self.local_package.as_ref().map(|p| p.name.clone()),
             self.owned_selected_file.clone(),
@@ -2623,24 +5047,48 @@ impl AutomationsWindow {
         };
         if !self.code_editor_is_modified() {
             self.dirty = false;
-            self.pending_nav = None;
-            return Update::none();
+            return Update::with_task(self.release_pending_navigation());
         }
         let content = self.code_editor_text();
-        if let Err(e) =
-            local_packages::write_local_file(&self.server_name, &name, &subpath, &content)
-        {
+        let Some(expected) = self.owned_source_baseline.clone() else {
             self.authoring_feedback = Some(crate::i18n::t!(
-                "package-file-save-failed",
-                "error" => e.to_string()
+                "package-file-changed-outside",
+                "path" => &subpath
             ));
             return Update::none();
+        };
+        let Some(_operation) = self.reserve_package_operation(&name, false) else {
+            return Update::none();
+        };
+        match local_packages::write_local_file_if_unchanged(
+            &self.server_name,
+            &name,
+            &subpath,
+            &expected,
+            &content,
+        ) {
+            Ok(local_packages::LocalFileWriteOutcome::Saved) => {}
+            Ok(local_packages::LocalFileWriteOutcome::Conflict) => {
+                self.authoring_feedback = Some(crate::i18n::t!(
+                    "package-file-changed-outside",
+                    "path" => &subpath
+                ));
+                return Update::none();
+            }
+            Err(e) => {
+                self.authoring_feedback = Some(crate::i18n::t!(
+                    "package-file-save-failed",
+                    "error" => e.to_string()
+                ));
+                return Update::none();
+            }
         }
+        self.owned_source_baseline = Some(content.clone());
         self.dirty = false;
-        self.pending_nav = None;
+        let released = self.release_pending_navigation();
         self.mark_code_editor_saved();
 
-        // The durable selected-file write is authoritative even if reloading an unrelated
+        // The selected-file write is authoritative even if reloading an unrelated
         // package file fails. Patch the retained graph base first so closing this overlay can
         // never reveal stale source to importers, then replace it with a complete reload when
         // available.
@@ -2649,7 +5097,9 @@ impl AutomationsWindow {
             .as_deref_mut()
             .filter(|package| package.name == name)
         {
-            if let Some(module) = package
+            if subpath == "README.md" {
+                package.readme = Some(content.clone());
+            } else if let Some(module) = package
                 .modules
                 .iter_mut()
                 .find(|module| module.subpath == subpath)
@@ -2672,7 +5122,7 @@ impl AutomationsWindow {
             }
             Err(error) => {
                 log::warn!(
-                    "saved owned package file {name}/{subpath}, but package reload failed: {error}"
+                    "owned package file {name}/{subpath} changed on disk, but package reload failed: {error}"
                 );
                 self.authoring_feedback = Some(crate::i18n::t!(
                     "package-file-read-failed",
@@ -2682,13 +5132,120 @@ impl AutomationsWindow {
             }
         }
         self.refresh_language_project();
-        Update::with_task(self.show_toast(crate::i18n::t!(
+        let toast = self.show_toast(crate::i18n::t!(
             "package-file-saved",
             "path" => &subpath
-        )))
+        ));
+        Update::new(
+            Task::batch([toast, released]),
+            Some(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            }),
+        )
+    }
+
+    /// Reserve one local package across synchronous disk work or an entire asynchronous cloud
+    /// workflow. The gate belongs to `CloudAccount`, so replacing the singleton window cannot
+    /// orphan its protection while an old task is still running.
+    pub(super) fn reserve_package_operation(
+        &mut self,
+        name: &str,
+        sharing_feedback: bool,
+    ) -> Option<PackageOperationPermit> {
+        let operation = self
+            .cloud
+            .package_operations
+            .try_acquire(&self.server_name, name);
+        if operation.is_none() {
+            let message = crate::i18n::t!("package-operation-in-progress");
+            if sharing_feedback {
+                self.share_feedback = Some(message);
+            } else {
+                self.authoring_feedback = Some(message);
+            }
+        }
+        operation
+    }
+
+    fn begin_sharing_operation(
+        &mut self,
+        name: &str,
+    ) -> Option<(PackageOperationPermit, PackageApiClient, u64)> {
+        let operation = self.reserve_package_operation(name, true)?;
+        let credential_generation = self.cloud.credentials.generation();
+        let Some(credential) = self.cloud.credentials.get() else {
+            self.share_feedback = Some(crate::i18n::t!("package-publish-sign-in"));
+            return None;
+        };
+        if self.cloud.credentials.generation() != credential_generation {
+            self.share_feedback = Some(crate::i18n::t!("package-account-changed"));
+            return None;
+        }
+        let client = PackageApiClient::new(
+            self.cloud.base_url.as_str(),
+            smudgy_cloud::CredentialSource::new(Some(credential)),
+        );
+        Some((operation, client, credential_generation))
+    }
+
+    /// Validate a sharing mutation completion without allowing an older message to release or
+    /// repaint a newer operation. All mutation results, including errors, can follow a committed
+    /// server write, so a stale result schedules a fresh load when this package is still open.
+    fn accept_sharing_completion(
+        &mut self,
+        server_name: &str,
+        name: &str,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        credential_generation: u64,
+    ) -> Result<(), Update<Message, Event>> {
+        if self.server_name != server_name {
+            return Err(Update::none());
+        }
+        let owns_operation = self.share_operation == Some(operation_id);
+        let exact_view =
+            owns_operation && seq == self.share_seq && self.share_package_id == Some(package_id);
+        if owns_operation {
+            self.share_operation = None;
+        }
+        if !exact_view {
+            let same_package_open = matches!(
+                &self.selection,
+                Selection::OwnedPackage(open) if open == name
+            );
+            let newer_mutation_active = self.cloud.package_operations.is_busy(server_name, name);
+            return Err(
+                if same_package_open && self.signed_in() && !newer_mutation_active {
+                    Update::with_task(self.load_owned_share(name.to_string()))
+                } else {
+                    Update::none()
+                },
+            );
+        }
+
+        self.share_busy = false;
+        if self.cloud.credentials.generation() != credential_generation {
+            self.share_package_id = None;
+            self.share_is_public = false;
+            self.share_versions.clear();
+            self.share_grants.clear();
+            self.share_feedback = Some(crate::i18n::t!("package-account-changed"));
+            return Err(
+                if self.signed_in() && !self.cloud.package_operations.is_busy(server_name, name) {
+                    Update::with_task(self.load_owned_share(name.to_string()))
+                } else {
+                    Update::none()
+                },
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn publish_owned(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
         if self.dirty || self.manifest_dirty {
             self.authoring_feedback = Some(crate::i18n::t!("package-save-before-publish"));
             return Update::none();
@@ -2696,7 +5253,35 @@ impl AutomationsWindow {
         let Some(name) = self.local_package.as_ref().map(|p| p.name.clone()) else {
             return Update::none();
         };
+        let account = self.cloud.snapshot.get();
+        let Some(publisher) = account
+            .profile
+            .as_ref()
+            .filter(|_| account.signed_in)
+            .cloned()
+        else {
+            self.authoring_feedback = Some(crate::i18n::t!("package-publish-sign-in"));
+            return Update::none();
+        };
+        if publisher.nickname.is_none() {
+            self.authoring_feedback = Some(crate::i18n::t!("package-publish-sign-in"));
+            return Update::none();
+        }
+        let credential_generation = self.cloud.credentials.generation();
+        let Some(credential) = self.cloud.credentials.get() else {
+            self.authoring_feedback = Some(crate::i18n::t!("package-publish-sign-in"));
+            return Update::none();
+        };
+        if self.cloud.credentials.generation() != credential_generation {
+            self.authoring_feedback = Some(crate::i18n::t!("package-account-changed"));
+            return Update::none();
+        }
+        let Some(operation) = self.reserve_package_operation(&name, false) else {
+            return Update::none();
+        };
+        let operation_id = operation.id();
         self.authoring_busy = true;
+        self.authoring_operation = Some(operation_id);
         self.authoring_feedback = None;
         // Shown live beside Publish while the (possibly slow) tsc declaration pass + upload run;
         // the outcome — including any non-fatal tsc warnings — lands in `PublishFinished`.
@@ -2707,128 +5292,102 @@ impl AutomationsWindow {
                 crate::i18n::t!("package-publishing-progress", "name" => &name)
             ),
         });
-        let client = self.package_client();
+        // Namespace claim, binding, metadata, and version upload are one irreversible workflow.
+        // Give it a detached credential so a login/logout cannot switch authors between awaits.
+        let client = PackageApiClient::new(
+            self.cloud.base_url.as_str(),
+            smudgy_cloud::CredentialSource::new(Some(credential)),
+        );
         let server = self.server_name.clone();
+        let result_server = server.clone();
         let result_name = name.clone();
+        let result_publisher_id = publisher.id;
         Update::with_task(Task::perform(
             async move {
-                local_packages::publish_local_package(&client, &server, &name)
-                    .await
-                    .map_err(|e| e.to_string())
+                let result =
+                    local_packages::publish_local_package(&client, &server, &name, &publisher)
+                        .await
+                        .map_err(|e| e.to_string());
+                (operation.into_completion(), result)
             },
-            move |result| Message::PublishFinished {
+            move |(completion, result)| Message::PublishFinished {
+                server_name: result_server.clone(),
                 name: result_name.clone(),
+                operation_id,
+                completion,
+                credential_generation,
+                publisher_id: result_publisher_id,
                 result,
             },
         ))
     }
 
     pub(super) fn delete_owned(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
+        if let Some(error) = self.package_state_error() {
+            self.authoring_feedback = Some(error);
+            return Update::none();
+        }
         let Some(name) = self.local_package.as_ref().map(|p| p.name.clone()) else {
             return Update::none();
         };
-        if let Err(e) = local_packages::delete_local_package(&self.server_name, &name) {
-            self.authoring_feedback = Some(crate::i18n::t!(
-                "package-delete-failed",
-                "error" => e.to_string()
-            ));
+        let Some(_operation) = self.reserve_package_operation(&name, false) else {
             return Update::none();
-        }
-        // The folder was the package: purge the lockfile installs that ran it, or they linger as
-        // phantom "installed" entries that fail to load every session (rename migrates its entry
-        // for the same reason). The reserved `local`-owner specifier can only ever resolve to the
-        // deleted folder, so it goes unconditionally. The account specifier can outlive the
-        // folder — deleting a local working copy un-shadows a published copy of the same name —
-        // so it is settled asynchronously below, once the cloud says whether one is published.
-        if let Err(e) = shared_packages::uninstall_package(
-            &self.server_name,
-            &specifier_for(local_packages::LOCAL_OWNER, &name),
-        ) {
-            log::warn!("Failed to remove the deleted package's install entry: {e}");
-        }
-        let account_check = self.cloud.snapshot.get().nickname_text().and_then(|nick| {
-            let spec = specifier_for(&nick, &name);
-            let was_enabled = shared_packages::load_lock(&self.server_name)
-                .ok()
-                .and_then(|lock| lock.find(&spec).map(|p| p.enabled));
-            was_enabled.map(|was_enabled| {
-                // Park the entry disabled across the cloud round-trip: the session reload this
-                // delete triggers must not try to load it — the folder is gone, so it would
-                // emit a spurious "no version could be found" notice for a deliberate delete.
-                if was_enabled
-                    && let Err(e) = shared_packages::set_enabled(&self.server_name, &spec, false)
-                {
-                    log::warn!("Failed to park the deleted package's account install: {e}");
-                }
-                let client = self.package_client();
-                let server = self.server_name.clone();
-                let name = name.clone();
-                Task::perform(
-                    async move {
-                        match client.resolve_package(&nick, &name, None).await {
-                            // A published copy exists: deleting the working copy un-shadows it
-                            // (the npm-unlink direction of the local-override design), so the
-                            // parked entry is restored and the published package takes over.
-                            Ok(_) => {
-                                if was_enabled
-                                    && shared_packages::set_enabled(&server, &spec, true).is_ok()
-                                {
-                                    StaleInstallCheck::Restored
-                                } else {
-                                    StaleInstallCheck::Unchanged
-                                }
-                            }
-                            // Nothing is published under the name, so the entry can never
-                            // resolve again — drop it, unless the author re-created a
-                            // same-named local package while this round-trip was in flight.
-                            Err(CloudError::NotFoundOrNoAccess) => {
-                                let recreated = local_packages::packages_dir(&server)
-                                    .is_ok_and(|dir| dir.join(&name).exists());
-                                if !recreated
-                                    && shared_packages::uninstall_package(&server, &spec).is_ok()
-                                {
-                                    StaleInstallCheck::Pruned
-                                } else {
-                                    StaleInstallCheck::Unchanged
-                                }
-                            }
-                            // Unreachable/offline: can't tell. The entry stays parked
-                            // (disabled) — the installed-list sweep prunes it later if nothing
-                            // is published, and the user can re-enable it any time.
-                            Err(_) => StaleInstallCheck::Unchanged,
-                        }
-                    },
-                    Message::StaleAccountInstallsChecked,
-                )
-            })
-        });
+        };
+        let deleted = match local_packages::delete_local_package(&self.server_name, &name) {
+            Ok(summary) => summary,
+            Err(e) => {
+                self.authoring_feedback = Some(crate::i18n::t!(
+                    "package-delete-failed",
+                    "error" => e.to_string()
+                ));
+                return Update::new(
+                    Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                );
+            }
+        };
         self.confirm_delete_local = false;
         self.local_package = None;
         // Drop the manifest draft too (delete doesn't route through clear_selection), so a dirty
         // draft for the now-deleted package can't trip the unsaved-changes guard on the next nav.
         self.manifest_draft = None;
+        self.owned_source_baseline = None;
+        self.manifest_source_baseline = None;
         self.manifest_dirty = false;
         self.manifest_editing = false;
         self.clear_code_editor();
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
-        let toast = self.show_toast(crate::i18n::t!(
-            "package-deleted-toast",
-            "name" => &name
-        ));
+        let toast = if deleted.warnings.is_empty() {
+            self.show_toast(crate::i18n::t!(
+                "package-deleted-toast",
+                "name" => &name
+            ))
+        } else {
+            self.show_toast(crate::i18n::t!(
+                "package-deleted-with-warning-toast",
+                "name" => &name,
+                "error" => deleted.warnings.join(" ")
+            ))
+        };
         // Reload same-server sessions like an uninstall does: the deleted package stops running
         // and the engine rebuild prunes its now-orphaned `.isolates/<slug>` scratch dir.
         // Re-read the installed list + re-resolve the graph too: deleting a local package can change
         // which installed rows are shadowed by a local override, so the installed pane must refresh
         // rather than keep showing a now-stale view until the next manual Reload.
-        let mut tasks = vec![
+        let tasks = vec![
             Task::done(Message::LoadLocalPackages),
             Task::done(Message::LoadInstalledPackages),
             toast,
         ];
-        if let Some(check) = account_check {
-            tasks.push(check);
-        }
         Update::new(
             Task::batch(tasks),
             Some(Event::ScriptsChanged {
@@ -2837,24 +5396,34 @@ impl AutomationsWindow {
         )
     }
 
-    /// Applies the outcome of an async account-install check ([`delete_owned`](Self::delete_owned)
-    /// or the installed-list sweep). Pruned entries only need the installed list refreshed — they
-    /// never loaded anything, so no session reload. A restored entry re-enabled a published copy
-    /// that should now take over, which is a change to the enabled set, so sessions reload.
+    /// Applies the outcome of an async stale account-install sweep. A row can still be running
+    /// from its verified cache when the registry no longer exposes it, so a committed prune must
+    /// rebuild every live session for this server as well as refresh the installed list.
     pub(super) fn stale_account_installs_checked(
         &mut self,
         outcome: StaleInstallCheck,
     ) -> Update<Message, Event> {
         match outcome {
-            StaleInstallCheck::Pruned => {
-                Update::with_task(Task::done(Message::LoadInstalledPackages))
+            StaleInstallCheck::Pruned(removed) => {
+                if self.installed_open.as_deref().is_some_and(|package| {
+                    removed
+                        .iter()
+                        .any(|specifier| specifier == &package.specifier)
+                }) {
+                    self.clear_selection();
+                    self.installed_open = None;
+                    self.installed_detail = None;
+                    self.installed_rating = None;
+                    self.selection = Selection::Dashboard;
+                    self.pane = Pane::Dashboard;
+                }
+                Update::new(
+                    Task::done(Message::LoadInstalledPackages),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                )
             }
-            StaleInstallCheck::Restored => Update::new(
-                Task::done(Message::LoadInstalledPackages),
-                Some(Event::ScriptsChanged {
-                    server_name: self.server_name.clone(),
-                }),
-            ),
             StaleInstallCheck::Unchanged => Update::none(),
         }
     }
@@ -2868,53 +5437,92 @@ impl AutomationsWindow {
     /// offline. `None` when signed out or when every own install has its folder (the common
     /// case — published packages by other authors are never checked).
     pub(super) fn sweep_stale_account_installs(&self) -> Option<Task<Message>> {
-        let nick = self.cloud.snapshot.get().nickname_text()?;
+        let account_snapshot = self.cloud.snapshot.get();
+        if !account_snapshot.signed_in {
+            return None;
+        }
+        let nick = account_snapshot.nickname_text()?;
         let prefix = format!("smudgy://{nick}/");
-        let candidates: Vec<String> = self
+        let candidates: Vec<LockedPackage> = self
             .installed_packages
             .iter()
-            .filter_map(|p| p.specifier.strip_prefix(&prefix).map(str::to_string))
-            .filter(|name| {
+            .filter(|package| package.specifier.starts_with(&prefix))
+            .filter(|package| {
+                let name = package_display_name(&package.specifier);
                 !self
                     .local_packages
                     .iter()
                     .any(|n| n.eq_ignore_ascii_case(name))
             })
+            .cloned()
             .collect();
         if candidates.is_empty() {
             return None;
         }
-        let client = self.package_client();
+        // Freeze the credential used by this destructive verifier. The app's normal package
+        // client is hot-swappable; a request that silently crosses a logout/account switch could
+        // turn a private package into NotFound and delete a valid install.
+        let credentials = self.cloud.credentials.clone();
+        let credential_generation = credentials.generation();
+        let credential = credentials.get();
+        if credentials.generation() != credential_generation {
+            return None;
+        }
+        let client = PackageApiClient::new(
+            self.cloud.base_url.as_str(),
+            smudgy_cloud::CredentialSource::new(credential),
+        );
+        let account = self.cloud.snapshot.clone();
         let server = self.server_name.clone();
         Some(Task::perform(
             async move {
-                let mut pruned = false;
-                for name in candidates {
+                let mut pruned = Vec::new();
+                for candidate in candidates {
+                    let name = package_display_name(&candidate.specifier).to_string();
                     if matches!(
                         client.resolve_package(&nick, &name, None).await,
                         Err(CloudError::NotFoundOrNoAccess)
                     ) {
                         // Re-check the folder right before the write: the package may have
                         // been (re)created since the candidate list was drawn up.
-                        let recreated = local_packages::packages_dir(&server)
-                            .is_ok_and(|dir| dir.join(&name).exists());
-                        if !recreated {
-                            let spec = specifier_for(&nick, &name);
-                            pruned |= shared_packages::uninstall_package(&server, &spec).is_ok();
+                        if credentials.generation() != credential_generation
+                            || account.get().nickname_text().as_deref() != Some(nick.as_str())
+                        {
+                            break;
+                        }
+                        // Discovery is strict: an unreadable directory is uncertainty, not proof
+                        // that the local shadow is absent.
+                        let Ok(local_names) = local_packages::list_local_packages(&server) else {
+                            continue;
+                        };
+                        let recreated = local_names
+                            .iter()
+                            .any(|local_name| local_name.eq_ignore_ascii_case(&name));
+                        if !recreated
+                            && shared_packages::uninstall_package_if_unchanged(&server, &candidate)
+                                .unwrap_or(false)
+                        {
+                            pruned.push(candidate.specifier);
                         }
                     }
                 }
-                if pruned {
-                    StaleInstallCheck::Pruned
-                } else {
+                if pruned.is_empty() {
                     StaleInstallCheck::Unchanged
+                } else {
+                    StaleInstallCheck::Pruned(pruned)
                 }
             },
-            Message::StaleAccountInstallsChecked,
+            move |outcome| Message::StaleAccountInstallsChecked { outcome },
         ))
     }
 
     pub(super) fn create_package(&mut self) -> Update<Message, Event> {
+        if let Some(state_error) = self.package_state_error() {
+            if let Pane::NewPackage { error, .. } = &mut self.pane {
+                *error = Some(state_error);
+            }
+            return Update::none();
+        }
         let name = match &self.pane {
             Pane::NewPackage { name, .. } => name.trim().to_string(),
             _ => return Update::none(),
@@ -2925,90 +5533,249 @@ impl AutomationsWindow {
             }
             return Update::none();
         }
-        if let Err(e) = local_packages::scaffold_local_package(&self.server_name, &name) {
-            if let Pane::NewPackage { error, .. } = &mut self.pane {
-                *error = Some(crate::i18n::t!(
-                    "package-create-failed",
-                    "error" => e.to_string()
-                ));
+        let canonical_owner = self
+            .cloud
+            .snapshot
+            .get()
+            .nickname_text()
+            .unwrap_or_else(|| local_packages::LOCAL_OWNER.to_string());
+        match local_packages::scaffold_local_package_with_state(
+            &self.server_name,
+            &name,
+            &canonical_owner,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                if let Pane::NewPackage { error, .. } = &mut self.pane {
+                    *error = Some(crate::i18n::t!(
+                        "package-create-failed",
+                        "error" => e.to_string()
+                    ));
+                }
+                // A failure can follow a visible folder. Refresh both package views and runtime
+                // instead of leaving a possible local shadow invisible.
+                return Update::new(
+                    Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                );
             }
-            return Update::none();
         }
-        Update::with_task(Task::batch([
-            Task::done(Message::LoadLocalPackages),
-            Task::done(Message::SelectOwnedPackage(name)),
-        ]))
+        let opened = self.open_owned_package(name);
+        self.local_package_tab = LocalPackageTab::Manifest;
+        Update::new(
+            Task::batch([
+                Task::done(Message::LoadLocalPackages),
+                Task::done(Message::LoadInstalledPackages),
+                opened.task,
+            ]),
+            Some(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            }),
+        )
     }
 
     pub(super) fn set_visibility(&mut self, public: bool) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
         let Some(id) = self.share_package_id else {
             return Update::none();
         };
-        let client = self.package_client();
+        let Some(name) = self
+            .local_package
+            .as_deref()
+            .map(|package| package.name.clone())
+        else {
+            return Update::none();
+        };
+        let Some((operation, client, credential_generation)) = self.begin_sharing_operation(&name)
+        else {
+            return Update::none();
+        };
+        let operation_id = operation.id();
+        self.share_seq.bump();
+        let seq = self.share_seq;
         self.share_busy = true;
+        self.share_operation = Some(operation_id);
+        let server_name = self.server_name.clone();
         Update::with_task(Task::perform(
             async move {
-                client
+                let result = client
                     .patch_package(id, None, Some(public))
                     .await
-                    .map(|view| view.is_public)
+                    .map(|view| view.is_public);
+                (operation.into_completion(), result)
             },
-            Message::VisibilityUpdated,
+            move |(completion, result)| Message::VisibilityUpdated {
+                server_name: server_name.clone(),
+                name: name.clone(),
+                seq,
+                package_id: id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            },
         ))
     }
 
     pub(super) fn visibility_updated(
         &mut self,
+        server_name: &str,
+        name: &str,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        credential_generation: u64,
         result: Result<bool, CloudError>,
     ) -> Update<Message, Event> {
-        self.share_busy = false;
+        if let Err(update) = self.accept_sharing_completion(
+            server_name,
+            name,
+            seq,
+            package_id,
+            operation_id,
+            credential_generation,
+        ) {
+            return update;
+        }
         match result {
             Ok(is_public) => self.share_is_public = is_public,
-            Err(e) => self.share_feedback = Some(display_error(&e)),
+            Err(e) => {
+                self.share_feedback = Some(display_error(&e));
+                return Update::with_task(self.load_owned_share(name.to_string()));
+            }
         }
         Update::none()
     }
 
     pub(super) fn yank_version(&mut self, version: String, yanked: bool) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
         let Some(id) = self.share_package_id else {
             return Update::none();
         };
-        let client = self.package_client();
+        let Some(name) = self
+            .local_package
+            .as_deref()
+            .map(|package| package.name.clone())
+        else {
+            return Update::none();
+        };
+        let Some((operation, client, credential_generation)) = self.begin_sharing_operation(&name)
+        else {
+            return Update::none();
+        };
+        let operation_id = operation.id();
+        self.share_seq.bump();
+        let seq = self.share_seq;
         self.share_busy = true;
+        self.share_operation = Some(operation_id);
+        let server_name = self.server_name.clone();
         Update::with_task(Task::perform(
-            async move { client.set_version_yanked(id, &version, yanked).await },
-            Message::VersionsUpdated,
+            async move {
+                let result = client.set_version_yanked(id, &version, yanked).await;
+                (operation.into_completion(), result)
+            },
+            move |(completion, result)| Message::VersionsUpdated {
+                server_name: server_name.clone(),
+                name: name.clone(),
+                seq,
+                package_id: id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            },
         ))
     }
 
     pub(super) fn delete_version(&mut self, version: String) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
         let Some(id) = self.share_package_id else {
             return Update::none();
         };
-        let client = self.package_client();
+        let Some(name) = self
+            .local_package
+            .as_deref()
+            .map(|package| package.name.clone())
+        else {
+            return Update::none();
+        };
+        let Some((operation, client, credential_generation)) = self.begin_sharing_operation(&name)
+        else {
+            return Update::none();
+        };
+        let operation_id = operation.id();
+        self.share_seq.bump();
+        let seq = self.share_seq;
         self.share_busy = true;
+        self.share_operation = Some(operation_id);
+        let server_name = self.server_name.clone();
         Update::with_task(Task::perform(
             async move {
-                client.delete_version(id, &version).await?;
-                client.list_versions(id).await
+                let result = async {
+                    client.delete_version(id, &version).await?;
+                    client.list_versions(id).await
+                }
+                .await;
+                (operation.into_completion(), result)
             },
-            Message::VersionsUpdated,
+            move |(completion, result)| Message::VersionsUpdated {
+                server_name: server_name.clone(),
+                name: name.clone(),
+                seq,
+                package_id: id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            },
         ))
     }
 
     pub(super) fn versions_updated(
         &mut self,
+        server_name: &str,
+        name: &str,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        credential_generation: u64,
         result: Result<Vec<VersionListItem>, CloudError>,
     ) -> Update<Message, Event> {
-        self.share_busy = false;
+        if let Err(update) = self.accept_sharing_completion(
+            server_name,
+            name,
+            seq,
+            package_id,
+            operation_id,
+            credential_generation,
+        ) {
+            return update;
+        }
         match result {
             Ok(versions) => self.share_versions = versions,
-            Err(e) => self.share_feedback = Some(display_error(&e)),
+            Err(e) => {
+                self.share_feedback = Some(display_error(&e));
+                return Update::with_task(self.load_owned_share(name.to_string()));
+            }
         }
         Update::none()
     }
 
     pub(super) fn share_with_friend(&mut self, grantee: Uuid) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
         let Some(id) = self.share_package_id else {
             return Update::none();
         };
@@ -3021,34 +5788,109 @@ impl AutomationsWindow {
             let grant_id = grant.id;
             return self.revoke_grant(grant_id);
         }
-        let client = self.package_client();
+        let Some(name) = self
+            .local_package
+            .as_deref()
+            .map(|package| package.name.clone())
+        else {
+            return Update::none();
+        };
+        let Some((operation, client, credential_generation)) = self.begin_sharing_operation(&name)
+        else {
+            return Update::none();
+        };
+        let operation_id = operation.id();
+        self.share_seq.bump();
+        let seq = self.share_seq;
         self.share_busy = true;
+        self.share_operation = Some(operation_id);
+        let server_name = self.server_name.clone();
         Update::with_task(Task::perform(
-            async move { client.share_with_friend(id, grantee).await },
-            Message::GrantsUpdated,
+            async move {
+                let result = client.share_with_friend(id, grantee).await;
+                (operation.into_completion(), result)
+            },
+            move |(completion, result)| Message::GrantsUpdated {
+                server_name: server_name.clone(),
+                name: name.clone(),
+                seq,
+                package_id: id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            },
         ))
     }
 
     pub(super) fn revoke_grant(&mut self, grant_id: Uuid) -> Update<Message, Event> {
+        if self.authoring_busy || self.share_busy {
+            return Update::none();
+        }
         let Some(id) = self.share_package_id else {
             return Update::none();
         };
-        let client = self.package_client();
+        let Some(name) = self
+            .local_package
+            .as_deref()
+            .map(|package| package.name.clone())
+        else {
+            return Update::none();
+        };
+        let Some((operation, client, credential_generation)) = self.begin_sharing_operation(&name)
+        else {
+            return Update::none();
+        };
+        let operation_id = operation.id();
+        self.share_seq.bump();
+        let seq = self.share_seq;
         self.share_busy = true;
+        self.share_operation = Some(operation_id);
+        let server_name = self.server_name.clone();
         Update::with_task(Task::perform(
-            async move { client.revoke_grant(id, grant_id).await },
-            Message::GrantsUpdated,
+            async move {
+                let result = client.revoke_grant(id, grant_id).await;
+                (operation.into_completion(), result)
+            },
+            move |(completion, result)| Message::GrantsUpdated {
+                server_name: server_name.clone(),
+                name: name.clone(),
+                seq,
+                package_id: id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            },
         ))
     }
 
     pub(super) fn grants_updated(
         &mut self,
+        server_name: &str,
+        name: &str,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        credential_generation: u64,
         result: Result<Vec<PackageGrantView>, CloudError>,
     ) -> Update<Message, Event> {
-        self.share_busy = false;
+        if let Err(update) = self.accept_sharing_completion(
+            server_name,
+            name,
+            seq,
+            package_id,
+            operation_id,
+            credential_generation,
+        ) {
+            return update;
+        }
         match result {
             Ok(grants) => self.share_grants = grants,
-            Err(e) => self.share_feedback = Some(display_error(&e)),
+            Err(e) => {
+                self.share_feedback = Some(display_error(&e));
+                return Update::with_task(self.load_owned_share(name.to_string()));
+            }
         }
         Update::none()
     }
@@ -3068,6 +5910,8 @@ impl AutomationsWindow {
         self.discover_detail = None;
         self.discover_readme = None;
         self.discover_comments.clear();
+        self.discover_owner = None;
+        self.discover_requested_package = None;
         self.selection = Selection::Discover;
         self.pane = Pane::Discover;
         // Public discovery needs no account, so load the results list for everyone.
@@ -3092,6 +5936,8 @@ impl AutomationsWindow {
     }
 
     pub(super) fn discover_search(&mut self) -> Update<Message, Event> {
+        self.discover_search_seq.bump();
+        let seq = self.discover_search_seq;
         self.discover_busy = true;
         self.discover_error = None;
         let client = self.package_client();
@@ -3112,14 +5958,18 @@ impl AutomationsWindow {
                     .search_packages(host.as_deref(), query.as_deref(), category)
                     .await
             },
-            Message::DiscoverResultsLoaded,
+            move |result| Message::DiscoverResultsLoaded(seq, result),
         ))
     }
 
     pub(super) fn discover_results_loaded(
         &mut self,
+        seq: DiscoverSearchSeq,
         result: Result<Vec<PackageSearchResult>, CloudError>,
     ) -> Update<Message, Event> {
+        if seq != self.discover_search_seq || self.selection != Selection::Discover {
+            return Update::none();
+        }
         self.discover_busy = false;
         match result {
             Ok(results) => self.discover_results = results,
@@ -3137,6 +5987,9 @@ impl AutomationsWindow {
         // detail renders there). Harmless when already on it.
         self.pane = Pane::Discover;
         self.selection = Selection::Discover;
+        self.discover_seq.bump();
+        let seq = self.discover_seq;
+        self.discover_requested_package = Some(package_id);
         self.discover_busy = true;
         self.discover_error = None;
         self.discover_owner = Some(owner);
@@ -3144,24 +5997,47 @@ impl AutomationsWindow {
         self.discover_readme = None;
         self.discover_comments.clear();
         self.param_prompt = None;
-        let detail_client = self.package_client();
-        let comments_client = self.package_client();
+        let (account_fence, frozen_credentials) = self.frozen_cloud_credentials();
+        let detail_client =
+            PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials.clone());
+        let comments_client =
+            PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials);
         Update::with_task(Task::batch([
             Task::perform(
                 async move { detail_client.get_package(package_id).await },
-                Message::DiscoverDetailLoaded,
+                move |result| Message::DiscoverDetailLoaded {
+                    seq,
+                    package_id,
+                    account_fence,
+                    result,
+                },
             ),
             Task::perform(
                 async move { comments_client.list_comments(package_id).await },
-                Message::DiscoverCommentsLoaded,
+                move |result| Message::DiscoverCommentsLoaded {
+                    seq,
+                    package_id,
+                    account_fence,
+                    result,
+                },
             ),
         ]))
     }
 
     pub(super) fn discover_detail_loaded(
         &mut self,
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
         result: Result<PackageDetail, CloudError>,
     ) -> Update<Message, Event> {
+        if seq != self.discover_seq
+            || self.discover_requested_package != Some(package_id)
+            || !self.account_read_is_current(account_fence)
+            || self.selection != Selection::Discover
+        {
+            return Update::none();
+        }
         self.discover_busy = false;
         match result {
             Ok(detail) => {
@@ -3175,8 +6051,18 @@ impl AutomationsWindow {
 
     pub(super) fn discover_comments_loaded(
         &mut self,
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
         result: Result<Vec<CommentView>, CloudError>,
     ) -> Update<Message, Event> {
+        if seq != self.discover_seq
+            || self.discover_requested_package != Some(package_id)
+            || !self.account_read_is_current(account_fence)
+            || self.selection != Selection::Discover
+        {
+            return Update::none();
+        }
         if let Ok(comments) = result {
             self.discover_comments = comments;
         }
@@ -3184,12 +6070,15 @@ impl AutomationsWindow {
     }
 
     pub(super) fn discover_back(&mut self) -> Update<Message, Event> {
+        self.discover_seq.bump();
+        self.discover_requested_package = None;
         self.discover_detail = None;
         self.discover_readme = None;
         self.discover_comments.clear();
         self.param_prompt = None;
         self.param_prompt_queue.clear();
         self.consent_prompt = None;
+        self.consent_busy = false;
         self.discover_error = None;
         // Back within the Discover pane abandons a pending install too (it doesn't go through
         // clear_selection), so invalidate any in-flight resolve.
@@ -3203,15 +6092,11 @@ impl AutomationsWindow {
     /// load until the required params are set. When more required roots are queued, their prompts
     /// follow; the closing toast reports the chosen package.
     pub(super) fn param_prompt_cancel(&mut self) -> Update<Message, Event> {
-        let Some((specifier, enable)) = self
-            .param_prompt
-            .as_ref()
-            .map(|p| (p.specifier.clone(), p.enable))
-        else {
+        if self.param_prompt.is_none() {
             return Update::none();
-        };
+        }
         self.param_prompt = None;
-        self.advance_param_prompt_queue(&specifier, enable)
+        self.advance_param_prompt_queue()
     }
 
     pub(super) fn rate_package(&self, stars: i16) -> Update<Message, Event> {
@@ -3219,17 +6104,38 @@ impl AutomationsWindow {
             return Update::none();
         };
         let package_id = detail.package.id;
-        let client = self.package_client();
+        let seq = self.discover_seq;
+        let (account_fence, client) = self.frozen_package_client();
         Update::with_task(Task::perform(
             async move { client.rate_package(package_id, stars).await },
-            Message::RatingUpdated,
+            move |result| Message::RatingUpdated {
+                seq,
+                package_id,
+                account_fence,
+                result,
+            },
         ))
     }
 
     pub(super) fn rating_updated(
         &mut self,
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
         result: Result<PackageDetail, CloudError>,
     ) -> Update<Message, Event> {
+        if seq != self.discover_seq
+            || self.discover_requested_package != Some(package_id)
+            || !self.account_read_is_current(account_fence)
+            || self.selection != Selection::Discover
+            || self
+                .discover_detail
+                .as_deref()
+                .map(|detail| detail.package.id)
+                != Some(package_id)
+        {
+            return Update::none();
+        }
         match result {
             Ok(detail) => {
                 self.discover_readme = detail.readme.as_deref().map(markdown::Content::parse);
@@ -3249,17 +6155,33 @@ impl AutomationsWindow {
             return Update::none();
         }
         let package_id = detail.package.id;
-        let client = self.package_client();
+        let seq = self.discover_seq;
+        let (account_fence, client) = self.frozen_package_client();
         Update::with_task(Task::perform(
             async move { client.add_comment(package_id, &body).await },
-            Message::CommentAdded,
+            move |result| Message::CommentAdded {
+                seq,
+                package_id,
+                account_fence,
+                result,
+            },
         ))
     }
 
     pub(super) fn comment_added(
         &mut self,
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
         result: Result<CommentView, CloudError>,
     ) -> Update<Message, Event> {
+        if seq != self.discover_seq
+            || self.discover_requested_package != Some(package_id)
+            || !self.account_read_is_current(account_fence)
+            || self.selection != Selection::Discover
+        {
+            return Update::none();
+        }
         match result {
             Ok(comment) => {
                 self.discover_comment_input.clear();
@@ -3309,49 +6231,93 @@ impl AutomationsWindow {
     }
 
     pub(super) fn begin_install(&mut self, owner: String, name: String) -> Update<Message, Event> {
+        if let Some(error) = self.package_state_error() {
+            self.discover_busy = false;
+            self.discover_error = Some(error);
+            return Update::none();
+        }
+        let (expected_lock, local_manifests) = match self.load_consent_resolution_state() {
+            Ok(state) => state,
+            Err(error) => {
+                self.discover_busy = false;
+                self.discover_error = Some(error);
+                return Update::none();
+            }
+        };
+        if let Some(local_name) = local_manifests.keys().find_map(|specifier| {
+            let local_name = package_display_name(specifier);
+            naming::names_conflict(local_name, &name).then(|| local_name.to_string())
+        }) {
+            // A local leaf is canonical for every author. Installing a hidden remote fallback here
+            // would offer a choice the resolver no longer supports, so open the implementation that
+            // will actually run instead.
+            self.install_seq.bump();
+            self.discover_busy = false;
+            return self.open_owned_package(local_name);
+        }
         self.discover_busy = true;
         self.discover_error = None;
         // New install generation: a result tagged with this seq is honored only if nothing has
         // abandoned the install (navigation, Back, or another install) in the meantime.
         self.install_seq.bump();
         let seq = self.install_seq;
-        let client = self.package_client();
+        let (account_fence, client) = self.frozen_package_client();
         // Resolve the root, fold the whole dependency-closure permission union, AND walk the
         // `requires`-closure (required roots + peer-conflict check) before showing
         // the consent window — the sandboxed isolate is granted exactly that union, and the user
         // grants the whole required set at once.
-        let installed = self.installed_packages.clone();
+        let installed = expected_lock.packages;
         Update::with_task(Task::perform(
-            async move { resolve_install_closure(&client, &owner, &name, None, &installed).await },
-            move |result| Message::InstallResolved(seq, result),
+            async move {
+                resolve_install_closure(&client, &owner, &name, None, &installed, &local_manifests)
+                    .await
+            },
+            move |result| Message::InstallResolved(seq, account_fence, result),
         ))
     }
 
     pub(super) fn install_resolved(
         &mut self,
         seq: InstallSeq,
+        account_fence: AccountReadFence,
         result: Result<InstallResolution, CloudError>,
     ) -> Update<Message, Event> {
         // Discard a stale resolve: the user navigated away, hit Back, or started another install
         // while this one was in flight, so the consent window would be orphaned.
-        if seq != self.install_seq {
+        if seq != self.install_seq || !self.account_read_is_current(account_fence) {
             return Update::none();
         }
         self.discover_busy = false;
+        self.consent_busy = false;
         match result {
             Ok(res) => {
+                if let Err(error) = self
+                    .validate_consent_snapshot(&res.expected_lock, &res.expected_local_manifests)
+                {
+                    self.discover_error = Some(error);
+                    return Update::with_task(Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]));
+                }
                 // The Install Confirmation window is ALWAYS shown before a lock entry is written,
                 // even for a zero-permission package. Nothing is persisted yet.
                 self.consent_prompt = Some(ConsentPrompt {
+                    account_fence,
                     specifier: res.specifier,
                     owner: res.owner,
                     name: res.name,
                     version: res.version,
                     permissions: res.permissions,
                     params: res.params,
+                    closure: res.closure,
                     required_roots: res.required_roots,
                     conflict: res.conflict,
                     needs_smudgy: res.needs_smudgy,
+                    required_unavailable: res.required_unavailable,
+                    expected_lock: res.expected_lock,
+                    expected_local_manifests: res.expected_local_manifests,
+                    operation: ConsentOperation::Install,
                     error: None,
                 });
                 Update::none()
@@ -3363,24 +6329,173 @@ impl AutomationsWindow {
         }
     }
 
-    /// Grant & install: write the lock entry for the chosen package (with the `enable` choice baked
-    /// into the same write, so an "install, don't enable" never transiently persists as
-    /// `enabled: true`), then co-install every not-already-satisfied **required root** as its own
-    /// top-level root (apt's "automatically installed" mark, via `install_required_package`).
-    /// Records the consented closure union + last-resolved version for each, then chains the
-    /// required-params prompt across every package (the root and each required root) that still has
-    /// unset required params. A single grant covers the whole set (`script/REQUIRED-PACKAGES.md`).
-    /// Install precedes `record_consent` so the entry exists for it to update. Both install actions
-    /// record the same consent; `enable` only decides whether each package is turned on (runs) now
-    /// or left off for the user to review first. A peer conflict (`conflict`) blocks the install —
-    /// the view disables the grant buttons, so this is only reached when there's no conflict.
+    /// Starts an accepted package change by hash-verifying and caching every exact published code
+    /// resolution first. No lock state changes until [`Self::consent_cache_prepared`] receives a
+    /// complete cache-authority set for the still-current prompt.
     pub(super) fn consent_grant(&mut self, enable: bool) -> Update<Message, Event> {
+        let Some((expected_lock, expected_local_manifests, prompt_account_fence)) =
+            self.consent_prompt.as_ref().map(|prompt| {
+                (
+                    prompt.expected_lock.clone(),
+                    prompt.expected_local_manifests.clone(),
+                    prompt.account_fence,
+                )
+            })
+        else {
+            return Update::none();
+        };
+        if !self.account_read_is_current(prompt_account_fence) {
+            self.consent_prompt = None;
+            self.consent_busy = false;
+            self.discover_error = Some(crate::i18n::t!("package-account-review-changed"));
+            return Update::none();
+        }
+        if let Err(error) =
+            self.validate_consent_snapshot(&expected_lock, &expected_local_manifests)
+        {
+            if let Some(prompt) = self.consent_prompt.as_mut() {
+                prompt.error = Some(error);
+            }
+            return Update::with_task(Task::batch([
+                Task::done(Message::LoadLocalPackages),
+                Task::done(Message::LoadInstalledPackages),
+            ]));
+        }
         let Some(prompt) = self.consent_prompt.as_ref() else {
             return Update::none();
         };
+        if self.consent_busy {
+            return Update::none();
+        }
         // A peer conflict or version-floor refusal is unresolvable from here — refuse rather
         // than install a broken set (the view disables the grant buttons for both).
-        if prompt.conflict.is_some() || prompt.needs_smudgy.is_some() {
+        if prompt.conflict.is_some()
+            || prompt.needs_smudgy.is_some()
+            || prompt.required_unavailable.is_some()
+        {
+            return Update::none();
+        }
+        let root =
+            (!matches!(prompt.operation, ConsentOperation::LocalManifest { .. })).then(|| {
+                ConsentCacheTarget {
+                    specifier: prompt.specifier.clone(),
+                    version: prompt.version.clone(),
+                    closure: prompt.closure.clone(),
+                }
+            });
+        let required = prompt
+            .required_roots
+            .iter()
+            .filter(|required| !required.already_satisfied)
+            .filter(|required| {
+                parse_specifier(&required.specifier).is_some_and(|(owner, _)| {
+                    !owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER)
+                })
+            })
+            .map(|required| ConsentCacheTarget {
+                specifier: required.specifier.clone(),
+                version: required.version.clone(),
+                closure: required.closure.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.consent_busy = true;
+        if let Some(prompt) = self.consent_prompt.as_mut() {
+            prompt.error = None;
+        }
+        let seq = self.install_seq;
+        let (account_fence, client) = self.frozen_package_client();
+        if account_fence != prompt_account_fence {
+            self.consent_busy = false;
+            self.consent_prompt = None;
+            self.discover_error = Some(crate::i18n::t!("package-account-review-changed"));
+            return Update::none();
+        }
+        Update::with_task(Task::perform(
+            prepare_consent_cache(client, root, required),
+            move |result| Message::ConsentCachePrepared {
+                seq,
+                account_fence,
+                enable,
+                result,
+            },
+        ))
+    }
+
+    pub(super) fn consent_cache_prepared(
+        &mut self,
+        seq: InstallSeq,
+        account_fence: AccountReadFence,
+        enable: bool,
+        result: Result<PreparedConsentCache, String>,
+    ) -> Update<Message, Event> {
+        if seq != self.install_seq {
+            return Update::none();
+        }
+        if !self.account_read_is_current(account_fence)
+            || self
+                .consent_prompt
+                .as_ref()
+                .is_none_or(|prompt| prompt.account_fence != account_fence)
+        {
+            self.consent_busy = false;
+            self.consent_prompt = None;
+            return Update::none();
+        }
+        self.consent_busy = false;
+        match result {
+            Ok(cache) => self.commit_consent_grant(enable, cache),
+            Err(error) => {
+                if let Some(prompt) = self.consent_prompt.as_mut() {
+                    prompt.error = Some(crate::i18n::t!(
+                        "package-install-failed",
+                        "error" => error
+                    ));
+                }
+                Update::none()
+            }
+        }
+    }
+
+    /// Commits the still-current, cache-complete consent plan in one lockfile transaction, then
+    /// chains required-parameter prompts across the changed roots.
+    fn commit_consent_grant(
+        &mut self,
+        enable: bool,
+        cache: PreparedConsentCache,
+    ) -> Update<Message, Event> {
+        let Some((expected_lock, expected_local_manifests, account_fence)) =
+            self.consent_prompt.as_ref().map(|prompt| {
+                (
+                    prompt.expected_lock.clone(),
+                    prompt.expected_local_manifests.clone(),
+                    prompt.account_fence,
+                )
+            })
+        else {
+            return Update::none();
+        };
+        if !self.account_read_is_current(account_fence) {
+            self.consent_prompt = None;
+            return Update::none();
+        }
+        if let Err(error) =
+            self.validate_consent_snapshot(&expected_lock, &expected_local_manifests)
+        {
+            if let Some(prompt) = self.consent_prompt.as_mut() {
+                prompt.error = Some(error);
+            }
+            return Update::with_task(Task::batch([
+                Task::done(Message::LoadLocalPackages),
+                Task::done(Message::LoadInstalledPackages),
+            ]));
+        }
+        let Some(prompt) = self.consent_prompt.as_ref() else {
+            return Update::none();
+        };
+        if prompt.conflict.is_some()
+            || prompt.needs_smudgy.is_some()
+            || prompt.required_unavailable.is_some()
+        {
             return Update::none();
         }
         let specifier = prompt.specifier.clone();
@@ -3388,93 +6503,239 @@ impl AutomationsWindow {
         let version = prompt.version.clone();
         let permissions = prompt.permissions.clone();
         let params = prompt.params.clone();
-        // Only the not-already-satisfied required roots are (co-)installed; an already-installed
-        // satisfying root is reused as-is (never downgraded, never re-consented).
+        let operation = prompt.operation.clone();
+        if matches!(&operation, ConsentOperation::LocalManifest { .. })
+            && self.manifest_operation.is_none()
+        {
+            if let Some(prompt) = self.consent_prompt.as_mut() {
+                prompt.error = Some(crate::i18n::t!("manifest-operation-expired"));
+            }
+            return Update::none();
+        }
+        if let ConsentOperation::LocalManifest {
+            name,
+            expected_manifest,
+            ..
+        } = &operation
+        {
+            if !self
+                .local_package
+                .as_deref()
+                .is_some_and(|package| package.name == *name)
+            {
+                if let Some(prompt) = self.consent_prompt.as_mut() {
+                    prompt.error = Some(crate::i18n::t!("manifest-changed-outside"));
+                }
+                return Update::none();
+            }
+            match local_packages::read_local_file(&self.server_name, name, "smudgy.package.json") {
+                Ok(current) if current == *expected_manifest => {}
+                Ok(_) => {
+                    if let Some(prompt) = self.consent_prompt.as_mut() {
+                        prompt.error = Some(crate::i18n::t!("manifest-changed-outside"));
+                    }
+                    return Update::none();
+                }
+                Err(error) => {
+                    if let Some(prompt) = self.consent_prompt.as_mut() {
+                        prompt.error = Some(crate::i18n::t!(
+                            "manifest-save-failed",
+                            "error" => error.to_string()
+                        ));
+                    }
+                    return Update::none();
+                }
+            }
+        }
+        let (activation, kind) = match &operation {
+            ConsentOperation::Install => (
+                ProfileActivation::from_legacy(enable),
+                PackageChangeKind::Install,
+            ),
+            ConsentOperation::Update { activation, .. } => {
+                (activation.clone(), PackageChangeKind::Update)
+            }
+            ConsentOperation::LocalManifest { activation, .. } => {
+                (activation.clone(), PackageChangeKind::Manifest)
+            }
+        };
+        // Only the not-already-satisfied required roots need parameter prompts after the atomic
+        // install. Satisfying roots are linked but keep all of their independent state.
         let required: Vec<RequiredRoot> = prompt
             .required_roots
             .iter()
             .filter(|r| !r.already_satisfied)
             .cloned()
             .collect();
+        let required_plan = prompt
+            .required_roots
+            .iter()
+            .map(|root| shared_packages::RequiredPackageInstall {
+                specifier: root.specifier.clone(),
+                version: root.version.clone(),
+                permissions: root.permissions.clone(),
+                already_satisfied: root.already_satisfied,
+            })
+            .collect::<Vec<_>>();
 
-        // Install + consent the chosen package first (the user's explicit, user-owned root).
-        if let Err(e) = shared_packages::install_package(
-            &self.server_name,
-            &specifier,
-            UpdateMode::Auto,
-            enable,
-        ) {
+        // A local package created while this consent window was open can take over a leaf. The
+        // resolved remote plan is then stale and must be reviewed again; never grant remote
+        // permissions or activation to newly-created mutable local code.
+        let requirement_plan_changed = prompt.required_roots.iter().any(|root| {
+            if self.governing_specifier(&root.specifier) != root.specifier {
+                return true;
+            }
+            parse_specifier(&root.specifier).is_some_and(|(owner, name)| {
+                owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER)
+                    && local_packages::load_local_package(&self.server_name, &name)
+                        .ok()
+                        .flatten()
+                        .is_none()
+            })
+        });
+        if self.governing_specifier(&specifier) != specifier || requirement_plan_changed {
             if let Some(prompt) = self.consent_prompt.as_mut() {
-                prompt.error = Some(crate::i18n::t!(
-                    "package-install-failed",
-                    "error" => e.to_string()
-                ));
+                prompt.error = Some(crate::i18n::t!("package-install-plan-changed"));
             }
             return Update::none();
         }
-        if let Err(e) = shared_packages::record_consent(&self.server_name, &specifier, &permissions)
-        {
-            // The lock entry is written; surface the consent-record failure rather than roll back
-            // (a missing record just means the engine denies everything until consent is recorded).
-            if let Some(prompt) = self.consent_prompt.as_mut() {
-                prompt.error = Some(crate::i18n::t!(
-                    "package-installed-consent-failed",
-                    "error" => e.to_string()
-                ));
-            }
-            return Update::none();
-        }
 
-        // Co-install each required root as its own top-level root (auto-installed mark on a NEW
-        // entry; a user-owned entry that already exists keeps its mark — handled by
-        // `install_required_package`). Mirrors the chosen package's install + consent recording;
-        // the engine records each one's resolved version + integrity on the next session load (the
-        // `ScriptsChanged` event below), as it does for the chosen package.
-        for root in &required {
-            if let Err(e) = shared_packages::install_required_package(
+        // Installed-root changes and a local manifest's derived relationship set each commit in
+        // one lock transaction.
+        let PreparedConsentCache = cache;
+        let commit = match operation {
+            ConsentOperation::Install => {
+                shared_packages::install_package_with_requirements_if_unchanged(
+                    &self.server_name,
+                    &expected_lock,
+                    &specifier,
+                    &version,
+                    &permissions,
+                    UpdateMode::Auto,
+                    activation.clone(),
+                    &required_plan,
+                )
+                .map(|committed| committed.then_some(()))
+            }
+            ConsentOperation::Update { mode, .. } => {
+                shared_packages::install_package_with_requirements_if_unchanged(
+                    &self.server_name,
+                    &expected_lock,
+                    &specifier,
+                    &version,
+                    &permissions,
+                    mode,
+                    activation.clone(),
+                    &required_plan,
+                )
+                .map(|committed| committed.then_some(()))
+            }
+            ConsentOperation::LocalManifest {
+                name: local_name,
+                manifest,
+                json,
+                expected_manifest,
+                ..
+            } => match shared_packages::commit_local_manifest_with_requirements_if_unchanged(
                 &self.server_name,
-                &root.specifier,
-                UpdateMode::Auto,
-                enable,
+                &local_name,
+                &specifier,
+                &expected_manifest,
+                &json,
+                &expected_lock,
+                &required_plan,
             ) {
+                Ok(shared_packages::LocalManifestCommit::Applied) => {
+                    self.apply_saved_manifest(&local_name, *manifest);
+                    Ok(Some(()))
+                }
+                Ok(shared_packages::LocalManifestCommit::Stale) => {
+                    if let Some(prompt) = self.consent_prompt.as_mut() {
+                        prompt.error = Some(crate::i18n::t!("manifest-changed-outside"));
+                    }
+                    return Update::none();
+                }
+                Ok(shared_packages::LocalManifestCommit::StateChanged) => Ok(None),
+                Err(error) => Err(error),
+            },
+        };
+        match commit {
+            Ok(Some(())) => {}
+            Ok(None) => {
                 if let Some(prompt) = self.consent_prompt.as_mut() {
-                    prompt.error = Some(format!("Failed to install required {}: {e}", root.name));
+                    prompt.error = Some(crate::i18n::t!("package-install-plan-changed"));
+                }
+                return Update::with_task(Task::batch([
+                    Task::done(Message::LoadLocalPackages),
+                    Task::done(Message::LoadInstalledPackages),
+                ]));
+            }
+            Err(e) => {
+                if let Some(prompt) = self.consent_prompt.as_mut() {
+                    prompt.error = Some(if matches!(kind, PackageChangeKind::Manifest) {
+                        crate::i18n::t!("manifest-save-failed", "error" => e.to_string())
+                    } else {
+                        crate::i18n::t!("package-install-failed", "error" => e.to_string())
+                    });
                 }
                 return Update::none();
             }
-            let _ = shared_packages::record_consent(
-                &self.server_name,
-                &root.specifier,
-                &root.permissions,
-            );
         }
+        if matches!(&kind, PackageChangeKind::Manifest) {
+            self.manifest_operation = None;
+        }
+        // The executable/relationship state is committed now. Reload immediately, before optional
+        // parameter prompts, so navigation cannot discard the only reload. Missing required
+        // parameters fail closed until the prompt is completed.
+        self.graph_seq.bump();
         self.consent_prompt = None;
+        self.package_change_finalize = Some(PackageChangeFinalize {
+            specifier: specifier.clone(),
+            activation,
+            kind: kind.clone(),
+            warning: None,
+        });
 
         // Build the required-params prompt queue across the chosen package and every co-installed
         // required root, in install order, skipping any with no missing required params.
         let mut prompts: Vec<ParamPrompt> = Vec::new();
-        if let Some(prompt) = self.build_param_prompt(&specifier, &name, &version, &params, enable)
-        {
-            prompts.push(prompt);
+        if !matches!(kind, PackageChangeKind::Manifest) {
+            match self.build_param_prompt(&specifier, &name, &version, &params) {
+                Ok(Some(prompt)) => prompts.push(prompt),
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(finalize) = self.package_change_finalize.as_mut() {
+                        finalize.warning = Some(error);
+                    }
+                    return self.finalize_package_change();
+                }
+            }
         }
         for root in &required {
-            if let Some(prompt) = self.build_param_prompt(
-                &root.specifier,
-                &root.name,
-                &root.version,
-                &root.params,
-                enable,
-            ) {
-                prompts.push(prompt);
+            match self.build_param_prompt(&root.specifier, &root.name, &root.version, &root.params)
+            {
+                Ok(Some(prompt)) => prompts.push(prompt),
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(finalize) = self.package_change_finalize.as_mut() {
+                        finalize.warning = Some(error);
+                    }
+                    return self.finalize_package_change();
+                }
             }
         }
         if prompts.is_empty() {
-            return self.finalize_install(&specifier, enable);
+            return self.finalize_package_change();
         }
         // Show the first prompt; the rest wait their turn (each submit/cancel pops the next).
         self.param_prompt = Some(prompts.remove(0));
         self.param_prompt_queue = prompts;
-        Update::none()
+        Update::new(
+            Task::done(Message::LoadInstalledPackages),
+            Some(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            }),
+        )
     }
 
     /// Build the install-time required-params prompt for `specifier`, or `None` when it has no
@@ -3486,18 +6747,47 @@ impl AutomationsWindow {
         name: &str,
         version: &str,
         params: &[PackageParameter],
-        enable: bool,
-    ) -> Option<ParamPrompt> {
+    ) -> Result<Option<ParamPrompt>, String> {
+        let lock = shared_packages::load_lock(&self.server_name).map_err(|error| {
+            crate::i18n::t!(
+                "package-settings-read-unavailable",
+                "error" => error.to_string()
+            )
+        })?;
+        let expected_package = lock
+            .find(specifier)
+            .cloned()
+            .ok_or_else(|| crate::i18n::t!("package-install-plan-changed"))?;
+        // A single modal cannot safely choose values for every profile. Profile-scoped packages
+        // remain fail-closed until the explicit Settings checklist is completed for each active
+        // profile.
+        if expected_package.parameter_scope == ParameterScope::Profile {
+            return Ok(None);
+        }
         let missing: Vec<PackageParameter> = params
             .iter()
-            .filter(|param| {
-                param.required
-                    && !shared_packages::param_has_value(&self.server_name, specifier, param)
+            .filter(|param| param.required)
+            .map(|param| {
+                shared_packages::param_has_value_scoped_checked(
+                    &self.server_name,
+                    ParamValueScope::Global,
+                    specifier,
+                    param,
+                )
+                .map(|present| (!present).then(|| param.clone()))
+                .map_err(|error| {
+                    crate::i18n::t!(
+                        "package-settings-read-unavailable",
+                        "error" => error.to_string()
+                    )
+                })
             })
-            .cloned()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect();
         if missing.is_empty() {
-            return None;
+            return Ok(None);
         }
         let values = missing
             .iter()
@@ -3512,28 +6802,23 @@ impl AutomationsWindow {
                 (param.key.clone(), state)
             })
             .collect();
-        Some(ParamPrompt {
-            specifier: specifier.to_string(),
+        Ok(Some(ParamPrompt {
+            expected_package,
             name: name.to_string(),
             version: version.to_string(),
             params: missing,
             values,
-            enable,
             error: None,
-        })
+        }))
     }
 
     /// Advance the install-time param-prompt queue: show the next pending prompt if any, else run
     /// the install tail. Called when a prompt is submitted or dismissed, so a multi-package required
     /// install configures each package in turn before finishing. `finalize_specifier`/`enable` drive
     /// the closing toast + reload once the queue drains.
-    fn advance_param_prompt_queue(
-        &mut self,
-        finalize_specifier: &str,
-        enable: bool,
-    ) -> Update<Message, Event> {
+    fn advance_param_prompt_queue(&mut self) -> Update<Message, Event> {
         if self.param_prompt_queue.is_empty() {
-            return self.finalize_install(finalize_specifier, enable);
+            return self.finalize_package_change();
         }
         self.param_prompt = Some(self.param_prompt_queue.remove(0));
         Update::none()
@@ -3541,33 +6826,272 @@ impl AutomationsWindow {
 
     pub(super) fn consent_cancel(&mut self) -> Update<Message, Event> {
         // Cancel writes nothing.
+        let abandoned_version_change = self.consent_prompt_for_open_installed().is_some();
         self.consent_prompt = None;
+        self.consent_busy = false;
+        self.manifest_operation = None;
+        self.install_seq.bump();
+        if abandoned_version_change {
+            // The version change fenced the pane's detail load when it began (so a late result
+            // could not repaint the pane mid-review). Abandoning it owes the pane a fresh load:
+            // the About/Source tabs and the update card go back to the still-current lock row.
+            return self.refresh_stale_installed_detail();
+        }
         Update::none()
     }
 
-    /// The common install tail: the package is already installed + consented. `enable` decides
-    /// whether it runs now (enabled + the session hot-reloads to pick it up) or is left off for the
-    /// user to review first (no reload, so it doesn't execute this session). Either way the hub's
-    /// installed list refreshes.
-    fn finalize_install(&mut self, specifier: &str, enable: bool) -> Update<Message, Event> {
+    /// The pending consent card that belongs to the open installed package: an update/pin review
+    /// for exactly that specifier. An install card (Discover/Shared) or another package's card is
+    /// never shown on this pane.
+    pub(super) fn consent_prompt_for_open_installed(&self) -> Option<&ConsentPrompt> {
+        let prompt = self.consent_prompt.as_ref()?;
+        let open = self.installed_open.as_deref()?;
+        (matches!(prompt.operation, ConsentOperation::Update { .. })
+            && prompt.specifier == open.specifier)
+            .then_some(prompt)
+    }
+
+    /// The pending consent card that belongs to the open owned (local) package: a manifest
+    /// requirements review for exactly that package name.
+    pub(super) fn consent_prompt_for_open_local(&self) -> Option<&ConsentPrompt> {
+        let prompt = self.consent_prompt.as_ref()?;
+        let open = self.local_package.as_deref()?;
+        match &prompt.operation {
+            ConsentOperation::LocalManifest { name, .. } if *name == open.name => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// The common package-change tail: every lock mutation already committed atomically. Refresh
+    /// the pane and reload live sessions. Effective activation can come from a recursively active
+    /// requiring parent even when this row's direct activation is `None`.
+    fn finalize_package_change(&mut self) -> Update<Message, Event> {
+        let Some(finalize) = self.package_change_finalize.take() else {
+            return Update::none();
+        };
         self.param_prompt = None;
         // The whole required set has been configured (the queue drained) — clear it defensively.
         self.param_prompt_queue.clear();
-        self.graph.intent.insert(specifier.to_string(), enable);
-        let name = package_display_name(specifier);
-        let toast = self.show_toast(if enable {
-            crate::i18n::t!("package-installed-enabled-toast", "name" => name)
-        } else {
-            crate::i18n::t!("package-installed-review-toast", "name" => name)
+        let enabled_here = finalize.activation.is_enabled_for(&self.profile_name);
+        self.graph
+            .intent
+            .insert(finalize.specifier.clone(), enabled_here);
+        let name = package_display_name(&finalize.specifier);
+        let message = finalize.warning.unwrap_or_else(|| match finalize.kind {
+            PackageChangeKind::Manifest => crate::i18n::t!("manifest-saved"),
+            PackageChangeKind::Update => {
+                crate::i18n::t!("package-updated-toast", "name" => name)
+            }
+            PackageChangeKind::Install if enabled_here => {
+                crate::i18n::t!("package-installed-enabled-toast", "name" => name)
+            }
+            PackageChangeKind::Install => {
+                crate::i18n::t!("package-installed-review-toast", "name" => name)
+            }
         });
-        // Only an enabled install reloads the live session; "install, don't enable" stays inert so
-        // the user can review the code before it executes.
-        let event = enable.then(|| Event::ScriptsChanged {
+        let toast = self.show_toast(message);
+        let event = Some(Event::ScriptsChanged {
             server_name: self.server_name.clone(),
         });
+        let mut tasks = vec![Task::done(Message::LoadInstalledPackages), toast];
+        // A version change committed against the open installed package: the inventory reload
+        // above never touches the open pane's detail/versions/README, and the change fenced the
+        // previous detail load when it began. Re-open the row from the committed lock so
+        // About/Source/Settings show the new version and mode.
+        if matches!(self.pane, Pane::InstalledPackage)
+            && self
+                .installed_open
+                .as_deref()
+                .is_some_and(|open| open.specifier == finalize.specifier)
+        {
+            tasks.push(self.refresh_stale_installed_detail().task);
+        }
+        Update::new(Task::batch(tasks), event)
+    }
+
+    /// Refresh the authored-package inventory without fabricating an empty list on I/O failure.
+    /// The previous good snapshot remains visible, while every shadow-sensitive mutation is
+    /// blocked until both the inventory and governing lock rows are authoritative again.
+    pub(super) fn reload_local_package_state(&mut self) -> Update<Message, Event> {
+        let local_names = match local_packages::list_local_packages(&self.server_name) {
+            Ok(names) => names,
+            Err(error) => {
+                log::warn!("Failed to list local packages: {error:#}");
+                self.local_package_state_error = Some(crate::i18n::t!(
+                    "package-local-state-unavailable",
+                    "error" => error.to_string()
+                ));
+                return Update::with_task(self.reconcile_owned_package_language_project_reload());
+            }
+        };
+        self.local_packages = local_names;
+        if let Err(error) =
+            load_local_manifest_snapshot_for_names(&self.server_name, &self.local_packages)
+        {
+            log::warn!("Failed to validate local packages: {error}");
+            self.local_package_state_error = Some(crate::i18n::t!(
+                "package-local-state-unavailable",
+                "error" => error
+            ));
+            return Update::with_task(self.reconcile_owned_package_language_project_reload());
+        }
+        let canonical_owner = self
+            .cloud
+            .snapshot
+            .get()
+            .nickname_text()
+            .unwrap_or_else(|| local_packages::LOCAL_OWNER.to_string());
+        if let Err(error) = local_packages::materialize_governing_local_lock_rows(
+            &self.server_name,
+            &self.local_packages,
+            &canonical_owner,
+        ) {
+            log::warn!("Failed to materialize local package settings: {error:#}");
+            self.local_package_state_error = Some(crate::i18n::t!(
+                "package-local-state-unavailable",
+                "error" => error.to_string()
+            ));
+            return Update::with_task(self.reconcile_owned_package_language_project_reload());
+        }
+        let package_state_authoritative = match shared_packages::load_lock(&self.server_name) {
+            Ok(lock) => {
+                self.installed_packages = lock.packages;
+                self.local_package_state_error = None;
+                self.rebuild_graph();
+                true
+            }
+            Err(error) => {
+                log::warn!("Failed to load installed package state: {error:#}");
+                self.installed_package_state_error = Some(crate::i18n::t!(
+                    "package-installed-state-unavailable",
+                    "error" => error.to_string()
+                ));
+                false
+            }
+        };
+        if !package_state_authoritative {
+            return Update::with_task(self.reconcile_owned_package_language_project_reload());
+        }
+        // Installed panes become non-authoritative when a local same-leaf package takes over. The
+        // helper refuses to close over a draft or accepted pending navigation.
+        self.close_newly_shadowed_installed_pane();
+        Update::with_task(self.reconcile_owned_package_language_project_reload())
+    }
+
+    /// Reconcile and load the complete package authority. Every prerequisite is strict: a missing
+    /// local inventory must never be interpreted as permission to activate its remote fallback,
+    /// and an unreadable lock must never close a valid pane as though it were uninstalled.
+    pub(super) fn reload_installed_package_state(&mut self) -> Update<Message, Event> {
+        let local_names = match local_packages::list_local_packages(&self.server_name) {
+            Ok(names) => names,
+            Err(error) => {
+                log::warn!("Failed to list local packages during reconciliation: {error:#}");
+                let message = crate::i18n::t!(
+                    "package-local-state-unavailable",
+                    "error" => error.to_string()
+                );
+                self.local_package_state_error = Some(message.clone());
+                self.installed_package_state_error = Some(message);
+                return Update::none();
+            }
+        };
+        self.local_packages = local_names;
+        if let Err(error) =
+            load_local_manifest_snapshot_for_names(&self.server_name, &self.local_packages)
+        {
+            log::warn!("Failed to validate local packages during reconciliation: {error}");
+            let message = crate::i18n::t!(
+                "package-local-state-unavailable",
+                "error" => error
+            );
+            self.local_package_state_error = Some(message.clone());
+            self.installed_package_state_error = Some(message);
+            return Update::none();
+        }
+        let changed = match shared_packages::reconcile_local_installs(&self.server_name) {
+            Ok(changed) => changed,
+            Err(error) => {
+                log::warn!("Failed to reconcile local installs: {error:#}");
+                let message = crate::i18n::t!(
+                    "package-local-reconcile-failed",
+                    "error" => error.to_string()
+                );
+                self.local_package_state_error = Some(message.clone());
+                self.installed_package_state_error = Some(message);
+                return Update::none();
+            }
+        };
+        if !changed.is_empty() {
+            log::info!("Reconciled local package installs: {}", changed.join(", "));
+        }
+        let nickname = self.cloud.snapshot.get().nickname_text();
+        let canonical_owner = nickname.unwrap_or_else(|| local_packages::LOCAL_OWNER.to_string());
+        if let Err(error) = local_packages::materialize_governing_local_lock_rows(
+            &self.server_name,
+            &self.local_packages,
+            &canonical_owner,
+        ) {
+            log::warn!("Failed to materialize local package settings: {error:#}");
+            let message = crate::i18n::t!(
+                "package-local-reconcile-failed",
+                "error" => error.to_string()
+            );
+            self.local_package_state_error = Some(message.clone());
+            self.installed_package_state_error = Some(message);
+            return Update::none();
+        }
+        let lock = match shared_packages::load_lock(&self.server_name) {
+            Ok(lock) => lock,
+            Err(error) => {
+                log::warn!("Failed to load lockfile: {error:#}");
+                self.installed_package_state_error = Some(crate::i18n::t!(
+                    "package-installed-state-unavailable",
+                    "error" => error.to_string()
+                ));
+                return Update::none();
+            }
+        };
+        self.local_package_state_error = None;
+        self.installed_package_state_error = None;
+        self.installed_packages = lock.packages;
+        self.close_newly_shadowed_installed_pane();
+
+        let open_was_removed = self.installed_open.as_deref().is_some_and(|open| {
+            changed.iter().any(|specifier| specifier == &open.specifier)
+                || !self
+                    .installed_packages
+                    .iter()
+                    .any(|package| package.specifier == open.specifier)
+        });
+        let selected_was_removed = match &self.selection {
+            Selection::InstalledPackage(specifier) => !self
+                .installed_packages
+                .iter()
+                .any(|package| package.specifier == *specifier),
+            _ => false,
+        };
+        if open_was_removed || selected_was_removed {
+            self.clear_selection();
+            self.installed_open = None;
+            self.installed_detail = None;
+            self.installed_rating = None;
+            self.selection = Selection::Dashboard;
+            self.pane = Pane::Dashboard;
+        }
+        self.graph.requires.clear();
+        self.graph.resolved.clear();
+        self.blocked_updates.clear();
+        self.rebuild_graph();
+        self.graph_seq.bump();
+        let mut task = self.resolve_graph_deps();
+        if let Some(sweep) = self.sweep_stale_account_installs() {
+            task = Task::batch([task, sweep]);
+        }
         Update::new(
-            Task::batch([Task::done(Message::LoadInstalledPackages), toast]),
-            event,
+            task,
+            (!changed.is_empty()).then_some(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            }),
         )
     }
 
@@ -3594,6 +7118,13 @@ impl AutomationsWindow {
                 prompt.error = None;
             }
             ParamTarget::Config => {
+                let editable = self
+                    .param_config
+                    .as_ref()
+                    .is_some_and(|config| self.param_config_edit_available(config));
+                if !editable {
+                    return Update::none();
+                }
                 let Some(config) = self.param_config.as_mut() else {
                     return Update::none();
                 };
@@ -3612,10 +7143,13 @@ impl AutomationsWindow {
     }
 
     pub(super) fn param_prompt_submit(&mut self) -> Update<Message, Event> {
-        let (specifier, params) = match self.param_prompt.as_ref() {
-            Some(prompt) => (prompt.specifier.clone(), prompt.params.clone()),
+        let (expected_package, params) = match self.param_prompt.as_ref() {
+            Some(prompt) => (prompt.expected_package.clone(), prompt.params.clone()),
             None => return Update::none(),
         };
+        if expected_package.parameter_scope != ParameterScope::Global {
+            return self.fail_prompt(crate::i18n::t!("package-param-prompt-scope-changed"));
+        }
         // Project + validate every value (all prompt params are required) before writing anything.
         let mut plan: Vec<(String, Persist)> = Vec::new();
         for param in &params {
@@ -3651,21 +7185,43 @@ impl AutomationsWindow {
                 }
             }
         }
-        for (key, persist) in &plan {
-            if let Err(e) = persist.write(&self.server_name, &specifier, key) {
+        let mutations = plan
+            .iter()
+            .map(|(key, persist)| persist.mutation(key))
+            .collect::<Vec<_>>();
+        match shared_packages::commit_package_params_scoped_if_unchanged(
+            &self.server_name,
+            ParamValueScope::Global,
+            &expected_package,
+            &mutations,
+        ) {
+            Ok(PackageParamCommit::Applied) => {}
+            Ok(PackageParamCommit::StateChanged) => {
+                self.package_change_finalize = None;
+                self.param_prompt_queue.clear();
+                let _ = self.fail_prompt(crate::i18n::t!("package-settings-state-changed"));
+                return Update::new(
+                    Task::batch([
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                );
+            }
+            Err(error) => {
                 return self.fail_prompt(crate::i18n::t!(
-                    "package-field-save-failed",
-                    "field" => key,
-                    "error" => e.to_string()
+                    "package-settings-save-failed",
+                    "error" => error.to_string()
                 ));
             }
         }
         // The package was already installed + consented at the Grant step; this only saves
-        // configuration, then advances to the next queued required-root prompt (or finishes with
-        // the enable choice made there once the queue drains).
-        let enable = self.param_prompt.as_ref().is_some_and(|p| p.enable);
+        // configuration, then advances to the next queued required-root prompt (or finishes the
+        // root operation captured in `package_change_finalize`).
         self.param_prompt = None;
-        self.advance_param_prompt_queue(&specifier, enable)
+        self.advance_param_prompt_queue()
     }
 
     /// Set the install-time prompt's inline error and stay open.
@@ -3685,14 +7241,155 @@ impl AutomationsWindow {
         Update::none()
     }
 
+    /// Replaces every cached lock row from one authoritative read while preserving the identity of
+    /// the installed package pane. The governing row for a shadowed remote can differ from the
+    /// remote row whose About/detail view is open; a settings refresh must not mix those models.
+    fn reload_package_lock_snapshot(&mut self) -> Result<(), String> {
+        let open_specifier = self
+            .installed_open
+            .as_deref()
+            .map(|package| package.specifier.clone());
+        let lock = shared_packages::load_lock(&self.server_name).map_err(|error| {
+            let message = crate::i18n::t!(
+                "package-installed-state-unavailable",
+                "error" => error.to_string()
+            );
+            self.installed_package_state_error = Some(message.clone());
+            message
+        })?;
+        self.installed_package_state_error = None;
+        self.installed_packages = lock.packages;
+        if let Some(specifier) = open_specifier {
+            self.installed_open = self
+                .installed_packages
+                .iter()
+                .find(|package| package.specifier == specifier)
+                .cloned()
+                .map(Box::new);
+        }
+        if let Some(config) = self.param_config.as_mut()
+            && let Some(package) = self
+                .installed_packages
+                .iter()
+                .find(|package| package.specifier == config.specifier)
+        {
+            config.parameter_scope = package.parameter_scope;
+        }
+        self.rebuild_graph();
+        Ok(())
+    }
+
+    pub(super) fn package_state_error(&self) -> Option<String> {
+        self.local_package_state_error
+            .clone()
+            .or_else(|| self.installed_package_state_error.clone())
+    }
+
+    pub(super) fn package_state_available(&self) -> bool {
+        self.local_package_state_error.is_none() && self.installed_package_state_error.is_none()
+    }
+
+    fn load_consent_resolution_state(
+        &mut self,
+    ) -> Result<(SharedPackageLock, HashMap<String, PackageManifest>), String> {
+        let local_manifests = load_local_manifest_snapshot(&self.server_name).map_err(|error| {
+            let message = crate::i18n::t!(
+                "package-local-state-unavailable",
+                "error" => error
+            );
+            self.local_package_state_error = Some(message.clone());
+            message
+        })?;
+        let lock = shared_packages::load_lock(&self.server_name).map_err(|error| {
+            let message = crate::i18n::t!(
+                "package-installed-state-unavailable",
+                "error" => error.to_string()
+            );
+            self.installed_package_state_error = Some(message.clone());
+            message
+        })?;
+        Ok((lock, local_manifests))
+    }
+
+    /// Revalidates the exact lock and local-manifest authority used to prepare a consent card.
+    /// This runs both when Grant starts and after asynchronous cache preparation, so a prompt
+    /// cannot approve a package plan whose activation, dependency graph, or local shadow changed
+    /// while it was open.
+    fn validate_consent_snapshot(
+        &mut self,
+        expected_lock: &SharedPackageLock,
+        expected_local_manifests: &HashMap<String, PackageManifest>,
+    ) -> Result<(), String> {
+        let (current_lock, current_local_manifests) = self.load_consent_resolution_state()?;
+        if &current_lock != expected_lock || &current_local_manifests != expected_local_manifests {
+            return Err(crate::i18n::t!("package-install-plan-changed"));
+        }
+        Ok(())
+    }
+
+    fn param_config_edit_available(&self, config: &ParamConfig) -> bool {
+        config.available
+            && self.package_state_available()
+            && (config.parameter_scope == ParameterScope::Global || self.profile_inventory_complete)
+    }
+
     // ---- in-pane param-value editor (installed & owned panes) -------------
 
     /// (Re)seed the inline param-value editor for the open package. `None` when the package
     /// declares no params, so the section renders nothing. Called when a package pane opens (and
     /// when an owned package's manifest is saved, which can add/remove params).
     pub(super) fn seed_param_config(&mut self, specifier: String, params: Vec<PackageParameter>) {
-        self.param_config =
-            (!params.is_empty()).then(|| ParamConfig::seed(&self.server_name, specifier, params));
+        if params.is_empty() {
+            self.param_config = None;
+            return;
+        }
+        let expected_package = self
+            .installed_packages
+            .iter()
+            .find(|package| package.specifier == specifier)
+            .cloned();
+        let unavailable = self.package_state_error().or_else(|| {
+            expected_package.is_none().then(|| {
+                crate::i18n::t!(
+                    "package-installed-state-unavailable",
+                    "error" => crate::i18n::t!("package-settings-row-missing")
+                )
+            })
+        });
+        let parameter_scope = expected_package
+            .as_ref()
+            .map_or_else(ParameterScope::default, |package| package.parameter_scope);
+        if let Some(error) = unavailable {
+            self.param_config = Some(ParamConfig::unavailable(
+                specifier,
+                parameter_scope,
+                &self.parameter_profile,
+                params,
+                error,
+            ));
+            return;
+        }
+        let expected_package = expected_package.expect("unavailable row handled above");
+        self.param_config = Some(
+            ParamConfig::seed(
+                &self.server_name,
+                &self.parameter_profile,
+                expected_package,
+                params.clone(),
+            )
+            .unwrap_or_else(|error| {
+                ParamConfig::unavailable(
+                    specifier,
+                    parameter_scope,
+                    &self.parameter_profile,
+                    params,
+                    crate::i18n::t!(
+                        "package-settings-read-unavailable",
+                        "error" => error
+                    ),
+                )
+            }),
+        );
     }
 
     /// Persist every declared param's configured value: non-secrets to `smudgy.params.json`
@@ -3702,9 +7399,26 @@ impl AutomationsWindow {
     /// enabled package hot-reloads so it picks the new config up; saving never changes the package's
     /// installed/enabled state.
     pub(super) fn param_config_save(&mut self) -> Update<Message, Event> {
-        let (specifier, params) = match self.param_config.as_ref() {
-            Some(config) => (config.specifier.clone(), config.params.clone()),
-            None => return Update::none(),
+        let editable = self
+            .param_config
+            .as_ref()
+            .is_some_and(|config| self.param_config_edit_available(config));
+        if !editable {
+            return Update::none();
+        }
+        let (specifier, expected_package, params, parameter_scope, profile_name) =
+            match self.param_config.as_ref() {
+                Some(config) => (
+                    config.specifier.clone(),
+                    config.expected_package.clone(),
+                    config.params.clone(),
+                    config.parameter_scope,
+                    config.profile_name.clone(),
+                ),
+                None => return Update::none(),
+            };
+        let Some(expected_package) = expected_package else {
+            return Update::none();
         };
         let secret_stored = self
             .param_config
@@ -3769,12 +7483,28 @@ impl AutomationsWindow {
             }
         }
 
-        for (key, persist) in &plan {
-            if let Err(e) = persist.write(&self.server_name, &specifier, key) {
+        let value_scope = match parameter_scope {
+            ParameterScope::Global => ParamValueScope::Global,
+            ParameterScope::Profile => ParamValueScope::Profile(&profile_name),
+        };
+        let mutations = plan
+            .iter()
+            .map(|(key, persist)| persist.mutation(key))
+            .collect::<Vec<_>>();
+        match shared_packages::commit_package_params_scoped_if_unchanged(
+            &self.server_name,
+            value_scope,
+            &expected_package,
+            &mutations,
+        ) {
+            Ok(PackageParamCommit::Applied) => {}
+            Ok(PackageParamCommit::StateChanged) => {
+                return self.fail_config_parameter_state_changed();
+            }
+            Err(error) => {
                 return self.fail_config(crate::i18n::t!(
-                    "package-field-save-failed",
-                    "field" => key,
-                    "error" => e.to_string()
+                    "package-settings-save-failed",
+                    "error" => error.to_string()
                 ));
             }
         }
@@ -3800,9 +7530,10 @@ impl AutomationsWindow {
         // A running (enabled) package should pick up the new config — hot-reload the live session,
         // the same signal an enabled install emits. A disabled package reads the new values when it
         // is next enabled, so there's nothing to reload.
+        let affected_profile =
+            matches!(parameter_scope, ParameterScope::Profile).then_some(profile_name.as_str());
         let event = self
-            .graph
-            .effectively_enabled(&specifier)
+            .configuration_change_affects_running(&specifier, affected_profile)
             .then(|| Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             });
@@ -3815,19 +7546,50 @@ impl AutomationsWindow {
     /// Remove a stored secret param entirely (the only way to *unset* a secret, since the box can
     /// only replace one). An enabled package hot-reloads so a script reading it sees the change.
     pub(super) fn param_config_clear_secret(&mut self, key: String) -> Update<Message, Event> {
-        let Some(specifier) = self.param_config.as_ref().map(|c| c.specifier.clone()) else {
+        let editable = self
+            .param_config
+            .as_ref()
+            .is_some_and(|config| self.param_config_edit_available(config));
+        if !editable {
+            return Update::none();
+        }
+        let Some((specifier, expected_package, parameter_scope, profile_name)) =
+            self.param_config.as_ref().and_then(|config| {
+                Some((
+                    config.specifier.clone(),
+                    config.expected_package.clone()?,
+                    config.parameter_scope,
+                    config.profile_name.clone(),
+                ))
+            })
+        else {
             return Update::none();
         };
-        if let Err(e) = shared_packages::clear_secret_param(&self.server_name, &specifier, &key) {
-            if let Some(config) = self.param_config.as_mut() {
-                config.error = Some(crate::i18n::t!(
-                    "package-clear-secret-failed",
-                    "field" => &key,
-                    "error" => e.to_string()
-                ));
-                config.saved = false;
+        let scope = match parameter_scope {
+            ParameterScope::Global => ParamValueScope::Global,
+            ParameterScope::Profile => ParamValueScope::Profile(&profile_name),
+        };
+        match shared_packages::clear_secret_param_scoped_if_unchanged(
+            &self.server_name,
+            scope,
+            &expected_package,
+            &key,
+        ) {
+            Ok(PackageParamCommit::Applied) => {}
+            Ok(PackageParamCommit::StateChanged) => {
+                return self.fail_config_parameter_state_changed();
             }
-            return Update::none();
+            Err(e) => {
+                if let Some(config) = self.param_config.as_mut() {
+                    config.error = Some(crate::i18n::t!(
+                        "package-clear-secret-failed",
+                        "field" => &key,
+                        "error" => e.to_string()
+                    ));
+                    config.saved = false;
+                }
+                return Update::none();
+            }
         }
         if let Some(config) = self.param_config.as_mut() {
             config.secret_stored.remove(&key);
@@ -3837,15 +7599,38 @@ impl AutomationsWindow {
             config.error = None;
             config.saved = false;
         }
+        let affected_profile = self.param_config.as_ref().and_then(|config| {
+            matches!(config.parameter_scope, ParameterScope::Profile)
+                .then_some(config.profile_name.as_str())
+        });
         let event = self
-            .graph
-            .effectively_enabled(&specifier)
+            .configuration_change_affects_running(&specifier, affected_profile)
             .then(|| Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             });
         Update::new(
             self.show_toast(crate::i18n::t!("package-secret-cleared")),
             event,
+        )
+    }
+
+    /// A parameter CAS mismatch means this editor no longer has authority to write. Keep its
+    /// values/touched markers for the user's review, disable further mutations, and refresh both
+    /// package inventories without silently rebasing the draft onto a different row.
+    fn fail_config_parameter_state_changed(&mut self) -> Update<Message, Event> {
+        if let Some(config) = self.param_config.as_mut() {
+            config.available = false;
+            config.error = Some(crate::i18n::t!("package-settings-state-changed"));
+            config.saved = false;
+        }
+        Update::new(
+            Task::batch([
+                Task::done(Message::LoadLocalPackages),
+                Task::done(Message::LoadInstalledPackages),
+            ]),
+            Some(Event::ScriptsChanged {
+                server_name: self.server_name.clone(),
+            }),
         )
     }
 
@@ -3860,27 +7645,50 @@ impl AutomationsWindow {
         if !self.signed_in() {
             return Update::none();
         }
+        self.load_shared_cloud_lists()
+    }
+
+    fn load_shared_cloud_lists(&self) -> Update<Message, Event> {
         // Load both halves of the pane in parallel: packages friends shared with the caller, and
         // the caller's own cloud packages (so an owner sees private packages that exist in no other
         // surface — e.g. one published from another machine).
-        let shared_client = self.package_client();
-        let mine_client = self.package_client();
+        let account_epoch = self.account_epoch;
+        let (account_fence, frozen_credentials) = self.frozen_cloud_credentials();
+        let shared_client =
+            PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials.clone());
+        let mine_client = PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials);
         Update::with_task(Task::batch([
             Task::perform(
                 async move { shared_client.list_shared_packages().await },
-                Message::SharedLoaded,
+                move |result| Message::SharedLoaded {
+                    account_epoch,
+                    account_fence,
+                    result,
+                },
             ),
             Task::perform(
                 async move { mine_client.list_my_packages().await },
-                Message::MyCloudLoaded,
+                move |result| Message::MyCloudLoaded {
+                    account_epoch,
+                    account_fence,
+                    result,
+                },
             ),
         ]))
     }
 
     pub(super) fn shared_loaded(
         &mut self,
+        account_epoch: u64,
+        account_fence: AccountReadFence,
         result: Result<Vec<PackageDetail>, CloudError>,
     ) -> Update<Message, Event> {
+        if account_epoch != self.account_epoch
+            || !self.account_read_is_current(account_fence)
+            || self.selection != Selection::Shared
+        {
+            return Update::none();
+        }
         match result {
             Ok(list) => self.shared_with_me = Some(list),
             Err(e) => {
@@ -3893,8 +7701,16 @@ impl AutomationsWindow {
 
     pub(super) fn my_cloud_loaded(
         &mut self,
+        account_epoch: u64,
+        account_fence: AccountReadFence,
         result: Result<Vec<PackageDetail>, CloudError>,
     ) -> Update<Message, Event> {
+        if account_epoch != self.account_epoch
+            || !self.account_read_is_current(account_fence)
+            || self.selection != Selection::Shared
+        {
+            return Update::none();
+        }
         match result {
             Ok(list) => self.my_cloud_packages = Some(list),
             Err(e) => {
@@ -3904,6 +7720,67 @@ impl AutomationsWindow {
         }
         Update::none()
     }
+
+    /// Clear every account-scoped package surface before refetching the currently visible one.
+    /// This also fences already-issued authenticated reads through `account_epoch`.
+    pub(super) fn account_changed(&mut self) -> Update<Message, Event> {
+        self.account_epoch = self.account_epoch.wrapping_add(1);
+        self.install_seq.bump();
+        self.discover_seq.bump();
+        self.detail_seq.bump();
+        self.graph_seq.bump();
+        self.share_seq.bump();
+        self.consent_prompt = None;
+        self.consent_busy = false;
+        // The permit is owned across manifest-consent continuations. Account invalidation cancels
+        // that continuation and must release the shared package gate as well.
+        self.manifest_operation = None;
+        self.update_delta = None;
+        self.authoring_operation = None;
+        self.authoring_busy = false;
+        self.share_operation = None;
+        self.share_busy = false;
+        self.share_package_id = None;
+        self.share_is_public = false;
+        self.share_friends.clear();
+        self.share_grants.clear();
+        self.share_versions.clear();
+        self.share_feedback = None;
+        self.shared_with_me = None;
+        self.my_cloud_packages = None;
+        // These details can include caller-specific ratings/comments. Public search results remain
+        // useful, but the selected personalized detail must be fetched again on demand.
+        self.discover_requested_package = None;
+        self.discover_owner = None;
+        self.discover_busy = false;
+        self.discover_detail = None;
+        self.discover_readme = None;
+        self.discover_comments.clear();
+        // Installed manifests, source URLs/bodies, requirements, and rating metadata can all be
+        // private to the prior account. Remove them before starting replacement reads.
+        self.installed_detail = None;
+        self.installed_versions.clear();
+        self.installed_source.clear();
+        self.installed_readme = InstalledReadmeState::Loaded(None);
+        self.installed_rating = None;
+        self.graph.requires.clear();
+        self.graph.resolved.clear();
+        self.blocked_updates.clear();
+        self.rebuild_graph();
+
+        let server_name = self.server_name.clone();
+        let selected_update = match self.selection.clone() {
+            Selection::OwnedPackage(name) => self.refresh_owned_share_if_open(&server_name, &name),
+            Selection::InstalledPackage(specifier) => self.load_installed_detail(&specifier),
+            Selection::Dependency { spec, .. } => self.load_installed_detail(&spec),
+            Selection::Shared if self.signed_in() => self.load_shared_cloud_lists(),
+            _ => Update::none(),
+        };
+        Update::new(
+            Task::batch([self.resolve_graph_deps(), selected_update.task]),
+            selected_update.event,
+        )
+    }
 }
 
 // ============================================================================
@@ -3912,7 +7789,9 @@ impl AutomationsWindow {
 
 impl AutomationsWindow {
     pub(super) fn package_status(&self, specifier: &str) -> NodeStatus {
-        if !self.graph.effectively_enabled(specifier) {
+        if !self.package_state_available() {
+            NodeStatus::Error
+        } else if !self.graph.effectively_enabled(specifier) {
             NodeStatus::Disabled
         } else if self.blocked_updates.contains(specifier) {
             // Enabled and running (at a fitting version), but its newest version is held back for
@@ -3923,33 +7802,114 @@ impl AutomationsWindow {
         }
     }
 
-    /// A local package's own published-style specifier `smudgy://<owner>/<name>` — the lockfile
-    /// install of which is what actually loads the local folder (the provider's local-override).
-    /// `<owner>` is the account nickname when signed in, else the reserved
-    /// [`LOCAL_OWNER`](smudgy_core::models::local_packages::LOCAL_OWNER) placeholder, so local
-    /// packages run signed out too (mirrors the provider's `local_owner`).
-    pub(super) fn local_own_spec(&self, name: &str) -> String {
-        let owner = self
-            .cloud
-            .snapshot
-            .get()
-            .nickname_text()
-            .unwrap_or_else(|| smudgy_core::models::local_packages::LOCAL_OWNER.to_string());
-        specifier_for(&owner, name)
+    pub(super) fn profile_activation_summary(&self, activation: &ProfileActivation) -> String {
+        if matches!(activation, ProfileActivation::All) {
+            return crate::i18n::t!("activation-every-profile");
+        }
+        if matches!(activation, ProfileActivation::None) {
+            return crate::i18n::t!("activation-no-profile");
+        }
+        let enabled = self
+            .profile_names
+            .iter()
+            .filter(|profile| activation.is_enabled_for(profile))
+            .count();
+        crate::i18n::t!(
+            "activation-profile-count",
+            "enabled" => enabled,
+            "total" => self.profile_names.len()
+        )
     }
 
-    /// The set of every local package's own specifier — the rows that represent a local package
-    /// (so an active fork's INSTALLED row can be suppressed in favor of its LOCAL row).
-    pub(super) fn local_own_specs(&self) -> std::collections::HashSet<String> {
+    /// A local package's distinct durable state specifier. Runtime/public identity can use the
+    /// current nickname, but activation, trust, consent, and parameter state always remain under
+    /// the reserved owner so a same-name published row can never lend authority to mutable code.
+    pub(super) fn local_own_spec(&self, name: &str) -> String {
+        specifier_for(smudgy_core::models::local_packages::LOCAL_OWNER, name)
+    }
+
+    /// The local package that canonically replaces `specifier`, matched by leaf name.
+    pub(super) fn local_override_name(&self, specifier: &str) -> Option<&str> {
+        let leaf = package_display_name(specifier);
         self.local_packages
             .iter()
-            .map(|name| self.local_own_spec(name))
-            .collect()
+            .find(|name| name.eq_ignore_ascii_case(leaf))
+            .map(String::as_str)
     }
 
-    /// Whether a local package is actually loading (an enabled install of its own specifier).
-    pub(super) fn local_active(&self, name: &str) -> bool {
-        self.graph.effectively_enabled(&self.local_own_spec(name))
+    /// Closes an installed fallback pane as soon as an authoritative local inventory says that a
+    /// same-leaf local package now governs it. Keeping the remote pane interactive would let its
+    /// trust or update controls mutate dormant state that runtime does not use.
+    pub(super) fn close_newly_shadowed_installed_pane(&mut self) -> bool {
+        if !matches!(self.pane, Pane::InstalledPackage)
+            || self.has_unsaved_draft()
+            || self.pending_nav.is_some()
+        {
+            return false;
+        }
+        let newly_shadowed = self.installed_open.as_deref().is_some_and(|package| {
+            parse_specifier(&package.specifier).is_some_and(|(owner, _)| {
+                !owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER)
+                    && self.local_override_name(&package.specifier).is_some()
+            })
+        });
+        if !newly_shadowed {
+            return false;
+        }
+        self.clear_selection();
+        self.installed_open = None;
+        self.installed_detail = None;
+        self.installed_rating = None;
+        self.selection = Selection::Dashboard;
+        self.pane = Pane::Dashboard;
+        true
+    }
+
+    fn refresh_local_shadow_after_authoritative_mutation(&mut self) {
+        match local_packages::list_local_packages(&self.server_name) {
+            Ok(names) => {
+                self.local_packages = names;
+                self.local_package_state_error = None;
+                self.rebuild_graph();
+                self.close_newly_shadowed_installed_pane();
+            }
+            Err(error) => {
+                self.local_package_state_error = Some(crate::i18n::t!(
+                    "package-local-state-unavailable",
+                    "error" => error.to_string()
+                ));
+            }
+        }
+    }
+
+    /// The lock row whose activation and settings govern a package reference.
+    pub(super) fn governing_specifier(&self, specifier: &str) -> String {
+        self.local_override_name(specifier)
+            .map_or_else(|| specifier.to_string(), |name| self.local_own_spec(name))
+    }
+
+    /// Lock rows that must carry one declared `requires` parent link. The published fallback keeps
+    /// the link for restoration after a local override is deleted; the canonical local row carries
+    /// it while the override is active so persisted/UI effective activation matches the runtime.
+    fn required_state_specifiers(&self, requested: &str) -> Vec<String> {
+        let mut targets = Vec::new();
+        if self
+            .installed_packages
+            .iter()
+            .any(|package| package.specifier == requested)
+        {
+            targets.push(requested.to_string());
+        }
+        let governing = self.governing_specifier(requested);
+        if governing != requested
+            && self
+                .installed_packages
+                .iter()
+                .any(|package| package.specifier == governing)
+        {
+            targets.push(governing);
+        }
+        targets
     }
 
     /// The truthful status of a local package: the status of its own-specifier install (Ok/Warning
@@ -3958,534 +7918,13 @@ impl AutomationsWindow {
         self.package_status(&self.local_own_spec(name))
     }
 
-    fn signed_out_banner<'a>(&self) -> Elem<'a> {
-        container(text(crate::i18n::t!("package-sign-in-shared")).size(13.0))
-            .width(Length::Fill)
-            .padding(Padding {
-                top: 10.0,
-                bottom: 10.0,
-                left: 14.0,
-                right: 14.0,
-            })
-            .style(common::banner_style)
-            .into()
-    }
-
     // ---- installed package pane -------------------------------------------
-
-    pub(super) fn view_installed_package(&self) -> Elem<'_> {
-        let Some(locked) = self.installed_open.as_deref() else {
-            return pane_scroll(column![
-                text(crate::i18n::t!("package-no-selection")).size(13.0)
-            ]);
-        };
-        let specifier = &locked.specifier;
-        let name = package_display_name(specifier).to_string();
-        let effective = self.graph.effectively_enabled(specifier);
-        let controllable = self.graph.controllable(specifier);
-        let dep_only = self.graph.is_dep_only(specifier);
-        let enabled_dependents = self.graph.enabled_dependents(specifier);
-        // A dependency-reference view shows a package whose resolved version is dictated by the
-        // parent's manifest, not chosen here. The blocked-update callout (and its "Latest
-        // (blocked)" metric) prompt to grant/keep a version the user can't actually pick in this
-        // context, so suppress them — they belong to the package's own top-level pane.
-        let viewing_as_dependency = matches!(self.selection, Selection::Dependency { .. });
-
-        // Header enable control: locked if a dependent forces it on or dep-only. Hidden entirely
-        // for a dependency-reference view — a dependency's on/off state follows its parent, so a
-        // toggle here would be meaningless.
-        let switch = (!viewing_as_dependency).then(|| {
-            common::pill_switch(
-                effective,
-                !controllable,
-                Some(Message::TogglePackageEnabled(specifier.clone())),
-            )
-        });
-        let status = if effective {
-            NodeStatus::Ok
-        } else {
-            NodeStatus::Disabled
-        };
-
-        let mut body =
-            column![self.scene_header(Some(status), &name, Some(specifier.clone()), switch,)]
-                .spacing(16.0);
-
-        // Context banner.
-        let banner_text = if dep_only {
-            Some(crate::i18n::t!("package-dependency-managed"))
-        } else if !enabled_dependents.is_empty() {
-            let who: Vec<String> = enabled_dependents
-                .iter()
-                .map(|s| package_display_name(s).to_string())
-                .collect();
-            Some(crate::i18n::t!(
-                "package-direct-and-required",
-                "packages" => who.join(", ")
-            ))
-        } else if controllable && !effective {
-            Some(crate::i18n::t!("package-disabled-review"))
-        } else {
-            None
-        };
-        if let Some(banner) = banner_text {
-            body = body.push(
-                container(text(banner).size(13.0))
-                    .width(Length::Fill)
-                    .padding(12.0)
-                    .style(common::banner_style),
-            );
-        }
-
-        // Update re-prompt: a newly-resolved version wants more access than was consented. Not
-        // shown for a dependency-reference view — its version follows the parent's manifest, so a
-        // grant/keep choice here would be meaningless.
-        if !viewing_as_dependency
-            && let Some(delta) = &self.update_delta
-            && delta.specifier == *specifier
-        {
-            body = body.push(self.view_update_delta(delta));
-        }
-
-        // Meta row. "Loaded" is the version the engine actually resolved (the lockfile's
-        // last-resolved record) — which, for a held-back package, is the older fitting version,
-        // NOT the latest the inspect pane probes. Show the held-back latest separately so the two
-        // never look contradictory.
-        let loaded = locked
-            .last_resolved_version
-            .clone()
-            .or_else(|| self.graph.resolved.get(specifier).cloned());
-        let blocked_latest = self
-            .update_delta
-            .as_ref()
-            .filter(|_| !viewing_as_dependency)
-            .filter(|delta| delta.specifier == *specifier)
-            .map(|delta| delta.version.clone());
-        let mut meta = row![].spacing(20.0).align_y(Vertical::Center);
-        if let Some(detail) = self.installed_detail.as_deref() {
-            meta = meta.push(metric(
-                crate::i18n::ts!("package-metric-author"),
-                &detail.owner_nickname,
-            ));
-        }
-        if let Some(v) = &loaded {
-            meta = meta.push(metric(
-                crate::i18n::ts!("package-metric-loaded"),
-                &format!("v{v}"),
-            ));
-        }
-        if let Some(v) = &blocked_latest {
-            meta = meta.push(metric(
-                crate::i18n::ts!("package-metric-latest-blocked"),
-                &format!("v{v}"),
-            ));
-        }
-        meta = meta.push(metric(
-            crate::i18n::ts!("package-metric-update"),
-            match &locked.mode {
-                UpdateMode::Auto => crate::i18n::ts!("package-update-auto"),
-                UpdateMode::Pinned { .. } => crate::i18n::ts!("package-update-pinned"),
-            },
-        ));
-        // Cloud rating + popularity (best-effort metadata; absent for a local/owned package or while
-        // the detail is still loading).
-        if let Some(rating) = self.installed_rating.as_deref() {
-            let star_color = crate::prefs::current().palette.output;
-            meta = meta.push(rating_metric(
-                rating.avg_rating,
-                rating.rating_count,
-                star_color,
-            ));
-            meta = meta.push(metric("Installs", &rating.install_count.to_string()));
-        }
-        body = body.push(meta);
-        // DEFERRED (`script/REQUIRED-PACKAGES.md` "Version contention surfacing"): a small note here
-        // when a singleton-registering library is loaded at more than one version — a `requires`
-        // root vs an `import`ed-for-helpers copy at a different version. Detecting it needs the
-        // per-importer (referrer-aware) resolved versions of *every* installed package, which lives
-        // in the engine's resolution (`package_solver.rs`/`package_provider.rs`), not in the UI: the
-        // window only caches one resolved version per specifier (`graph.resolved`) and the open
-        // package's own `dependencies`, neither of which can witness a second loaded version pulled
-        // in by another package. Surfacing it from here would mean resolving every installed
-        // package's closure and threading per-version provenance into the UI — out of proportion to
-        // a best-effort note — so this is deferred rather than faked. Items 1–5 (the install/consent
-        // closure, peer conflict, orphan prompt) are the substantive deliverables.
-
-        // Rate — an account-only write, so the star control shows only when signed in and the
-        // package's cloud metadata loaded (i.e. it's a real cloud package, not a local copy).
-        if self.signed_in() && self.installed_rating.is_some() {
-            body = body.push(star_rate_row(Message::RateInstalledPackage));
-        }
-
-        if let Some(feedback) = &self.manage_feedback {
-            body = body.push(text(feedback.clone()).size(12.0).style(common::muted));
-        }
-
-        // Permissions view + trust toggle. A dependency has no sandbox or consent of its own — it
-        // loads into its parent's isolate and runs with the parent's grants — so describing its
-        // own manifest permissions here would be misleading. Point at the parent instead.
-        body = if let Selection::Dependency { parent, .. } = &self.selection {
-            body.push(self.view_dependency_permissions_section(parent))
-        } else {
-            body.push(self.view_permissions_section(locked))
-        };
-
-        // Required by.
-        if !enabled_dependents.is_empty() || !self.graph.required_by(specifier).is_empty() {
-            let mut req = Column::new()
-                .spacing(4.0)
-                .push(common::section_label(crate::i18n::ts!(
-                    "package-required-by"
-                )));
-            for parent in self.graph.required_by(specifier) {
-                let enabled = self.graph.effectively_enabled(&parent);
-                req = req.push(self.dep_link_row(
-                    &parent,
-                    enabled,
-                    crate::i18n::ts!("package-needs"),
-                    None,
-                ));
-            }
-            body = body.push(req);
-        }
-
-        // Settings (configured param values). A dependency-reference view configures nothing of its
-        // own — like permissions, its params belong to its own top-level pane — so it's suppressed
-        // here; the section also renders nothing unless the package declares params.
-        if !viewing_as_dependency && let Some(settings) = self.view_param_config_section(specifier)
-        {
-            body = body.push(settings);
-        }
-
-        // Update mode (controllable only).
-        if controllable {
-            let mut update_row = row![
-                common::section_label(crate::i18n::ts!("package-update-mode")),
-                radio(
-                    crate::i18n::t!("package-update-auto-track"),
-                    false,
-                    Some(matches!(locked.mode, UpdateMode::Pinned { .. })),
-                    |_| Message::SetInstalledUpdateMode(UpdateMode::Auto)
-                ),
-            ]
-            .spacing(16.0)
-            .align_y(Vertical::Center);
-            if !self.installed_versions.is_empty() {
-                let current = match &locked.mode {
-                    UpdateMode::Pinned { version } => Some(version.clone()),
-                    UpdateMode::Auto => None,
-                };
-                update_row = update_row.push(
-                    pick_list(self.installed_versions.clone(), current, |v| {
-                        Message::SetInstalledUpdateMode(UpdateMode::Pinned { version: v })
-                    })
-                    .placeholder(crate::i18n::ts!("package-update-pinned-placeholder")),
-                );
-            }
-            body = body.push(update_row);
-        }
-
-        // Dependencies.
-        let deps = self
-            .graph
-            .requires
-            .get(specifier)
-            .cloned()
-            .unwrap_or_default();
-        if !deps.is_empty() {
-            let mut dep_col =
-                Column::new()
-                    .spacing(4.0)
-                    .push(common::section_label(crate::i18n::ts!(
-                        "package-dependencies"
-                    )));
-            for edge in &deps {
-                // This row exists because the open package (`specifier`) depends on
-                // `edge.specifier`, so its dot follows the parent's context: it greys when the
-                // parent is disabled, instead of staying lit on the dep's global enabled state
-                // (which a separately-installed dep keeps on its own row).
-                let enabled = self.graph.dep_edge_active(specifier, &edge.specifier);
-                let resolved = self.graph.resolved.get(&edge.specifier).cloned();
-                let range = if edge.range.is_empty() {
-                    resolved
-                        .clone()
-                        .map(|v| format!("→ v{v}"))
-                        .unwrap_or_default()
-                } else {
-                    format!(
-                        "{} → v{}",
-                        edge.range,
-                        resolved.clone().unwrap_or_else(|| "?".to_string())
-                    )
-                };
-                dep_col =
-                    dep_col.push(self.dep_link_row(&edge.specifier, enabled, &range, Some(())));
-            }
-            if controllable
-                && !effective
-                && deps
-                    .iter()
-                    .any(|e| !self.graph.effectively_enabled(&e.specifier))
-            {
-                let names: Vec<String> = deps
-                    .iter()
-                    .map(|e| package_display_name(&e.specifier).to_string())
-                    .collect();
-                dep_col = dep_col.push(
-                    text(format!(
-                        "Enabling {name} will also enable {}.",
-                        names.join(", ")
-                    ))
-                    .size(12.0)
-                    .style(common::muted),
-                );
-            }
-            body = body.push(dep_col);
-        }
-
-        // README & source — tabbed (README rendered full-width; Source is the file browser).
-        body = body.push(self.installed_file_browser());
-
-        // Actions. A dep-only package is removed automatically and has nothing to manage. A
-        // dependency-reference view of a package that's *also* installed on its own defers
-        // management to that package's own pane: uninstalling from here would drop only the
-        // standalone install while the parent keeps the package resolved, so it reads as a no-op
-        // (this mirrors how the dependency view already suppresses the toggle, params, and
-        // permissions). Otherwise — the package's own pane — show the real actions. `controllable`
-        // only gates the enable *toggle* (an enabled dependent forces it on); it must NOT gate
-        // fork/uninstall here, or a package installed directly *and* pulled in as a dependency
-        // would lose "Edit a copy" on its own pane just because something else also needs it.
-        if dep_only {
-            body = body.push(
-                container(
-                    text(crate::i18n::t!("package-dependency-auto-remove"))
-                        .size(12.0)
-                        .style(common::muted),
-                )
-                .padding(10.0)
-                .style(common::banner_style),
-            );
-        } else if viewing_as_dependency {
-            body = body.push(self.dependency_also_installed_note(specifier));
-        } else {
-            body = body.push(self.installed_actions(&name, &enabled_dependents));
-        }
-
-        pane_scroll(body)
-    }
-
-    fn dep_link_row<'a>(
-        &self,
-        specifier: &str,
-        enabled: bool,
-        prefix: &str,
-        is_dep: Option<()>,
-    ) -> Elem<'a> {
-        let name = package_display_name(specifier).to_string();
-        // A dependency has no enable state of its own — it loads because the package that requires
-        // it is enabled — so its rows read "active/inactive". The user-controllable "enabled/
-        // disabled" is reserved for the "Required by" parent rows (`is_dep` is `None`), which are
-        // top-level packages the user actually toggles.
-        let state = match (is_dep.is_some(), enabled) {
-            (true, true) => crate::i18n::ts!("package-state-active"),
-            (true, false) => crate::i18n::ts!("package-state-inactive"),
-            (false, true) => crate::i18n::ts!("package-state-enabled"),
-            (false, false) => crate::i18n::ts!("package-state-disabled"),
-        };
-        button(
-            row![
-                common::status_dot(if enabled {
-                    NodeStatus::Ok
-                } else {
-                    NodeStatus::Disabled
-                }),
-                text(name).size(13.0),
-                text(prefix.to_string()).size(12.0).style(common::muted),
-                iced::widget::space::horizontal(),
-                text(state).size(11.0).style(common::faint),
-                text("\u{203A}").size(14.0).style(common::muted),
-            ]
-            .spacing(8.0)
-            .align_y(Vertical::Center),
-        )
-        .style(button_style::list_item)
-        .on_press(Message::SelectInstalledPackage(specifier.to_string()))
-        .width(Length::Fill)
-        .into()
-    }
-
-    /// The tabbed "README & source" area: a README tab (rendered markdown, full width, no interior
-    /// scroll — it flows in the pane's own scroll) and a Source tab (file list + on-demand source
-    /// browser). No README pseudo-file: a module literally named `README.md` appears in the Source
-    /// tab and has its real bytes fetched like any other file.
-    fn installed_file_browser(&self) -> Elem<'_> {
-        let tab = self.installed_file_tab;
-        let tabs = row![
-            installed_file_tab_button(
-                tab,
-                InstalledFileTab::Readme,
-                crate::i18n::ts!("package-tab-readme")
-            ),
-            installed_file_tab_button(
-                tab,
-                InstalledFileTab::Source,
-                crate::i18n::ts!("package-tab-source")
-            ),
-        ]
-        .spacing(4.0)
-        .align_y(Vertical::Center);
-
-        let content: Elem = match tab {
-            InstalledFileTab::Readme => self.installed_readme_view(),
-            InstalledFileTab::Source => self.installed_source_browser(),
-        };
-
-        column![tabs, content].spacing(12.0).into()
-    }
 
     /// The README tab: the resolved version's markdown rendered full-width with no interior scroll,
     /// so the whole document flows in the pane's own scrollbar.
-    fn installed_readme_view(&self) -> Elem<'_> {
-        if let Some(readme) = &self.local_readme {
-            let settings = markdown::Settings::with_text_size(
-                13.0,
-                markdown::Style::from_palette(iced::theme::Palette::DARK),
-            );
-            container(markdown::view(readme.items(), settings).map(Message::OpenReadmeLink))
-                .width(Length::Fill)
-                .into()
-        } else {
-            container(
-                text(crate::i18n::t!("package-no-readme"))
-                    .size(13.0)
-                    .style(common::muted),
-            )
-            .padding(10.0)
-            .into()
-        }
-    }
-
     /// The Source tab: the module file list (left) and the selected file's on-demand source (right).
     /// The right pane keeps its own fixed-height scroll so a long file scrolls independently of the
     /// README. README is intentionally absent — it lives in its own tab.
-    fn installed_source_browser(&self) -> Elem<'_> {
-        let detail = self.installed_detail.as_deref();
-        let mut files = Column::new().spacing(2.0);
-        if let Some(detail) = detail {
-            for module in &detail.modules {
-                let selected =
-                    self.installed_selected_file.as_deref() == Some(module.subpath.as_str());
-                files = files.push(file_row(
-                    &module.subpath,
-                    selected,
-                    Message::SelectInstalledFile(module.subpath.clone()),
-                ));
-            }
-        }
-
-        let right: Elem = match detail {
-            None => container(
-                text(crate::i18n::t!("package-loading"))
-                    .size(13.0)
-                    .style(common::muted),
-            )
-            .padding(10.0)
-            .into(),
-            Some(detail) if detail.modules.is_empty() => container(
-                text(crate::i18n::t!("package-no-source-files"))
-                    .size(13.0)
-                    .style(common::muted),
-            )
-            .padding(10.0)
-            .into(),
-            Some(detail) => match self.installed_selected_file.as_deref() {
-                Some(subpath) => self.installed_source_view(detail, subpath),
-                None => container(
-                    text(crate::i18n::t!("package-select-source"))
-                        .size(13.0)
-                        .style(common::muted),
-                )
-                .padding(10.0)
-                .into(),
-            },
-        };
-
-        row![
-            container(scrollable(files)).width(Length::Fixed(220.0)),
-            container(right)
-                .width(Length::Fill)
-                .height(Length::Fixed(320.0))
-                .style(common::code_surface_style),
-        ]
-        .spacing(12.0)
-        .into()
-    }
-
-    /// Render the right-hand pane of the installed-package source browser for the selected
-    /// (non-README) file: its fetched source, or a placeholder for the loading / binary / oversized
-    /// / error states. The body is read from the content-addressed cache keyed by the module's
-    /// `content_hash`; the fetch is kicked off in [`Self::ensure_selected_source`].
-    fn installed_source_view<'a>(
-        &'a self,
-        detail: &'a ResolvedPackageWire,
-        subpath: &str,
-    ) -> Elem<'a> {
-        let placeholder = |message: String| -> Elem<'a> {
-            container(text(message).size(13.0).style(common::muted))
-                .padding(10.0)
-                .into()
-        };
-        let Some(module) = detail.modules.iter().find(|m| m.subpath == subpath) else {
-            return placeholder(crate::i18n::t!("package-source-missing"));
-        };
-        match self.installed_source.get(&module.content_hash) {
-            None | Some(FilePreview::Loading) => {
-                placeholder(crate::i18n::t!("package-source-fetching"))
-            }
-            Some(FilePreview::Text { source, bidi }) => {
-                let code = scrollable(
-                    container(text(source.as_str()).size(12.0).font(fonts::GEIST_MONO_VF))
-                        .padding(10.0)
-                        .width(Length::Fill),
-                )
-                .height(Length::Fill);
-                // Trojan-Source warning: if the body carries bidi/invisible control characters, the
-                // rendered order can differ from what the engine runs, so caution the auditor rather
-                // than trusting their eyes. Pinned above the (scrolling) source so it stays visible.
-                if *bidi {
-                    column![
-                        container(
-                            text(crate::i18n::t!("package-source-bidi-warning"))
-                                .size(11.0)
-                                .style(common::muted),
-                        )
-                        .padding(8.0)
-                        .width(Length::Fill)
-                        .style(common::banner_style),
-                        code,
-                    ]
-                    .height(Length::Fixed(320.0))
-                    .into()
-                } else {
-                    code.height(Length::Fixed(320.0)).into()
-                }
-            }
-            Some(FilePreview::Binary { size }) => placeholder(crate::i18n::t!(
-                "package-source-binary",
-                "size" => human_size(*size)
-            )),
-            Some(FilePreview::TooLarge { size }) => placeholder(crate::i18n::t!(
-                "package-source-too-large",
-                "size" => human_size(*size),
-                "limit" => human_size(SOURCE_PREVIEW_CAP_BYTES)
-            )),
-            Some(FilePreview::Error(error)) => placeholder(crate::i18n::t!(
-                "package-source-load-error",
-                "error" => error.to_string()
-            )),
-        }
-    }
-
     /// Shown in a dependency-reference view of a package that is *also* installed on its own:
     /// management belongs to that standalone entry, not here. Uninstalling from this view would
     /// drop only the standalone install while the parent keeps the package resolved — a no-op to
@@ -4494,196 +7933,6 @@ impl AutomationsWindow {
     /// In this view the specifier is always directly installed: dependency edges are cloud
     /// specifiers, so a dep that isn't `dep_only` is in `direct` (an owned `local:` package can't
     /// be a dependency), and `SelectInstalledPackage` opens its own top-level pane.
-    fn dependency_also_installed_note(&self, specifier: &str) -> Elem<'_> {
-        column![
-            container(
-                text(crate::i18n::t!("package-also-installed"))
-                    .size(12.0)
-                    .style(common::muted),
-            )
-            .padding(10.0)
-            .style(common::banner_style),
-            row![
-                iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("package-open-own-pane")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::SelectInstalledPackage(specifier.to_string())),
-            ]
-            .align_y(Vertical::Center),
-        ]
-        .spacing(8.0)
-        .into()
-    }
-
-    /// The package's own-pane actions. `kept_by` is the set of enabled packages that require this
-    /// one: when it's non-empty, "uninstalling" only removes the standalone install — the package
-    /// stays resolved as their dependency — so the uninstall action says exactly that rather than
-    /// implying full removal.
-    fn installed_actions(&self, name: &str, kept_by: &[String]) -> Elem<'_> {
-        let mut col = Column::new()
-            .spacing(10.0)
-            .push(common::section_label(crate::i18n::ts!("package-actions")));
-
-        // Edit a copy (local fork). The button sits on its own row so the explainer text can't
-        // squeeze it into a sliver.
-        col = col.push(
-            column![
-                text(crate::i18n::t!("package-edit-copy")).size(13.0),
-                text(crate::i18n::t!("package-edit-copy-help"))
-                    .size(11.0)
-                    .style(common::muted),
-                row![
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("package-edit-copy")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press_maybe(
-                            (!self.manage_busy && self.installed_detail.is_some())
-                                .then_some(Message::ForkPackage)
-                        ),
-                ]
-                .align_y(Vertical::Center),
-            ]
-            .spacing(6.0),
-        );
-
-        // Uninstall (base-state → inline confirm). When an enabled package still requires this
-        // one, removing the standalone install leaves the package resolved as that dependent's
-        // dependency, so the label + confirm describe a standalone removal rather than a full
-        // uninstall. The "Required by …" section above already names who keeps it.
-        let survives = !kept_by.is_empty();
-        let mut uninstall = Column::new().spacing(6.0);
-        if survives {
-            let kept_names = kept_by
-                .iter()
-                .map(|s| package_display_name(s).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            uninstall = uninstall
-                .push(text(crate::i18n::t!("package-remove-standalone")).size(13.0))
-                .push(
-                    text(format!(
-                        "Removes the on-its-own copy. {name} stays installed as a dependency of \
-                     {kept_names}."
-                    ))
-                    .size(11.0)
-                    .style(common::muted),
-                );
-        }
-        if self.confirm_uninstall {
-            let breaks = &self.uninstall_breaks;
-            let orphans = &self.uninstall_orphans;
-            // Forced: packages that `require` this one would break without it, so they're removed too
-            // (`script/REQUIRED-PACKAGES.md`). Not a choice — keeping them would leave them depending
-            // on a missing package.
-            if !breaks.is_empty() {
-                let names = breaks
-                    .iter()
-                    .map(|s| package_display_name(s).to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                uninstall = uninstall.push(
-                    container(
-                        text(format!(
-                            "{names} {} {name} and will be removed too.",
-                            if breaks.len() == 1 {
-                                "requires"
-                            } else {
-                                "require"
-                            },
-                        ))
-                        .size(12.0)
-                        .style(common::warning),
-                    )
-                    .padding(8.0)
-                    .width(Length::Fill)
-                    .style(common::banner_style),
-                );
-            }
-            // apt-style orphan prompt: auto-installed required roots nothing else would need once
-            // this (and any forced removals) are gone — offered, never silent.
-            if !orphans.is_empty() {
-                let names = orphans
-                    .iter()
-                    .map(|s| package_display_name(s).to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                uninstall = uninstall.push(
-                    container(
-                        text(crate::i18n::t!(
-                            "package-remove-orphans",
-                            "packages" => names
-                        ))
-                        .size(12.0)
-                        .style(common::muted),
-                    )
-                    .padding(8.0)
-                    .width(Length::Fill)
-                    .style(common::banner_style),
-                );
-            }
-            let confirm_label = if !breaks.is_empty() {
-                crate::i18n::t!("package-remove-all")
-            } else if survives {
-                crate::i18n::t!("package-remove")
-            } else if orphans.is_empty() {
-                crate::i18n::t!("package-uninstall")
-            } else {
-                crate::i18n::t!("package-remove-all")
-            };
-            let mut buttons = row![
-                text(if !breaks.is_empty() {
-                    crate::i18n::ts!("package-remove-together-question")
-                } else if survives {
-                    crate::i18n::ts!("package-remove-standalone-question")
-                } else if orphans.is_empty() {
-                    crate::i18n::ts!("package-uninstall-question")
-                } else {
-                    crate::i18n::ts!("package-remove-together-question")
-                })
-                .size(12.0),
-                iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::CancelUninstall),
-            ]
-            .spacing(8.0)
-            .align_y(Vertical::Center);
-            // "Keep them" applies only to the offered orphans; the forced breaks always go.
-            if !orphans.is_empty() && !survives {
-                buttons = buttons.push(
-                    button(text(crate::i18n::t!("package-keep-orphans")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::UninstallKeepOrphans),
-                );
-            }
-            buttons = buttons.push(
-                button(text(confirm_label).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::ConfirmUninstall),
-            );
-            uninstall = uninstall.push(buttons);
-        } else {
-            uninstall = uninstall.push(
-                row![
-                    iced::widget::space::horizontal(),
-                    button(
-                        text(if survives {
-                            crate::i18n::t!("package-remove-standalone-ellipsis")
-                        } else {
-                            crate::i18n::t!("package-uninstall-name", "name" => name)
-                        })
-                        .size(12.0)
-                    )
-                    .style(button_style::secondary)
-                    .on_press(Message::RequestUninstall),
-                ]
-                .align_y(Vertical::Center),
-            );
-        }
-        col = col.push(uninstall);
-        col.into()
-    }
-
     // ---- creator automation (read-only) -----------------------------------
 
     /// The read-only detail of a script-created automation: its pattern and body, plus a jump
@@ -4732,18 +7981,21 @@ impl AutomationsWindow {
                 })
             })
             .unwrap_or_else(|| creator_id.to_string());
+        let status_label = if entry.enabled {
+            crate::i18n::t!("state-enabled")
+        } else {
+            crate::i18n::t!("state-disabled")
+        };
 
         let mut body = column![self.scene_header(
             Some(status),
             name,
-            Some(format!(
-                "Read-only {kind_label} · created by {creator_label}"
+            Some(crate::i18n::t!(
+                "package-readonly-created-by",
+                "kind" => kind_label,
+                "creator" => &creator_label
             )),
-            Some(common::badge(if entry.enabled {
-                "Enabled"
-            } else {
-                "Disabled"
-            })),
+            Some(common::badge(status_label)),
         )]
         .spacing(16.0);
 
@@ -4779,534 +8031,29 @@ impl AutomationsWindow {
             .spacing(6.0),
         );
 
-        let (body_label, body_text): (&str, String) = match &entry.body {
-            AutomationBody::Command(cmd) => ("Sends", cmd.to_string()),
-            AutomationBody::Script(Some(src)) => ("Script", src.to_string()),
+        let (body_label, body_text): (String, String) = match &entry.body {
+            AutomationBody::Command(cmd) => {
+                (crate::i18n::t!("package-body-sends"), cmd.to_string())
+            }
+            AutomationBody::Script(Some(src)) => {
+                (crate::i18n::t!("package-body-script"), src.to_string())
+            }
             AutomationBody::Script(None) => (
-                "Script",
-                "(JavaScript handler — source not available)".to_string(),
+                crate::i18n::t!("package-body-script"),
+                crate::i18n::t!("package-body-script-unavailable"),
             ),
-            AutomationBody::Noop => ("Does", "(nothing)".to_string()),
+            AutomationBody::Noop => (
+                crate::i18n::t!("package-body-does"),
+                crate::i18n::t!("package-body-nothing"),
+            ),
         };
         body = body
-            .push(column![common::section_label(body_label), code_block(&body_text)].spacing(6.0));
+            .push(column![common::section_label(&body_label), code_block(&body_text)].spacing(6.0));
 
         pane_scroll(body)
     }
 
     // ---- owned package pane -----------------------------------------------
-
-    pub(super) fn view_owned_package(&self) -> Elem<'_> {
-        let Some(package) = self.local_package.as_deref() else {
-            return pane_scroll(column![
-                text(crate::i18n::t!("package-no-selection")).size(13.0)
-            ]);
-        };
-        let manifest = &package.manifest;
-        let visibility = if self.share_is_public {
-            "Public"
-        } else {
-            "Private"
-        };
-        // Display the *draft* manifest the form is editing (falling back to the on-disk one), so the
-        // header/meta/publish-verdict never contradict the editor below while there are unsaved edits.
-        let draft = self.manifest_draft.as_ref();
-        let disp_version = draft.map_or_else(
-            || manifest.version.clone(),
-            |d| d.version.trim().to_string(),
-        );
-        let disp_description = draft.map_or_else(
-            || manifest.description.clone(),
-            |d| d.description.trim().to_string(),
-        );
-        let disp_dep_count = draft.map_or(manifest.dependencies.len(), |d| {
-            d.dependencies
-                .iter()
-                .filter(|s| !s.trim().is_empty())
-                .count()
-        });
-        let verdict = publish_verdict(&disp_version, &self.share_versions);
-
-        let mut body = column![self.scene_header(
-            None,
-            &package.name,
-            Some(crate::i18n::t!("package-owned-subtitle", "version" => &disp_version)),
-            Some(common::badge(visibility)),
-        )]
-        .spacing(16.0);
-
-        // The package description (authored in the manifest) — what Discover shows publicly.
-        if !disp_description.is_empty() {
-            body = body.push(text(disp_description).size(13.0).style(common::muted));
-        }
-
-        if let Some(feedback) = &self.authoring_feedback {
-            body = body.push(text(feedback.clone()).size(12.0).style(common::muted));
-        }
-
-        // Rename affordance — the folder name is the package's identity (the manifest has no name),
-        // and renaming is how a fork is "claimed" so it can be published.
-        if let Some(buffer) = &self.rename_buffer {
-            body = body.push(
-                row![
-                    text_input(crate::i18n::ts!("package-new-name-placeholder"), buffer)
-                        .on_input(Message::RenameOwnedChanged)
-                        .on_submit(Message::CommitRenameOwned)
-                        .width(Length::Fixed(220.0)),
-                    button(text(crate::i18n::t!("package-save-name")).size(12.0))
-                        .style(button_style::primary)
-                        .on_press(Message::CommitRenameOwned),
-                    button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::CancelRenameOwned),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            );
-        } else {
-            body = body.push(
-                button(text(crate::i18n::t!("package-rename")).size(12.0))
-                    .style(button_style::subtle)
-                    .on_press(Message::StartRenameOwned),
-            );
-        }
-
-        // Enabled toggle (mirrors cloud packages' pane switch): a local "runs" when an enabled
-        // install of its own specifier loads it; enabling installs it as a base package so it runs
-        // even if it's currently only pulled in as a dependency.
-        body = body.push(
-            row![
-                text(crate::i18n::t!("package-enabled")).size(13.0),
-                iced::widget::space::horizontal(),
-                common::pill_switch(
-                    self.local_active(&package.name),
-                    false,
-                    Some(Message::ToggleLocalEnabled(package.name.clone())),
-                ),
-            ]
-            .align_y(Vertical::Center),
-        );
-
-        // Meta.
-        let mut meta = row![].spacing(20.0).align_y(Vertical::Center);
-        meta = meta.push(metric(
-            crate::i18n::ts!("package-metric-latest"),
-            &format!("v{disp_version}"),
-        ));
-        let live_count = self.share_versions.iter().filter(|v| !v.deleted).count();
-        meta = meta.push(metric(
-            crate::i18n::ts!("package-metric-versions"),
-            &live_count.to_string(),
-        ));
-        if disp_dep_count > 0 {
-            meta = meta.push(metric(
-                crate::i18n::ts!("package-dependencies"),
-                &disp_dep_count.to_string(),
-            ));
-        }
-        body = body.push(meta);
-
-        // Sandbox status: a local package runs sandboxed against its own manifest permissions (the
-        // manifest is the grant table). States the runtime reality the QA pass found missing, and
-        // links into the manifest editor as the capability-grant mechanism.
-        body = body.push(self.view_owned_sandbox_section(package));
-
-        // Rich manifest editor (the smudgy.package.json file itself is hidden from the source
-        // browser below).
-        body = body.push(self.view_manifest_section());
-
-        // Settings (configured param values) — the manifest above declares the params; this sets
-        // the values the package reads when run locally. Keyed by the local package's own-handle
-        // specifier, the same one the runtime resolves it under. Renders nothing without params.
-        if let Some(settings) = self.view_param_config_section(&self.local_own_spec(&package.name))
-        {
-            body = body.push(settings);
-        }
-
-        // Source browser (editable).
-        body = body.push(self.owned_file_browser(package));
-
-        // Publish. Publish reads the on-disk package, so it's disabled while a source or manifest
-        // editor has unsaved edits (you'd otherwise ship the pre-edit bytes). Otherwise it's gated on a
-        // semver-fluent verdict: disabled while busy, when the version isn't valid publishable semver,
-        // or when the number is already used (live/yanked/deleted) — numbers are permanently reserved.
-        // Package names are owner-scoped on the server, so a fork always publishes under your own
-        // handle and can never clobber another author's package — no client-side rename gate needed.
-        let can_publish = !self.authoring_busy
-            && !self.share_busy
-            && !self.dirty
-            && !self.manifest_dirty
-            && matches!(verdict, PublishVerdict::Ready);
-        body = body.push(
-            row![
-                iced::widget::space::horizontal(),
-                button(
-                    row![
-                        text(crate::assets::bootstrap_icons::CLOUD_UPLOAD)
-                            .font(fonts::BOOTSTRAP_ICONS)
-                            .size(13.0),
-                        text(crate::i18n::t!("package-publish")).size(13.0),
-                    ]
-                    .spacing(6.0)
-                    .align_y(Vertical::Center)
-                )
-                .style(button_style::primary)
-                .on_press_maybe(can_publish.then_some(Message::PublishOwned)),
-            ]
-            .align_y(Vertical::Center),
-        );
-        // Explain why Publish is disabled (when it is). Unsaved manifest edits take precedence —
-        // publishing them requires saving them first.
-        if self.dirty || self.manifest_dirty {
-            body = body.push(
-                text(crate::i18n::t!("package-save-before-publish"))
-                    .size(12.0)
-                    .style(common::warning),
-            );
-        } else {
-            match &verdict {
-                PublishVerdict::Invalid(reason) => {
-                    body = body.push(text(reason.clone()).size(12.0).style(common::danger));
-                }
-                PublishVerdict::AlreadyUsed => {
-                    body = body.push(
-                        text(crate::i18n::t!(
-                            "package-version-already-used",
-                            "version" => &disp_version
-                        ))
-                        .size(12.0)
-                        .style(common::warning),
-                    );
-                }
-                PublishVerdict::Ready => {}
-            }
-        }
-
-        if let Some(output) = self
-            .publish_output
-            .as_ref()
-            .filter(|output| output.package == package.name)
-        {
-            body = body.push(
-                column![
-                    common::section_label(crate::i18n::ts!("package-publish-output")),
-                    publish_output_panel(&output.text),
-                ]
-                .spacing(6.0),
-            );
-        }
-
-        // Published versions.
-        let mut versions =
-            Column::new()
-                .spacing(4.0)
-                .push(common::section_label(crate::i18n::ts!(
-                    "package-published-versions"
-                )));
-        if self.share_versions.is_empty() {
-            versions = versions.push(
-                text(crate::i18n::t!("package-no-published-versions"))
-                    .size(12.0)
-                    .style(common::muted),
-            );
-        }
-        // "latest" is the highest live (non-yanked, non-deleted) version. The list now
-        // also carries hard-deleted numbers (reserved forever) which render greyed.
-        let latest_idx = self
-            .share_versions
-            .iter()
-            .position(|v| !v.yanked && !v.deleted);
-        for (i, v) in self.share_versions.iter().enumerate() {
-            // A hard-deleted number: content is gone, but the number stays reserved. Show
-            // it greyed so the author sees it's spent; no actions.
-            if v.deleted {
-                versions = versions.push(
-                    row![
-                        text(format!("v{}", v.version))
-                            .size(13.0)
-                            .style(common::faint),
-                        text(crate::i18n::t!("package-version-deleted"))
-                            .size(11.0)
-                            .style(common::faint),
-                    ]
-                    .spacing(8.0)
-                    .align_y(Vertical::Center),
-                );
-                continue;
-            }
-            let mut left = row![text(format!("v{}", v.version)).size(13.0)]
-                .spacing(8.0)
-                .align_y(Vertical::Center);
-            if Some(i) == latest_idx {
-                left = left.push(common::badge(crate::i18n::t!("package-version-latest")));
-            }
-            if v.yanked {
-                left = left.push(
-                    text(crate::i18n::t!("package-version-yanked"))
-                        .size(11.0)
-                        .style(common::faint),
-                );
-            }
-            let mut actions = row![
-                left,
-                iced::widget::space::horizontal(),
-                button(
-                    text(if v.yanked {
-                        crate::i18n::t!("package-version-unyank")
-                    } else {
-                        crate::i18n::t!("package-version-yank")
-                    })
-                    .size(11.0)
-                )
-                .style(button_style::secondary)
-                .on_press(Message::YankVersion {
-                    version: v.version.clone(),
-                    yanked: !v.yanked,
-                }),
-            ]
-            .spacing(8.0)
-            .align_y(Vertical::Center);
-            // Delete is the heavy, deliberate step — only offered once a version is yanked.
-            if v.yanked {
-                actions = actions.push(
-                    button(
-                        text(crate::i18n::t!("action-delete"))
-                            .size(11.0)
-                            .style(common::danger),
-                    )
-                    .style(button_style::secondary)
-                    .on_press(Message::DeleteVersion(v.version.clone())),
-                );
-            }
-            versions = versions.push(actions);
-        }
-        versions = versions.push(
-            text(crate::i18n::t!("package-yank-help"))
-                .size(11.0)
-                .style(common::faint),
-        );
-        body = body.push(versions);
-
-        // Sharing.
-        body = body.push(self.owned_sharing_section());
-
-        // Delete package.
-        if self.confirm_delete_local {
-            body = body.push(
-                row![
-                    text(crate::i18n::t!("package-delete-question")).size(12.0),
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::CancelDeleteOwned),
-                    button(text(crate::i18n::t!("action-delete")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::DeleteOwned),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            );
-        } else {
-            body = body.push(
-                row![
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("package-delete-ellipsis")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::RequestDeleteOwned),
-                ]
-                .align_y(Vertical::Center),
-            );
-        }
-
-        pane_scroll(body)
-    }
-
-    fn owned_file_browser<'a>(&'a self, package: &'a LocalPackage) -> Elem<'a> {
-        // A platform-aware "reveal the package folder in the OS file manager" affordance, so the
-        // author can drag files in, open the folder in an external editor, or use git.
-        let reveal_label = if cfg!(target_os = "windows") {
-            crate::i18n::ts!("package-show-explorer")
-        } else if cfg!(target_os = "macos") {
-            crate::i18n::ts!("package-show-finder")
-        } else {
-            crate::i18n::ts!("package-open-folder")
-        };
-        let source_header = row![
-            common::section_label(crate::i18n::ts!("package-tab-source")),
-            iced::widget::space::horizontal(),
-            button(text(reveal_label).size(11.0))
-                .style(button_style::subtle)
-                .on_press(Message::RevealPackageFolder),
-        ]
-        .align_y(Vertical::Center);
-        let mut files = Column::new().spacing(2.0).push(source_header);
-        let readme_selected = self.owned_selected_file.is_none();
-        if package.readme.is_some() {
-            files = files.push(file_row(
-                "README.md",
-                readme_selected,
-                Message::SelectOwnedFile("README.md".to_string()),
-            ));
-        }
-        // `smudgy.package.json` is intentionally not listed: the manifest is edited through the
-        // rich manifest editor (`view_manifest_section`) instead of a raw text editor.
-        for module in &package.modules {
-            let selected = self.owned_selected_file.as_deref() == Some(module.subpath.as_str());
-            files = files.push(file_row(
-                &module.subpath,
-                selected,
-                Message::SelectOwnedFile(module.subpath.clone()),
-            ));
-        }
-
-        let right: Elem<'a> = if self.owned_selected_file.is_none() {
-            if let Some(readme) = &self.local_readme {
-                let settings = markdown::Settings::with_text_size(
-                    13.0,
-                    markdown::Style::from_palette(iced::theme::Palette::DARK),
-                );
-                scrollable(
-                    container(
-                        markdown::view(readme.items(), settings).map(Message::OpenReadmeLink),
-                    )
-                    .padding(10.0),
-                )
-                .height(Length::Fixed(340.0))
-                .into()
-            } else {
-                container(
-                    text(crate::i18n::t!("package-select-file-edit"))
-                        .size(13.0)
-                        .style(common::muted),
-                )
-                .padding(10.0)
-                .into()
-            }
-        } else {
-            let editor = self.code_editor_view(300.0);
-            column![
-                editor,
-                row![
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("action-save")).size(12.0))
-                        .style(button_style::primary)
-                        .on_press(Message::SaveOwnedFile),
-                ]
-                .padding(Padding {
-                    top: 6.0,
-                    bottom: 0.0,
-                    left: 0.0,
-                    right: 0.0,
-                })
-                .align_y(Vertical::Center),
-            ]
-            .spacing(0.0)
-            .into()
-        };
-
-        row![
-            container(scrollable(files)).width(Length::Fixed(220.0)),
-            container(right)
-                .width(Length::Fill)
-                .style(common::code_surface_style)
-                .padding(6.0),
-        ]
-        .spacing(12.0)
-        .into()
-    }
-
-    fn owned_sharing_section(&self) -> Elem<'_> {
-        let mut col = Column::new()
-            .spacing(10.0)
-            .push(common::section_label(crate::i18n::ts!("package-sharing")));
-        if self.share_package_id.is_none() {
-            return col
-                .push(
-                    text(crate::i18n::t!("package-publish-before-sharing"))
-                        .size(12.0)
-                        .style(common::muted),
-                )
-                .into();
-        }
-        // Visibility card.
-        col = col.push(
-            container(
-                row![
-                    column![
-                        text(if self.share_is_public {
-                            "Public"
-                        } else {
-                            "Private"
-                        })
-                        .size(13.0),
-                        text(if self.share_is_public {
-                            crate::i18n::ts!("package-public-help")
-                        } else {
-                            crate::i18n::ts!("package-private-help")
-                        })
-                        .size(11.0)
-                        .style(common::muted),
-                    ]
-                    .spacing(2.0),
-                    iced::widget::space::horizontal(),
-                    button(
-                        text(if self.share_is_public {
-                            crate::i18n::t!("package-make-private")
-                        } else {
-                            crate::i18n::t!("package-make-public")
-                        })
-                        .size(12.0)
-                    )
-                    .style(button_style::secondary)
-                    .on_press(Message::SetVisibility(!self.share_is_public)),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            )
-            .padding(12.0)
-            .width(Length::Fill)
-            .style(common::banner_style),
-        );
-
-        // Friends list (private only).
-        if !self.share_is_public {
-            let mut friends = Column::new().spacing(4.0);
-            if self.share_friends.is_empty() {
-                friends = friends.push(
-                    text(crate::i18n::t!("package-no-friends"))
-                        .size(12.0)
-                        .style(common::muted),
-                );
-            }
-            for friend in &self.share_friends {
-                let handle = friend
-                    .nickname
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let shared = self
-                    .share_grants
-                    .iter()
-                    .any(|g| g.grantee_id == Some(friend.user_id) || g.all_friends);
-                friends = friends.push(
-                    row![
-                        text(crate::assets::bootstrap_icons::PEOPLE)
-                            .font(fonts::BOOTSTRAP_ICONS)
-                            .size(13.0)
-                            .style(common::muted),
-                        text(handle).size(13.0),
-                        iced::widget::space::horizontal(),
-                        button(text(if shared { "\u{2713} Shared" } else { "Share" }).size(12.0))
-                            .style(button_style::secondary)
-                            .on_press(Message::ShareWithFriend(friend.user_id)),
-                    ]
-                    .spacing(8.0)
-                    .align_y(Vertical::Center),
-                );
-            }
-            col = col.push(friends);
-        }
-        col.into()
-    }
 
     pub(super) fn view_new_package(&self, name: &str, error: Option<&str>) -> Elem<'_> {
         let mut body = column![self.scene_header(
@@ -5493,11 +8240,11 @@ impl AutomationsWindow {
         // Meta line as a single text run: the prefix and rating average/count inherit the faint base
         // color, while the ★ span is tinted the "out" color.
         let star_color = crate::prefs::current().palette.output;
-        let mut meta_spans: Vec<iced::widget::text::Span<'_, ()>> = vec![span(format!(
-            "{} · v{} · {} installs · ",
-            result.owner_nickname,
-            result.latest_version.as_deref().unwrap_or("—"),
-            result.install_count,
+        let mut meta_spans: Vec<iced::widget::text::Span<'_, ()>> = vec![span(crate::i18n::t!(
+            "package-search-meta",
+            "owner" => &result.owner_nickname,
+            "version" => result.latest_version.as_deref().unwrap_or("—"),
+            "count" => result.install_count
         ))];
         meta_spans.extend(rating_spans(
             result.avg_rating,
@@ -5510,7 +8257,7 @@ impl AutomationsWindow {
                 row![
                     text(result.name.clone()).size(15.0),
                     if installed {
-                        common::badge("Installed")
+                        common::badge(crate::i18n::t!("package-installed"))
                     } else {
                         iced::widget::space::horizontal()
                             .width(Length::Shrink)
@@ -5538,7 +8285,7 @@ impl AutomationsWindow {
         let owner = pkg
             .owner_nickname
             .clone()
-            .unwrap_or_else(|| "you".to_string());
+            .unwrap_or_else(|| crate::i18n::t!("package-you"));
         let installed = super::model::is_installed(&self.installed_packages, &owner, &pkg.name);
         let action: Elem = if installed {
             button(text(crate::i18n::t!("package-installed")).size(12.0))
@@ -5553,10 +8300,11 @@ impl AutomationsWindow {
         // The meta line is a single text run: the owner/version/installs prefix and the rating
         // average/count inherit the muted base color, while the ★ span is tinted the "out" color.
         let star_color = crate::prefs::current().palette.output;
-        let mut meta_spans: Vec<iced::widget::text::Span<'_, ()>> = vec![span(format!(
-            "{owner} · v{} · {} installs · ",
-            detail.latest_version.as_deref().unwrap_or("—"),
-            detail.install_count,
+        let mut meta_spans: Vec<iced::widget::text::Span<'_, ()>> = vec![span(crate::i18n::t!(
+            "package-search-meta",
+            "owner" => &owner,
+            "version" => detail.latest_version.as_deref().unwrap_or("—"),
+            "count" => detail.install_count,
         ))];
         meta_spans.extend(rating_spans(
             detail.avg_rating,
@@ -5627,7 +8375,7 @@ impl AutomationsWindow {
             let who = comment
                 .user_nickname
                 .clone()
-                .unwrap_or_else(|| "someone".to_string());
+                .unwrap_or_else(|| crate::i18n::t!("package-someone"));
             col = col.push(
                 column![
                     text(who).size(12.0).style(common::accent),
@@ -5676,6 +8424,13 @@ impl AutomationsWindow {
         if let Some(error) = &prompt.error {
             form = form.push(text(error.clone()).size(12.0).style(common::danger));
         }
+        if self.consent_busy {
+            form = form.push(
+                text(crate::i18n::t!("package-preparing-cache"))
+                    .size(12.0)
+                    .style(common::faint),
+            );
+        }
         form = form.push(
             row![
                 iced::widget::space::horizontal(),
@@ -5700,83 +8455,29 @@ impl AutomationsWindow {
     /// [`Self::param_config_save`]. Renders nothing unless a [`ParamConfig`] is seeded for
     /// `specifier` (i.e. the open package declares params) — the caller guards on a matching
     /// specifier so a stale config from a previous pane can't leak in.
-    fn view_param_config_section<'a>(&'a self, specifier: &str) -> Option<Elem<'a>> {
-        let config = self
-            .param_config
-            .as_ref()
-            .filter(|c| c.specifier == specifier)?;
-
-        let mut form = Column::new().spacing(10.0).push(
-            text(crate::i18n::t!("package-runtime-settings-help"))
-                .size(12.0)
-                .style(common::muted),
-        );
-
-        for param in &config.params {
-            let state = config.values.get(&param.key);
-            let field = if is_secret_string(param) {
-                let stored = config.secret_stored.contains(&param.key);
-                let placeholder = if stored {
-                    "set — leave blank to keep"
-                } else {
-                    "secret value"
-                };
-                // A stored secret can only be replaced through the box (never revealed), so offer an
-                // explicit Clear — the one way to unset it.
-                let clear = stored.then(|| Message::ParamConfigClearSecret(param.key.clone()));
-                secret_field_row(param, state, ParamTarget::Config, placeholder, clear)
-            } else if let Some(state) = state {
-                param_values::view(param, state, ParamTarget::Config)
-            } else {
-                continue;
-            };
-            form = form.push(field);
-        }
-
-        if let Some(error) = &config.error {
-            form = form.push(text(error.clone()).size(12.0).style(common::danger));
-        } else if config.saved {
-            form = form.push(
-                text(crate::i18n::t!("package-saved"))
-                    .size(12.0)
-                    .style(common::accent),
-            );
-        }
-
-        form = form.push(
-            row![
-                iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("package-save-settings")).size(12.0))
-                    .style(button_style::primary)
-                    .on_press(Message::ParamConfigSave),
-            ]
-            .align_y(Vertical::Center),
-        );
-
-        Some(
-            column![
-                common::section_label(crate::i18n::ts!("package-settings")),
-                container(form)
-                    .padding(16.0)
-                    .width(Length::Fill)
-                    .style(common::card_style),
-            ]
-            .spacing(8.0)
-            .into(),
-        )
-    }
-
     /// The always-shown Install Confirmation window: an all-or-nothing grant of the closure
     /// permission union, enumerating both what the package *will* and *will NOT* be able to do.
-    fn view_consent_prompt<'a>(&self, prompt: &'a ConsentPrompt) -> Elem<'a> {
+    pub(super) fn view_consent_prompt<'a>(&self, prompt: &'a ConsentPrompt) -> Elem<'a> {
+        let is_update = matches!(&prompt.operation, ConsentOperation::Update { .. });
+        let is_manifest = matches!(&prompt.operation, ConsentOperation::LocalManifest { .. });
         let mut form = Column::new()
             .spacing(12.0)
             .push(
-                text(crate::i18n::t!(
-                    "package-install-title",
-                    "name" => &prompt.name,
-                    "version" => &prompt.version
-                ))
+                text(if is_manifest {
+                    crate::i18n::t!("package-manifest-review-title", "name" => &prompt.name)
+                } else if is_update {
+                    crate::i18n::t!(
+                        "package-update-review-title",
+                        "name" => &prompt.name,
+                        "version" => &prompt.version
+                    )
+                } else {
+                    crate::i18n::t!(
+                        "package-install-title",
+                        "name" => &prompt.name,
+                        "version" => &prompt.version
+                    )
+                })
                 .size(16.0),
             )
             .push(
@@ -5878,29 +8579,80 @@ impl AutomationsWindow {
             );
         }
 
+        // A mandatory required package could not be resolved/read. Do not reinterpret `requires`
+        // as optional just because the registry or manifest is temporarily unavailable.
+        let required_unavailable = prompt.required_unavailable.as_deref();
+        if let Some(message) = required_unavailable {
+            form = form.push(
+                container(
+                    column![
+                        row![
+                            text("\u{26A0}").size(14.0).style(common::danger),
+                            text(crate::i18n::t!("package-install-required-unavailable"))
+                                .size(14.0),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Vertical::Center),
+                        text(message.to_string()).size(12.0),
+                    ]
+                    .spacing(6.0),
+                )
+                .padding(12.0)
+                .width(Length::Fill)
+                .style(common::banner_style),
+            );
+        }
+
         if let Some(error) = &prompt.error {
             form = form.push(text(error.clone()).size(12.0).style(common::danger));
         }
         // Both install actions grant the shown permissions (and co-install the required set); they
         // differ only in whether the packages are enabled (run) now or left off for review. A peer
         // conflict or version-floor refusal disables both install buttons — only Cancel remains.
-        let can_install = conflict.is_none() && needs_smudgy.is_none();
-        form = form.push(
-            row![
-                iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::ConsentCancel),
-                button(text(crate::i18n::t!("package-install-disabled")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press_maybe(can_install.then_some(Message::ConsentGrant { enable: false })),
-                button(text(crate::i18n::t!("package-install-enabled")).size(12.0))
+        let can_install = conflict.is_none()
+            && needs_smudgy.is_none()
+            && required_unavailable.is_none()
+            && !self.consent_busy;
+        let mut actions = row![
+            iced::widget::space::horizontal(),
+            button(text(crate::i18n::t!("action-cancel")).size(12.0))
+                .style(button_style::secondary)
+                .on_press(Message::ConsentCancel),
+        ]
+        .spacing(8.0)
+        .align_y(Vertical::Center);
+        if is_manifest {
+            actions = actions.push(
+                button(text(crate::i18n::t!("manifest-save")).size(12.0))
                     .style(button_style::primary)
-                    .on_press_maybe(can_install.then_some(Message::ConsentGrant { enable: true })),
-            ]
-            .spacing(8.0)
-            .align_y(Vertical::Center),
-        );
+                    // `enable` is ignored for a manifest save; existing activation is kept.
+                    .on_press_maybe(can_install.then_some(Message::ConsentGrant { enable: false })),
+            );
+        } else if is_update {
+            actions = actions.push(
+                button(text(crate::i18n::t!("package-apply-update")).size(12.0))
+                    .style(button_style::primary)
+                    // `enable` is ignored for updates; their complete existing activation is kept.
+                    .on_press_maybe(can_install.then_some(Message::ConsentGrant { enable: false })),
+            );
+        } else {
+            actions = actions
+                .push(
+                    button(text(crate::i18n::t!("package-install-disabled")).size(12.0))
+                        .style(button_style::secondary)
+                        .on_press_maybe(
+                            can_install.then_some(Message::ConsentGrant { enable: false }),
+                        ),
+                )
+                .push(
+                    button(text(crate::i18n::t!("package-install-enabled")).size(12.0))
+                        .style(button_style::primary)
+                        .on_press_maybe(
+                            can_install.then_some(Message::ConsentGrant { enable: true }),
+                        ),
+                );
+        }
+        form = form.push(actions);
         container(form)
             .padding(16.0)
             .width(Length::Fill)
@@ -5925,9 +8677,10 @@ impl AutomationsWindow {
                 col = col.push(
                     row![
                         text("\u{2022}").size(13.0).style(common::muted),
-                        text(format!(
-                            "{} v{} \u{2014} already installed",
-                            root.name, root.version
+                        text(crate::i18n::t!(
+                            "package-already-installed-version",
+                            "name" => &root.name,
+                            "version" => &root.version
                         ))
                         .size(12.0)
                         .style(common::muted),
@@ -5963,9 +8716,9 @@ impl AutomationsWindow {
                     entry = entry.push(
                         row![
                             text("\u{26A0}").size(12.0).style(common::danger),
-                            text(format!(
-                                "Effectively full access \u{2014} it can {}.",
-                                join_reasons(&escape_reasons(&root.permissions))
+                            text(crate::i18n::t!(
+                                "package-effectively-full-access-reasons",
+                                "reasons" => join_reasons(&escape_reasons(&root.permissions))
                             ))
                             .size(12.0)
                             .style(common::danger),
@@ -5995,430 +8748,6 @@ impl AutomationsWindow {
     /// sandbox identically. Also offers the advanced "develop unsandboxed" (trust) escape hatch —
     /// full, unenumerated access while iterating (scoped `run`/`ffi` grants are declarable in the
     /// manifest, so the hatch is a convenience, no longer the only route to native power).
-    fn view_owned_sandbox_section(&self, package: &LocalPackage) -> Elem<'_> {
-        let own_spec = self.local_own_spec(&package.name);
-        let unsandboxed = self
-            .installed_packages
-            .iter()
-            .find(|p| p.specifier == own_spec)
-            .is_some_and(|p| p.trusted);
-
-        let mut col = Column::new()
-            .spacing(8.0)
-            .push(common::section_label(crate::i18n::ts!("package-sandbox")));
-
-        if unsandboxed {
-            col = col.push(
-                container(
-                    column![
-                        row![
-                            text("\u{26A0}").size(14.0).style(common::danger),
-                            text(crate::i18n::t!("package-developing-unsandboxed")).size(14.0),
-                        ]
-                        .spacing(8.0)
-                        .align_y(Vertical::Center),
-                        text(crate::i18n::t!("package-unsandboxed-owned-help"))
-                            .size(12.0)
-                            .style(common::muted),
-                    ]
-                    .spacing(6.0),
-                )
-                .padding(12.0)
-                .width(Length::Fill)
-                .style(common::banner_style),
-            );
-            // Re-sandboxing is the safe direction — always offered, even with advanced features off.
-            col = col.push(
-                row![
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("package-use-manifest-sandbox")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::SetLocalUnsandboxed(false)),
-                ]
-                .align_y(Vertical::Center),
-            );
-            return col.into();
-        }
-
-        // Sandboxed against the live manifest: show what it currently grants (reusing the consent
-        // can-lines), and point at the manifest editor as the grant mechanism. The full-access
-        // banner shows here too — the author sees exactly the framing installers will get.
-        let can = permission_can_lines(&package.manifest.permissions);
-        let mut card =
-            column![text(crate::i18n::t!("package-runs-manifest-sandbox")).size(14.0)].spacing(6.0);
-        if can.is_empty() {
-            card = card.push(text(sandbox_summary()).size(12.0).style(common::muted));
-        } else {
-            if let Some(banner) = full_access_banner(&package.manifest.permissions) {
-                card = card.push(banner);
-            }
-            card = card.push(
-                text(crate::i18n::t!("package-it-can"))
-                    .size(12.0)
-                    .style(common::muted),
-            );
-            let mut lines = Column::new().spacing(4.0);
-            for line in &can {
-                lines = lines.push(consent_can_row(line));
-            }
-            card = card.push(lines);
-        }
-        card = card.push(
-            row![
-                button(text(crate::i18n::t!("package-edit-capabilities")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::EditOwnedCapabilities),
-            ]
-            .align_y(Vertical::Center),
-        );
-        col = col.push(
-            container(card)
-                .padding(12.0)
-                .width(Length::Fill)
-                .style(common::banner_style),
-        );
-
-        // Advanced escape hatch: develop with full access (trust), for ffi/run etc. a sandbox can't
-        // grant. Gated on advanced features + a heavy two-step confirm (reusing the trust confirm
-        // state; only one package pane shows at a time).
-        if self.advanced_features {
-            if self.confirm_trust {
-                col = col.push(
-                    container(
-                        column![
-                            row![
-                                text("\u{26A0}").size(14.0).style(common::danger),
-                                text(crate::i18n::t!("package-develop-unsandboxed-question"))
-                                    .size(14.0),
-                            ]
-                            .spacing(8.0)
-                            .align_y(Vertical::Center),
-                            text(crate::i18n::t!("package-develop-unsandboxed-warning")).size(12.0),
-                            row![
-                                iced::widget::space::horizontal(),
-                                button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                                    .style(button_style::secondary)
-                                    .on_press(Message::CancelTrust),
-                                button(
-                                    text(crate::i18n::t!("package-develop-unsandboxed")).size(12.0)
-                                )
-                                .style(button_style::primary)
-                                .on_press(Message::SetLocalUnsandboxed(true)),
-                            ]
-                            .spacing(8.0)
-                            .align_y(Vertical::Center),
-                        ]
-                        .spacing(10.0),
-                    )
-                    .padding(12.0)
-                    .width(Length::Fill)
-                    .style(common::banner_style),
-                );
-            } else {
-                col = col.push(
-                    row![
-                        column![
-                            text(crate::i18n::t!("package-develop-unsandboxed-advanced"))
-                                .size(13.0),
-                            text(crate::i18n::t!("package-develop-unsandboxed-help"))
-                                .size(11.0)
-                                .style(common::muted),
-                        ]
-                        .spacing(2.0),
-                        iced::widget::space::horizontal(),
-                        button(
-                            text(crate::i18n::t!("package-develop-unsandboxed-ellipsis"))
-                                .size(12.0)
-                        )
-                        .style(button_style::secondary)
-                        .on_press(Message::RequestTrust),
-                    ]
-                    .align_y(Vertical::Center),
-                );
-            }
-        }
-        col.into()
-    }
-
-    /// The manage-pane permission view: the consented closure union read-only (all-or-nothing,
-    /// so no per-permission revoke), or "full access (trusted)" — plus the trust toggle.
-    /// The "Permissions" card for a dependency-reference view. A dependency isn't its own
-    /// sandboxed package: it loads into its parent's isolate and runs with the parent's grants, so
-    /// it has no separate consent of its own. Describing its manifest permissions here (as the
-    /// installed pane does) would imply a sandbox and a grant/keep choice that don't exist in this
-    /// context — so explain the parent relationship in plain terms and send the user there instead.
-    fn view_dependency_permissions_section(&self, parent: &str) -> Elem<'_> {
-        let parent_name = package_display_name(parent).to_string();
-        let card = column![
-            text(crate::i18n::t!("package-runs-inside", "parent" => &parent_name)).size(14.0),
-            text(crate::i18n::t!(
-                "package-dependency-permissions-help",
-                "parent" => &parent_name
-            ))
-            .size(12.0)
-            .style(common::muted),
-        ]
-        .spacing(6.0);
-        column![
-            common::section_label(crate::i18n::ts!("manifest-permissions")),
-            container(card)
-                .padding(12.0)
-                .width(Length::Fill)
-                .style(common::banner_style),
-        ]
-        .spacing(8.0)
-        .into()
-    }
-
-    fn view_permissions_section(&self, locked: &LockedPackage) -> Elem<'_> {
-        let mut col = Column::new()
-            .spacing(8.0)
-            .push(common::section_label(crate::i18n::ts!(
-                "manifest-permissions"
-            )));
-
-        if locked.trusted {
-            col = col.push(
-                container(
-                    column![
-                        row![
-                            text("\u{26A0}").size(14.0).style(common::danger),
-                            text(crate::i18n::t!("package-full-access")).size(14.0),
-                        ]
-                        .spacing(8.0)
-                        .align_y(Vertical::Center),
-                        text(crate::i18n::t!("package-full-access-help"))
-                            .size(12.0)
-                            .style(common::muted),
-                    ]
-                    .spacing(6.0),
-                )
-                .padding(12.0)
-                .width(Length::Fill)
-                .style(common::banner_style),
-            );
-            // Restoring the sandbox is the safe direction — always offered, even with advanced
-            // features off (so a package can't get stuck unsandboxed if the gate is later disabled).
-            col = col.push(
-                row![
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("package-restore-sandbox")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::SetTrusted(false)),
-                ]
-                .align_y(Vertical::Center),
-            );
-            return col.into();
-        }
-
-        // Sandboxed: mirror the trusted card — a heading plus a breakdown of the consented access
-        // (read-only; the union is whatever was granted at install). A consented sandbox-escape
-        // grant keeps its banner here too: "Runs in sandbox" must not read as containment the
-        // grant no longer provides.
-        let consented = locked.consented_permissions.clone().unwrap_or_default();
-        let can = permission_can_lines(&consented);
-        let heading = if union_risk(&consented) == PermissionRisk::Critical {
-            "Runs in sandbox \u{2014} with grants that can escape it"
-        } else {
-            "Runs in sandbox"
-        };
-        let mut card = column![text(heading).size(14.0)].spacing(6.0);
-        if can.is_empty() {
-            card = card.push(text(sandbox_summary()).size(12.0).style(common::muted));
-        } else {
-            if let Some(banner) = full_access_banner(&consented) {
-                card = card.push(banner);
-            }
-            card = card.push(
-                text(crate::i18n::t!("package-it-can-only"))
-                    .size(12.0)
-                    .style(common::muted),
-            );
-            let mut lines = Column::new().spacing(4.0);
-            for line in &can {
-                lines = lines.push(consent_can_row(line));
-            }
-            card = card.push(lines);
-        }
-        if locked.consented_permissions.is_none() {
-            card = card.push(
-                text(crate::i18n::t!("package-not-consented"))
-                    .size(11.0)
-                    .style(common::faint),
-            );
-        }
-        col = col.push(
-            container(card)
-                .padding(12.0)
-                .width(Length::Fill)
-                .style(common::banner_style),
-        );
-
-        // "Remove sandbox" is an advanced, footgun-prone action (run the package with full
-        // authority), so the affordance only appears when advanced scripting features are unlocked
-        // in Settings. The heavy two-step confirm applies.
-        if self.advanced_features {
-            if self.confirm_trust {
-                col = col.push(
-                    container(
-                        column![
-                            row![
-                                text("\u{26A0}").size(14.0).style(common::danger),
-                                text(crate::i18n::t!("package-remove-sandbox-question")).size(14.0),
-                            ]
-                            .spacing(8.0)
-                            .align_y(Vertical::Center),
-                            text(crate::i18n::t!("package-remove-sandbox-warning")).size(12.0),
-                            row![
-                                iced::widget::space::horizontal(),
-                                button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                                    .style(button_style::secondary)
-                                    .on_press(Message::CancelTrust),
-                                button(text(crate::i18n::t!("package-remove-sandbox")).size(12.0))
-                                    .style(button_style::primary)
-                                    .on_press(Message::SetTrusted(true)),
-                            ]
-                            .spacing(8.0)
-                            .align_y(Vertical::Center),
-                        ]
-                        .spacing(10.0),
-                    )
-                    .padding(12.0)
-                    .width(Length::Fill)
-                    .style(common::banner_style),
-                );
-            } else {
-                col = col.push(
-                    row![
-                        column![
-                            text(crate::i18n::t!("package-remove-sandbox-advanced")).size(13.0),
-                            text(crate::i18n::t!("package-remove-sandbox-help"))
-                                .size(11.0)
-                                .style(common::muted),
-                        ]
-                        .spacing(2.0),
-                        iced::widget::space::horizontal(),
-                        button(text(crate::i18n::t!("package-remove-sandbox-ellipsis")).size(12.0))
-                            .style(button_style::secondary)
-                            .on_press(Message::RequestTrust),
-                    ]
-                    .spacing(10.0)
-                    .align_y(Vertical::Center),
-                );
-            }
-        }
-        col.into()
-    }
-
-    /// The update re-prompt card: the new version's *added* asks beyond the consented
-    /// baseline. "Grant & update" adopts the new union; "Keep current perms" leaves the old union
-    /// enforced (the new asks stay withheld).
-    fn view_update_delta<'a>(&self, delta: &'a UpdateDelta) -> Elem<'a> {
-        // A version-floor hold-back is informational: no grant can load the held-back version
-        // (only updating smudgy, or pinning an older version, would), so the card explains the
-        // floor and offers only dismissal.
-        if let Some(reason) = &delta.needs_smudgy {
-            let col = Column::new()
-                .spacing(8.0)
-                .push(
-                    row![
-                        common::status_dot(NodeStatus::Warning),
-                        text(format!(
-                            "Update held back — {} needs a newer smudgy",
-                            delta.name
-                        ))
-                        .size(14.0),
-                    ]
-                    .spacing(8.0)
-                    .align_y(Vertical::Center),
-                )
-                .push(
-                    // No "you're running vX" claim: the lockfile's last-resolved version can
-                    // be stale (a floored pin, or a smudgy downgrade since it last loaded),
-                    // so the card states only what is certainly true. The reason carries its
-                    // own remedy.
-                    text(format!(
-                        "v{} is held back \u{2014} {reason}.",
-                        delta.version
-                    ))
-                    .size(12.0)
-                    .style(common::muted),
-                )
-                .push(
-                    row![
-                        iced::widget::space::horizontal(),
-                        button(text(crate::i18n::t!("package-ok")).size(12.0))
-                            .style(button_style::secondary)
-                            .on_press(Message::DismissUpdate),
-                    ]
-                    .spacing(8.0)
-                    .align_y(Vertical::Center),
-                );
-            return container(col)
-                .padding(14.0)
-                .width(Length::Fill)
-                .style(common::card_style)
-                .into();
-        }
-        let mut col = Column::new()
-            .spacing(8.0)
-            .push(
-                row![
-                    common::status_dot(NodeStatus::Warning),
-                    text(format!(
-                        "Update blocked — {} needs more permissions",
-                        delta.name
-                    ))
-                    .size(14.0),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            )
-            .push(
-                text(match &delta.current_version {
-                    Some(current) => crate::i18n::t!(
-                        "package-update-current-held",
-                        "current" => current,
-                        "next" => &delta.version
-                    ),
-                    None => crate::i18n::t!(
-                        "package-update-held-load",
-                        "version" => &delta.version
-                    ),
-                })
-                .size(12.0)
-                .style(common::muted),
-            );
-        // An update whose ADDED asks include a sandbox escape is a bigger decision than "more
-        // hosts" — the banner makes granting it a deliberate trust call, not a reflex.
-        if let Some(banner) = full_access_banner(&delta.added) {
-            col = col.push(banner);
-        }
-        let mut lines = Column::new().spacing(4.0);
-        for line in permission_can_lines(&delta.added) {
-            lines = lines.push(consent_can_row(&line));
-        }
-        col = col.push(lines);
-        col = col.push(
-            row![
-                iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("package-keep-current-version")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::DismissUpdate),
-                button(text(crate::i18n::t!("package-grant-update")).size(12.0))
-                    .style(button_style::primary)
-                    .on_press(Message::GrantUpdate),
-            ]
-            .spacing(8.0)
-            .align_y(Vertical::Center),
-        );
-        container(col)
-            .padding(14.0)
-            .width(Length::Fill)
-            .style(common::card_style)
-            .into()
-    }
-
     // ---- Shared-with-me ----------------------------------------------------
 
     pub(super) fn view_shared(&self) -> Elem<'_> {
@@ -6641,7 +8970,7 @@ fn rating_spans<'a>(
 /// A 1–5 star rating control emitting `make_msg(stars)` on press. Rating is an account-only write,
 /// so callers gate this on `signed_in()`. Shared by the Discover detail and the installed-package
 /// pane. The star glyphs take the terminal palette's "out" (output) color, matching outgoing text.
-fn star_rate_row<'a>(make_msg: fn(i16) -> Message) -> Elem<'a> {
+pub(super) fn star_rate_row<'a>(make_msg: fn(i16) -> Message) -> Elem<'a> {
     let star_color = crate::prefs::current().palette.output;
     let mut rate = row![
         text(crate::i18n::t!("package-rate"))
@@ -6667,7 +8996,11 @@ fn star_rate_row<'a>(make_msg: fn(i16) -> Message) -> Elem<'a> {
 /// (output) palette color while the average/count keep the default metric color. Using `rich_text`
 /// spans keeps it a single text run (one baseline, wraps as a unit) rather than separate widgets.
 /// Falls back to a plain `unrated` value when the package has no ratings yet.
-fn rating_metric<'a>(avg_rating: Option<f64>, rating_count: i64, star_color: Color) -> Elem<'a> {
+pub(super) fn rating_metric<'a>(
+    avg_rating: Option<f64>,
+    rating_count: i64,
+    star_color: Color,
+) -> Elem<'a> {
     let value_font = Font {
         weight: iced::font::Weight::Light,
         ..fonts::GEIST_VF
@@ -6686,7 +9019,7 @@ fn rating_metric<'a>(avg_rating: Option<f64>, rating_count: i64, star_color: Col
     .into()
 }
 
-fn metric<'a>(label: &str, value: &str) -> Elem<'a> {
+pub(super) fn metric<'a>(label: &str, value: &str) -> Elem<'a> {
     column![
         text(value.to_string()).size(20.0).font(Font {
             weight: iced::font::Weight::Light,
@@ -6709,7 +9042,7 @@ fn code_block<'a>(content: &str) -> Elem<'a> {
 
 /// A bounded publish console using the user's actual terminal font and palette. Diagnostics can be
 /// arbitrarily long, so both axes scroll inside this surface instead of pushing the pane around.
-fn publish_output_panel<'a>(output: &str) -> Elem<'a> {
+pub(super) fn publish_output_panel<'a>(output: &str) -> Elem<'a> {
     let prefs = crate::prefs::current();
     let background = prefs.palette.background;
     let foreground = prefs.palette.foreground;
@@ -6765,7 +9098,7 @@ fn consent_cannot_row<'a>(line: &str) -> Elem<'a> {
     .into()
 }
 
-fn file_row<'a>(label: &str, selected: bool, msg: Message) -> Elem<'a> {
+pub(super) fn file_row<'a>(label: &str, selected: bool, msg: Message) -> Elem<'a> {
     button(
         row![
             text(crate::assets::bootstrap_icons::FONTS)
@@ -6789,27 +9122,24 @@ fn file_row<'a>(label: &str, selected: bool, msg: Message) -> Elem<'a> {
     .into()
 }
 
-/// One tab button for the installed-package "README & source" area. Active uses the selected
-/// list-item fill; inactive is quiet — mirroring the manifest editor's tab strip.
-fn installed_file_tab_button<'a>(
-    active: InstalledFileTab,
-    tab: InstalledFileTab,
+pub(super) fn installed_package_tab_button<'a>(
+    active: InstalledPackageTab,
+    tab: InstalledPackageTab,
     label: &str,
 ) -> Elem<'a> {
-    button(text(label.to_string()).size(13.0))
-        .style(if active == tab {
-            button_style::list_item_selected
-        } else {
-            button_style::list_item
-        })
-        .on_press(Message::SelectInstalledFileTab(tab))
-        .padding(Padding {
-            top: 6.0,
-            bottom: 6.0,
-            left: 12.0,
-            right: 12.0,
-        })
-        .into()
+    common::tab(
+        label,
+        active == tab,
+        Message::SelectInstalledPackageTab(tab),
+    )
+}
+
+pub(super) fn local_package_tab_button<'a>(
+    active: LocalPackageTab,
+    tab: LocalPackageTab,
+    label: impl Into<String>,
+) -> Elem<'a> {
+    common::tab(label, active == tab, Message::SelectLocalPackageTab(tab))
 }
 
 /// The cached body for a fork-copied module, when the content-addressed store
@@ -6868,7 +9198,9 @@ mod tests {
             published_at: "2026-08-10T00:00:00Z".parse().unwrap(),
         };
 
+        let current = window.share_seq;
         let _ = window.owned_share_loaded(
+            current,
             "demo",
             Ok((Uuid::new_v4(), true, vec![], vec![], vec![version.clone()])),
         );
@@ -6878,6 +9210,7 @@ mod tests {
         window.selection = Selection::OwnedPackage("other".to_string());
         window.share_busy = true;
         let _ = window.owned_share_loaded(
+            current,
             "demo",
             Ok((Uuid::new_v4(), false, vec![], vec![], Vec::new())),
         );
@@ -6886,33 +9219,33 @@ mod tests {
             "a stale result must not finish the current load"
         );
         assert_eq!(window.share_versions, vec![version]);
+
+        window.selection = Selection::OwnedPackage("demo".to_string());
+        window.share_seq.bump();
+        window.share_busy = true;
+        let _ = window.owned_share_loaded(
+            current,
+            "demo",
+            Ok((Uuid::new_v4(), false, vec![], vec![], Vec::new())),
+        );
+        assert!(window.share_busy, "an older same-package load stays fenced");
+        assert_eq!(window.share_versions.len(), 1);
     }
 
-    #[test]
-    fn fork_mirrors_source_enabled_state() {
-        // Source disabled: the fork is an inspect-only copy.
-        assert_eq!(fork_activation(false, false), ForkActivation::Inactive);
-        assert_eq!(fork_activation(false, true), ForkActivation::Inactive);
-        // Source enabled, distinct slot (foreign fork or renamed self-fork): hand the name over.
-        assert_eq!(fork_activation(true, false), ForkActivation::TookOver);
-        // Source enabled, self-fork keeping the leaf name: share the slot, just enable it. This is
-        // the regression guard — the old path disabled the shared entry and left it disabled.
-        assert_eq!(fork_activation(true, true), ForkActivation::Mirrored);
-    }
-
-    /// The source-browser classifier is an audit-safety guard, so pin its decisions: plain UTF-8 is
-    /// text, NUL or invalid UTF-8 is binary (never decoded into the view), and the size cap is
-    /// enforced on the *actual* bytes regardless of any declared size.
     #[test]
     fn classify_source_text_vs_binary_vs_oversize() {
         assert!(matches!(
             classify_source(b"export const x = 1;\n".to_vec()),
             FilePreview::Text { bidi: false, .. }
         ));
-        // A NUL byte → binary, even though the rest is valid UTF-8.
+        let nul = classify_source(b"valid text\0then nul".to_vec());
         assert!(matches!(
-            classify_source(b"valid text\0then nul".to_vec()),
-            FilePreview::Binary { .. }
+            nul,
+            FilePreview::Text {
+                nul: true,
+                ref source,
+                ..
+            } if source == "valid text␀then nul"
         ));
         // Invalid UTF-8 (lone continuation byte) → binary, never lossy-decoded.
         assert!(matches!(
@@ -6963,15 +9296,334 @@ mod tests {
     fn fork_bodies_come_from_the_cache_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::with_root(dir.path().join("cache").join("packages"));
+        const HASH: &str = "2bf28849cade87113ec4170ef2bf9ffb1179fc9a276afa675c9de2424349560b";
         cache
-            .write_blob_bytes("cafe01", b"export const x = 1;")
+            .write_blob_bytes(HASH, b"export const x = 1;")
             .unwrap();
         assert_eq!(
-            cached_fork_body(Some(&cache), "cafe01").as_deref(),
+            cached_fork_body(Some(&cache), HASH).as_deref(),
             Some(b"export const x = 1;".as_slice())
         );
         // A miss — and an unavailable cache — both defer to the network fetch.
         assert!(cached_fork_body(Some(&cache), "feed02").is_none());
-        assert!(cached_fork_body(None, "cafe01").is_none());
+        assert!(cached_fork_body(None, HASH).is_none());
+    }
+
+    #[test]
+    fn authoritative_local_shadow_closes_only_a_clean_remote_pane() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "package-shadow-pane-test".to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let remote = LockedPackage::new("smudgy://publisher/tools", UpdateMode::Auto);
+        window.pane = Pane::InstalledPackage;
+        window.selection = Selection::InstalledPackage(remote.specifier.clone());
+        window.installed_open = Some(Box::new(remote.clone()));
+        window.local_packages = vec!["tools".to_string()];
+
+        assert!(window.close_newly_shadowed_installed_pane());
+        assert!(matches!(window.pane, Pane::Dashboard));
+        assert!(window.installed_open.is_none());
+
+        window.pane = Pane::InstalledPackage;
+        window.selection = Selection::InstalledPackage(remote.specifier.clone());
+        window.installed_open = Some(Box::new(remote));
+        window.dirty = true;
+        assert!(!window.close_newly_shadowed_installed_pane());
+        assert!(matches!(window.pane, Pane::InstalledPackage));
+        assert!(window.installed_open.is_some());
+    }
+
+    #[test]
+    fn account_change_releases_a_manifest_consent_package_gate() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "manifest-account-change-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("publisher"),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let permit = window
+            .cloud
+            .package_operations
+            .try_acquire("manifest-account-change-test", "tools")
+            .unwrap();
+        window.manifest_operation = Some(permit);
+        assert!(
+            window
+                .cloud
+                .package_operations
+                .is_busy("manifest-account-change-test", "tools")
+        );
+
+        let _ = window.account_changed();
+
+        assert!(window.manifest_operation.is_none());
+        assert!(
+            !window
+                .cloud
+                .package_operations
+                .is_busy("manifest-account-change-test", "tools")
+        );
+    }
+
+    #[test]
+    fn stale_sharing_completion_schedules_refresh_for_the_current_account() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "sharing-account-refresh-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("publisher"),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.selection = Selection::OwnedPackage("tools".to_string());
+        let current_generation = window.cloud.credentials.generation();
+        let permit = window
+            .cloud
+            .package_operations
+            .try_acquire("sharing-account-refresh-test", "finished-operation")
+            .unwrap();
+        let old_operation_id = permit.id();
+        drop(permit);
+
+        let Err(update) = window.accept_sharing_completion(
+            "sharing-account-refresh-test",
+            "tools",
+            window.share_seq,
+            Uuid::new_v4(),
+            old_operation_id,
+            current_generation.wrapping_sub(1),
+        ) else {
+            panic!("an operation not owned by this view must be stale");
+        };
+
+        assert_eq!(update.task.units(), 1);
+        assert!(
+            window.share_busy,
+            "the replacement account refresh owns busy state"
+        );
+    }
+
+    fn test_window(server_name: &str) -> AutomationsWindow {
+        AutomationsWindow::new(
+            iced::window::Id::unique(),
+            server_name.to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        )
+    }
+
+    fn resolution_for(
+        specifier: &str,
+        version: &str,
+        permissions: PackagePermissions,
+    ) -> InstallResolution {
+        let (owner, name) = parse_specifier(specifier).unwrap();
+        InstallResolution {
+            specifier: specifier.to_string(),
+            owner,
+            name,
+            version: version.to_string(),
+            permissions,
+            params: Vec::new(),
+            closure: Vec::new(),
+            required_roots: Vec::new(),
+            conflict: None,
+            needs_smudgy: None,
+            required_unavailable: None,
+            expected_lock: SharedPackageLock::default(),
+            expected_local_manifests: HashMap::new(),
+        }
+    }
+
+    fn manifest_prompt(name: &str, fence: AccountReadFence) -> ConsentPrompt {
+        let manifest: PackageManifest = serde_json::from_str(r#"{"version":"0.1.0"}"#).unwrap();
+        ConsentPrompt {
+            account_fence: fence,
+            specifier: format!("smudgy://{}/{name}", local_packages::LOCAL_OWNER),
+            owner: local_packages::LOCAL_OWNER.to_string(),
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            permissions: PackagePermissions::default(),
+            params: Vec::new(),
+            closure: Vec::new(),
+            required_roots: Vec::new(),
+            conflict: None,
+            needs_smudgy: None,
+            required_unavailable: None,
+            expected_lock: SharedPackageLock::default(),
+            expected_local_manifests: HashMap::new(),
+            operation: ConsentOperation::LocalManifest {
+                name: name.to_string(),
+                manifest: Box::new(manifest),
+                json: String::new(),
+                expected_manifest: String::new(),
+                activation: ProfileActivation::All,
+            },
+            error: None,
+        }
+    }
+
+    /// A resolved pin/update whose closure asks for more than the consented baseline leaves an
+    /// update review card targeted at the open installed package, and the installed pane renders
+    /// that card (the pane used to drop it on the floor).
+    #[test]
+    fn resolved_version_change_with_delta_prompts_for_the_open_package_and_renders() {
+        let mut window = test_window("version-change-consent-test");
+        let specifier = "smudgy://publisher/tools";
+        let mut open = LockedPackage::new(specifier, UpdateMode::Auto);
+        open.consented_permissions = Some(PackagePermissions::default());
+        window.pane = Pane::InstalledPackage;
+        window.selection = Selection::InstalledPackage(specifier.to_string());
+        window.installed_open = Some(Box::new(open.clone()));
+        window.installed_readme = InstalledReadmeState::Loaded(None);
+        window.manage_busy = true;
+        let mode = UpdateMode::Pinned {
+            version: "2.0.0".to_string(),
+        };
+        let fence = window.account_read_fence();
+        let seq = window.detail_seq;
+        let permissions = PackagePermissions {
+            net: vec!["api.example.org".to_string()],
+            ..PackagePermissions::default()
+        };
+
+        let _ = window.installed_version_change_resolved(
+            seq,
+            fence,
+            mode.clone(),
+            Ok(resolution_for(specifier, "2.0.0", permissions.clone())),
+        );
+
+        assert!(!window.manage_busy);
+        let prompt = window
+            .consent_prompt_for_open_installed()
+            .expect("the resolved version change must leave a review card for the open package");
+        assert_eq!(prompt.specifier, specifier);
+        assert_eq!(prompt.version, "2.0.0");
+        assert_eq!(prompt.permissions, permissions);
+        assert!(matches!(
+            &prompt.operation,
+            ConsentOperation::Update { mode: requested, .. } if *requested == mode
+        ));
+        // The installed pane renders the card in place of the tab body.
+        drop(window.view_installed_package());
+
+        // The card belongs to exactly one package: another open package never claims it.
+        window.installed_open = Some(Box::new(LockedPackage::new(
+            "smudgy://publisher/other",
+            UpdateMode::Auto,
+        )));
+        assert!(window.consent_prompt.is_some());
+        assert!(window.consent_prompt_for_open_installed().is_none());
+        drop(window.view_installed_package());
+        window.installed_open = Some(Box::new(open));
+
+        // Cancel abandons the review and re-opens the package from the committed lock. This test
+        // server has no lock row for it, so that reload closes the pane rather than leaving a
+        // fenced, never-completing detail load behind.
+        let _ = window.consent_cancel();
+        assert!(window.consent_prompt.is_none());
+        assert!(matches!(window.pane, Pane::Dashboard));
+    }
+
+    /// Granting a delta card keeps the package's update policy: a pinned install re-pins to the
+    /// version the card was built from instead of silently switching to "follow latest".
+    #[test]
+    fn grant_update_on_a_pinned_package_requests_the_pinned_version() {
+        let specifier = "smudgy://publisher/tools";
+        let delta = UpdateDelta {
+            specifier: specifier.to_string(),
+            name: "tools".to_string(),
+            version: "1.4.0".to_string(),
+            current_version: Some("1.4.0".to_string()),
+            added: PackagePermissions::default(),
+            needs_smudgy: None,
+            requirements_changed: true,
+        };
+        let pinned = LockedPackage::new(
+            specifier,
+            UpdateMode::Pinned {
+                version: "1.4.0".to_string(),
+            },
+        );
+        assert_eq!(
+            update_grant_mode(&pinned, &delta),
+            UpdateMode::Pinned {
+                version: "1.4.0".to_string()
+            }
+        );
+        let auto = LockedPackage::new(specifier, UpdateMode::Auto);
+        assert_eq!(update_grant_mode(&auto, &delta), UpdateMode::Auto);
+    }
+
+    /// Cancelling a manifest requirements review releases the package-operation gate it held, so
+    /// the manifest editor's Save is usable again.
+    #[test]
+    fn consent_cancel_releases_the_manifest_operation() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "consent-cancel-manifest-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("publisher"),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let permit = window
+            .cloud
+            .package_operations
+            .try_acquire("consent-cancel-manifest-test", "tools")
+            .unwrap();
+        window.manifest_operation = Some(permit);
+        window.consent_prompt = Some(manifest_prompt("tools", window.account_read_fence()));
+        assert!(
+            window
+                .cloud
+                .package_operations
+                .is_busy("consent-cancel-manifest-test", "tools")
+        );
+
+        let _ = window.consent_cancel();
+
+        assert!(window.consent_prompt.is_none());
+        assert!(window.manifest_operation.is_none());
+        assert!(
+            !window
+                .cloud
+                .package_operations
+                .is_busy("consent-cancel-manifest-test", "tools")
+        );
+    }
+
+    #[test]
+    fn ui_audit_parameter_state_change_preserves_draft_and_disables_stale_authority() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "parameter-cas-ui-test".to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let expected = LockedPackage::new("smudgy://publisher/tools", UpdateMode::Auto);
+        window.param_config = Some(ParamConfig {
+            specifier: expected.specifier.clone(),
+            expected_package: Some(expected.clone()),
+            parameter_scope: ParameterScope::Global,
+            profile_name: "main".to_string(),
+            available: true,
+            params: Vec::new(),
+            values: HashMap::new(),
+            secret_stored: HashSet::new(),
+            touched: HashSet::from(["token".to_string()]),
+            error: None,
+            saved: false,
+        });
+
+        let update = window.fail_config_parameter_state_changed();
+
+        let config = window.param_config.as_ref().unwrap();
+        assert!(!config.available);
+        assert_eq!(config.expected_package.as_ref(), Some(&expected));
+        assert!(config.touched.contains("token"));
+        assert!(config.error.is_some());
+        assert_eq!(update.task.units(), 2);
+        assert!(matches!(update.event, Some(Event::ScriptsChanged { .. })));
     }
 }

@@ -1544,6 +1544,7 @@ impl Runtime {
             let script_engine = ScriptEngine::new(ScriptEngineParams {
                 session_id,
                 server_name: &local_server_name,
+                profile_name: &local_profile_name,
                 ui_tx: local_ui_tx.clone(),
                 ui_command_producer: ui_command_producer.clone(),
                 spawned_actions: spawned_actions.clone(),
@@ -1883,6 +1884,7 @@ impl Runtime {
                 let new_script_engine = ScriptEngine::new(ScriptEngineParams {
                     session_id,
                     server_name: &local_server_name,
+                    profile_name: &local_profile_name,
                     ui_tx: local_ui_tx.clone(),
                     ui_command_producer: ui_command_producer.clone(),
                     spawned_actions: spawned_actions.clone(),

@@ -1,5 +1,4 @@
 use crate::get_smudgy_home;
-use crate::models::packages::PackageTree;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fs, io, path::PathBuf};
@@ -251,20 +250,6 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
 }
 
 impl TriggerDefinition {
-    /// Checks if the trigger is effectively enabled.
-    #[must_use]
-    pub fn is_effectively_enabled(&self, package_tree: &PackageTree) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        match &self.package {
-            None => true,
-            Some(path_str) => {
-                super::packages::is_package_effectively_enabled(path_str, package_tree)
-            }
-        }
-    }
-
     /// Attempts to retrieve the script content and its language.
     ///
     /// # Errors
