@@ -144,11 +144,27 @@ pub struct ResolvedPackageWire {
     pub dependencies: Vec<ResolvedDependency>,
 }
 
-/// One locked `smudgy://` dependency carried on a [`ResolvedPackageWire`]: the dep's
-/// owner nickname, name, declared `range`, and the concrete version this package
-/// locked. The runtime selects each importer's dependency version from its own map
-/// (referrer-aware resolution); the `range` lets it honor an author exact-version pin
-/// (`@=x`, exempt from upgrade-collapse) and show declared intent.
+/// The relationship represented by a [`ResolvedDependency`].
+///
+/// An omitted kind is an old-server dependency edge and defaults to
+/// [`Dependency`](Self::Dependency). Unknown future values fail to deserialize instead of
+/// being treated as executable imports: that is the safe failure mode for a relation whose
+/// runtime semantics are not known to this client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DependencyKind {
+    /// Import this package's code into the dependent package's isolate.
+    #[default]
+    Dependency,
+    /// Install and run this package as its own top-level root; consume it through interop.
+    Requires,
+}
+
+/// One locked `smudgy://` relationship carried on a [`ResolvedPackageWire`]: the target's
+/// owner nickname, name, declared `range`, concrete locked version, and relation kind.
+/// Only [`DependencyKind::Dependency`] participates in the importing package's module,
+/// permission, and version-solver closure. A [`DependencyKind::Requires`] edge instead names
+/// a separately installed and executed root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDependency {
     pub owner_nickname: String,
@@ -156,6 +172,10 @@ pub struct ResolvedDependency {
     #[serde(default)]
     pub range: String,
     pub resolved_version: String,
+    /// Missing on older servers and cache records, where every returned edge was a code
+    /// dependency. Defaults accordingly.
+    #[serde(default)]
+    pub kind: DependencyKind,
 }
 
 /// One module within a [`ResolvedPackageWire`].
@@ -674,6 +694,42 @@ impl PackageApiClient {
         dependencies: &[PublishDependency],
         readme: Option<&str>,
     ) -> CloudResult<PublishedVersionView> {
+        self.publish_version_checked(
+            package_id,
+            version,
+            manifest,
+            modules,
+            dependencies,
+            readme,
+            || Ok(()),
+        )
+        .await
+    }
+
+    /// Publishes an immutable version and runs `pre_finalize` after every requested blob upload,
+    /// immediately before the irreversible finalize request. A caller that builds the payload from
+    /// mutable local state can use this hook to prove that state still matches its snapshot.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::publish_version`], or the error returned by
+    /// `pre_finalize`. Uploaded content-addressed blobs can remain unreferenced when that check
+    /// fails; no package version has been committed at that point.
+    // This mirrors `publish_version`'s wire fields and adds exactly one lifecycle hook. Bundling
+    // the established public arguments into a second request type would make the two APIs drift.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_version_checked<F>(
+        &self,
+        package_id: Uuid,
+        version: &str,
+        manifest: &Value,
+        modules: &[PublishModule],
+        dependencies: &[PublishDependency],
+        readme: Option<&str>,
+        pre_finalize: F,
+    ) -> CloudResult<PublishedVersionView>
+    where
+        F: FnOnce() -> CloudResult<()>,
+    {
         // Hash each body once; build the metadata wire list + a content_hash -> bytes lookup.
         let mut by_hash: HashMap<String, &[u8]> = HashMap::new();
         let metas: Vec<PublishModuleMeta> = modules
@@ -719,6 +775,7 @@ impl PackageApiClient {
         }
 
         // 3. finalize — confirm the uploads + commit.
+        pre_finalize()?;
         self.post(
             &format!("/packages/{package_id}/versions/finalize"),
             Some(&body),
@@ -1251,14 +1308,36 @@ mod tests {
             "manifest": { "name": "app", "version": "1.0.0" },
             "modules": [],
             "dependencies": [
-                { "owner_nickname": "wbk", "name": "util", "range": "^1.2", "resolved_version": "1.4.0" }
+                { "owner_nickname": "wbk", "name": "util", "range": "^1.2", "resolved_version": "1.4.0" },
+                { "owner_nickname": "wbk", "name": "events", "range": "^2", "resolved_version": "2.1.0", "kind": "requires" }
             ]
         });
         let resolved: ResolvedPackageWire = serde_json::from_value(json).unwrap();
-        assert_eq!(resolved.dependencies.len(), 1);
+        assert_eq!(resolved.dependencies.len(), 2);
         assert_eq!(resolved.dependencies[0].name, "util");
         assert_eq!(resolved.dependencies[0].range, "^1.2");
         assert_eq!(resolved.dependencies[0].resolved_version, "1.4.0");
+        assert_eq!(
+            resolved.dependencies[0].kind,
+            DependencyKind::Dependency,
+            "an old server's omitted kind is a code dependency"
+        );
+        assert_eq!(resolved.dependencies[1].kind, DependencyKind::Requires);
+    }
+
+    #[test]
+    fn resolved_dependency_rejects_unknown_relation_kinds() {
+        let unknown = serde_json::json!({
+            "owner_nickname": "wbk",
+            "name": "future",
+            "range": "*",
+            "resolved_version": "1.0.0",
+            "kind": "suggests"
+        });
+        assert!(
+            serde_json::from_value::<ResolvedDependency>(unknown).is_err(),
+            "a future relation must not silently become executable code"
+        );
     }
 
     #[test]

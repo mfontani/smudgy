@@ -220,14 +220,17 @@ impl ScriptModuleLoader {
         let Some(coords) = crate::package_resolver::parse_canonical(&referrer_url) else {
             return Ok(());
         };
-        let imported = spec.package_key();
-        // A package may always reference itself by its full specifier.
-        if imported == coords.key {
-            return Ok(());
-        }
+        let requested = spec.package_key();
         let Some(provider) = &self.package_provider else {
             return Ok(());
         };
+        let imported = provider.canonical_key(&requested);
+        // A package may always reference itself through any coordinate that the provider
+        // canonicalizes to its own identity (notably a copied local package's old published
+        // author coordinate).
+        if imported == coords.key {
+            return Ok(());
+        }
         let Some(pkg) = provider.get_cached(&coords.key, &coords.version) else {
             return Ok(());
         };
@@ -240,13 +243,13 @@ impl ScriptModuleLoader {
             .manifest
             .smudgy_dependencies()
             .iter()
-            .any(|dep| dep.key == imported)
+            .any(|dep| provider.canonical_key(&dep.key) == imported)
             || matches!(gate, DepGate::InteropConsume)
                 && pkg
                     .manifest
                     .smudgy_requires()
                     .iter()
-                    .any(|dep| dep.key == imported);
+                    .any(|dep| provider.canonical_key(&dep.key) == imported);
         if declared {
             return Ok(());
         }

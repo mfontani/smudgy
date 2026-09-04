@@ -187,6 +187,7 @@ impl AutomationsWindow {
                         // Scripts never warn (only installed packages do), but the match is
                         // exhaustive — count a warning as active (it's still enabled).
                         NodeStatus::Ok | NodeStatus::Warning => s.active += 1,
+                        NodeStatus::Neutral => {}
                         NodeStatus::Error => {
                             s.errors += 1;
                             if s.first_error.is_none() {

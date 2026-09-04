@@ -15,11 +15,12 @@ use crate::i18n::{t, ts};
 use crate::theme::Element;
 use crate::theme::builtins;
 
-use smudgy_core::models::server::{Server, ServerConfig};
+use smudgy_core::models::server::{ServerCas, ServerConfig};
 
 use super::{
-    Message, ServerCrudAction, ServerFormField, State, server_host_input_id, server_name_input_id,
-    server_port_input_id,
+    AppliedServerOperation, Message, ServerCrudAction, ServerFormField, ServerOperationAction,
+    ServerOperationCompletion, ServerOperationEnvelope, ServerOperationError, State,
+    next_server_operation_id, server_host_input_id, server_name_input_id, server_port_input_id,
 };
 
 /// The encoding dropdown's "no override" entry — UTF-8, i.e.
@@ -135,27 +136,42 @@ fn encoding_field(state: &State) -> Element<'_, Message> {
 
 // --- Server CRUD Async Wrappers ---
 
-pub(super) async fn create_server_async(
-    name: String,
-    config: ServerConfig,
-) -> Result<Server, String> {
-    smudgy_core::models::server::create_server(&name, config) // Pass name explicitly
-        .map_err(|e| e.to_string())
-}
-
-pub(super) async fn update_server_async(
-    name: String,
-    config: ServerConfig,
-) -> Result<Server, String> {
-    smudgy_core::models::server::update_server(&name, config).map_err(|e| e.to_string())
-}
-
-pub(super) async fn delete_server_async(name: String) -> Result<String, String> {
-    smudgy_core::models::server::delete_server(&name).map_err(|e| e.to_string())?;
-    // A deleted server's image-cache namespace goes with it (plan D10). Already off the
-    // UI thread here; blocking I/O is fine.
-    crate::images::on_server_deleted(&name);
-    Ok(name) // Return the name on success for state update
+pub(super) async fn execute_server_operation(
+    envelope: ServerOperationEnvelope,
+) -> ServerOperationCompletion {
+    let key = envelope.key();
+    let failed = |error: anyhow::Error| ServerOperationError::Failed(error.to_string());
+    let result = match envelope.action {
+        ServerOperationAction::Create {
+            target_name,
+            config,
+        } => smudgy_core::models::server::create_server(&target_name, config)
+            .map(AppliedServerOperation::Created)
+            .map_err(failed),
+        ServerOperationAction::Update { expected, config } => {
+            match smudgy_core::models::server::update_server_if_unchanged(&expected, config) {
+                Ok(ServerCas::Applied(server)) => Ok(AppliedServerOperation::Updated(server)),
+                Ok(ServerCas::StateChanged) => Err(ServerOperationError::StateChanged),
+                Err(error) => Err(failed(error)),
+            }
+        }
+        ServerOperationAction::Delete { expected } => {
+            match smudgy_core::models::server::delete_server_if_unchanged_and_then(
+                &expected,
+                || {
+                    // Memory is cleared first, aborting same-process fetches before the retired
+                    // name-keyed disk namespace is removed. The Core helper keeps the lifecycle lock
+                    // across this callback, so no same-name replacement can appear in between.
+                    crate::images::clear_server_image_cache(&expected.name);
+                },
+            ) {
+                Ok(ServerCas::Applied(())) => Ok(AppliedServerOperation::Deleted),
+                Ok(ServerCas::StateChanged) => Err(ServerOperationError::StateChanged),
+                Err(error) => Err(failed(error)),
+            }
+        }
+    };
+    ServerOperationCompletion { key, result }
 }
 
 /// `1234567` → `"1.2 MB"` — decimal units, one decimal, matching user expectations for
@@ -179,6 +195,10 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 
 /// Helper function to handle server form submission.
 pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
+    if state.pending_server_operation.is_some() {
+        warn!("Ignoring server-form submit because an operation is already pending");
+        return Task::none();
+    }
     state.server_crud_error = None; // Clear previous error
 
     match state.server_action.clone() {
@@ -211,9 +231,21 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                 state.server_crud_error = Some(t!("server-error-name-format"));
                 return Task::none();
             }
-            Task::perform(create_server_async(name, config), Message::ServerCreated)
+            let envelope = ServerOperationEnvelope {
+                id: next_server_operation_id(state),
+                action: ServerOperationAction::Create {
+                    target_name: name,
+                    config,
+                },
+                form_revision: state.server_form_revision,
+            };
+            state.pending_server_operation = Some(envelope.clone());
+            Task::perform(
+                execute_server_operation(envelope),
+                Message::ServerOperationFinished,
+            )
         }
-        Some(ServerCrudAction::Edit(original_name)) => {
+        Some(ServerCrudAction::Edit(expected)) => {
             let port = match state.server_form_data.port.trim().parse::<u16>() {
                 Ok(p) => p,
                 Err(_) => {
@@ -224,11 +256,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             // Carry everything the form doesn't edit (the link-trust grants)
             // forward from the existing config, so an address edit never
             // silently revokes them.
-            let mut config = state
-                .servers
-                .iter()
-                .find(|s| s.name == *original_name)
-                .map_or_else(|| ServerConfig::new(String::new(), 0), |s| s.config.clone());
+            let mut config = expected.config.clone();
             config.host = state.server_form_data.host.trim().to_string();
             config.port = port;
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
@@ -240,9 +268,15 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                 state.server_crud_error = Some(t!("server-error-config", "error" => e.to_string()));
                 return Task::none();
             }
+            let envelope = ServerOperationEnvelope {
+                id: next_server_operation_id(state),
+                action: ServerOperationAction::Update { expected, config },
+                form_revision: state.server_form_revision,
+            };
+            state.pending_server_operation = Some(envelope.clone());
             Task::perform(
-                update_server_async(original_name.clone(), config),
-                Message::ServerUpdated,
+                execute_server_operation(envelope),
+                Message::ServerOperationFinished,
             )
         }
         Some(ServerCrudAction::ConfirmDelete(_)) => {
@@ -378,10 +412,12 @@ pub(super) fn view_server_form<'a>(
             ]
             .spacing(4);
 
-            let save_button = button(text(t!("server-save-add-profile")))
+            let mut save_button = button(text(t!("server-save-add-profile")))
                 .style(builtins::button::primary)
-                .padding([8, 18])
-                .on_press(Message::SubmitServerForm);
+                .padding([8, 18]);
+            if state.pending_server_operation.is_none() {
+                save_button = save_button.on_press(Message::SubmitServerForm);
+            }
             let cancel_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
@@ -400,8 +436,9 @@ pub(super) fn view_server_form<'a>(
                 .spacing(15)
                 .into()
         }
-        ServerCrudAction::Edit(name) => {
+        ServerCrudAction::Edit(expected) => {
             // --- Edit Form — name is the key and stays read-only ---
+            let name = &expected.name;
             let name_field = column![
                 text(t!("server-name"))
                     .size(13)
@@ -436,17 +473,21 @@ pub(super) fn view_server_form<'a>(
             ]
             .spacing(4);
 
-            let save_button = button(text(t!("action-save")))
+            let mut save_button = button(text(t!("action-save")))
                 .style(builtins::button::primary)
-                .padding([8, 18])
-                .on_press(Message::SubmitServerForm);
+                .padding([8, 18]);
+            if state.pending_server_operation.is_none() {
+                save_button = save_button.on_press(Message::SubmitServerForm);
+            }
             let cancel_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::CancelServerForm);
-            let delete_button = button(text(t!("server-delete")))
-                .style(builtins::button::link)
-                .on_press(Message::RequestConfirmDeleteServer(name.clone()));
+            let mut delete_button = button(text(t!("server-delete"))).style(builtins::button::link);
+            if state.pending_server_operation.is_none() {
+                delete_button =
+                    delete_button.on_press(Message::RequestConfirmDeleteServer(name.clone()));
+            }
 
             // Per-server image cache management (beside the other whole-server action).
             let cache_usage = text(match state.image_cache_usage {
@@ -457,7 +498,7 @@ pub(super) fn view_server_form<'a>(
             .style(builtins::text::muted);
             let clear_cache_button = button(text(t!("server-clear-image-cache")))
                 .style(builtins::button::link)
-                .on_press(Message::RequestClearImageCache(name.clone()));
+                .on_press(Message::RequestClearImageCache(expected.clone()));
 
             Column::new()
                 .push(text(t!("server-edit")).size(Pixels(22.0)))
@@ -481,15 +522,19 @@ pub(super) fn view_server_form<'a>(
                 .spacing(15)
                 .into()
         }
-        ServerCrudAction::ConfirmDelete(name) => {
+        ServerCrudAction::ConfirmDelete(expected) => {
             // --- Delete Confirmation ---
+            let name = &expected.name;
             let confirmation_text =
                 text(t!("server-confirm-delete", "name" => name)).size(Pixels(16.0));
 
-            let confirm_delete_button = button(text(t!("server-confirm-delete-action")))
+            let mut confirm_delete_button = button(text(t!("server-confirm-delete-action")))
                 .style(builtins::button::secondary)
-                .padding([8, 18])
-                .on_press(Message::ConfirmDeleteServer(name.clone()));
+                .padding([8, 18]);
+            if state.pending_server_operation.is_none() {
+                confirm_delete_button =
+                    confirm_delete_button.on_press(Message::ConfirmDeleteServer);
+            }
             let cancel_delete_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])

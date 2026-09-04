@@ -11,6 +11,7 @@ use iced::{
     window,
 };
 use smudgy_cloud::{AreaId, Mapper};
+use smudgy_core::models::shared_packages::LockedPackage;
 use smudgy_core::session::SessionId;
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TabPosition, TitleBarPolicy,
@@ -149,6 +150,9 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Ask the daemon to close this main window. The daemon owns application-exit ordering so it
+    /// can run the singleton Automations window's terminal draft/durability guard first.
+    RequestCloseWindow,
     CreateNewScriptEditorWindow {
         server_name: Arc<String>,
         session_id: SessionId,
@@ -220,18 +224,18 @@ pub enum Event {
     PackageReloadScripts {
         server_name: String,
     },
-    /// The needs-permissions toast's Later: persist the dismissal of the
-    /// offered `version` so the offer stays quiet until a strictly newer one
-    /// appears.
+    /// The needs-permissions toast's Later: persist the dismissal of the offered `version` if its
+    /// source row is unchanged, so a stale visible offer cannot modify a replacement install.
     PackageUpdateDismissed {
         server_name: String,
+        expected: LockedPackage,
         specifier: String,
         version: String,
     },
-    /// Pin the package at `version` (its currently staged version) — the
-    /// terminal answer that ends update offers and delta scans for it.
+    /// Pin the package at `version` (its currently staged version) if its source row is unchanged.
     PackageUpdatePinned {
         server_name: String,
+        expected: LockedPackage,
         specifier: String,
         version: String,
     },
@@ -240,9 +244,8 @@ pub enum Event {
     OpenAutomationsForServer {
         server_name: String,
     },
-    /// The review modal's Grant & update: record the offer's union as the
-    /// consented grant, then stage the update (prefetch + lockfile advance)
-    /// and live-reload the server's sessions when it lands.
+    /// The review modal's Grant & update: prefetch, then atomically record the offer's union and
+    /// staged version if its source row is unchanged; live-reload when it lands.
     PackageUpdateGranted {
         offer: Box<components::toast::UpdateOffer>,
     },
@@ -2827,10 +2830,7 @@ impl SmudgyWindow {
                 toolbar::Message::ToggleMaximizePressed => {
                     Update::with_task(window::toggle_maximize(self.window_id))
                 }
-                toolbar::Message::ClosePressed => {
-                    // Cleanup happens in main.rs via window::close_events()
-                    Update::with_task(window::close(self.window_id))
-                }
+                toolbar::Message::ClosePressed => Update::with_event(Event::RequestCloseWindow),
                 toolbar::Message::AutomationsPressed => {
                     // Only allow automation actions when there's an active session
                     if let Some(active_id) = self.active_session_id {
@@ -2983,10 +2983,12 @@ impl SmudgyWindow {
                         }
                         modal::package_update::Event::Pin {
                             server_name,
+                            expected,
                             specifier,
                             version,
                         } => Update::with_event(Event::PackageUpdatePinned {
                             server_name,
+                            expected: *expected,
                             specifier,
                             version,
                         }),
@@ -3426,24 +3428,28 @@ impl SmudgyWindow {
                 }
                 toast::Message::PinCurrent {
                     server_name,
+                    expected,
                     specifier,
                     version,
                 } => {
                     self.toasts.advance();
                     Update::with_event(Event::PackageUpdatePinned {
                         server_name,
+                        expected,
                         specifier,
                         version,
                     })
                 }
                 toast::Message::Later {
                     server_name,
+                    expected,
                     specifier,
                     version,
                 } => {
                     self.toasts.advance();
                     Update::with_event(Event::PackageUpdateDismissed {
                         server_name,
+                        expected,
                         specifier,
                         version,
                     })

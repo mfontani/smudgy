@@ -1,5 +1,4 @@
 use crate::get_smudgy_home;
-use crate::models::packages::PackageTree;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
@@ -72,34 +71,6 @@ pub struct AliasDefinition {
 }
 
 impl AliasDefinition {
-    /// Checks if the alias is effectively enabled.
-    ///
-    /// An alias is effectively enabled if its own `enabled` flag is true AND
-    /// its package (if any) is effectively enabled according to the provided
-    /// `PackageTree`.
-    ///
-    /// # Arguments
-    ///
-    /// * `package_tree` - The loaded `PackageTree` for the server.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the alias should be considered active, `false` otherwise.
-    #[must_use]
-    pub fn is_effectively_enabled(&self, package_tree: &PackageTree) -> bool {
-        if !self.enabled {
-            return false; // Explicitly disabled
-        }
-
-        match &self.package {
-            None => true, // Enabled and in root package
-            Some(path_str) => {
-                // Enabled, check if package path is also enabled
-                super::packages::is_package_effectively_enabled(path_str, package_tree)
-            }
-        }
-    }
-
     /// Attempts to retrieve the script content and its language.
     ///
     /// Checks for inline script first. If none, looks for corresponding

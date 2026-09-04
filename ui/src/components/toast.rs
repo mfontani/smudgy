@@ -18,7 +18,7 @@ use iced::widget::{button, column, container, row, text};
 use iced::{Alignment, Length, Padding};
 
 use smudgy_core::models::package_updates::PackageVersionRef;
-use smudgy_core::models::shared_packages::PackagePermissions;
+use smudgy_core::models::shared_packages::{LockedPackage, PackagePermissions};
 
 use crate::theme::{self, Element, Theme};
 
@@ -30,6 +30,10 @@ use crate::theme::{self, Element, Theme};
 pub struct UpdateOffer {
     /// The server whose lockfile installs the package.
     pub server_name: String,
+    /// The complete lock row from which this offer was evaluated. Granting compares this snapshot
+    /// before it changes consent or stages content, so an old toast cannot modify a reinstalled or
+    /// concurrently edited package.
+    pub expected: LockedPackage,
     /// The lock entry's specifier (`smudgy://owner/name`).
     pub specifier: String,
     /// The package's display name (the specifier's name segment).
@@ -69,9 +73,8 @@ pub enum Toast {
         server_name: String,
         specifiers: Vec<String>,
     },
-    /// A granted update's staging failed: consent stays recorded, nothing else moved,
-    /// and the next check cycle retries — but the user acted, so the failure must be
-    /// visible, not a log line. Dismiss-only.
+    /// A granted update's prefetch or atomic lock commit failed. The lock row stays unchanged, but
+    /// the user acted, so the failure must be visible rather than only a log line. Dismiss-only.
     StageFailed { server_name: String, name: String },
 }
 
@@ -103,12 +106,14 @@ pub enum Message {
     /// answer that also ends the per-load delta scans.
     PinCurrent {
         server_name: String,
+        expected: LockedPackage,
         specifier: String,
         version: String,
     },
     /// Dismiss the offer until a strictly newer version appears (persisted).
     Later {
         server_name: String,
+        expected: LockedPackage,
         specifier: String,
         version: String,
     },
@@ -337,6 +342,7 @@ impl Toasts {
                         theme::builtins::button::secondary,
                         Message::PinCurrent {
                             server_name: offer.server_name.clone(),
+                            expected: offer.expected.clone(),
                             specifier: offer.specifier.clone(),
                             version: current.clone(),
                         },
@@ -348,6 +354,7 @@ impl Toasts {
                         theme::builtins::button::link,
                         Message::Later {
                             server_name: offer.server_name.clone(),
+                            expected: offer.expected.clone(),
                             specifier: offer.specifier.clone(),
                             version: offer.latest.clone(),
                         },
@@ -440,11 +447,14 @@ fn count_arg(count: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use smudgy_core::models::shared_packages::UpdateMode;
+
     use super::*;
 
     fn offer(server: &str, name: &str) -> Toast {
         Toast::NeedsPermissions(Box::new(UpdateOffer {
             server_name: server.to_string(),
+            expected: LockedPackage::new(format!("smudgy://wbk/{name}"), UpdateMode::Auto),
             specifier: format!("smudgy://wbk/{name}"),
             name: name.to_string(),
             current: Some("1.0.0".into()),

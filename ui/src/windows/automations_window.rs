@@ -9,7 +9,7 @@
 //! Uses the on-disk model (`aliases.json` / `triggers.json` / `hotkeys.json` /
 //! `packages.json`, `modules/`, `packages/`, `smudgy.lock.json`) and the cloud clients.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,17 +24,22 @@ use smudgy_cloud::package_api::{
     VersionListItem,
 };
 use smudgy_cloud::{CloudError, Uuid};
-use smudgy_core::models::local_packages::{LocalPackage, PublishSummary};
-use smudgy_core::models::modules::ModuleFile;
-use smudgy_core::models::packages::{self as core_packages, PackageTree};
+use smudgy_core::models::local_packages::{LocalPackage, PublicationWarning, PublishSummary};
+use smudgy_core::models::modules::{ModuleFile, ModuleSettings};
+use smudgy_core::models::packages::PackageTree;
+use smudgy_core::models::profile_activation::ProfileActivation;
 use smudgy_core::models::server;
-use smudgy_core::models::shared_packages::{LockedPackage, PackagePermissions, UpdateMode};
-use smudgy_core::models::{ScriptLang, aliases, hotkeys};
+use smudgy_core::models::shared_packages::{
+    LockedPackage, PackagePermissions, ParameterScope, SharedPackageLock, UpdateMode,
+};
+use smudgy_core::models::{ScriptLang, aliases, automation_transaction, hotkeys};
 use smudgy_core::session::SessionId;
 use smudgy_core::session::runtime::catalogue::{CatalogueEvent, CatalogueSnapshot};
 use smudgy_core::session::runtime::{AutomationEvent, AutomationKind};
 
-use crate::cloud_account::CloudHandles;
+use crate::cloud_account::{
+    CloudHandles, PackageOperationCompletion, PackageOperationId, PackageOperationPermit,
+};
 use crate::keymap::MaybePhysicalKey;
 use crate::theme::Element as ThemedElement;
 use crate::update::Update;
@@ -50,6 +55,7 @@ mod highlight;
 mod keyboard_control;
 mod manifest;
 pub(crate) mod model;
+mod package_tabs;
 mod packages;
 mod palette;
 mod param_values;
@@ -59,9 +65,11 @@ mod topbar;
 
 use manifest::{ManifestDraft, ManifestEdit, ManifestTab};
 use model::{LiveAutomations, PackageGraph, PatternKind, Script, ScriptKey};
+pub(crate) use packages::StaleInstallCheck;
 use packages::{
-    ConsentPrompt, DetailSeq, FilePreview, ForkActivation, InstallResolution, InstallSeq,
-    InstalledFileTab, ParamConfig, ParamPrompt, PublishOutput, StaleInstallCheck, UpdateDelta,
+    AccountReadFence, ConsentPrompt, DetailSeq, DiscoverSearchSeq, DiscoverSeq, FilePreview,
+    GraphSeq, InstallResolution, InstallSeq, PackageChangeFinalize, ParamConfig, ParamPrompt,
+    PreparedConsentCache, PublicationStatus, PublishOutput, ShareSeq, UpdateDelta,
 };
 
 /// Returns the traversal direction for an unconsumed, unmodified Tab press.
@@ -155,6 +163,32 @@ pub enum Event {
     UserAutomationsChanged { server_name: String },
     /// Modules or script packages changed and still require the existing full engine reload.
     ScriptsChanged { server_name: String },
+    /// Replace this singleton window's disk/session context after the user has accepted any
+    /// unsaved-changes guard. The daemon owns reconstruction so every pending task and subscription
+    /// from the old context can be fenced out together.
+    SwitchContext {
+        server_name: String,
+        session_id: SessionId,
+        profile_name: String,
+    },
+    /// The user chose Keep editing for this exact daemon-requested context switch.
+    ContextSwitchCancelled,
+    /// Close the native singleton after the window has accepted the unsaved-changes guard.
+    CloseRequested,
+    /// The user kept editing after an application-exit request was routed through this window.
+    /// The daemon uses this to release the main window that it kept alive for the confirmation.
+    CloseCancelled,
+}
+
+/// A daemon-requested navigation that a save or discard released without the user choosing
+/// either banner action. The daemon retains state for both targets while the guard is open, so
+/// each is answered with its cancel event; see [`AutomationsWindow::release_pending_navigation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedNavigation {
+    /// [`Message::RequestClose`] was pending.
+    Close,
+    /// [`Message::SwitchContext`] was pending.
+    ContextSwitch,
 }
 
 /// Create vs. edit, shared by the script and folder editors.
@@ -226,7 +260,7 @@ pub struct FolderState {
     pub mode: EditorMode,
     pub original_path: Option<String>,
     pub path: String,
-    pub enabled: bool,
+    pub activation: ProfileActivation,
     pub error: Option<String>,
 }
 
@@ -237,6 +271,13 @@ pub enum ModuleMode {
     Create,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModuleTab {
+    #[default]
+    Settings,
+    Source,
+}
+
 /// State for the module pane (a local, non-shareable helper file).
 #[derive(Debug, Clone)]
 pub struct ModuleState {
@@ -244,7 +285,47 @@ pub struct ModuleState {
     pub subpath: String,
     pub path: Option<PathBuf>,
     pub name: String,
+    pub tab: ModuleTab,
+    pub activation: ProfileActivation,
+    /// Create-mode activation follows the path-based default only until the user changes it.
+    pub activation_touched: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InstalledPackageTab {
+    #[default]
+    About,
+    Settings,
+    Source,
+    Permissions,
+}
+
+/// The installed package's README belongs to the exact resolved detail generation. Keeping
+/// loading and failure distinct from a successful response with no README prevents About from
+/// describing incomplete data as an authoritative absence.
+pub(super) enum InstalledReadmeState {
+    Loading,
+    Loaded(Option<markdown::Content>),
+    Failed(String),
+}
+
+impl InstalledReadmeState {
+    #[must_use]
+    pub(super) fn is_loaded(&self) -> bool {
+        matches!(self, Self::Loaded(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LocalPackageTab {
+    #[default]
+    About,
+    Settings,
+    Source,
+    Permissions,
+    Manifest,
+    Sharing,
 }
 
 /// Exactly one content pane shows at a time.
@@ -313,12 +394,27 @@ pub enum Selection {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Ask the singleton window to move to another live session. This is normal guarded navigation:
+    /// clean windows switch immediately, while dirty windows reuse the existing Keep editing /
+    /// Discard banner before emitting [`Event::SwitchContext`].
+    SwitchContext {
+        server_name: String,
+        session_id: SessionId,
+        profile_name: String,
+    },
     // ---- loading -----------------------------------------------------------
-    ScriptsLoaded(BTreeMap<String, Script>, Arc<Vec<String>>),
+    ScriptsLoaded {
+        scripts: BTreeMap<String, Script>,
+        load: Option<automation_transaction::AutomationStateSnapshot>,
+        errors: Arc<Vec<String>>,
+    },
     LoadFolders,
     LoadModules,
     LoadLocalPackages,
     LoadInstalledPackages,
+    /// The app-global signed-in identity changed. Invalidate authenticated pane data before any
+    /// result launched under the previous identity can repaint it.
+    AccountChanged,
 
     // ---- navigation / selection -------------------------------------------
     ShowDashboard,
@@ -471,11 +567,20 @@ pub enum Message {
     Save,
     Discard,
     Delete,
-    ConfirmDiscardNav,
-    CancelDiscardNav,
+    /// Confirm only the pending navigation revision that rendered this action.
+    ConfirmDiscardNavRevision(u64),
+    /// Cancel only the pending navigation revision that rendered this action.
+    CancelDiscardNavRevision(u64),
+    RequestClose,
+    /// A save or discard released a daemon-requested navigation. Delivered through a task so
+    /// the releasing update can still carry its own event.
+    NavigationReleased(ReleasedNavigation),
 
     // ---- folder ------------------------------------------------------------
     SetFolderPath(String),
+    EnableEverywhere,
+    DisableEverywhere,
+    ToggleActivationProfile(String),
     SaveFolder,
     RequestDeleteFolder,
     CancelDeleteFolder,
@@ -485,6 +590,7 @@ pub enum Message {
     SaveModule,
     SetNewModuleName(String),
     CreateModule,
+    SelectModuleTab(ModuleTab),
 
     // ---- owned (local) package --------------------------------------------
     SelectOwnedFile(String),
@@ -498,7 +604,12 @@ pub enum Message {
     RevertManifest,
     PublishOwned,
     PublishFinished {
+        server_name: String,
         name: String,
+        operation_id: PackageOperationId,
+        completion: PackageOperationCompletion,
+        credential_generation: u64,
+        publisher_id: Uuid,
         result: Result<PublishSummary, String>,
     },
     RequestDeleteOwned,
@@ -508,17 +619,53 @@ pub enum Message {
     CreatePackage,
     // owned sharing / versions
     SetVisibility(bool),
-    VisibilityUpdated(Result<bool, CloudError>),
+    VisibilityUpdated {
+        server_name: String,
+        name: String,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        completion: PackageOperationCompletion,
+        credential_generation: u64,
+        result: Result<bool, CloudError>,
+    },
     YankVersion {
         version: String,
         yanked: bool,
     },
     DeleteVersion(String),
-    VersionsUpdated(Result<Vec<VersionListItem>, CloudError>),
+    VersionsUpdated {
+        server_name: String,
+        name: String,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        completion: PackageOperationCompletion,
+        credential_generation: u64,
+        result: Result<Vec<VersionListItem>, CloudError>,
+    },
     ShareWithFriend(Uuid),
-    GrantsUpdated(Result<Vec<PackageGrantView>, CloudError>),
+    GrantsUpdated {
+        server_name: String,
+        name: String,
+        seq: ShareSeq,
+        package_id: Uuid,
+        operation_id: PackageOperationId,
+        completion: PackageOperationCompletion,
+        credential_generation: u64,
+        result: Result<Vec<PackageGrantView>, CloudError>,
+    },
+    /// A mutation launched by an older singleton instance completed. Refresh only when that same
+    /// package is open; never navigate the replacement window on its behalf.
+    RefreshOwnedShareIfOpen {
+        server_name: String,
+        name: String,
+    },
     #[allow(clippy::type_complexity)]
     OwnedShareLoaded {
+        account_epoch: u64,
+        account_fence: AccountReadFence,
+        seq: ShareSeq,
         name: String,
         result: Result<
             (
@@ -537,49 +684,78 @@ pub enum Message {
     /// stale result (the open package changed, navigation, uninstall, or a re-resolve) is discarded.
     InstalledDetailLoaded(
         DetailSeq,
+        AccountReadFence,
         Box<Result<packages::InstalledDetail, CloudError>>,
     ),
+    InstalledLatestCompared(
+        DetailSeq,
+        AccountReadFence,
+        Result<packages::InstalledLatestComparison, CloudError>,
+    ),
+    InstalledVersionChangeResolved(
+        DetailSeq,
+        AccountReadFence,
+        UpdateMode,
+        Result<InstallResolution, CloudError>,
+    ),
+    LocalManifestRequirementsResolved {
+        seq: InstallSeq,
+        account_fence: AccountReadFence,
+        completion: PackageOperationCompletion,
+        result: Result<ConsentPrompt, String>,
+    },
     InstalledResolvedForGraph(
+        GraphSeq,
+        AccountReadFence,
         String,
+        Option<String>,
         Result<(ResolvedPackageWire, PackagePermissions), CloudError>,
     ),
     SetInstalledUpdateMode(UpdateMode),
-    TogglePackageEnabled(String),
-    /// Make `target_spec` the active member of a same-name group (enable it, disabling siblings).
-    SetActiveMember {
-        target_spec: String,
-        siblings: Vec<String>,
-    },
-    /// Enable/disable a lone (non-colliding) local package from the tree.
-    ToggleLocalEnabled(String),
+    /// Select a source file in the open installed package.
     SelectInstalledFile(String),
-    /// Switch the installed-package "README & source" area between its README and Source tabs.
-    SelectInstalledFileTab(InstalledFileTab),
+    SelectInstalledPackageTab(InstalledPackageTab),
+    SelectLocalPackageTab(LocalPackageTab),
+    SetParameterScope(ParameterScope),
+    ConfirmGlobalParameterSource,
+    CancelGlobalParameterSource,
+    SelectParameterProfile(String),
+    /// Open the dialog that copies the current profile's settings to another profile.
+    OpenCopySettings,
+    SelectCopySettingsDestination(String),
+    CancelCopySettings,
+    ConfirmCopySettings,
     /// A source-browser module body finished fetching for the open installed package, keyed by its
     /// `content_hash`. Content-addressed, so a late result just fills the cache and is matched to
     /// the selected file by hash — no staleness token needed.
     InstalledSourceLoaded {
         hash: String,
+        account_fence: AccountReadFence,
         result: Result<FilePreview, CloudError>,
     },
     RequestUninstall,
-    /// The apt-style removal plan finished for the requested uninstall: `breaks` are the installed
-    /// packages that `require` the open one (removed with it, forced); `orphans` are the
-    /// auto-installed required roots nothing else would need once it's gone (offered).
-    UninstallPlanComputed {
-        breaks: Vec<String>,
-        orphans: Vec<String>,
-    },
     /// "Keep them": keep the offered orphans (clears only the orphan set; forced breaks still go).
     UninstallKeepOrphans,
     CancelUninstall,
     ConfirmUninstall,
+    StartForkPackage,
+    SetForkName(String),
+    CancelForkPackage,
     ForkPackage,
-    ForkFinished(Result<(String, ForkActivation), String>),
-    /// An async cloud check of account-owned installs finished (`delete_owned`'s post-delete
-    /// check, or the installed-list sweep): stale entries were pruned, a parked entry was
-    /// restored, or nothing changed.
-    StaleAccountInstallsChecked(StaleInstallCheck),
+    ForkFinished {
+        source_specifier: String,
+        destination_name: String,
+        operation_id: PackageOperationId,
+        completion: PackageOperationCompletion,
+        origin: Selection,
+        origin_revision: u64,
+        result: Result<String, String>,
+    },
+    /// An async installed-list sweep of account-owned legacy rows finished: stale entries were
+    /// pruned, or no still-current row needed a change.
+    StaleAccountInstallsChecked {
+        outcome: StaleInstallCheck,
+    },
     RevealPackageFolder,
     StartRenameOwned,
     RenameOwnedChanged(String),
@@ -598,7 +774,12 @@ pub enum Message {
     // rating (a cloud package the user has installed): set the caller's 1–5 star rating, and the
     // fresh `PackageDetail` (rating average/count) the server returns for it.
     RateInstalledPackage(i16),
-    InstalledRatingUpdated(Result<PackageDetail, CloudError>),
+    InstalledRatingUpdated {
+        detail_seq: DetailSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
+        result: Result<PackageDetail, CloudError>,
+    },
 
     // ---- discover ----------------------------------------------------------
     OpenDiscover,
@@ -608,7 +789,10 @@ pub enum Message {
     DiscoverQueryChanged(String),
     DiscoverSearch,
     DiscoverScopeChanged(DiscoverScope),
-    DiscoverResultsLoaded(Result<Vec<PackageSearchResult>, CloudError>),
+    DiscoverResultsLoaded(
+        DiscoverSearchSeq,
+        Result<Vec<PackageSearchResult>, CloudError>,
+    ),
     DiscoverSelect {
         package_id: Uuid,
         owner: String,
@@ -619,23 +803,55 @@ pub enum Message {
         owner: String,
         name: String,
     },
-    DiscoverDetailLoaded(Result<PackageDetail, CloudError>),
-    DiscoverCommentsLoaded(Result<Vec<CommentView>, CloudError>),
+    DiscoverDetailLoaded {
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
+        result: Result<PackageDetail, CloudError>,
+    },
+    DiscoverCommentsLoaded {
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
+        result: Result<Vec<CommentView>, CloudError>,
+    },
     DiscoverBack,
     RatePackage(i16),
-    RatingUpdated(Result<PackageDetail, CloudError>),
+    RatingUpdated {
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
+        result: Result<PackageDetail, CloudError>,
+    },
     CommentInputChanged(String),
     AddComment,
-    CommentAdded(Result<CommentView, CloudError>),
+    CommentAdded {
+        seq: DiscoverSeq,
+        package_id: Uuid,
+        account_fence: AccountReadFence,
+        result: Result<CommentView, CloudError>,
+    },
     OpenReadmeLink(markdown::Uri),
     DiscoverInstall,
     /// The [`InstallSeq`] is the install generation captured at `begin_install`; a stale result
     /// (the user navigated away / clicked Back / started another install) is discarded.
-    InstallResolved(InstallSeq, Result<InstallResolution, CloudError>),
+    InstallResolved(
+        InstallSeq,
+        AccountReadFence,
+        Result<InstallResolution, CloudError>,
+    ),
     // install-time consent confirmation; `enable` = "Install & enable" vs "Install, don't
     // enable" (both record the same consent — they differ only in turning the package on now).
     ConsentGrant {
         enable: bool,
+    },
+    /// Hash-verified cache preparation completed for the consent prompt at `seq`. The lockfile is
+    /// still unchanged; a stale result is discarded.
+    ConsentCachePrepared {
+        seq: InstallSeq,
+        account_fence: AccountReadFence,
+        enable: bool,
+        result: Result<PreparedConsentCache, String>,
     },
     ConsentCancel,
     // One edit to a parameter's value, routed by `ParamTarget` to the install-time prompt or the
@@ -655,11 +871,19 @@ pub enum Message {
 
     // ---- private & shared --------------------------------------------------
     OpenShared,
-    SharedLoaded(Result<Vec<PackageDetail>, CloudError>),
+    SharedLoaded {
+        account_epoch: u64,
+        account_fence: AccountReadFence,
+        result: Result<Vec<PackageDetail>, CloudError>,
+    },
     /// The caller's own cloud packages (`GET /packages/mine`), shown alongside the
     /// shared-with-me list in the "Private & Shared" pane — including private ones with
     /// no local copy on this machine, which appear in no other surface.
-    MyCloudLoaded(Result<Vec<PackageDetail>, CloudError>),
+    MyCloudLoaded {
+        account_epoch: u64,
+        account_fence: AccountReadFence,
+        result: Result<Vec<PackageDetail>, CloudError>,
+    },
     InstallShared {
         owner: String,
         name: String,
@@ -701,12 +925,32 @@ pub enum Message {
     ToggleStoreNode(String),
 }
 
-/// The Automations window. One per (server, session) the user opens it for.
+/// The app-wide singleton Automations window, bound to one disk/session context at a time.
 pub struct AutomationsWindow {
     window_id: window::Id,
     pub(super) server_name: String,
     pub(super) cloud: CloudHandles,
     pub(super) session_id: SessionId,
+    pub(super) profile_name: String,
+    /// Cleared by the daemon before this bound session leaves the UI store. Omitting the runtime
+    /// subscriptions on the next subscription rebuild cancels a pre-registration polling loop as
+    /// well as any live broadcast receivers; the remaining window continues as an offline editor.
+    session_binding_live: bool,
+    pub(super) profile_names: Vec<String>,
+    /// False when the profile directory could not be read as one complete inventory. Per-profile
+    /// edits stay disabled in that state so a partial list cannot erase hidden profile keys.
+    pub(super) profile_inventory_complete: bool,
+    /// Display captions keyed by the stable profile directory name. Activation persists the key
+    /// but labels the checklist with the user-facing caption.
+    pub(super) profile_captions: HashMap<String, String>,
+    pub(super) parameter_profile: String,
+    /// Window-local fence for authenticated reads, including nickname changes that retain the
+    /// same session credential.
+    pub(super) account_epoch: u64,
+    /// Profile→Global needs an explicit source when stored profile values differ.
+    pub(super) confirm_global_parameter_source: bool,
+    /// The open copy-settings dialog, if any. Cleared with the rest of the parameter editor.
+    pub(super) copy_settings_prompt: Option<packages::CopySettingsPrompt>,
     pub(super) mud_host: Option<String>,
     /// Whether advanced scripting features are unlocked (settings `advanced_scripting_features`):
     /// the "Remove sandbox" package action and the script inspector. Read at construction and
@@ -716,9 +960,26 @@ pub struct AutomationsWindow {
     // ---- script tree -------------------------------------------------------
     pub(super) scripts: BTreeMap<String, Script>,
     pub(super) packages: PackageTree,
+    /// Complete on-disk snapshot from which `scripts` and `packages` were built. Every editor save
+    /// compares this baseline before committing so trusted script mutations cannot be overwritten
+    /// by a stale open window.
+    pub(super) automation_snapshot: Option<automation_transaction::AutomationStateSnapshot>,
+    /// Present when `packages.json` could not be read as authoritative state. Keep the last good
+    /// tree for display, but do not permit activation writes against a fabricated default.
+    pub(super) folder_state_error: Option<String>,
     pub(super) modules: Vec<ModuleFile>,
+    pub(super) module_settings: ModuleSettings,
+    /// Present when either the module inventory or its settings file is unreadable. Runtime loads
+    /// modules fail closed in this state, so the editor must not present editable/default-on state.
+    pub(super) module_state_error: Option<String>,
     pub(super) local_packages: Vec<String>,
     pub(super) installed_packages: Vec<LockedPackage>,
+    /// The local package inventory or its governing-row reconciliation is unavailable. Preserve
+    /// the last good list for display, but block every mutation whose target depends on shadowing.
+    pub(super) local_package_state_error: Option<String>,
+    /// The installed-package lock is unavailable. Preserve the last good rows for display, but do
+    /// not infer absent installs or permit settings/activation mutations.
+    pub(super) installed_package_state_error: Option<String>,
 
     // ---- live (script-created) automations --------------------------------
     /// Streamed from this session's automation broadcast; rendered nested under each
@@ -740,6 +1001,9 @@ pub struct AutomationsWindow {
     pub(super) store_toggled: HashSet<String>,
 
     pub(super) selection: Selection,
+    /// Advanced whenever a pane replacement clears selection-owned state. Async recovery may
+    /// navigate only when the revision captured at launch still matches this value.
+    pub(super) selection_revision: u64,
     pub(super) collapsed_folders: HashSet<String>,
     pub(super) pane: Pane,
 
@@ -771,6 +1035,9 @@ pub struct AutomationsWindow {
     next_language_graph_generation: u64,
     pub(super) next_language_request_id: u64,
     pub(super) next_code_disk_revision: u64,
+    /// Saved module text captured when the current module editor was bound. A save compares the
+    /// disk file with this baseline before replacing it, so an external edit is never discarded.
+    pub(super) module_source_baseline: Option<String>,
     /// Legacy plaintext body used only while a hotkey's behavior is Send Text.
     pub(super) hotkey_text_content: text_editor::Content,
     /// The send-text action draft, held separately from the script draft so
@@ -811,6 +1078,9 @@ pub struct AutomationsWindow {
     pub(super) test_input: String,
     pub(super) dirty: bool,
     pub(super) pending_nav: Option<Box<Message>>,
+    /// Advanced whenever a guarded navigation replaces the pending target. Rendered confirmation
+    /// actions carry this value so a click from an older frame cannot affect a newer request.
+    pending_nav_revision: u64,
     pub(super) confirm_folder_delete: bool,
 
     // ---- package dependency graph ------------------------------------------
@@ -820,41 +1090,63 @@ pub struct AutomationsWindow {
     /// load them), so the tree flags them orange and the manage pane shows "update blocked"
     /// (`PACKAGE-ISOLATES-CONSENT-TRUST.md`). Populated by the background graph resolve.
     pub(super) blocked_updates: HashSet<String>,
+    /// Generation fence for the background installed-package graph resolve batch.
+    pub(super) graph_seq: GraphSeq,
 
     // ---- owned (local) package state --------------------------------------
     pub(super) local_package: Option<Box<LocalPackage>>,
     pub(super) local_readme: Option<markdown::Content>,
     pub(super) owned_selected_file: Option<String>,
+    /// Saved text captured when the selected local-package file was opened.
+    pub(super) owned_source_baseline: Option<String>,
     /// Inline rename buffer for the open local package (the folder name is its identity). `Some`
     /// while the rename field is showing; `None` otherwise.
     pub(super) rename_buffer: Option<String>,
+    /// Exact local package identity that owns `rename_buffer`. The pair is cleared only by an
+    /// explicit cancel/discard or a successful/no-op rename commit.
+    pub(super) rename_source_name: Option<String>,
     /// The editable manifest form for the open owned package (the rich editor for its
     /// `smudgy.package.json`). Seeded on open + after a Save; `None` off-pane.
     pub(super) manifest_draft: Option<ManifestDraft>,
+    /// Exact on-disk manifest text from the start of the current structured edit.
+    pub(super) manifest_source_baseline: Option<String>,
     /// Whether the manifest draft has unsaved edits (independent of the script-editor `dirty`
     /// flag, which guards a different pane).
     pub(super) manifest_dirty: bool,
     /// Whether the manifest section is in the structured editor (vs the default read-only summary).
     pub(super) manifest_editing: bool,
+    /// Local package reservation retained while a requirements-changing manifest waits for its
+    /// consent/cache steps. Dropping the pane releases it without allowing a stale task to commit.
+    pub(super) manifest_operation: Option<PackageOperationPermit>,
     /// Which manifest-editor tab is showing (view-only; reset to `Settings` when a package opens).
     pub(super) manifest_tab: ManifestTab,
     pub(super) authoring_busy: bool,
+    /// Exact publish operation represented by `authoring_busy`. Manifest resolution also uses the
+    /// visual latch but has its own generation fence and therefore leaves this as `None`.
+    pub(super) authoring_operation: Option<PackageOperationId>,
     pub(super) authoring_feedback: Option<String>,
     /// The latest publish command/output, scoped to the package that produced it. Kept separate
     /// from general authoring feedback so it can render beside Publish in a bounded console.
     publish_output: Option<PublishOutput>,
     pub(super) confirm_delete_local: bool,
     pub(super) share_package_id: Option<Uuid>,
+    /// Durable/cloud-backed publication knowledge used to gate rename independently of whether
+    /// Sharing details are loaded or the user is signed in.
+    publication_status: PublicationStatus,
     pub(super) share_is_public: bool,
     pub(super) share_friends: Vec<FriendView>,
     pub(super) share_grants: Vec<PackageGrantView>,
     pub(super) share_versions: Vec<VersionListItem>,
     pub(super) share_busy: bool,
+    /// Exact sharing mutation represented by `share_busy`. Share-state loads use `share_seq` only.
+    pub(super) share_operation: Option<PackageOperationId>,
+    pub(super) share_seq: ShareSeq,
     pub(super) share_feedback: Option<String>,
 
     // ---- installed package state ------------------------------------------
     pub(super) installed_open: Option<Box<LockedPackage>>,
     pub(super) installed_detail: Option<Box<ResolvedPackageWire>>,
+    pub(super) installed_readme: InstalledReadmeState,
     /// The cloud package metadata (rating, install count) for the open installed package, fetched
     /// best-effort alongside the detail resolve. `None` for a local/owned package, while loading, or
     /// when the fetch failed — gating the rating UI on `Some` keeps it to real cloud packages.
@@ -862,15 +1154,26 @@ pub struct AutomationsWindow {
     pub(super) installed_rating: Option<Box<PackageDetail>>,
     pub(super) installed_versions: Vec<String>,
     pub(super) installed_selected_file: Option<String>,
-    /// Which tab of the installed-package "README & source" area is showing (README vs Source).
-    pub(super) installed_file_tab: InstalledFileTab,
+    pub(super) installed_package_tab: InstalledPackageTab,
+    pub(super) local_package_tab: LocalPackageTab,
     /// On-demand source for the installed-package source browser, keyed by module `content_hash`
     /// (content-addressed, so identical blobs share an entry and a late fetch is self-validating).
     /// Populated lazily when a file is selected; cleared when a different installed package opens.
     pub(super) installed_source: HashMap<String, FilePreview>,
     pub(super) manage_busy: bool,
     pub(super) manage_feedback: Option<String>,
+    /// Inline destination-name buffer for "Edit a copy". The user can keep the package's leaf
+    /// name to create a local override, or choose a new name for an independent local package.
+    pub(super) fork_name: Option<String>,
+    /// Exact installed source that owns `fork_name`, so a retained form can never be rendered or
+    /// submitted as if it belonged to another package.
+    pub(super) fork_source_specifier: Option<String>,
+    /// Exact app-global destination reservation owned by the active Edit-a-copy task.
+    pub(super) fork_operation: Option<PackageOperationId>,
     pub(super) confirm_uninstall: bool,
+    /// Exact lock snapshot used to render the open uninstall confirmation. Confirm uses it as an
+    /// optimistic concurrency token, so a package update or relationship change forces a retry.
+    pub(super) uninstall_expected_lock: Option<SharedPackageLock>,
     /// The auto-installed required roots that would become **orphans** if the open package were
     /// uninstalled — apt-style, surfaced in the uninstall confirmation so the user can remove them
     /// too (`script/REQUIRED-PACKAGES.md`). Computed asynchronously when uninstall is requested
@@ -885,6 +1188,8 @@ pub struct AutomationsWindow {
     /// A pending update re-prompt for the open installed package: the new version's added
     /// permission asks beyond the consented baseline. `None` when there's nothing new to grant.
     pub(super) update_delta: Option<UpdateDelta>,
+    /// The root operation to finish after any required-parameter prompt queue drains.
+    package_change_finalize: Option<PackageChangeFinalize>,
 
     // ---- discover state ----------------------------------------------------
     pub(super) discover_query: String,
@@ -895,14 +1200,20 @@ pub struct AutomationsWindow {
     /// stable regardless of how the user later searches/filters inside the Discover pane.
     pub(super) featured_packages: Vec<PackageSearchResult>,
     pub(super) discover_owner: Option<String>,
+    pub(super) discover_requested_package: Option<Uuid>,
     pub(super) discover_detail: Option<Box<PackageDetail>>,
     pub(super) discover_readme: Option<markdown::Content>,
     pub(super) discover_comments: Vec<CommentView>,
     pub(super) discover_comment_input: String,
     pub(super) discover_busy: bool,
     pub(super) discover_error: Option<String>,
+    pub(super) discover_seq: DiscoverSeq,
+    pub(super) discover_search_seq: DiscoverSearchSeq,
     /// The always-shown install confirmation; shown before any lock entry is written.
     pub(super) consent_prompt: Option<ConsentPrompt>,
+    /// The accepted package set is being hash-verified and made cache-complete. Until this clears,
+    /// another Grant is disabled; Cancel invalidates the result without touching the lockfile.
+    pub(super) consent_busy: bool,
     /// Monotonic generation for the in-flight install resolve; bumped on `begin_install` and on any
     /// action that abandons a pending install, so a late async result that no longer matches is
     /// discarded instead of popping a stale consent window.
@@ -921,6 +1232,10 @@ pub struct AutomationsWindow {
     /// package that declares params opens; `None` otherwise. Independent of `param_prompt`, which is
     /// the install-time required-params gate.
     pub(super) param_config: Option<ParamConfig>,
+    /// Per-profile required-parameter completeness for `param_config` when it is profile-scoped;
+    /// `None` otherwise. Maintained by `sync_profile_param_status` after every update so the
+    /// Settings tab never reads parameter storage while rendering.
+    pub(super) profile_param_status: Option<model::ProfileParamStatus>,
 
     // ---- private & shared --------------------------------------------------
     pub(super) shared_with_me: Option<Vec<PackageDetail>>,
@@ -1003,35 +1318,91 @@ fn catalogue_stream(session_id: SessionId) -> impl iced::futures::Stream<Item = 
 }
 
 impl AutomationsWindow {
+    fn load_profile_choices(
+        server_name: &str,
+    ) -> Result<(Vec<String>, HashMap<String, String>), String> {
+        let mut profiles = smudgy_core::models::profile::list_profiles_strict(server_name)
+            .map_err(|error| error.to_string())?;
+        profiles.sort_by(|left, right| {
+            left.config
+                .caption
+                .cmp(&right.config.caption)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let captions = profiles
+            .iter()
+            .map(|profile| (profile.name.clone(), profile.config.caption.clone()))
+            .collect();
+        let names = profiles.into_iter().map(|profile| profile.name).collect();
+        Ok((names, captions))
+    }
+
+    #[cfg(test)]
     pub fn new(
         window_id: window::Id,
         server_name: String,
         cloud: CloudHandles,
         session_id: SessionId,
     ) -> Self {
+        let (profile_names, _) = Self::load_profile_choices(&server_name).unwrap_or_default();
+        let profile_name = profile_names.first().cloned().unwrap_or_default();
+        Self::new_for_profile(window_id, server_name, cloud, session_id, profile_name)
+    }
+
+    pub fn new_for_profile(
+        window_id: window::Id,
+        server_name: String,
+        cloud: CloudHandles,
+        session_id: SessionId,
+        profile_name: String,
+    ) -> Self {
         let mud_host = server::load_server(&server_name)
             .ok()
             .map(|server| server.config.host);
         let advanced_features =
             smudgy_core::models::settings::load_settings().advanced_scripting_features;
+        let profile_choices = Self::load_profile_choices(&server_name);
+        let mut profile_inventory_complete = profile_choices.is_ok();
+        let (mut profile_names, mut profile_captions) = profile_choices.unwrap_or_default();
+        if profile_names.is_empty() && !profile_name.is_empty() {
+            profile_names.push(profile_name.clone());
+            profile_captions.insert(profile_name.clone(), profile_name.clone());
+            profile_inventory_complete = false;
+        }
         Self {
             window_id,
             server_name,
             cloud,
             session_id,
+            profile_name: profile_name.clone(),
+            session_binding_live: true,
+            parameter_profile: profile_name,
+            account_epoch: 0,
+            confirm_global_parameter_source: false,
+            copy_settings_prompt: None,
+            profile_names,
+            profile_inventory_complete,
+            profile_captions,
             mud_host,
             advanced_features,
             scripts: BTreeMap::new(),
             packages: PackageTree::new(),
+            automation_snapshot: None,
+            folder_state_error: None,
             modules: Vec::new(),
+            module_settings: ModuleSettings::default(),
+            module_state_error: None,
             local_packages: Vec::new(),
             installed_packages: Vec::new(),
+            local_package_state_error: None,
+            installed_package_state_error: None,
             live: LiveAutomations::default(),
             expanded_creators: HashSet::new(),
             show_all_creators: HashSet::new(),
             catalogue: None,
             store_toggled: HashSet::new(),
             selection: Selection::Dashboard,
+            selection_revision: 0,
             collapsed_folders: HashSet::new(),
             pane: Pane::Dashboard,
             search: String::new(),
@@ -1048,6 +1419,7 @@ impl AutomationsWindow {
             next_language_graph_generation: 2,
             next_language_request_id: 1,
             next_code_disk_revision: 1,
+            module_source_baseline: None,
             hotkey_text_content: text_editor::Content::new(),
             send_text_content: text_editor::Content::new(),
             action_text_pinned: false,
@@ -1065,59 +1437,81 @@ impl AutomationsWindow {
             test_input: String::new(),
             dirty: false,
             pending_nav: None,
+            pending_nav_revision: 0,
             confirm_folder_delete: false,
             graph: PackageGraph::default(),
             blocked_updates: HashSet::new(),
+            graph_seq: GraphSeq::default(),
             local_package: None,
             local_readme: None,
             owned_selected_file: None,
+            owned_source_baseline: None,
             rename_buffer: None,
+            rename_source_name: None,
             manifest_draft: None,
+            manifest_source_baseline: None,
             manifest_dirty: false,
             manifest_editing: false,
+            manifest_operation: None,
             manifest_tab: ManifestTab::default(),
             authoring_busy: false,
+            authoring_operation: None,
             authoring_feedback: None,
             publish_output: None,
             confirm_delete_local: false,
             share_package_id: None,
+            publication_status: PublicationStatus::Unknown,
             share_is_public: false,
             share_friends: Vec::new(),
             share_grants: Vec::new(),
             share_versions: Vec::new(),
             share_busy: false,
+            share_operation: None,
+            share_seq: ShareSeq::default(),
             share_feedback: None,
             installed_open: None,
             installed_detail: None,
+            installed_readme: InstalledReadmeState::Loaded(None),
             installed_rating: None,
             installed_versions: Vec::new(),
             installed_selected_file: None,
-            installed_file_tab: InstalledFileTab::default(),
+            installed_package_tab: InstalledPackageTab::default(),
+            local_package_tab: LocalPackageTab::default(),
             installed_source: HashMap::new(),
             manage_busy: false,
             manage_feedback: None,
+            fork_name: None,
+            fork_source_specifier: None,
+            fork_operation: None,
             confirm_uninstall: false,
+            uninstall_expected_lock: None,
             uninstall_orphans: Vec::new(),
             uninstall_breaks: Vec::new(),
             confirm_trust: false,
             update_delta: None,
+            package_change_finalize: None,
             discover_query: String::new(),
             discover_scope: DiscoverScope::default(),
             discover_results: Vec::new(),
             featured_packages: Vec::new(),
             discover_owner: None,
+            discover_requested_package: None,
             discover_detail: None,
             discover_readme: None,
             discover_comments: Vec::new(),
             discover_comment_input: String::new(),
             discover_busy: false,
             discover_error: None,
+            discover_seq: DiscoverSeq::default(),
+            discover_search_seq: DiscoverSearchSeq::default(),
             consent_prompt: None,
+            consent_busy: false,
             install_seq: InstallSeq::default(),
             detail_seq: DetailSeq::default(),
             param_prompt: None,
             param_prompt_queue: Vec::new(),
             param_config: None,
+            profile_param_status: None,
             shared_with_me: None,
             my_cloud_packages: None,
             palette_open: false,
@@ -1141,6 +1535,65 @@ impl AutomationsWindow {
 
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// The live session whose runtime streams this window follows. The window remains useful as an
+    /// offline disk editor if that session later closes.
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Stop subscriptions that are scoped to `session_id` when the daemon removes that session.
+    /// A different session closing has no effect on this window's exact binding.
+    pub fn retire_session_binding(&mut self, session_id: SessionId) {
+        if self.session_id == session_id {
+            self.session_binding_live = false;
+        }
+    }
+
+    /// Whether a test navigation would abandon a draft.
+    #[cfg(test)]
+    #[must_use]
+    fn has_unsaved_changes(&self) -> bool {
+        self.has_unsaved_draft()
+    }
+
+    #[must_use]
+    fn has_content_draft(&self) -> bool {
+        self.dirty
+            || self.manifest_dirty
+            || self
+                .param_config
+                .as_ref()
+                .is_some_and(|config| !config.touched.is_empty())
+    }
+
+    #[must_use]
+    fn has_unsaved_draft(&self) -> bool {
+        self.has_content_draft() || self.rename_buffer.is_some() || self.fork_name.is_some()
+    }
+
+    /// A repeated request for this window's current session supersedes a previously queued switch.
+    pub fn cancel_pending_context_switch(&mut self) {
+        if self.pending_context_switch() {
+            self.pending_nav = None;
+            self.pending_nav_revision = self.pending_nav_revision.wrapping_add(1);
+        }
+    }
+
+    #[must_use]
+    fn pending_context_switch(&self) -> bool {
+        self.pending_nav
+            .as_deref()
+            .is_some_and(|message| matches!(message, Message::SwitchContext { .. }))
+    }
+
+    #[must_use]
+    fn pending_close(&self) -> bool {
+        self.pending_nav
+            .as_deref()
+            .is_some_and(|message| matches!(message, Message::RequestClose))
     }
 
     /// Ctrl/⌘+P opens the palette; arrows/enter/escape drive it while open.
@@ -1186,20 +1639,27 @@ impl AutomationsWindow {
                 _ => None,
             }
         });
-        // Stream this session's script-created automation updates, keyed by session id so
-        // iced keeps a single broadcast subscription (one runtime receiver) across renders.
-        let automations =
-            Subscription::run_with(self.session_id, |session_id| automation_stream(*session_id))
-                .map(Message::AutomationEvent);
-        let mut subscriptions = vec![keyboard, automations];
-        // The catalogue broadcast is subscribed only while the store pane is showing: the
-        // runtime builds snapshots only while receivers exist, so a closed pane costs it
-        // nothing, and re-opening gets a fresh snapshot (the new-subscriber resync).
-        if matches!(self.pane, Pane::StoreInspector) {
+        let mut subscriptions = vec![keyboard];
+        if self.session_binding_live {
+            // Stream this session's script-created automation updates, keyed by session id so
+            // iced keeps a single broadcast subscription (one runtime receiver) across renders.
             subscriptions.push(
-                Subscription::run_with(self.session_id, |session_id| catalogue_stream(*session_id))
-                    .map(Message::CatalogueEvent),
+                Subscription::run_with(self.session_id, |session_id| {
+                    automation_stream(*session_id)
+                })
+                .map(Message::AutomationEvent),
             );
+            // The catalogue broadcast is subscribed only while the store pane is showing: the
+            // runtime builds snapshots only while receivers exist, so a closed pane costs it
+            // nothing, and re-opening gets a fresh snapshot (the new-subscriber resync).
+            if matches!(self.pane, Pane::StoreInspector) {
+                subscriptions.push(
+                    Subscription::run_with(self.session_id, |session_id| {
+                        catalogue_stream(*session_id)
+                    })
+                    .map(Message::CatalogueEvent),
+                );
+            }
         }
         if self.language_service.is_some() {
             subscriptions.push(
@@ -1225,9 +1685,28 @@ impl AutomationsWindow {
         // `SMUDGY_LOG=smudgy_ui::windows::automations_window=trace` to watch
         // every message this window handles.
         log::trace!("{message:?}");
-        // Unsaved-changes guard: defer navigation away from a dirty editor or an edited but
-        // unsaved manifest draft (the rich manifest editor tracks its own dirty flag).
-        if (self.dirty || self.manifest_dirty) && Self::is_guarded_navigation(&message) {
+        // Drafts guard all navigation that can unmount them.
+        let navigation_needs_guard =
+            Self::is_guarded_navigation(&message) && self.has_unsaved_draft();
+        if navigation_needs_guard {
+            // Once the app has asked this singleton to switch session context (or close), ordinary
+            // sidebar clicks must not replace that request. Otherwise cancelling the new ordinary
+            // navigation cannot clear the app-level switch target, and a later switch message can
+            // unexpectedly replace the window after the user chose to keep editing.
+            let pending_is_terminal = self.pending_nav.as_deref().is_some_and(|pending| {
+                matches!(
+                    pending,
+                    Message::SwitchContext { .. } | Message::RequestClose
+                )
+            });
+            let incoming_is_terminal = matches!(
+                &message,
+                Message::SwitchContext { .. } | Message::RequestClose
+            );
+            if pending_is_terminal && !incoming_is_terminal {
+                return Update::none();
+            }
+            self.pending_nav_revision = self.pending_nav_revision.wrapping_add(1);
             self.pending_nav = Some(Box::new(message));
             return Update::none();
         }
@@ -1235,17 +1714,45 @@ impl AutomationsWindow {
             self.dirty = true;
         }
         let refresh_generated = Self::affects_captures(&message);
+        let values_written = Self::writes_parameter_values(&message);
         let mut update = match message {
+            Message::RequestClose => Update::with_event(Event::CloseRequested),
+            Message::NavigationReleased(released) => Update::with_event(match released {
+                ReleasedNavigation::Close => Event::CloseCancelled,
+                ReleasedNavigation::ContextSwitch => Event::ContextSwitchCancelled,
+            }),
+            Message::SwitchContext {
+                server_name,
+                session_id,
+                profile_name,
+            } => Update::with_event(Event::SwitchContext {
+                server_name,
+                session_id,
+                profile_name,
+            }),
             // -------- loading ----------------------------------------------
-            Message::ScriptsLoaded(scripts, errors) => {
-                self.scripts = scripts;
-                self.merge_folders();
-                if self
-                    .language_project_context_matches(&code_editor::LanguageProjectContext::Inline)
-                {
-                    self.language_project_target_context =
-                        Some(code_editor::LanguageProjectContext::Inline);
-                    self.refresh_language_project();
+            Message::AccountChanged => self.account_changed(),
+            Message::ScriptsLoaded {
+                scripts,
+                load,
+                errors,
+            } => {
+                if let Some(snapshot) = load {
+                    self.packages = snapshot.packages.clone();
+                    self.automation_snapshot = Some(snapshot);
+                    self.folder_state_error = None;
+                    self.scripts = scripts;
+                    self.merge_folders();
+                    if self.language_project_context_matches(
+                        &code_editor::LanguageProjectContext::Inline,
+                    ) {
+                        self.language_project_target_context =
+                            Some(code_editor::LanguageProjectContext::Inline);
+                        self.refresh_language_project();
+                    }
+                } else {
+                    let error = errors.join("\n");
+                    self.folder_state_error = Some(error);
                 }
                 if errors.is_empty() {
                     Update::none()
@@ -1255,63 +1762,34 @@ impl AutomationsWindow {
                 }
             }
             Message::LoadFolders => {
-                self.packages =
-                    core_packages::load_packages(&self.server_name).unwrap_or_else(|e| {
-                        log::warn!("Failed to load folders for {}: {e}", self.server_name);
-                        PackageTree::new()
-                    });
+                // The failure is already logged and reflected in `profile_inventory_complete`;
+                // the tree renders the stale inventory with its warning until the next reload.
+                let _ = self.refresh_profile_inventory();
+                if !self.profile_names.contains(&self.parameter_profile) {
+                    self.parameter_profile.clone_from(&self.profile_name);
+                }
                 self.merge_folders();
                 Update::none()
             }
             Message::LoadModules => {
-                self.modules = smudgy_core::models::modules::list_modules(&self.server_name)
-                    .unwrap_or_else(|e| {
-                        log::warn!("Failed to list modules for {}: {e}", self.server_name);
-                        Vec::new()
-                    });
+                match smudgy_core::models::modules::load_module_state(&self.server_name) {
+                    Ok((modules, settings)) => {
+                        self.modules = modules;
+                        self.module_settings = settings;
+                        self.module_state_error = None;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to load module state for {}: {error}",
+                            self.server_name
+                        );
+                        self.module_state_error = Some(error.to_string());
+                    }
+                }
                 Update::with_task(self.reconcile_module_language_project_reload())
             }
-            Message::LoadLocalPackages => {
-                self.local_packages =
-                    smudgy_core::models::local_packages::list_local_packages(&self.server_name)
-                        .unwrap_or_else(|e| {
-                            log::warn!("Failed to list local packages: {e}");
-                            Vec::new()
-                        });
-                self.rebuild_graph();
-                Update::with_task(self.reconcile_owned_package_language_project_reload())
-            }
-            Message::LoadInstalledPackages => {
-                // Self-heal before reading: a reserved-`local`-owner install whose folder is gone
-                // can never resolve again and would render as a phantom installed package (and
-                // fail to load every session) — lockfiles written by app versions whose package
-                // delete left install entries behind carry such strays. One with a folder is
-                // migrated to the account's nickname form once a nickname exists.
-                let nickname = self.cloud.snapshot.get().nickname_text();
-                match smudgy_core::models::shared_packages::reconcile_local_installs(
-                    &self.server_name,
-                    nickname.as_deref(),
-                ) {
-                    Ok(changed) if !changed.is_empty() => {
-                        log::info!("Reconciled local package installs: {}", changed.join(", "));
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("Failed to reconcile local installs: {e}"),
-                }
-                self.installed_packages =
-                    smudgy_core::models::shared_packages::load_lock(&self.server_name)
-                        .map(|lock| lock.packages)
-                        .unwrap_or_else(|e| {
-                            log::warn!("Failed to load lockfile: {e}");
-                            Vec::new()
-                        });
-                self.rebuild_graph();
-                let mut task = self.resolve_graph_deps();
-                if let Some(sweep) = self.sweep_stale_account_installs() {
-                    task = Task::batch([task, sweep]);
-                }
-                Update::with_task(task)
-            }
+            Message::LoadLocalPackages => self.reload_local_package_state(),
+            Message::LoadInstalledPackages => self.reload_installed_package_state(),
             // -------- live (script-created) automations --------------------
             Message::AutomationEvent(event) => {
                 match event {
@@ -1589,6 +2067,9 @@ impl AutomationsWindow {
                 let Some((previous, kind)) = previous else {
                     return Update::none();
                 };
+                if kind == code_editor::CodeDocument::Hotkey && language != ScriptLang::Plaintext {
+                    self.action_script_lang = language;
+                }
                 if previous == language {
                     Update::none()
                 } else if kind == code_editor::CodeDocument::Hotkey {
@@ -2209,50 +2690,36 @@ impl AutomationsWindow {
             Message::Save => self.save_open(),
             Message::Discard => {
                 self.dirty = false;
-                self.pending_nav = None;
+                let released = self.release_pending_navigation();
                 self.clear_selection();
                 self.selection = Selection::Dashboard;
                 self.pane = Pane::Dashboard;
-                Update::none()
+                Update::with_task(released)
             }
             Message::Delete => self.delete_open(),
-            Message::ConfirmDiscardNav => {
-                match self.pending_nav.take() {
-                    Some(msg) => match *msg {
-                        // Definition results are state-fenced and can become stale while this
-                        // confirmation is open. Execute synchronously and clear dirty state only
-                        // if the jump really leaves the origin; otherwise the mounted draft must
-                        // remain protected by the next navigation guard.
-                        Message::NavigateCodeDefinition(navigation) => {
-                            let (update, left_origin) =
-                                self.navigate_code_definition_checked(navigation);
-                            if left_origin {
-                                self.accept_discarded_navigation();
-                            }
-                            update
-                        }
-                        message => {
-                            // Other guarded navigation is replayed through the normal update path.
-                            // Re-seed the manifest immediately so Discard cannot leave a dormant
-                            // edited draft behind if the destination remains in this package.
-                            self.accept_discarded_navigation();
-                            Update::with_task(Task::done(message))
-                        }
-                    },
-                    None => Update::none(),
-                }
+            Message::ConfirmDiscardNavRevision(revision) => {
+                self.confirm_pending_navigation(revision)
             }
-            Message::CancelDiscardNav => {
-                self.pending_nav = None;
-                Update::none()
-            }
+            Message::CancelDiscardNavRevision(revision) => self.cancel_pending_navigation(revision),
 
             // -------- folder -----------------------------------------------
             Message::SetFolderPath(value) => {
                 if let Pane::Folder(state) = &mut self.pane {
                     state.path = value;
+                    // The error described the previous path; it also locks the activation
+                    // controls, so a fresh attempt must not stay blocked by it.
+                    state.error = None;
                 }
                 Update::none()
+            }
+            Message::EnableEverywhere => self.set_open_activation(ProfileActivation::All),
+            Message::DisableEverywhere => self.set_open_activation(ProfileActivation::None),
+            Message::ToggleActivationProfile(profile_name) => {
+                if self.profile_inventory_complete {
+                    self.toggle_open_activation_profile(profile_name)
+                } else {
+                    Update::none()
+                }
             }
             Message::SaveFolder => self.save_folder(),
             Message::RequestDeleteFolder => {
@@ -2270,6 +2737,9 @@ impl AutomationsWindow {
             Message::SetNewModuleName(value) => {
                 let is_module = if let Pane::Module(state) = &mut self.pane {
                     state.name.clone_from(&value);
+                    if !state.activation_touched {
+                        state.activation = smudgy_core::models::modules::default_activation(&value);
+                    }
                     true
                 } else {
                     false
@@ -2294,6 +2764,12 @@ impl AutomationsWindow {
                 }
             }
             Message::CreateModule => self.create_module(),
+            Message::SelectModuleTab(tab) => {
+                if let Pane::Module(state) = &mut self.pane {
+                    state.tab = tab;
+                }
+                Update::none()
+            }
 
             // -------- owned package ----------------------------------------
             Message::SelectOwnedFile(subpath) => self.select_owned_file(subpath),
@@ -2307,31 +2783,79 @@ impl AutomationsWindow {
             Message::SaveManifest => self.save_manifest(),
             Message::RevertManifest => self.revert_manifest(),
             Message::PublishOwned => self.publish_owned(),
-            Message::PublishFinished { name, result } => {
+            Message::PublishFinished {
+                server_name,
+                name,
+                operation_id,
+                completion,
+                credential_generation,
+                publisher_id,
+                result,
+            } => {
+                completion.release();
+                if self.server_name != server_name {
+                    return Update::none();
+                }
+                if self.authoring_operation != Some(operation_id) {
+                    // The durable workflow belongs to an older pane operation. It can still have
+                    // changed the local publication binding before its result was lost or delayed.
+                    // Reconcile disk/runtime state, but never clear or repaint the newer command.
+                    return Update::new(
+                        Task::batch([
+                            Task::done(Message::LoadLocalPackages),
+                            Task::done(Message::LoadInstalledPackages),
+                            Task::done(Message::RefreshOwnedShareIfOpen {
+                                server_name: server_name.clone(),
+                                name,
+                            }),
+                        ]),
+                        Some(Event::ScriptsChanged { server_name }),
+                    );
+                }
+                self.authoring_operation = None;
                 self.authoring_busy = false;
-                match result {
+                let same_account = self.cloud.credentials.generation() == credential_generation
+                    && self
+                        .cloud
+                        .snapshot
+                        .get()
+                        .profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.id == publisher_id);
+                let is_open_package = matches!(
+                    &self.selection,
+                    Selection::OwnedPackage(open) if open == &name
+                );
+                let update: Update<Message, Event> = match result {
                     Ok(summary) => {
-                        let is_open_package = matches!(
-                            &self.selection,
-                            Selection::OwnedPackage(open) if open == &name
-                        );
                         if is_open_package {
-                            self.share_package_id = Some(summary.package_id);
-                            self.share_is_public = summary.is_public;
-                            if !self
-                                .share_versions
-                                .iter()
-                                .any(|version| version.version == summary.version)
-                            {
-                                self.share_versions.insert(
-                                    0,
-                                    VersionListItem {
-                                        version: summary.version.clone(),
-                                        yanked: false,
-                                        deleted: false,
-                                        published_at: summary.published_at,
-                                    },
-                                );
+                            self.publication_status = PublicationStatus::Bound(summary.package_id);
+                            if same_account {
+                                self.share_package_id = Some(summary.package_id);
+                                self.share_is_public = summary.is_public;
+                                if !self
+                                    .share_versions
+                                    .iter()
+                                    .any(|version| version.version == summary.version)
+                                {
+                                    self.share_versions.insert(
+                                        0,
+                                        VersionListItem {
+                                            version: summary.version.clone(),
+                                            yanked: false,
+                                            deleted: false,
+                                            published_at: summary.published_at,
+                                        },
+                                    );
+                                }
+                            } else {
+                                // The frozen workflow completed for the account that launched it.
+                                // Keep the durable rename lock, but do not expose that account's
+                                // sharing controls under the newly active credential.
+                                self.share_package_id = None;
+                                self.share_is_public = false;
+                                self.share_versions.clear();
+                                self.share_grants.clear();
                             }
                         }
                         let mut feedback = format!(
@@ -2394,18 +2918,98 @@ impl AutomationsWindow {
                                 "warnings" => summary.interop_warnings.join("\n")
                             ));
                         }
+                        // The cloud publish is already complete. A local sidecar warning is
+                        // therefore informational and must never invite a retry of the immutable
+                        // version upload.
+                        if !summary.publication_warnings.is_empty() {
+                            let warnings = summary
+                                .publication_warnings
+                                .iter()
+                                .map(|warning| match warning {
+                                    PublicationWarning::VersionPresentAfterLostResponse {
+                                        name,
+                                        version,
+                                    } => crate::i18n::t!(
+                                        "automation-publication-response-lost-warning",
+                                        "name" => name,
+                                        "version" => version
+                                    ),
+                                    PublicationWarning::InconsistentResponseRecovered {
+                                        name,
+                                        version,
+                                    } => crate::i18n::t!(
+                                        "automation-publication-inconsistent-response-warning",
+                                        "name" => name,
+                                        "version" => version
+                                    ),
+                                    PublicationWarning::ExistingVersionRecovered {
+                                        name,
+                                        version,
+                                    } => crate::i18n::t!(
+                                        "automation-publication-existing-version-warning",
+                                        "name" => name,
+                                        "version" => version
+                                    ),
+                                    PublicationWarning::MissingLocalBinding { name, version } => {
+                                        crate::i18n::t!(
+                                            "automation-publication-link-missing-warning",
+                                            "name" => name,
+                                            "version" => version
+                                        )
+                                    }
+                                    PublicationWarning::LocalBindingUnverified {
+                                        name,
+                                        version,
+                                        error,
+                                    } => crate::i18n::t!(
+                                        "automation-publication-link-unverified-warning",
+                                        "name" => name,
+                                        "version" => version,
+                                        "error" => error
+                                    ),
+                                    PublicationWarning::LocalSnapshotChanged { name, version } => {
+                                        crate::i18n::t!(
+                                            "automation-publication-local-changed-warning",
+                                            "name" => name,
+                                            "version" => version
+                                        )
+                                    }
+                                    PublicationWarning::DescriptionUpdateFailed {
+                                        name,
+                                        version,
+                                        error,
+                                    } => crate::i18n::t!(
+                                        "automation-publication-description-warning",
+                                        "name" => name,
+                                        "version" => version,
+                                        "error" => error
+                                    ),
+                                })
+                                .collect::<Vec<_>>();
+                            feedback.push('\n');
+                            feedback.push_str(&crate::i18n::t!(
+                                "automation-publication-record-warning",
+                                "warnings" => warnings.join("\n")
+                            ));
+                        }
                         self.publish_output = Some(PublishOutput {
                             package: name.clone(),
                             text: feedback,
                         });
-                        let refresh = if is_open_package {
+                        // AccountChanged may have attempted this refresh while the publish still
+                        // owned the package gate. Once the completion releases it, reload with the
+                        // currently active account even when that is not the publishing account.
+                        let refresh = if is_open_package && self.signed_in() {
                             self.load_owned_share(name)
                         } else {
                             Task::none()
                         };
                         Update::with_task(Task::batch([
                             refresh,
-                            self.show_toast(format!("Published v{}", summary.version)),
+                            self.show_toast(crate::i18n::t!(
+                                "automation-published",
+                                "version" => &summary.version
+                            )),
                         ]))
                     }
                     Err(e) => {
@@ -2419,12 +3023,50 @@ impl AutomationsWindow {
                                 )
                             ),
                         });
-                        Update::none()
+                        // Namespace creation/finalize can commit before a response is lost. Always
+                        // reconcile server truth after an error so Rename stays locked if the cloud
+                        // accepted any irreversible part of the publish.
+                        if is_open_package
+                            && let Ok(Some(binding)) =
+                                smudgy_core::models::local_packages::load_publication_binding(
+                                    &server_name,
+                                    &name,
+                                )
+                        {
+                            self.publication_status = PublicationStatus::Bound(binding.package_id);
+                        }
+                        if is_open_package && self.signed_in() {
+                            Update::with_task(self.load_owned_share(name))
+                        } else {
+                            Update::none()
+                        }
                     }
-                }
+                };
+                // Publish can durably claim a namespace or save its binding before a later step
+                // fails. Refresh both lists and every same-server runtime after all outcomes.
+                Update::new(
+                    Task::batch([
+                        update.task,
+                        Task::done(Message::LoadLocalPackages),
+                        Task::done(Message::LoadInstalledPackages),
+                    ]),
+                    Some(Event::ScriptsChanged { server_name }),
+                )
             }
             Message::RequestDeleteOwned => {
-                self.confirm_delete_local = true;
+                if !self.authoring_busy && !self.share_busy {
+                    let package_busy = self.local_package.as_deref().is_some_and(|package| {
+                        self.cloud
+                            .package_operations
+                            .is_busy(&self.server_name, &package.name)
+                    });
+                    if package_busy {
+                        self.authoring_feedback =
+                            Some(crate::i18n::t!("package-operation-in-progress"));
+                    } else {
+                        self.confirm_delete_local = true;
+                    }
+                }
                 Update::none()
             }
             Message::CancelDeleteOwned => {
@@ -2440,51 +3082,145 @@ impl AutomationsWindow {
             }
             Message::CreatePackage => self.create_package(),
             Message::SetVisibility(public) => self.set_visibility(public),
-            Message::VisibilityUpdated(result) => self.visibility_updated(result),
+            Message::VisibilityUpdated {
+                server_name,
+                name,
+                seq,
+                package_id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            } => {
+                completion.release();
+                self.visibility_updated(
+                    &server_name,
+                    &name,
+                    seq,
+                    package_id,
+                    operation_id,
+                    credential_generation,
+                    result,
+                )
+            }
             Message::YankVersion { version, yanked } => self.yank_version(version, yanked),
             Message::DeleteVersion(version) => self.delete_version(version),
-            Message::VersionsUpdated(result) => self.versions_updated(result),
+            Message::VersionsUpdated {
+                server_name,
+                name,
+                seq,
+                package_id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            } => {
+                completion.release();
+                self.versions_updated(
+                    &server_name,
+                    &name,
+                    seq,
+                    package_id,
+                    operation_id,
+                    credential_generation,
+                    result,
+                )
+            }
             Message::ShareWithFriend(grantee) => self.share_with_friend(grantee),
-            Message::GrantsUpdated(result) => self.grants_updated(result),
-            Message::OwnedShareLoaded { name, result } => self.owned_share_loaded(&name, result),
+            Message::GrantsUpdated {
+                server_name,
+                name,
+                seq,
+                package_id,
+                operation_id,
+                completion,
+                credential_generation,
+                result,
+            } => {
+                completion.release();
+                self.grants_updated(
+                    &server_name,
+                    &name,
+                    seq,
+                    package_id,
+                    operation_id,
+                    credential_generation,
+                    result,
+                )
+            }
+            Message::RefreshOwnedShareIfOpen { server_name, name } => {
+                self.refresh_owned_share_if_open(&server_name, &name)
+            }
+            Message::OwnedShareLoaded {
+                account_epoch,
+                account_fence,
+                seq,
+                name,
+                result,
+            } => {
+                if account_epoch == self.account_epoch
+                    && self.account_read_is_current(account_fence)
+                {
+                    self.owned_share_loaded(seq, &name, result)
+                } else {
+                    Update::none()
+                }
+            }
 
             // -------- installed package ------------------------------------
-            Message::InstalledDetailLoaded(seq, result) => {
-                self.installed_detail_loaded(seq, *result)
+            Message::InstalledDetailLoaded(seq, account_fence, result) => {
+                self.installed_detail_loaded(seq, account_fence, *result)
             }
-            Message::InstalledResolvedForGraph(spec, result) => {
-                self.installed_resolved_for_graph(&spec, result)
+            Message::InstalledLatestCompared(seq, account_fence, result) => {
+                self.installed_latest_compared(seq, account_fence, result)
             }
+            Message::InstalledVersionChangeResolved(seq, account_fence, mode, result) => {
+                self.installed_version_change_resolved(seq, account_fence, mode, result)
+            }
+            Message::LocalManifestRequirementsResolved {
+                seq,
+                account_fence,
+                completion,
+                result,
+            } => self.local_manifest_requirements_resolved(seq, account_fence, completion, result),
+            Message::InstalledResolvedForGraph(seq, account_fence, spec, staged, result) => self
+                .installed_resolved_for_graph(seq, account_fence, &spec, staged.as_deref(), result),
             Message::SetInstalledUpdateMode(mode) => self.set_installed_update_mode(mode),
-            Message::TogglePackageEnabled(spec) => self.toggle_package_enabled(spec),
-            Message::SetActiveMember {
-                target_spec,
-                siblings,
-            } => self.set_active_member(target_spec, siblings),
-            Message::ToggleLocalEnabled(name) => self.toggle_local_enabled(name),
             Message::SelectInstalledFile(subpath) => self.select_installed_file(subpath),
-            Message::SelectInstalledFileTab(tab) => {
-                self.installed_file_tab = tab;
-                // Entering the Source tab with a file already selected: make sure its source is
-                // loading/loaded (idempotent — no-ops when nothing is selected or it's cached).
-                match tab {
-                    InstalledFileTab::Source => self.ensure_selected_source(),
-                    InstalledFileTab::Readme => Update::none(),
+            Message::SelectInstalledPackageTab(tab) => {
+                self.installed_package_tab = tab;
+                if tab == InstalledPackageTab::Source {
+                    self.ensure_selected_source()
+                } else {
+                    Update::none()
                 }
             }
-            Message::InstalledSourceLoaded { hash, result } => {
-                self.installed_source_loaded(hash, result)
-            }
-            Message::RequestUninstall => self.request_uninstall(),
-            Message::UninstallPlanComputed { breaks, orphans } => {
-                // Only adopt the result if the user is still in the uninstall confirmation (it
-                // wasn't cancelled while the resolve was in flight).
-                if self.confirm_uninstall {
-                    self.uninstall_breaks = breaks;
-                    self.uninstall_orphans = orphans;
-                }
+            Message::SelectLocalPackageTab(tab) => {
+                self.local_package_tab = tab;
                 Update::none()
             }
+            Message::SetParameterScope(scope) => self.set_open_parameter_scope(scope),
+            Message::ConfirmGlobalParameterSource => self.confirm_global_parameter_source(),
+            Message::CancelGlobalParameterSource => {
+                self.confirm_global_parameter_source = false;
+                self.copy_settings_prompt = None;
+                Update::none()
+            }
+            Message::OpenCopySettings => self.open_copy_settings(),
+            Message::SelectCopySettingsDestination(profile_name) => {
+                self.select_copy_settings_destination(profile_name)
+            }
+            Message::CancelCopySettings => self.cancel_copy_settings(),
+            Message::ConfirmCopySettings => self.confirm_copy_settings(),
+            Message::SelectParameterProfile(profile_name) => {
+                self.select_parameter_profile(profile_name)
+            }
+            Message::InstalledSourceLoaded {
+                hash,
+                account_fence,
+                result,
+            } => self.installed_source_loaded(hash, account_fence, result),
+            Message::RequestUninstall => self.request_uninstall(),
             Message::UninstallKeepOrphans => {
                 // Keep the offered orphans; the forced breaks still go.
                 self.uninstall_orphans.clear();
@@ -2492,25 +3228,61 @@ impl AutomationsWindow {
             }
             Message::CancelUninstall => {
                 self.confirm_uninstall = false;
+                self.uninstall_expected_lock = None;
                 self.uninstall_orphans.clear();
                 self.uninstall_breaks.clear();
                 Update::none()
             }
             Message::ConfirmUninstall => self.uninstall_installed(),
+            Message::StartForkPackage => self.start_fork_package(),
+            Message::SetForkName(name) => {
+                if !self.manage_busy && self.fork_draft_is_for_open_package() {
+                    self.fork_name = Some(name);
+                    self.manage_feedback = None;
+                }
+                Update::none()
+            }
+            Message::CancelForkPackage => {
+                if !self.manage_busy {
+                    self.clear_fork_draft();
+                    self.manage_feedback = None;
+                }
+                Update::none()
+            }
             Message::ForkPackage => self.fork_installed(),
-            Message::ForkFinished(result) => self.fork_finished(result),
-            Message::StaleAccountInstallsChecked(outcome) => {
+            Message::ForkFinished {
+                source_specifier,
+                destination_name,
+                operation_id,
+                completion,
+                origin,
+                origin_revision,
+                result,
+            } => {
+                completion.release();
+                self.fork_finished(
+                    &source_specifier,
+                    &destination_name,
+                    operation_id,
+                    &origin,
+                    origin_revision,
+                    result,
+                )
+            }
+            Message::StaleAccountInstallsChecked { outcome } => {
                 self.stale_account_installs_checked(outcome)
             }
             Message::RevealPackageFolder => self.reveal_package_folder(),
             Message::StartRenameOwned => self.start_rename_owned(),
             Message::RenameOwnedChanged(value) => {
-                self.rename_buffer = Some(value);
+                if self.rename_draft_is_for_open_package() {
+                    self.rename_buffer = Some(value);
+                }
                 Update::none()
             }
             Message::CommitRenameOwned => self.commit_rename_owned(),
             Message::CancelRenameOwned => {
-                self.rename_buffer = None;
+                self.clear_rename_draft();
                 Update::none()
             }
             Message::RequestTrust => self.request_trust(),
@@ -2521,7 +3293,12 @@ impl AutomationsWindow {
             Message::GrantUpdate => self.grant_update(),
             Message::DismissUpdate => self.dismiss_update(),
             Message::RateInstalledPackage(stars) => self.rate_installed_package(stars),
-            Message::InstalledRatingUpdated(result) => self.installed_rating_updated(result),
+            Message::InstalledRatingUpdated {
+                detail_seq,
+                package_id,
+                account_fence,
+                result,
+            } => self.installed_rating_updated(detail_seq, package_id, account_fence, result),
 
             // -------- discover ---------------------------------------------
             Message::OpenDiscover => self.open_discover(),
@@ -2542,31 +3319,61 @@ impl AutomationsWindow {
                 self.discover_scope = scope;
                 self.discover_search()
             }
-            Message::DiscoverResultsLoaded(result) => self.discover_results_loaded(result),
+            Message::DiscoverResultsLoaded(seq, result) => {
+                self.discover_results_loaded(seq, result)
+            }
             Message::DiscoverSelect { package_id, owner } => {
                 self.discover_select(package_id, owner)
             }
             Message::DiscoverInstallResult { owner, name } => {
                 self.discover_install_result(owner, name)
             }
-            Message::DiscoverDetailLoaded(result) => self.discover_detail_loaded(result),
-            Message::DiscoverCommentsLoaded(result) => self.discover_comments_loaded(result),
+            Message::DiscoverDetailLoaded {
+                seq,
+                package_id,
+                account_fence,
+                result,
+            } => self.discover_detail_loaded(seq, package_id, account_fence, result),
+            Message::DiscoverCommentsLoaded {
+                seq,
+                package_id,
+                account_fence,
+                result,
+            } => self.discover_comments_loaded(seq, package_id, account_fence, result),
             Message::DiscoverBack => self.discover_back(),
             Message::RatePackage(stars) => self.rate_package(stars),
-            Message::RatingUpdated(result) => self.rating_updated(result),
+            Message::RatingUpdated {
+                seq,
+                package_id,
+                account_fence,
+                result,
+            } => self.rating_updated(seq, package_id, account_fence, result),
             Message::CommentInputChanged(value) => {
                 self.discover_comment_input = value;
                 Update::none()
             }
             Message::AddComment => self.add_comment(),
-            Message::CommentAdded(result) => self.comment_added(result),
+            Message::CommentAdded {
+                seq,
+                package_id,
+                account_fence,
+                result,
+            } => self.comment_added(seq, package_id, account_fence, result),
             Message::OpenReadmeLink(uri) => {
                 let _ = open::that(uri.as_str());
                 Update::none()
             }
             Message::DiscoverInstall => self.discover_install(),
-            Message::InstallResolved(seq, result) => self.install_resolved(seq, result),
+            Message::InstallResolved(seq, account_fence, result) => {
+                self.install_resolved(seq, account_fence, result)
+            }
             Message::ConsentGrant { enable } => self.consent_grant(enable),
+            Message::ConsentCachePrepared {
+                seq,
+                account_fence,
+                enable,
+                result,
+            } => self.consent_cache_prepared(seq, account_fence, enable, result),
             Message::ConsentCancel => self.consent_cancel(),
             Message::ParamValueEdit(target, key, edit) => self.param_value_edit(target, key, edit),
             Message::ParamPromptSubmit => self.param_prompt_submit(),
@@ -2576,8 +3383,16 @@ impl AutomationsWindow {
 
             // -------- private & shared -------------------------------------
             Message::OpenShared => self.open_shared(),
-            Message::SharedLoaded(result) => self.shared_loaded(result),
-            Message::MyCloudLoaded(result) => self.my_cloud_loaded(result),
+            Message::SharedLoaded {
+                account_epoch,
+                account_fence,
+                result,
+            } => self.shared_loaded(account_epoch, account_fence, result),
+            Message::MyCloudLoaded {
+                account_epoch,
+                account_fence,
+                result,
+            } => self.my_cloud_loaded(account_epoch, account_fence, result),
             Message::InstallShared { owner, name } => self.begin_install(owner, name),
 
             // -------- top action bar ---------------------------------------
@@ -2585,7 +3400,10 @@ impl AutomationsWindow {
                 // Pick up a Settings change to the advanced-features gate without reopening.
                 self.advanced_features =
                     smudgy_core::models::settings::load_settings().advanced_scripting_features;
-                let toast = self.show_toast(format!("Reloaded scripts for {}.", self.server_name));
+                let toast = self.show_toast(crate::i18n::t!(
+                    "automation-reloaded",
+                    "server" => &self.server_name
+                ));
                 Update::new(
                     Task::batch([
                         Task::done(self.load_scripts_message()),
@@ -2680,6 +3498,9 @@ impl AutomationsWindow {
         if refresh_generated {
             update.task = Task::batch([update.task, self.refresh_generated_actions()]);
         }
+        // The Settings tab reads parameter completeness from a cache; keep it aligned with the
+        // parameter editor this update may have opened, re-seeded, or written through.
+        self.sync_profile_param_status(values_written);
         update
     }
 
@@ -2695,6 +3516,7 @@ impl AutomationsWindow {
                 matches!(action, text_editor::Action::Edit(_))
             }
             Message::SetName(_)
+            | Message::SetFolderPath(_)
             | Message::SetNewModuleName(_)
             | Message::SetAliasKind(_)
             | Message::SetArgName(_, _)
@@ -2777,7 +3599,8 @@ impl AutomationsWindow {
     fn is_guarded_navigation(message: &Message) -> bool {
         matches!(
             message,
-            Message::SelectScript(_)
+            Message::SwitchContext { .. }
+                | Message::SelectScript(_)
                 | Message::SelectFolder(_)
                 | Message::SelectModule(_)
                 | Message::SelectOwnedPackage(_)
@@ -2785,6 +3608,10 @@ impl AutomationsWindow {
                 | Message::NavigateCodeDefinition(_)
                 | Message::SelectInstalledPackage(_)
                 | Message::SelectDependency { .. }
+                | Message::SetParameterScope(_)
+                | Message::ConfirmGlobalParameterSource
+                | Message::SelectParameterProfile(_)
+                | Message::RequestClose
                 | Message::SelectCreatorAutomation { .. }
                 | Message::ShowDashboard
                 | Message::OpenDiscover
@@ -2807,6 +3634,100 @@ impl AutomationsWindow {
         if self.manifest_dirty {
             let _ = self.revert_manifest();
         }
+        if let Some(config) = self.param_config.as_mut() {
+            config.touched.clear();
+        }
+        // These forms are drafts too. Ordinary navigation reaches this point only after the user
+        // selected Discard; terminal navigation retains the whole window until the daemon accepts
+        // the close/switch, so it deliberately does not call this helper.
+        self.clear_rename_draft();
+        self.clear_fork_draft();
+    }
+
+    fn confirm_pending_navigation(&mut self, revision: u64) -> Update<Message, Event> {
+        if revision != self.pending_nav_revision {
+            return Update::none();
+        }
+        let Some(message) = self.pending_nav.take() else {
+            return Update::none();
+        };
+        self.pending_nav_revision = self.pending_nav_revision.wrapping_add(1);
+        match *message {
+            // Terminal navigation is accepted or rejected by the daemon in this same update turn.
+            // Do not clear drafts first: an obsolete target must leave the old
+            // window fully protected. An accepted switch/close drops this entire state.
+            Message::SwitchContext {
+                server_name,
+                session_id,
+                profile_name,
+            } => Update::with_event(Event::SwitchContext {
+                server_name,
+                session_id,
+                profile_name,
+            }),
+            Message::RequestClose => Update::with_event(Event::CloseRequested),
+            // Definition results are state-fenced and can become stale while this confirmation is
+            // open. Execute synchronously and clear dirty state only if the jump leaves the origin.
+            Message::NavigateCodeDefinition(navigation) => {
+                let (update, left_origin) = self.navigate_code_definition_checked(navigation);
+                if left_origin {
+                    self.accept_discarded_navigation();
+                }
+                update
+            }
+            message => {
+                // Complete ordinary navigation in this turn too. Deferring it would let a newer
+                // click run first and then allow this older confirmed destination to overwrite it.
+                // Re-seed the manifest immediately so Discard cannot leave a dormant edited draft.
+                self.accept_discarded_navigation();
+                self.update(message)
+            }
+        }
+    }
+
+    fn cancel_pending_navigation(&mut self, revision: u64) -> Update<Message, Event> {
+        if revision != self.pending_nav_revision {
+            return Update::none();
+        }
+        let cancelled_navigation = self
+            .pending_nav
+            .as_deref()
+            .and_then(|message| match message {
+                Message::SwitchContext { .. } => Some(Event::ContextSwitchCancelled),
+                Message::RequestClose => Some(Event::CloseCancelled),
+                _ => None,
+            });
+        self.pending_nav = None;
+        self.pending_nav_revision = self.pending_nav_revision.wrapping_add(1);
+        Update::new(Task::none(), cancelled_navigation)
+    }
+
+    /// Drops the deferred navigation once a save or discard has resolved the draft that guarded
+    /// it. Every path that forgets a pending navigation outside the banner's own actions goes
+    /// through here.
+    ///
+    /// A terminal target (an application close or a session switch) is answered with its cancel
+    /// event, exactly as Keep editing does: the daemon retains the last main window and the queued
+    /// switch until it hears one answer, and a silent drop would leave the application unable to
+    /// exit or switch sessions. The window stays open on the saved item; the banner offers no
+    /// save-and-continue path, so a save never completes the close or switch by itself. The event
+    /// is delivered through [`Message::NavigationReleased`] because the releasing update already
+    /// carries the save's own event. Ordinary tree navigation is simply forgotten.
+    pub(super) fn release_pending_navigation(&mut self) -> Task<Message> {
+        let released = self
+            .pending_nav
+            .as_deref()
+            .and_then(|message| match message {
+                Message::SwitchContext { .. } => Some(ReleasedNavigation::ContextSwitch),
+                Message::RequestClose => Some(ReleasedNavigation::Close),
+                _ => None,
+            });
+        if self.pending_nav.take().is_some() {
+            self.pending_nav_revision = self.pending_nav_revision.wrapping_add(1);
+        }
+        released.map_or_else(Task::none, |released| {
+            Task::done(Message::NavigationReleased(released))
+        })
     }
 
     /// Swaps a trigger row with its neighbor **within its role group** — the
@@ -2875,32 +3796,61 @@ impl AutomationsWindow {
 
     /// Resets per-pane selection scaffolding before opening a new pane.
     pub(super) fn clear_selection(&mut self) {
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         self.clear_code_editor();
         self.new_menu_open = false;
         self.confirm_folder_delete = false;
         self.confirm_delete_local = false;
         self.confirm_uninstall = false;
+        self.uninstall_expected_lock = None;
         self.confirm_trust = false;
+        self.clear_rename_draft();
+        self.clear_fork_draft();
+        self.fork_operation = None;
+        // Detail/fork tasks are fenced below. The latch belongs to the pane being abandoned; a
+        // stale completion must not be required to make a later pane usable.
+        self.manage_busy = false;
+        self.installed_readme = InstalledReadmeState::Loaded(None);
         // Drop any open manifest draft + its unsaved/editing flags — leaving the owned-package pane
         // abandons the edit (re-seeded fresh from disk when an owned package is next opened). Also
         // keeps the unsaved-changes guard from later firing for a package that's no longer open.
         self.manifest_draft = None;
+        self.module_source_baseline = None;
+        self.owned_source_baseline = None;
+        self.manifest_source_baseline = None;
         self.manifest_dirty = false;
         self.manifest_editing = false;
+        self.manifest_operation = None;
+        self.authoring_operation = None;
+        self.authoring_busy = false;
+        self.authoring_feedback = None;
+        self.manage_feedback = None;
+        self.share_feedback = None;
         // Drop the inline param-value editor; the next package pane re-seeds it from its own params.
         self.param_config = None;
+        self.confirm_global_parameter_source = false;
         // Abandon any in-flight install confirmation / update re-prompt on navigation — neither
         // has written anything yet (the consent window writes only on Grant). Bumping the
         // generation also discards a still-pending resolve so it can't pop a stale window later.
         self.consent_prompt = None;
+        self.consent_busy = false;
         self.update_delta = None;
+        self.package_change_finalize = None;
         self.install_seq.bump();
-        // Drop any not-yet-shown required-params prompts queued after a multi-package install; their
-        // packages are already installed (just left unconfigured), so navigating away is safe.
+        // Drop required-parameter prompts after a committed package change. Missing values keep
+        // that package fail-closed, and the inventory refresh was already queued at commit time.
+        self.param_prompt = None;
         self.param_prompt_queue.clear();
         // Opening any pane abandons the manage pane's in-flight detail load too — invalidate it so a
         // late result can't repaint or record consent against the package that was open before.
         self.detail_seq.bump();
+        // Discover detail, comments, ratings, and comments can carry viewer-specific state. A late
+        // completion from the pane being abandoned must not repaint a later visit to the same item.
+        self.discover_seq.bump();
+        self.discover_requested_package = None;
+        self.share_seq.bump();
+        self.share_busy = false;
+        self.share_operation = None;
     }
 
     /// The cloud package client (constructed per use).
@@ -2926,9 +3876,16 @@ impl AutomationsWindow {
         let main = column![
             self.view_topbar(),
             self.view_nav_banner(),
-            container(scrollable(self.view_pane()).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill),
+            self.view_state_error_banner(),
+            // The pane learns its viewport height here, outside the scrollable, so an editor
+            // pane can grow into the room the viewport has before it has to scroll.
+            container(iced::widget::responsive(move |size| {
+                scrollable(self.view_pane(size.height))
+                    .height(Length::Fill)
+                    .into()
+            }))
+            .width(Length::Fill)
+            .height(Length::Fill),
         ]
         .spacing(0)
         .width(Length::Fill)
@@ -2955,6 +3912,9 @@ impl AutomationsWindow {
         if self.palette_open {
             layers.push(self.view_palette());
         }
+        if let Some(prompt) = &self.copy_settings_prompt {
+            layers.push(self.view_copy_settings_modal(prompt));
+        }
         if let Some(message) = &self.toast {
             layers.push(common::toast(message));
         }
@@ -2965,7 +3925,59 @@ impl AutomationsWindow {
             .into()
     }
 
-    /// The sticky unsaved-changes banner, shown while a navigation is deferred.
+    /// Persistent fail-closed notice for inventories that could not be read completely. Keep it
+    /// outside the selected pane: an empty sidebar must never look like a valid empty setup.
+    fn view_state_error_banner(&self) -> Elem<'_> {
+        use iced::alignment::Vertical;
+        use iced::widget::{button, text};
+
+        let errors = [
+            self.folder_state_error.as_deref(),
+            self.module_state_error.as_deref(),
+            self.local_package_state_error.as_deref(),
+            self.installed_package_state_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+        if errors.is_empty() {
+            return iced::widget::space::vertical()
+                .height(Length::Fixed(0.0))
+                .into();
+        }
+
+        let mut details = column![
+            text(crate::i18n::t!("automations-state-unavailable"))
+                .size(13.0)
+                .style(common::warning)
+        ]
+        .spacing(3.0);
+        for error in errors {
+            details = details.push(text(error).size(11.0).style(common::muted));
+        }
+        container(
+            row![
+                details,
+                iced::widget::space::horizontal(),
+                button(text(crate::i18n::t!("automations-reload")).size(13.0))
+                    .style(crate::theme::builtins::button::secondary)
+                    .on_press(Message::Reload),
+            ]
+            .spacing(12.0)
+            .align_y(Vertical::Center),
+        )
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 8.0,
+            bottom: 8.0,
+            left: 18.0,
+            right: 18.0,
+        })
+        .style(common::banner_style)
+        .into()
+    }
+
+    /// The sticky draft banner shown while navigation is deferred.
     fn view_nav_banner(&self) -> Elem<'_> {
         use iced::alignment::Vertical;
         use iced::widget::{button, text};
@@ -2974,17 +3986,28 @@ impl AutomationsWindow {
                 .height(Length::Fixed(0.0))
                 .into();
         }
+        let message = crate::i18n::t!("automation-nav-unsaved");
+        let continue_label = if self.pending_context_switch() {
+            crate::i18n::t!("automation-discard-and-switch")
+        } else if self.pending_close() {
+            crate::i18n::t!("automation-discard-and-close")
+        } else {
+            crate::i18n::t!("editor-discard")
+        };
+        let stay_label = crate::i18n::t!("automation-keep-editing");
         container(
             row![
                 text("\u{25CF}").size(10.0).style(common::danger),
-                text(crate::i18n::t!("automation-nav-unsaved")).size(13.0),
+                text(message).size(13.0),
                 iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("editor-discard")).size(13.0))
+                button(text(continue_label).size(13.0))
                     .style(crate::theme::builtins::button::secondary)
-                    .on_press(Message::ConfirmDiscardNav),
-                button(text(crate::i18n::t!("automation-keep-editing")).size(13.0))
+                    .on_press(Message::ConfirmDiscardNavRevision(
+                        self.pending_nav_revision,
+                    )),
+                button(text(stay_label).size(13.0))
                     .style(crate::theme::builtins::button::primary)
-                    .on_press(Message::CancelDiscardNav),
+                    .on_press(Message::CancelDiscardNavRevision(self.pending_nav_revision,)),
             ]
             .spacing(10.0)
             .align_y(Vertical::Center),
@@ -3001,13 +4024,14 @@ impl AutomationsWindow {
     }
 
     /// Dispatches to the active content pane.
-    fn view_pane(&self) -> Elem<'_> {
+    /// `viewport_height` is the height of the scroll viewport the pane renders into.
+    fn view_pane(&self, viewport_height: f32) -> Elem<'_> {
         match &self.pane {
             Pane::Dashboard => self.view_dashboard(),
             Pane::Error(errors) => self.view_error(errors),
-            Pane::Editor(state) => self.view_editor(state),
+            Pane::Editor(state) => self.view_editor(state, viewport_height),
             Pane::Folder(state) => self.view_folder_editor(state),
-            Pane::Module(state) => self.view_module(state),
+            Pane::Module(state) => self.view_module(state, viewport_height),
             Pane::OwnedPackage => self.view_owned_package(),
             Pane::NewPackage { name, error } => self.view_new_package(name, error.as_deref()),
             Pane::InstalledPackage => self.view_installed_package(),
@@ -3097,20 +4121,52 @@ mod tab_traversal_tests {
     }
 
     #[test]
+    fn retiring_a_session_cancels_only_its_exact_runtime_subscriptions() {
+        let session_id = SessionId::from(71);
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "subscription-liveness-test".to_string(),
+            crate::cloud_account::test_handles(),
+            session_id,
+        );
+        assert!(window.session_binding_live);
+
+        window.retire_session_binding(SessionId::from(72));
+        assert!(window.session_binding_live);
+
+        window.retire_session_binding(session_id);
+        assert!(!window.session_binding_live);
+    }
+
+    #[test]
     fn publish_completion_updates_the_open_pane_immediately() {
         let mut window = AutomationsWindow::new(
             window::Id::unique(),
             "publish-completion-test".to_string(),
-            crate::cloud_account::test_handles(),
+            crate::cloud_account::test_handles_signed_in("publisher"),
             SessionId::from(1),
         );
         window.selection = Selection::OwnedPackage("demo".to_string());
         window.authoring_busy = true;
+        let operation = window
+            .cloud
+            .package_operations
+            .try_acquire("publish-completion-test", "demo")
+            .unwrap();
+        let operation_id = operation.id();
+        window.authoring_operation = Some(operation_id);
+        let completion = operation.into_completion();
         let package_id = Uuid::new_v4();
         let published_at = "2026-08-10T00:00:00Z".parse().unwrap();
+        let publisher_id = window.cloud.snapshot.get().profile.as_ref().unwrap().id;
 
         let _ = window.update(Message::PublishFinished {
+            server_name: "publish-completion-test".to_string(),
             name: "demo".to_string(),
+            operation_id,
+            completion,
+            credential_generation: window.cloud.credentials.generation(),
+            publisher_id,
             result: Ok(PublishSummary {
                 package_id,
                 is_public: true,
@@ -3121,6 +4177,7 @@ mod tab_traversal_tests {
                 locked_dependencies: Vec::new(),
                 dependency_warnings: Vec::new(),
                 interop_warnings: Vec::new(),
+                publication_warnings: Vec::new(),
             }),
         });
 
@@ -3133,6 +4190,236 @@ mod tab_traversal_tests {
         let output = window.publish_output.as_ref().unwrap();
         assert_eq!(output.package, "demo");
         assert!(output.text.starts_with("smudgy> publish demo\n"));
+    }
+
+    #[test]
+    fn publish_completion_does_not_expose_another_accounts_sharing_state() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "publish-account-fence-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("same-visible-name"),
+            SessionId::from(1),
+        );
+        window.selection = Selection::OwnedPackage("demo".to_string());
+        window.authoring_busy = true;
+        window.share_package_id = Some(Uuid::new_v4());
+        window.share_is_public = true;
+        let operation = window
+            .cloud
+            .package_operations
+            .try_acquire("publish-account-fence-test", "demo")
+            .unwrap();
+        let operation_id = operation.id();
+        window.authoring_operation = Some(operation_id);
+        let package_id = Uuid::new_v4();
+
+        let _ = window.update(Message::PublishFinished {
+            server_name: "publish-account-fence-test".to_string(),
+            name: "demo".to_string(),
+            operation_id,
+            completion: operation.into_completion(),
+            credential_generation: window.cloud.credentials.generation(),
+            publisher_id: Uuid::new_v4(),
+            result: Ok(PublishSummary {
+                package_id,
+                is_public: true,
+                version: "1.0.0".to_string(),
+                published_at: "2026-08-10T00:00:00Z".parse().unwrap(),
+                typings_generated: 0,
+                typings_warnings: Vec::new(),
+                locked_dependencies: Vec::new(),
+                dependency_warnings: Vec::new(),
+                interop_warnings: Vec::new(),
+                publication_warnings: Vec::new(),
+            }),
+        });
+
+        assert_eq!(
+            window.publication_status,
+            PublicationStatus::Bound(package_id)
+        );
+        assert_eq!(window.share_package_id, None);
+        assert!(!window.share_is_public);
+        assert!(window.share_versions.is_empty());
+        assert!(window.share_grants.is_empty());
+        assert!(
+            window.share_busy,
+            "the completion must start a refresh for the newly active account"
+        );
+    }
+
+    #[test]
+    fn old_package_completions_do_not_release_newer_ui_latches() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "operation-fence-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("publisher"),
+            SessionId::from(1),
+        );
+        let old_publish = window
+            .cloud
+            .package_operations
+            .try_acquire("operation-fence-test", "demo")
+            .unwrap();
+        let old_publish_id = old_publish.id();
+        let old_publish_completion = old_publish.into_completion();
+        let current_publish = window
+            .cloud
+            .package_operations
+            .try_acquire("operation-fence-test", "other")
+            .unwrap();
+        window.authoring_operation = Some(current_publish.id());
+        window.authoring_busy = true;
+        let publisher_id = window.cloud.snapshot.get().profile.as_ref().unwrap().id;
+
+        let _ = window.update(Message::PublishFinished {
+            server_name: "operation-fence-test".to_string(),
+            name: "demo".to_string(),
+            operation_id: old_publish_id,
+            completion: old_publish_completion,
+            credential_generation: window.cloud.credentials.generation(),
+            publisher_id,
+            result: Err("old result".to_string()),
+        });
+        assert!(window.authoring_busy);
+        assert_eq!(window.authoring_operation, Some(current_publish.id()));
+        drop(current_publish);
+
+        let old_fork = window
+            .cloud
+            .package_operations
+            .try_acquire("operation-fence-test", "copy")
+            .unwrap();
+        let old_fork_id = old_fork.id();
+        let old_fork_completion = old_fork.into_completion();
+        let current_fork = window
+            .cloud
+            .package_operations
+            .try_acquire("operation-fence-test", "other-copy")
+            .unwrap();
+        window.fork_operation = Some(current_fork.id());
+        window.fork_name = Some("current-copy".to_string());
+        window.fork_source_specifier = Some("smudgy://publisher/current".to_string());
+        window.manage_busy = true;
+
+        old_fork_completion.release();
+        let _ = window.fork_finished(
+            "smudgy://publisher/source",
+            "copy",
+            old_fork_id,
+            &Selection::Dashboard,
+            0,
+            Err("old result".to_string()),
+        );
+        assert!(window.manage_busy);
+        assert_eq!(window.fork_operation, Some(current_fork.id()));
+        assert_eq!(window.fork_name.as_deref(), Some("current-copy"));
+        assert_eq!(
+            window.fork_source_specifier.as_deref(),
+            Some("smudgy://publisher/current")
+        );
+    }
+
+    #[test]
+    fn ui_audit_package_action_forms_are_source_bound_navigation_drafts() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "package-form-draft-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let source = "smudgy://publisher/alpha";
+        window.installed_open = Some(Box::new(LockedPackage::new(source, UpdateMode::Auto)));
+        window.selection = Selection::InstalledPackage(source.to_string());
+        window.pane = Pane::InstalledPackage;
+        window.fork_source_specifier = Some(source.to_string());
+        window.fork_name = Some("alpha-copy".to_string());
+
+        assert_eq!(window.open_fork_name(), Some("alpha-copy"));
+        assert!(window.has_unsaved_changes());
+        let guarded = window.update(Message::ShowDashboard);
+        assert!(guarded.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::ShowDashboard)
+        ));
+        assert_eq!(window.open_fork_name(), Some("alpha-copy"));
+
+        let revision = window.pending_nav_revision;
+        let _ = window.update(Message::ConfirmDiscardNavRevision(revision));
+        assert!(window.fork_name.is_none());
+        assert!(window.fork_source_specifier.is_none());
+        assert_eq!(window.selection, Selection::Dashboard);
+
+        let manifest = serde_json::from_value(serde_json::json!({"version": "0.1.0"}))
+            .expect("minimal package manifest");
+        window.local_package = Some(Box::new(LocalPackage {
+            name: "alpha".to_string(),
+            manifest,
+            readme: None,
+            modules: Vec::new(),
+        }));
+        window.rename_source_name = Some("alpha".to_string());
+        window.rename_buffer = Some("alpha-renamed".to_string());
+        assert_eq!(window.open_rename_buffer(), Some("alpha-renamed"));
+
+        window.local_package.as_mut().unwrap().name = "beta".to_string();
+        assert_eq!(window.open_rename_buffer(), None);
+        let _ = window.update(Message::RenameOwnedChanged("must-not-leak".to_string()));
+        assert_eq!(window.rename_buffer.as_deref(), Some("alpha-renamed"));
+        let _ = window.update(Message::CancelRenameOwned);
+        assert!(window.rename_buffer.is_none());
+        assert!(window.rename_source_name.is_none());
+    }
+
+    #[test]
+    fn ui_audit_installed_readme_state_distinguishes_empty_loading_and_failure() {
+        assert!(InstalledReadmeState::Loaded(None).is_loaded());
+        assert!(!InstalledReadmeState::Loading.is_loaded());
+        assert!(!InstalledReadmeState::Failed("offline".to_string()).is_loaded());
+
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "installed-readme-state-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.installed_readme = InstalledReadmeState::Loading;
+        window.manage_busy = true;
+        let _ = window.installed_detail_loaded(
+            window.detail_seq,
+            window.account_read_fence(),
+            Err(CloudError::NetworkError("offline".to_string())),
+        );
+        assert!(matches!(
+            window.installed_readme,
+            InstalledReadmeState::Failed(_)
+        ));
+        assert!(!window.installed_detail_ready_for_copy());
+    }
+
+    #[test]
+    fn opening_legacy_folder_uses_existing_case_insensitive_activation_row() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "folder-case-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        smudgy_core::models::packages::insert_folder(&mut window.packages, "Combat");
+
+        let _ = window.open_folder("combat".to_string());
+
+        assert_eq!(
+            smudgy_core::models::packages::collect_folder_paths(&window.packages),
+            vec!["Combat".to_string()]
+        );
+        assert_eq!(window.selection, Selection::Folder("combat".to_string()));
+        let Pane::Folder(folder) = &window.pane else {
+            panic!("folder pane should be open");
+        };
+        assert_eq!(folder.path, "combat");
+        assert_eq!(folder.original_path.as_deref(), Some("combat"));
     }
 
     #[test]
@@ -3212,11 +4499,14 @@ mod tab_traversal_tests {
             crate::cloud_account::test_handles(),
             SessionId::from(1),
         );
+        window.action_script_lang = ScriptLang::TS;
         let _ = window.new_hotkey();
+        assert_eq!(window.action_script_lang, ScriptLang::JS);
         window.hotkey_text_content = text_editor::Content::with_text("say hello");
 
         let _ = window.update(Message::SetBehavior(ScriptLang::JS));
 
+        assert_eq!(window.action_script_lang, ScriptLang::JS);
         assert!(window.code_editor.is_some());
         assert!(window.language_service.is_some());
         assert_eq!(window.code_editor_text(), "say hello");
@@ -3230,6 +4520,7 @@ mod tab_traversal_tests {
         let _ = window.update(Message::CodeEditorAction(message));
         let _ = window.update(Message::SetBehavior(ScriptLang::Plaintext));
 
+        assert_eq!(window.action_script_lang, ScriptLang::JS);
         assert_eq!(window.hotkey_text_content.text(), "say hello();");
         assert!(window.code_editor.is_none());
         assert!(matches!(
@@ -3244,7 +4535,50 @@ mod tab_traversal_tests {
         ));
 
         let _ = window.update(Message::SetBehavior(ScriptLang::TS));
+        assert_eq!(window.action_script_lang, ScriptLang::TS);
         assert_eq!(window.code_editor_text(), "say hello();");
+    }
+
+    #[test]
+    fn opening_a_hotkey_restores_its_script_dialect_for_tab_round_trips() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "hotkey-script-dialect-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.scripts.insert(
+            "typed hotkey".to_string(),
+            Script::Hotkey(hotkeys::HotkeyDefinition {
+                key: "F1".to_string(),
+                modifiers: Vec::new(),
+                script: Some("const value: number = 1;".to_string()),
+                package: None,
+                language: ScriptLang::TS,
+                enabled: true,
+            }),
+        );
+        window.action_script_lang = ScriptLang::JS;
+
+        let _ = window.open_script(ScriptKey {
+            folder_name: None,
+            script_name: "typed hotkey".to_string(),
+        });
+        assert_eq!(window.action_script_lang, ScriptLang::TS);
+
+        let _ = window.update(Message::SetBehavior(ScriptLang::Plaintext));
+        assert_eq!(window.action_script_lang, ScriptLang::TS);
+        let _ = window.update(Message::SetBehavior(window.action_script_lang));
+        assert!(matches!(
+            &window.pane,
+            Pane::Editor(EditorState {
+                node: EditNode::Hotkey(hotkeys::HotkeyDefinition {
+                    language: ScriptLang::TS,
+                    ..
+                }),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3341,6 +4675,40 @@ mod tab_traversal_tests {
     }
 
     #[test]
+    fn new_module_name_changes_do_not_replace_explicit_activation() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "new-module-activation-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let _ = window.new_module();
+        let _ = window.update(Message::SetNewModuleName("nested/worker.ts".to_owned()));
+        assert!(matches!(
+            &window.pane,
+            Pane::Module(state) if state.activation == ProfileActivation::None
+        ));
+
+        // This equals the nested-path default, but it is still an explicit user choice.
+        let _ = window.update(Message::DisableEverywhere);
+        let _ = window.update(Message::SetNewModuleName("worker.ts".to_owned()));
+        assert!(matches!(
+            &window.pane,
+            Pane::Module(state)
+                if state.activation == ProfileActivation::None && state.activation_touched
+        ));
+
+        let _ = window.new_module();
+        let _ = window.update(Message::EnableEverywhere);
+        let _ = window.update(Message::SetNewModuleName("nested/worker.ts".to_owned()));
+        assert!(matches!(
+            &window.pane,
+            Pane::Module(state)
+                if state.activation == ProfileActivation::All && state.activation_touched
+        ));
+    }
+
+    #[test]
     fn stale_async_editor_message_cannot_mutate_a_remounted_stable_document() {
         let mut window = AutomationsWindow::new(
             window::Id::unique(),
@@ -3353,6 +4721,9 @@ mod tab_traversal_tests {
             subpath: "same.ts".to_owned(),
             path: Some(std::path::PathBuf::from("same.ts")),
             name: String::new(),
+            tab: ModuleTab::Source,
+            activation: ProfileActivation::All,
+            activation_touched: false,
             error: None,
         });
         let _ = window.bind_code_editor(
@@ -3420,6 +4791,9 @@ mod tab_traversal_tests {
             subpath: "same.ts".to_owned(),
             path: Some(path.clone()),
             name: String::new(),
+            tab: ModuleTab::Source,
+            activation: ProfileActivation::All,
+            activation_touched: false,
             error: None,
         });
         let _ = window.bind_code_editor(
@@ -3952,5 +5326,782 @@ mod tab_traversal_tests {
                 .color_range_last_valid,
             range
         );
+    }
+
+    fn context_switch_message() -> Message {
+        Message::SwitchContext {
+            server_name: "other-server".to_string(),
+            session_id: SessionId::from(42),
+            profile_name: "other-profile".to_string(),
+        }
+    }
+
+    fn confirm_pending(window: &mut AutomationsWindow) -> Update<Message, Event> {
+        window.update(Message::ConfirmDiscardNavRevision(
+            window.pending_nav_revision,
+        ))
+    }
+
+    fn cancel_pending(window: &mut AutomationsWindow) -> Update<Message, Event> {
+        window.update(Message::CancelDiscardNavRevision(
+            window.pending_nav_revision,
+        ))
+    }
+
+    #[test]
+    fn clean_context_switch_preserves_the_exact_requested_binding() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+
+        let update = window.update(context_switch_message());
+
+        assert!(matches!(
+            update.event,
+            Some(Event::SwitchContext {
+                server_name,
+                session_id,
+                profile_name,
+            }) if server_name == "other-server"
+                && session_id == SessionId::from(42)
+                && profile_name == "other-profile"
+        ));
+        assert!(window.pending_nav.is_none());
+    }
+
+    #[test]
+    fn copy_settings_dialog_needs_profile_scope_and_a_different_destination() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "copy-settings-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.profile_names = vec!["alt".to_string(), "main".to_string()];
+        window.profile_inventory_complete = true;
+        window.parameter_profile = "main".to_string();
+        let seed = |scope: ParameterScope| ParamConfig {
+            specifier: "smudgy://owner/package".to_string(),
+            expected_package: Some(LockedPackage::new(
+                "smudgy://owner/package",
+                UpdateMode::Auto,
+            )),
+            parameter_scope: scope,
+            profile_name: "main".to_string(),
+            available: true,
+            params: Vec::new(),
+            values: HashMap::new(),
+            secret_stored: HashSet::new(),
+            touched: HashSet::new(),
+            error: None,
+            saved: false,
+        };
+
+        window.param_config = Some(seed(ParameterScope::Global));
+        let _ = window.update(Message::OpenCopySettings);
+        assert!(
+            window.copy_settings_prompt.is_none(),
+            "same-settings-everywhere has nothing to copy between profiles"
+        );
+
+        window.param_config = Some(seed(ParameterScope::Profile));
+        let _ = window.update(Message::OpenCopySettings);
+        let prompt = window.copy_settings_prompt.clone().expect("dialog opens");
+        assert_eq!(prompt.source, "main");
+        assert_eq!(prompt.destination, None);
+
+        let _ = window.update(Message::SelectCopySettingsDestination("main".to_string()));
+        assert_eq!(
+            window.copy_settings_prompt.as_ref().unwrap().destination,
+            None,
+            "the source profile is not a destination"
+        );
+        let _ = window.update(Message::SelectCopySettingsDestination("alt".to_string()));
+        assert_eq!(
+            window.copy_settings_prompt.as_ref().unwrap().destination,
+            Some("alt".to_string())
+        );
+
+        let _ = window.update(Message::CancelCopySettings);
+        assert!(window.copy_settings_prompt.is_none());
+    }
+
+    #[test]
+    fn context_switch_uses_the_existing_guard_for_parameter_drafts() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.param_config = Some(ParamConfig {
+            specifier: "smudgy://owner/package".to_string(),
+            expected_package: Some(LockedPackage::new(
+                "smudgy://owner/package",
+                UpdateMode::Auto,
+            )),
+            parameter_scope: ParameterScope::Global,
+            profile_name: "main".to_string(),
+            available: true,
+            params: Vec::new(),
+            values: HashMap::new(),
+            secret_stored: HashSet::new(),
+            touched: HashSet::from(["draft".to_string()]),
+            error: None,
+            saved: false,
+        });
+
+        let update = window.update(context_switch_message());
+
+        assert!(update.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SwitchContext { session_id, .. })
+                if *session_id == SessionId::from(42)
+        ));
+
+        let confirmed = confirm_pending(&mut window);
+        assert!(matches!(confirmed.event, Some(Event::SwitchContext { .. })));
+        assert!(window.pending_nav.is_none());
+        assert!(window.has_unsaved_changes());
+    }
+
+    #[test]
+    fn ordinary_navigation_cannot_replace_a_pending_context_switch() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.dirty = true;
+
+        let _ = window.update(context_switch_message());
+        let _ = window.update(Message::ShowDashboard);
+
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SwitchContext { session_id, .. })
+                if *session_id == SessionId::from(42)
+        ));
+        let cancelled = cancel_pending(&mut window);
+        assert!(matches!(
+            cancelled.event,
+            Some(Event::ContextSwitchCancelled)
+        ));
+    }
+
+    #[test]
+    fn stale_confirmation_actions_cannot_affect_a_newer_terminal_target() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.dirty = true;
+        let _ = window.update(context_switch_message());
+        let stale_revision = window.pending_nav_revision;
+
+        let _ = window.update(Message::SwitchContext {
+            server_name: "newest-server".to_string(),
+            session_id: SessionId::from(99),
+            profile_name: "newest-profile".to_string(),
+        });
+        assert_ne!(window.pending_nav_revision, stale_revision);
+
+        let stale_confirm = window.update(Message::ConfirmDiscardNavRevision(stale_revision));
+        assert!(stale_confirm.event.is_none());
+        assert!(window.dirty);
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SwitchContext { session_id, .. })
+                if *session_id == SessionId::from(99)
+        ));
+
+        let stale_cancel = window.update(Message::CancelDiscardNavRevision(stale_revision));
+        assert!(stale_cancel.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SwitchContext { session_id, .. })
+                if *session_id == SessionId::from(99)
+        ));
+
+        let current_revision = window.pending_nav_revision;
+        let current = window.update(Message::ConfirmDiscardNavRevision(current_revision));
+        assert!(matches!(
+            current.event,
+            Some(Event::SwitchContext { session_id, .. })
+                if session_id == SessionId::from(99)
+        ));
+        assert!(window.dirty, "daemon acceptance still owns draft disposal");
+    }
+
+    #[test]
+    fn close_request_uses_the_existing_dirty_navigation_guard() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "close-guard-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.dirty = true;
+
+        let guarded = window.update(Message::RequestClose);
+        assert!(guarded.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::RequestClose)
+        ));
+
+        let accepted = confirm_pending(&mut window);
+        assert!(matches!(accepted.event, Some(Event::CloseRequested)));
+        assert!(window.has_unsaved_changes());
+    }
+
+    #[test]
+    fn authenticated_read_fence_expires_as_soon_as_the_credential_changes() {
+        let window = AutomationsWindow::new(
+            window::Id::unique(),
+            "account-read-fence-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("first"),
+            SessionId::from(1),
+        );
+        let fence = window.account_read_fence();
+        assert!(window.account_read_is_current(fence));
+
+        window.cloud.credentials.set(None);
+        assert!(!window.account_read_is_current(fence));
+    }
+
+    #[test]
+    fn authenticated_read_fence_expires_on_an_account_snapshot_epoch_change() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "account-read-epoch-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("first"),
+            SessionId::from(1),
+        );
+        let fence = window.account_read_fence();
+        window.account_epoch = window.account_epoch.wrapping_add(1);
+        assert!(!window.account_read_is_current(fence));
+    }
+
+    #[test]
+    fn discover_drops_out_of_order_search_results() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "discover-search-fence-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.selection = Selection::Discover;
+        window.discover_busy = true;
+        let superseded = window.discover_search_seq;
+        window.discover_search_seq.bump();
+
+        let _ = window.discover_results_loaded(superseded, Ok(Vec::new()));
+
+        assert!(window.discover_busy, "the current search must remain busy");
+    }
+
+    #[test]
+    fn discover_drops_viewer_results_after_an_account_change() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "discover-account-fence-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("first"),
+            SessionId::from(1),
+        );
+        let package_id = Uuid::new_v4();
+        window.selection = Selection::Discover;
+        window.discover_requested_package = Some(package_id);
+        let seq = window.discover_seq;
+        let fence = window.account_read_fence();
+        window.cloud.credentials.set(None);
+
+        let _ = window.discover_detail_loaded(
+            seq,
+            package_id,
+            fence,
+            Err(CloudError::Unauthorized("old account".to_string())),
+        );
+
+        assert!(window.discover_error.is_none());
+        assert!(window.discover_detail.is_none());
+    }
+
+    #[test]
+    fn installed_detail_drops_results_from_the_previous_account() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "installed-account-fence-test".to_string(),
+            crate::cloud_account::test_handles_signed_in("first"),
+            SessionId::from(1),
+        );
+        let seq = window.detail_seq;
+        let fence = window.account_read_fence();
+        window.manage_busy = true;
+        window.cloud.credentials.set(None);
+
+        let _ = window.installed_detail_loaded(
+            seq,
+            fence,
+            Err(CloudError::Unauthorized("old account".to_string())),
+        );
+
+        assert!(window.manage_busy, "a newer load owns the busy state");
+        assert!(window.manage_feedback.is_none());
+    }
+
+    #[test]
+    fn parameter_drafts_guard_profile_and_scope_changes() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.param_config = Some(ParamConfig {
+            specifier: "smudgy://owner/package".to_string(),
+            expected_package: Some(LockedPackage::new(
+                "smudgy://owner/package",
+                UpdateMode::Auto,
+            )),
+            parameter_scope: ParameterScope::Global,
+            profile_name: "main".to_string(),
+            available: true,
+            params: Vec::new(),
+            values: HashMap::new(),
+            secret_stored: HashSet::new(),
+            touched: HashSet::from(["draft".to_string()]),
+            error: None,
+            saved: false,
+        });
+
+        let profile_update = window.update(Message::SelectParameterProfile("alt".to_string()));
+        assert!(profile_update.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SelectParameterProfile(profile)) if profile == "alt"
+        ));
+
+        let _ = cancel_pending(&mut window);
+        let scope_update = window.update(Message::SetParameterScope(ParameterScope::Profile));
+        assert!(scope_update.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::SetParameterScope(ParameterScope::Profile))
+        ));
+    }
+
+    #[test]
+    fn repeated_current_session_request_can_cancel_a_queued_context_switch() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.dirty = true;
+        let _ = window.update(context_switch_message());
+        assert!(window.pending_nav.is_some());
+
+        window.cancel_pending_context_switch();
+
+        assert!(window.pending_nav.is_none());
+        assert!(window.has_unsaved_changes());
+    }
+
+    #[test]
+    fn keep_editing_notifies_the_daemon_that_the_switch_was_cancelled() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.manifest_dirty = true;
+        let _ = window.update(context_switch_message());
+
+        let update = cancel_pending(&mut window);
+
+        assert!(matches!(update.event, Some(Event::ContextSwitchCancelled)));
+        assert!(window.pending_nav.is_none());
+        assert!(window.has_unsaved_changes());
+    }
+
+    /// The messages a task yields without waiting on anything: `Task::done` values and batches
+    /// of them. Timed work (toasts) never appears here, so callers pass tasks that contain none.
+    fn task_messages(task: Task<Message>) -> Vec<Message> {
+        use iced::futures::StreamExt;
+        let Some(stream) = iced_runtime::task::into_stream(task) else {
+            return Vec::new();
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(
+                stream
+                    .filter_map(|action| async move {
+                        match action {
+                            iced_runtime::Action::Output(message) => Some(message),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+    }
+
+    #[test]
+    fn discard_with_a_pending_terminal_navigation_answers_the_daemon_with_its_cancel_event() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "release-pending-close-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.dirty = true;
+        let guarded = window.update(Message::RequestClose);
+        assert!(guarded.event.is_none());
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::RequestClose)
+        ));
+
+        let discarded = window.update(Message::Discard);
+        assert!(discarded.event.is_none());
+        assert!(window.pending_nav.is_none());
+        let mut released = task_messages(discarded.task);
+        assert!(matches!(
+            released.as_slice(),
+            [Message::NavigationReleased(ReleasedNavigation::Close)]
+        ));
+        // Delivering the released notice is what lets the daemon drop
+        // `main_window_close_after_automations` and un-close the last main window.
+        let answered = window.update(released.remove(0));
+        assert!(matches!(answered.event, Some(Event::CloseCancelled)));
+        assert!(window.pending_nav.is_none());
+
+        window.dirty = true;
+        let _ = window.update(context_switch_message());
+        let discarded = window.update(Message::Discard);
+        let mut released = task_messages(discarded.task);
+        assert!(matches!(
+            released.as_slice(),
+            [Message::NavigationReleased(
+                ReleasedNavigation::ContextSwitch
+            )]
+        ));
+        let answered = window.update(released.remove(0));
+        assert!(matches!(
+            answered.event,
+            Some(Event::ContextSwitchCancelled)
+        ));
+
+        // Ordinary tree navigation owes the daemon nothing.
+        window.dirty = true;
+        let _ = window.update(Message::ShowDashboard);
+        assert!(window.pending_nav.is_some());
+        let discarded = window.update(Message::Discard);
+        assert!(task_messages(discarded.task).is_empty());
+        assert!(window.pending_nav.is_none());
+    }
+
+    #[test]
+    fn a_save_that_leaves_nothing_dirty_releases_a_pending_close() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "release-pending-close-save-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.pane = Pane::Module(ModuleState {
+            mode: ModuleMode::View,
+            subpath: "same.ts".to_owned(),
+            path: Some(PathBuf::from("same.ts")),
+            name: String::new(),
+            tab: ModuleTab::Source,
+            activation: ProfileActivation::All,
+            activation_touched: false,
+            error: None,
+        });
+        window.dirty = true;
+        let _ = window.update(Message::RequestClose);
+        assert!(matches!(
+            window.pending_nav.as_deref(),
+            Some(Message::RequestClose)
+        ));
+
+        let saved = window.update(Message::SaveModule);
+
+        assert!(!window.dirty);
+        assert!(window.pending_nav.is_none());
+        assert!(matches!(
+            task_messages(saved.task).as_slice(),
+            [Message::NavigationReleased(ReleasedNavigation::Close)]
+        ));
+    }
+
+    #[test]
+    fn folder_activation_controls_share_one_availability_predicate_with_the_writes() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "folder-activation-predicate-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.profile_names = vec!["alpha".to_string(), "beta".to_string()];
+        window.profile_inventory_complete = true;
+        window.pane = Pane::Folder(FolderState {
+            mode: EditorMode::Create,
+            original_path: None,
+            path: "combat".to_string(),
+            activation: ProfileActivation::All,
+            error: Some("the last write failed".to_string()),
+        });
+
+        assert_eq!(
+            window.open_activation_storage_error().as_deref(),
+            Some(crate::i18n::t!("activation-folder-error-blocked").as_str())
+        );
+        assert!(!window.open_activation_storage_available());
+        let _ = window.update(Message::DisableEverywhere);
+        let _ = window.update(Message::ToggleActivationProfile("alpha".to_string()));
+        let Pane::Folder(state) = &window.pane else {
+            panic!("folder pane");
+        };
+        assert_eq!(state.activation, ProfileActivation::All);
+        assert!(!window.dirty);
+
+        // A new path attempt clears the stale error, and with it the block.
+        let _ = window.update(Message::SetFolderPath("combat-2".to_string()));
+        assert!(window.open_activation_storage_error().is_none());
+        assert!(window.open_activation_storage_available());
+        let _ = window.update(Message::DisableEverywhere);
+        let Pane::Folder(state) = &window.pane else {
+            panic!("folder pane");
+        };
+        assert_eq!(state.activation, ProfileActivation::None);
+    }
+
+    #[test]
+    fn settings_profile_completeness_is_cached_by_the_model_not_read_by_the_view() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "param-status-cache-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.profile_names = vec!["main".to_string(), "alt".to_string()];
+        let token: smudgy_core::models::shared_packages::PackageParameter =
+            serde_json::from_value(serde_json::json!({"key": "token", "required": true}))
+                .expect("required parameter");
+        let config = ParamConfig {
+            specifier: "smudgy://owner/package".to_string(),
+            expected_package: Some(LockedPackage::new(
+                "smudgy://owner/package",
+                UpdateMode::Auto,
+            )),
+            parameter_scope: ParameterScope::Profile,
+            profile_name: "main".to_string(),
+            available: true,
+            params: vec![token],
+            values: HashMap::new(),
+            secret_stored: HashSet::new(),
+            touched: HashSet::new(),
+            error: None,
+            saved: false,
+        };
+        window.param_config = Some(config.clone());
+        assert!(window.profile_param_status.is_none());
+
+        // Any update aligns the cache with the open editor: the server has no stored values, so
+        // every profile still lacks the required key.
+        let _ = window.update(Message::CancelGlobalParameterSource);
+        let status = window
+            .profile_param_status
+            .as_ref()
+            .expect("profile-scoped editor is cached");
+        assert_eq!(status.specifier, "smudgy://owner/package");
+        assert_eq!(status.missing_for("main"), Some(&["token".to_string()][..]));
+        assert_eq!(status.missing_for("alt"), Some(&["token".to_string()][..]));
+        assert_eq!(status.missing_for("other"), None);
+
+        // A changed inventory is part of the cache identity.
+        window.profile_names.push("third".to_string());
+        let _ = window.update(Message::CancelGlobalParameterSource);
+        let status = window.profile_param_status.as_ref().expect("recomputed");
+        assert_eq!(status.missing.len(), 3);
+        assert_eq!(
+            status.missing_for("third"),
+            Some(&["token".to_string()][..])
+        );
+
+        // Global scope and a closed editor carry no per-profile status.
+        window.param_config = Some(ParamConfig {
+            parameter_scope: ParameterScope::Global,
+            ..config
+        });
+        let _ = window.update(Message::CancelGlobalParameterSource);
+        assert!(window.profile_param_status.is_none());
+        window.param_config = None;
+        let _ = window.update(Message::CancelGlobalParameterSource);
+        assert!(window.profile_param_status.is_none());
+    }
+
+    /// A process-wide temporary smudgy home for tests that write server state. Another test
+    /// module may already own the override; whichever temporary root won is the one every model
+    /// read resolves to, so the returned path is always the live home.
+    fn use_temp_smudgy_home() -> PathBuf {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME
+            .get_or_init(|| {
+                let path = std::env::temp_dir().join(format!(
+                    "smudgy-automations-window-test-home-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&path).expect("create automations test home");
+                smudgy_core::set_smudgy_home(path);
+                smudgy_core::get_smudgy_home().expect("resolve the test home")
+            })
+            .clone()
+    }
+
+    fn create_test_server(server_name: &str, profiles: &[&str]) {
+        server::create_server(
+            server_name,
+            server::ServerConfig::new("mud.example.com".to_string(), 4000),
+        )
+        .expect("create test server");
+        for profile in profiles {
+            create_test_profile(server_name, profile);
+        }
+    }
+
+    fn create_test_profile(server_name: &str, profile: &str) {
+        smudgy_core::models::profile::create_profile(
+            server_name,
+            profile,
+            smudgy_core::models::profile::ProfileConfig {
+                caption: profile.to_string(),
+                send_on_connect: String::new(),
+            },
+        )
+        .expect("create test profile");
+    }
+
+    fn selected(profiles: &[&str]) -> ProfileActivation {
+        ProfileActivation::Selected {
+            profiles: profiles.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn activation_toggles_canonicalize_against_a_fresh_profile_inventory() {
+        let home = use_temp_smudgy_home();
+        let server_name = format!("activation-inventory-test-{}", std::process::id());
+        create_test_server(&server_name, &["alpha", "beta", "gamma"]);
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name.clone(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        assert_eq!(window.profile_names, ["alpha", "beta", "gamma"]);
+        window.pane = Pane::Folder(FolderState {
+            mode: EditorMode::Create,
+            original_path: None,
+            path: "combat".to_string(),
+            activation: selected(&["alpha", "beta"]),
+            error: None,
+        });
+
+        // With the open-time inventory, enabling the last visible profile would canonicalize to
+        // `All` and silently enable the profile created meanwhile.
+        create_test_profile(&server_name, "delta");
+        let _ = window.update(Message::ToggleActivationProfile("gamma".to_string()));
+
+        let Pane::Folder(state) = &window.pane else {
+            panic!("folder pane");
+        };
+        assert_eq!(state.activation, selected(&["alpha", "beta", "gamma"]));
+        assert_eq!(window.profile_names, ["alpha", "beta", "delta", "gamma"]);
+        assert!(window.profile_inventory_complete);
+        assert!(window.dirty);
+
+        // An inventory that cannot be read completely refuses the write rather than guessing.
+        std::fs::write(
+            home.join(&server_name)
+                .join("profiles")
+                .join("delta")
+                .join("profile.json"),
+            "{ not json",
+        )
+        .expect("corrupt a profile");
+        let _ = window.update(Message::ToggleActivationProfile("delta".to_string()));
+
+        let Pane::Folder(state) = &window.pane else {
+            panic!("folder pane");
+        };
+        assert_eq!(state.activation, selected(&["alpha", "beta", "gamma"]));
+        assert_eq!(
+            state.error.as_deref(),
+            Some(crate::i18n::t!("activation-profile-inventory-error").as_str())
+        );
+        assert!(!window.profile_inventory_complete);
+    }
+
+    #[test]
+    fn folder_create_and_rename_leave_the_editor_clean() {
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("folder-create-clean-test-{}", std::process::id());
+        create_test_server(&server_name, &["alpha"]);
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name,
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let loaded = window.load_scripts_message();
+        let _ = window.update(loaded);
+        assert!(window.automation_snapshot.is_some());
+
+        let _ = window.update(Message::NewFolder);
+        let _ = window.update(Message::SetFolderPath("combat".to_string()));
+        assert!(window.dirty);
+        let _ = window.update(Message::SaveFolder);
+        assert!(!window.dirty, "a created folder is not an unsaved draft");
+        assert!(matches!(
+            &window.pane,
+            Pane::Folder(FolderState {
+                mode: EditorMode::Edit,
+                original_path: Some(path),
+                error: None,
+                ..
+            }) if path == "combat"
+        ));
+        let _ = window.update(Message::ShowDashboard);
+        assert!(window.pending_nav.is_none());
+        assert!(matches!(window.pane, Pane::Dashboard));
+
+        let _ = window.update(Message::SelectFolder("combat".to_string()));
+        let _ = window.update(Message::SetFolderPath("combat-renamed".to_string()));
+        assert!(window.dirty);
+        let _ = window.update(Message::SaveFolder);
+        assert!(!window.dirty, "a renamed folder is not an unsaved draft");
+        assert_eq!(
+            window.selection,
+            Selection::Folder("combat-renamed".to_string())
+        );
+
+        // Retyping the current path is not a change either.
+        let _ = window.update(Message::SetFolderPath("combat-renamed".to_string()));
+        assert!(window.dirty);
+        let _ = window.update(Message::SaveFolder);
+        assert!(!window.dirty);
     }
 }

@@ -229,10 +229,7 @@ pub(super) fn metadata_band<'a>(
                 button(text(label).size(12))
                     .style(builtins::button::link)
                     .padding([2, 8])
-                    .on_press(Message::OpenObservedLink(
-                        server.name.clone(),
-                        url.to_string(),
-                    )),
+                    .on_press(Message::OpenObservedLink(server.clone(), url.to_string())),
             );
             has_chips = true;
         }
@@ -247,7 +244,7 @@ pub(super) fn metadata_band<'a>(
                 .style(builtins::button::link)
                 .padding([2, 8])
                 .on_press(Message::OpenObservedLink(
-                    server.name.clone(),
+                    server.clone(),
                     format!("mailto:{email}"),
                 )),
         );

@@ -67,8 +67,9 @@ pub const EVENTS_SCHEME: &str = "smudgy-events";
 pub const PROCEDURES_SCHEME: &str = "smudgy-procedures";
 
 /// A package coordinate without version or subpath — the version-cache and lockfile
-/// key. `owner` is the publisher's (globally unique) nickname; `name` is unique
-/// within that owner's namespace.
+/// key. `owner` is the publisher's globally unique nickname. The registry reserves
+/// `name` globally across publishers, while the full coordinate keeps the owner so
+/// published identities remain stable and attributable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackageKey {
     pub owner: String,
@@ -1617,6 +1618,14 @@ impl ResolvedPackage {
 /// like the npm stack — never under a nested `block_on`.
 #[async_trait::async_trait(?Send)]
 pub trait PackageProvider {
+    /// Canonical runtime identity for a requested package coordinate. Most providers return
+    /// `key` unchanged. A provider with a local leaf-name override returns the local owner's
+    /// coordinate so module identity, provenance, parameters, storage, and trust cannot inherit
+    /// a shadowed foreign author.
+    fn canonical_key(&self, key: &PackageKey) -> PackageKey {
+        key.clone()
+    }
+
     /// Resolve a package to a concrete version and fetch its whole module set (cached
     /// by resolved version). When `referrer` is `Some`, the version is selected from that
     /// importing package instance's locked deps (referrer-aware resolution); when
@@ -1797,10 +1806,10 @@ pub(crate) async fn load_marker_module(
     // isolate trust: trust grants permissions, it does not bypass another package's import-deny.
     if !fetched.manifest.importable {
         if let Some(referrer) = spec.referrer() {
-            if referrer.key.owner != key.owner {
+            if referrer.key.owner != fetched.key.owner {
                 return Err(crate::generic_loader_error(format!(
                     "package {}/{} is not importable: it declares \"importable\": false, so {}/{} may not `import` it — consume it via the package's `requires` + its events/types instead",
-                    key.owner, key.name, referrer.key.owner, referrer.key.name
+                    fetched.key.owner, fetched.key.name, referrer.key.owner, referrer.key.name
                 )));
             }
         }
@@ -1808,11 +1817,11 @@ pub(crate) async fn load_marker_module(
     let module = fetched
         .resolve_module(spec.subpath.as_deref())
         .map_err(|err| crate::generic_loader_error(err.to_string()))?;
-    let canonical = canonical_url(&key, &fetched.resolved_version, &module.subpath);
+    let canonical = canonical_url(&fetched.key, &fetched.resolved_version, &module.subpath);
     let is_entry = fetched
         .resolve_module(None)
         .is_ok_and(|entry| entry.subpath == module.subpath);
-    let text = serve_text(&provider, &key, &canonical, &module.text, is_entry);
+    let text = serve_text(&provider, &fetched.key, &canonical, &module.text, is_entry);
     let (code, _source_map) = crate::transpiler::transpile(&canonical, &text).map_err(|err| {
         crate::generic_loader_error(format!("failed transpiling {canonical}: {err}"))
     })?;
@@ -2464,7 +2473,7 @@ pub(crate) async fn load_kind_scheme_module(
     let parsed = parse_kind_scheme_url(url)
         .ok_or_else(|| crate::generic_loader_error(format!("invalid kind-scheme url {url}")))?;
     let display = kind_scheme_display(parsed.kind);
-    let producer_spec = kind_scheme_producer_spec(&parsed.target);
+    let mut producer_spec = kind_scheme_producer_spec(&parsed.target);
 
     let (handles, other_kind_names): (HandleExports, Vec<(InteropKind, Vec<String>)>) =
         match &parsed.target {
@@ -2532,13 +2541,18 @@ pub(crate) async fn load_kind_scheme_module(
                     key.owner, key.name
                 ))
             })?;
+                // A local same-leaf override owns the interop identity too. Keeping the
+                // requested foreign specifier here would route reads/events through a foreign
+                // home and let local code impersonate that publisher.
+                producer_spec = fetched.key.to_user_specifier();
                 let entry = fetched.resolve_module(None).map_err(|err| {
                     crate::generic_loader_error(format!(
                         "cannot consume {display}/{}/{}: {err}",
                         key.owner, key.name
                     ))
                 })?;
-                let entry_url = canonical_url(key, &fetched.resolved_version, &entry.subpath);
+                let entry_url =
+                    canonical_url(&fetched.key, &fetched.resolved_version, &entry.subpath);
                 let extraction = crate::interop_extract::extract_interop_handles(
                     &entry_url,
                     &entry.text,

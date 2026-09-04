@@ -28,7 +28,9 @@ use smudgy_core::models::input_history::{load_input_history, save_input_history}
 use smudgy_core::models::map_scopes::MapScopes;
 use smudgy_core::models::observed::{load_observed, save_observed};
 use smudgy_core::models::profile::load_profile;
-use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
+use smudgy_core::models::server::{
+    ServerCas, ServerConfig, link_url_host, load_server, update_server_if_unchanged,
+};
 #[cfg(feature = "web-audio-cpal")]
 use smudgy_core::models::settings::AudioGainSettings;
 use smudgy_core::models::settings::{ScriptSettings, Settings, load_settings};
@@ -556,12 +558,12 @@ fn next_audio_row_key() -> Option<u64> {
 }
 
 #[cfg(feature = "web-audio-cpal")]
-fn load_audio_package_rows(server: &str) -> Result<Vec<AudioPackageRow>, String> {
+fn load_audio_package_rows(server: &str, profile: &str) -> Result<Vec<AudioPackageRow>, String> {
     let lock = shared_packages::load_lock(server).map_err(|error| error.to_string())?;
     let mut rows: Vec<_> = lock
         .packages
-        .into_iter()
-        .filter(|package| package.enabled)
+        .iter()
+        .filter(|package| lock.is_effectively_enabled_for(&package.specifier, profile))
         .filter_map(|package| {
             let rest = package.specifier.strip_prefix("smudgy://")?;
             let (owner, name) = rest.rsplit_once('/')?;
@@ -1175,7 +1177,7 @@ impl ManagedSession {
         // Resolve the exact package snapshot before touching any live state.
         // A malformed/unreadable lock must leave the old runtime, rows, and
         // hotkeys intact instead of silently staging an empty package set.
-        let mut next_packages = load_audio_package_rows(&self.server_name)
+        let mut next_packages = load_audio_package_rows(&self.server_name, &self.profile_name)
             .map_err(AudioReloadPreparationError::PackageConfiguration)?;
         let settings = load_settings();
         let policy = settings
@@ -1508,16 +1510,17 @@ impl ManagedSession {
         let desired_audio_gain =
             audio_policy.map_or_else(AudioGainSettings::default, |row| row.gain);
         #[cfg(feature = "web-audio-cpal")]
-        let mut audio_packages = load_audio_package_rows(&server_name).unwrap_or_else(|error| {
-            // Package loading itself follows the same optional baseline: the
-            // engine warns and starts without packages on a malformed lock,
-            // so auxiliary audio metadata must never make the terminal
-            // stricter than the runtime it accompanies.
-            log::warn!(
-                "could not load package audio policy snapshot for {server_name}; starting without package rows: {error}"
-            );
-            Vec::new()
-        });
+        let mut audio_packages = load_audio_package_rows(&server_name, &profile_name)
+            .unwrap_or_else(|error| {
+                // Package loading itself follows the same optional baseline: the
+                // engine warns and starts without packages on a malformed lock,
+                // so auxiliary audio metadata must never make the terminal
+                // stricter than the runtime it accompanies.
+                log::warn!(
+                    "could not load package audio policy snapshot for {server_name}; starting without package rows: {error}"
+                );
+                Vec::new()
+            });
         #[cfg(feature = "web-audio-cpal")]
         let mut audio_gain = AudioGainSettings::default();
         #[cfg(feature = "web-audio-cpal")]
@@ -3142,27 +3145,33 @@ impl ManagedSession {
                         // Persist by re-reading the on-disk config and applying
                         // only this grant, so a concurrent session's grant or an
                         // address edit made since this session opened is not
-                        // clobbered by writing back a stale whole-config
-                        // snapshot. Fall back to our in-memory copy if the load
-                        // fails. The in-memory copy is updated to match either
-                        // way, so the gate reflects the grant immediately.
-                        let mut config = load_server(&self.server_name)
-                            .map_or_else(|_| self.server_config.borrow().clone(), |s| s.config);
-                        if pending.grant_server {
-                            config.trust_all_links = true;
-                        }
-                        if pending.grant_host
-                            && let Some(host) = &pending.host
-                        {
-                            config.grant_link_host(host);
-                        }
-                        if let Err(e) = update_server(&self.server_name, config.clone()) {
-                            log::error!(
-                                "Failed to persist link-trust grants for '{}': {e}",
+                        // snapshot. The write is compare-and-set against the
+                        // snapshot just read, so a concurrent edit is reported
+                        // rather than overwritten.
+                        match load_server(&self.server_name).and_then(|current| {
+                            let mut config = current.config.clone();
+                            if pending.grant_server {
+                                config.trust_all_links = true;
+                            }
+                            if pending.grant_host
+                                && let Some(host) = &pending.host
+                            {
+                                config.grant_link_host(host);
+                            }
+                            update_server_if_unchanged(&current, config)
+                        }) {
+                            Ok(ServerCas::Applied(server)) => {
+                                *self.server_config.borrow_mut() = server.config;
+                            }
+                            Ok(ServerCas::StateChanged) => log::warn!(
+                                "Link-trust grant was not saved because server '{}' changed; the user can retry it",
                                 self.server_name
-                            );
+                            ),
+                            Err(error) => log::error!(
+                                "Failed to persist link-trust grants for '{}': {error}",
+                                self.server_name
+                            ),
                         }
-                        *self.server_config.borrow_mut() = config;
                     }
                     self.perform_server_link(&pending.action);
                 }
@@ -3177,21 +3186,34 @@ impl ManagedSession {
                 // concurrent grant or address edit is not clobbered by a
                 // stale whole-config snapshot. `tls_verify` keeps whatever
                 // the config says — verification stays default-on.
-                let mut config = load_server(&self.server_name)
-                    .map_or_else(|_| self.server_config.borrow().clone(), |s| s.config);
-                config.tls = true;
-                config.port = port;
-                if let Err(e) = update_server(&self.server_name, config.clone()) {
-                    log::error!(
-                        "Failed to persist the TLS upgrade for '{}': {e}",
-                        self.server_name
-                    );
-                    // Reconnecting would come back plain; keep the banner so
-                    // the user can retry (or decline).
-                    self.tls_offer = Some(port);
-                    return Task::none();
+                match load_server(&self.server_name).and_then(|current| {
+                    let mut config = current.config.clone();
+                    config.tls = true;
+                    config.port = port;
+                    update_server_if_unchanged(&current, config)
+                }) {
+                    Ok(ServerCas::Applied(server)) => {
+                        *self.server_config.borrow_mut() = server.config;
+                    }
+                    Ok(ServerCas::StateChanged) => {
+                        log::warn!(
+                            "TLS upgrade was not saved because server '{}' changed; the user can retry it",
+                            self.server_name
+                        );
+                        self.tls_offer = Some(port);
+                        return Task::none();
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Failed to persist the TLS upgrade for '{}': {error}",
+                            self.server_name
+                        );
+                        // Reconnecting would come back plain; keep the banner so
+                        // the user can retry (or decline).
+                        self.tls_offer = Some(port);
+                        return Task::none();
+                    }
                 }
-                *self.server_config.borrow_mut() = config;
                 // Reconnect picks the flipped config up from disk
                 // (`load_connect_action` re-reads on every connect).
                 self.send_runtime_action(RuntimeAction::Disconnect);

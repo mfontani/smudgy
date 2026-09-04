@@ -104,14 +104,6 @@ pub fn clear_server_image_cache(server: &str) {
     }
 }
 
-/// The delete-server hook: the server's cache namespace goes with it (memory entries
-/// stay — they're content-keyed and possibly shared; the LRU handles them). Blocking I/O.
-pub fn on_server_deleted(server: &str) {
-    if let Some(cache) = disk_cache() {
-        cache.clear_server(server);
-    }
-}
-
 /// Startup housekeeping: drop namespaces of servers that no longer exist, trim to the
 /// `image_cache_max_mb` budget (LRU by fetch time), sweep unreferenced blobs. Blocking
 /// I/O — run on a background thread at app start.

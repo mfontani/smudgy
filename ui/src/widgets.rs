@@ -12,6 +12,7 @@ pub mod tab_press;
 // Only the macOS/Linux toolbar mounts the press surface (Windows moves via
 // the `WM_NCHITTEST` chrome), but it compiles everywhere so a Windows
 // `cargo check` still covers it.
+pub mod grow_column;
 #[cfg_attr(windows, allow(dead_code))]
 pub mod titlebar_press;
 pub mod wrap_row;

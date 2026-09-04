@@ -5,6 +5,44 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Automations can run in some profiles and not others.** Folders, modules, and
+  packages each carry an activation of every profile, no profiles, or a chosen set,
+  edited from one checklist with Enable everywhere and Disable everywhere actions.
+  The sidebar and the runtime report the state for the profile the Automations
+  window is open on. A package a running root requires still runs in that profile
+  even when its own setting is off, and Settings says which package needs it.
+- **Package parameters can be global or separate per profile.** A package's Settings
+  tab chooses the mode for its whole parameter set. Entering profile mode seeds each
+  profile from the global values; returning to global mode asks which profile's
+  values to keep. Secrets follow the same scope in the keyring.
+- **Installed and local packages are tabbed.** About, Settings, Source, and
+  Permissions for installed packages; local packages add Manifest and Sharing. The
+  About tab carries the version card with Follow latest and Pin version; every
+  version movement goes through the same permission review as an install.
+- **A local package shadows every published package with its name.** Direct
+  installs, dependencies, requires links, and imports of any author's copy resolve
+  to the local folder while it exists; the published install stays on disk and
+  comes back when the local folder is removed.
+
+### Changed
+
+- **A selected-profile item is off everywhere in an older smudgy.** Activation is
+  stored beside the old `enabled` flag, which is written true only for "every
+  profile", so a build without profile scoping fails closed instead of running an
+  item in profiles you excluded.
+- **Local package folders are identified as `smudgy://local/<name>`.** A lock row
+  under your account nickname for a local folder migrates to the local identity on
+  the next load, keeping its trust, permissions, activation, parameter mode, and
+  values.
+- **Removing a local folder no longer deletes its settings.** Only the deliberate
+  delete and uninstall actions clean up parameter values and secrets; a folder that
+  is merely missing keeps them, and a package re-created under that name adopts
+  them.
+
 ## [0.5.7-ptb] - 2026-09-01
 
 ### Added

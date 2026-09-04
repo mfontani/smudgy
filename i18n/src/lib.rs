@@ -267,6 +267,33 @@ fn catalog_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_recovery_messages_bind_only_the_variables_their_callers_supply() {
+        for catalog in available_catalogs() {
+            let translator = Translator::for_tag(catalog.tag).expect("built-in catalog");
+            let mut warnings = FluentArgs::new();
+            warnings.set("warnings", "RECOVERY-DETAIL");
+            let record =
+                translator.translate_with("automation-publication-record-warning", &warnings);
+            assert!(
+                record.contains("RECOVERY-DETAIL"),
+                "{} record warning omitted its details",
+                catalog.tag
+            );
+
+            let mut link = FluentArgs::new();
+            link.set("name", "demo");
+            link.set("version", "1.0.0");
+            let missing_link =
+                translator.translate_with("automation-publication-link-missing-warning", &link);
+            assert!(
+                !missing_link.starts_with('⟦'),
+                "{} link warning required an argument its caller does not supply",
+                catalog.tag
+            );
+        }
+    }
     use regex::Regex;
     use std::path::{Path, PathBuf};
 
