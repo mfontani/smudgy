@@ -32,7 +32,7 @@ use smudgy_core::session::styled_line::{
 
 mod spans;
 
-use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection};
+use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection, word_span_at};
 use spans::Spans;
 
 type Link = SpanMetadata;
@@ -1086,6 +1086,12 @@ pub(super) struct State<P: text::Paragraph> {
     /// release first and flips `Selecting` → `Selected`, so selection state alone
     /// cannot tell this pane a click just ended on it.
     pub pressed_cell: Option<BufferPosition>,
+    /// The most recent left click, kept to feed `mouse::Click::new` so a
+    /// same-spot follow-up press within its distance/time window reads as a
+    /// double (word-select) or triple (line-select) click. Same way/primitive
+    /// used by `titlebar_press.rs`'s own `State` for its "double click to
+    /// maximize" gesture.
+    previous_click: Option<mouse::Click>,
     /// The terminal-owned OSC/script link context menu, anchored where it was
     /// opened. Actions are cloned with the scrollback so the popup remains
     /// valid even if new output arrives before a choice is clicked.
@@ -1124,6 +1130,7 @@ impl<P: text::Paragraph> Default for State<P> {
             advance: None,
             modifiers: keyboard::Modifiers::default(),
             pressed_cell: None,
+            previous_click: None,
             menu_popup: None,
             link_tooltip_hover: None,
             link_tooltip_paragraph: RefCell::new(None),
@@ -2344,6 +2351,16 @@ where
                 let mut selection = self.selection.borrow_mut();
 
                 if let Some(click_position) = cursor.position_in(layout.bounds()) {
+                    // A same-spot follow-up press within its distance/time
+                    // window reads as Double/Triple, driving word/line select
+                    // instead of starting an ordinary drag-selection.
+                    let click = mouse::Click::new(
+                        click_position,
+                        mouse::Button::Left,
+                        state.previous_click,
+                    );
+                    state.previous_click = Some(click);
+
                     if let Some(position) = state.hit_test(layout.bounds(), click_position) {
                         if let Some((key, link)) =
                             self.available_link_at(state, position.line, position.column)
@@ -2356,12 +2373,56 @@ where
                             }
                             state.invalidate_link_styles();
                         }
-                        state.pressed_cell = Some(position.clone());
-                        *selection = Selection::Selecting {
-                            origin: position.clone(),
-                            from: position.clone(),
-                            to: position,
+
+                        // Double/triple click selects a whole word/line
+                        // straight away. A double click on whitespace falls
+                        // back to the ordinary single-click start below.
+                        let word_or_line = match click.kind() {
+                            mouse::click::Kind::Double => self
+                                .terminal_buffer
+                                .line_text(position.line)
+                                .and_then(|text| word_span_at(text, position.column))
+                                .map(|(start, end)| {
+                                    (
+                                        BufferPosition {
+                                            line: position.line,
+                                            column: start,
+                                        },
+                                        BufferPosition {
+                                            line: position.line,
+                                            column: end,
+                                        },
+                                    )
+                                }),
+                            mouse::click::Kind::Triple => Some((
+                                BufferPosition {
+                                    line: position.line,
+                                    column: 0,
+                                },
+                                BufferPosition {
+                                    line: position.line,
+                                    column: usize::MAX,
+                                },
+                            )),
+                            mouse::click::Kind::Single => None,
                         };
+
+                        if let Some((from, to)) = word_or_line {
+                            // Deliberately don't set `pressed_cell` here: it's
+                            // what the release handler uses to decide "was this
+                            // a plain click on a link" -- a double/triple click
+                            // is unambiguously a select-gesture, not an
+                            // activate-gesture, even when it lands on a link
+                            // word.
+                            *selection = Selection::Selected { from, to };
+                        } else {
+                            state.pressed_cell = Some(position.clone());
+                            *selection = Selection::Selecting {
+                                origin: position.clone(),
+                                from: position.clone(),
+                                to: position,
+                            };
+                        }
                         // The press hands the shared selection to the user:
                         // search no longer owns it, so the search styling
                         // must not apply and dismissing search must not
