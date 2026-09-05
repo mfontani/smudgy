@@ -200,8 +200,6 @@ pub struct SessionInput {
     /// field before a next Up/Down press. Only `Some` while `history_index`
     /// is `Some`; see `history_search_prefix`.
     history_prefix: Option<String>,
-    /// Maximum number of history entries to keep
-    max_history: usize,
     /// Bumped on every actual history change (a submission or scripted push
     /// entering it, a scripted clear emptying it), so the parent can feed the
     /// session-thread history mirror exactly when there is something new —
@@ -434,7 +432,6 @@ impl SessionInput {
             history: VecDeque::new(),
             history_index: None,
             history_prefix: None,
-            max_history: 100,
             history_revision: 0,
             completion_state: None,
             terminal_buffer: None,
@@ -485,8 +482,9 @@ impl SessionInput {
     /// revision. The runtime-ready resync sends the complete initial snapshot
     /// unconditionally.
     pub fn with_history(mut self, entries: Vec<String>) -> Self {
+        let max_history = Self::max_history();
         for entry in entries {
-            if self.history.len() >= self.max_history {
+            if max_history.is_some_and(|max| self.history.len() >= max) {
                 break;
             }
             if entry.trim().is_empty() {
@@ -710,11 +708,23 @@ impl SessionInput {
         self.history.push_front(command);
 
         // Limit history size
-        while self.history.len() > self.max_history {
-            self.history.pop_back();
+        if let Some(max_history) = Self::max_history() {
+            while self.history.len() > max_history {
+                self.history.pop_back();
+            }
         }
 
         self.history_revision += 1;
+    }
+
+    /// The configured history cap, read live from prefs (not cached at
+    /// construction, so a settings change takes effect immediately) --
+    /// `None` means unlimited, the `0` sentinel in `TerminalPrefs::max_history`.
+    fn max_history() -> Option<usize> {
+        match crate::prefs::current().max_history {
+            0 => None,
+            n => Some(n),
+        }
     }
 
     /// Remove every history entry (the scripted `history.clear()`). Bumps the
@@ -2434,6 +2444,58 @@ mod tests {
                 assert_eq!(
                     input.value, "GT ",
                     "case-sensitive match: no match, Up is a no-op"
+                );
+            },
+        );
+    }
+
+    /// Test for the `max_history` setting: a configured cap evicts the
+    /// oldest entry once exceeded, and `0` means unlimited -- nothing is
+    /// ever evicted.
+    #[test]
+    fn max_history_caps_by_configured_value_and_zero_means_unlimited() {
+        use smudgy_core::models::settings::Settings;
+
+        with_prefs(
+            Settings {
+                max_history: 2,
+                ..Settings::default()
+            },
+            || {
+                let mut input = SessionInput::new();
+                submit_unmasked(&mut input, "one");
+                submit_unmasked(&mut input, "two");
+                submit_unmasked(&mut input, "three");
+                assert_eq!(
+                    input.history.len(),
+                    2,
+                    "the oldest entry is evicted once the cap is exceeded"
+                );
+                assert_eq!(
+                    input.history.back().map(|entry| entry.as_str()),
+                    Some("two")
+                );
+                assert_eq!(
+                    input.history.front().map(|entry| entry.as_str()),
+                    Some("three")
+                );
+            },
+        );
+
+        with_prefs(
+            Settings {
+                max_history: 0,
+                ..Settings::default()
+            },
+            || {
+                let mut input = SessionInput::new();
+                for i in 0..250 {
+                    submit_unmasked(&mut input, &format!("command {i}"));
+                }
+                assert_eq!(
+                    input.history.len(),
+                    250,
+                    "0 means unlimited -- nothing is evicted"
                 );
             },
         );
