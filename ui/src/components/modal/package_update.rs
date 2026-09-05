@@ -4,14 +4,15 @@
 //!
 //! Opened from the needs-permissions toast's Review action. The modal itself only
 //! renders the offer and reports the decision as an [`Event`]; the window closes it and
-//! the daemon performs the consequences — Grant & update records the new union and
-//! stages the update, Pin writes the pinned mode, Not now changes nothing (the toast's
-//! Later is the *persisted* dismissal; closing here merely defers).
+//! the daemon performs the consequences — Grant & update atomically records the new union and
+//! stages the update if its source row is unchanged, Pin conditionally writes the pinned mode,
+//! and Not now changes nothing (the toast's Later is the persisted dismissal).
 
 use iced::Length;
 use iced::Task;
 use iced::alignment::Vertical;
 use iced::widget::{button, column, container, row, scrollable, text};
+use smudgy_core::models::shared_packages::LockedPackage;
 
 use crate::components::permissions::{consent_can_row, full_access_banner, permission_can_lines};
 use crate::components::toast::UpdateOffer;
@@ -43,12 +44,12 @@ pub enum Message {
 /// The decision, for the window to close the modal on and the daemon to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Grant & update: record the offer's new union as the consented grant, then
-    /// stage the update (prefetch, lockfile advance, live reload).
+    /// Grant & update: prefetch, then atomically record consent and stage if the row is unchanged.
     Grant(Box<UpdateOffer>),
     /// Pin the currently staged `version` — the terminal "stop asking" answer.
     Pin {
         server_name: String,
+        expected: Box<LockedPackage>,
         specifier: String,
         version: String,
     },
@@ -62,6 +63,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
         Message::Pin => match &state.offer.current {
             Some(version) => Event::Pin {
                 server_name: state.offer.server_name.clone(),
+                expected: Box::new(state.offer.expected.clone()),
                 specifier: state.offer.specifier.clone(),
                 version: version.clone(),
             },

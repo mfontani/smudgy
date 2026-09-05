@@ -160,7 +160,11 @@ impl AutomationsWindow {
                 if current == Some(path.as_str()) {
                     continue;
                 }
-                let status = if packages::is_package_effectively_enabled(&path, &self.packages) {
+                let status = if packages::is_package_effectively_enabled_for(
+                    &path,
+                    &self.packages,
+                    &self.profile_name,
+                ) {
                     NodeStatus::Ok
                 } else {
                     NodeStatus::Disabled

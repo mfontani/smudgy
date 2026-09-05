@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod aliases;
 pub mod auth;
+pub mod automation_transaction;
 pub mod hotkeys;
 pub mod input_history;
 pub mod local_packages;
@@ -14,10 +15,12 @@ pub mod package_updates;
 pub mod packages;
 pub mod persistence;
 pub mod profile;
+pub mod profile_activation;
 pub mod script_typings;
 pub mod server;
 pub mod settings;
 pub mod shared_packages;
+pub(crate) mod state_lock;
 pub mod triggers;
 
 /// Represents the programming language of a script.

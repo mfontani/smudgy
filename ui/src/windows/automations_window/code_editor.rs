@@ -2522,10 +2522,10 @@ impl super::AutomationsWindow {
 
     /// Renders the active writable editor plus its visible language-service
     /// status, current problems, and clickable completion candidates.
-    pub(super) fn code_editor_view(&self, height: f32) -> super::Elem<'_> {
+    pub(super) fn code_editor_view(&self, height: iced::Length) -> super::Elem<'_> {
         let Some(editor) = &self.code_editor else {
             return iced::widget::container(iced::widget::text(""))
-                .height(iced::Length::Fixed(height))
+                .height(height)
                 .into();
         };
         let mount_generation = self.code_editor_mount_generation;
@@ -2554,7 +2554,7 @@ impl super::AutomationsWindow {
                 })
             }))
             .width(iced::Length::Fill)
-            .height(iced::Length::Fixed(height))
+            .height(height)
             .into(),
         ];
         // Keep a permanent stack slot for signature help. Iced diffs Stack
@@ -2565,7 +2565,7 @@ impl super::AutomationsWindow {
         editor_layers.push(
             iced::widget::container(iced::widget::space::vertical())
                 .width(iced::Length::Fill)
-                .height(iced::Length::Fixed(height))
+                .height(height)
                 .into(),
         );
 
@@ -2684,7 +2684,7 @@ impl super::AutomationsWindow {
                     .spacing(0.0),
                 )
                 .width(iced::Length::Fill)
-                .height(iced::Length::Fixed(height))
+                .height(height)
                 .into();
             }
         }
@@ -2814,7 +2814,7 @@ impl super::AutomationsWindow {
                     .spacing(0.0),
                 )
                 .width(iced::Length::Fill)
-                .height(iced::Length::Fixed(height))
+                .height(height)
                 .into(),
             );
         } else if !editor.is_dialog_open()
@@ -2871,7 +2871,7 @@ impl super::AutomationsWindow {
                     .spacing(0.0),
                 )
                 .width(iced::Length::Fill)
-                .height(iced::Length::Fixed(height))
+                .height(height)
                 .into(),
             );
         }
@@ -2879,7 +2879,7 @@ impl super::AutomationsWindow {
         let editor_area = iced::widget::mouse_area(
             iced::widget::stack(editor_layers)
                 .width(iced::Length::Fill)
-                .height(iced::Length::Fixed(height)),
+                .height(height),
         )
         .on_exit(super::Message::DismissCodeOverlays);
         let suggestion_button = iced::widget::button(
@@ -3583,6 +3583,7 @@ impl super::AutomationsWindow {
                 if let super::Pane::Module(state) = &mut self.pane {
                     state.path = Some(path);
                 }
+                self.module_source_baseline = Some(text.clone());
                 self.bind_code_editor(&text, language, CodeDocument::StandaloneModule)
             }
             Some(Err(error)) => {
@@ -3624,6 +3625,12 @@ impl super::AutomationsWindow {
         let clean = !self.dirty && !self.code_editor_is_modified();
         let selected = self.owned_selected_file.clone();
         let reloaded = selected.as_ref().filter(|_| clean).map(|subpath| {
+            if subpath.eq_ignore_ascii_case("README.md") {
+                return package
+                    .readme
+                    .clone()
+                    .ok_or("file disappeared during reload");
+            }
             let module = package
                 .modules
                 .iter()
@@ -3635,6 +3642,10 @@ impl super::AutomationsWindow {
         if reloaded.is_some() {
             self.clear_code_editor();
         }
+        self.local_readme = package
+            .readme
+            .as_deref()
+            .map(iced::widget::markdown::Content::parse);
         self.local_package = Some(Box::new(package));
         let context = LanguageProjectContext::OwnedPackage(name.clone());
         if self.language_project_context_matches(&context) {
@@ -3644,6 +3655,7 @@ impl super::AutomationsWindow {
 
         match (selected, reloaded) {
             (Some(subpath), Some(Ok(text))) => {
+                self.owned_source_baseline = Some(text.clone());
                 self.bind_code_editor(&text, path_language(&subpath), CodeDocument::OwnedPackage)
             }
             (Some(subpath), Some(Err(error))) => {
@@ -6999,6 +7011,9 @@ mod tests {
             subpath: "origin.ts".to_owned(),
             path: Some(origin_path),
             name: String::new(),
+            tab: super::super::ModuleTab::Source,
+            activation: smudgy_core::models::profile_activation::ProfileActivation::All,
+            activation_touched: false,
             error: None,
         });
         window.language_project_context = Some(LanguageProjectContext::Modules);
@@ -7090,7 +7105,8 @@ mod tests {
             .as_mut()
             .expect("origin service state")
             .graph_generation = number::<GraphGeneration>(10);
-        let _ = window.update(super::super::Message::ConfirmDiscardNav);
+        let revision = window.pending_nav_revision;
+        let _ = window.update(super::super::Message::ConfirmDiscardNavRevision(revision));
         assert!(
             window.dirty,
             "a stale confirmed jump must retain the dirty guard"
@@ -7107,7 +7123,8 @@ mod tests {
             .expect("origin editor")
             .service_state = Some(navigation.origin);
         let _ = window.update(super::super::Message::NavigateCodeDefinition(navigation));
-        let _ = window.update(super::super::Message::ConfirmDiscardNav);
+        let revision = window.pending_nav_revision;
+        let _ = window.update(super::super::Message::ConfirmDiscardNavRevision(revision));
         assert!(!window.dirty);
         assert!(matches!(
             window.selection,

@@ -67,8 +67,9 @@ pub const EVENTS_SCHEME: &str = "smudgy-events";
 pub const PROCEDURES_SCHEME: &str = "smudgy-procedures";
 
 /// A package coordinate without version or subpath — the version-cache and lockfile
-/// key. `owner` is the publisher's (globally unique) nickname; `name` is unique
-/// within that owner's namespace.
+/// key. `owner` is the publisher's globally unique nickname. The registry reserves
+/// `name` globally across publishers, while the full coordinate keeps the owner so
+/// published identities remain stable and attributable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackageKey {
     pub owner: String,
@@ -1617,6 +1618,14 @@ impl ResolvedPackage {
 /// like the npm stack — never under a nested `block_on`.
 #[async_trait::async_trait(?Send)]
 pub trait PackageProvider {
+    /// Canonical runtime identity for a requested package coordinate. Most providers return
+    /// `key` unchanged. A provider with a local leaf-name override returns the local owner's
+    /// coordinate so module identity, provenance, parameters, storage, and trust cannot inherit
+    /// a shadowed foreign author.
+    fn canonical_key(&self, key: &PackageKey) -> PackageKey {
+        key.clone()
+    }
+
     /// Resolve a package to a concrete version and fetch its whole module set (cached
     /// by resolved version). When `referrer` is `Some`, the version is selected from that
     /// importing package instance's locked deps (referrer-aware resolution); when
@@ -1672,8 +1681,8 @@ pub trait PackageProvider {
     /// Every package this provider has resolved for its isolate so far — i.e. the packages whose
     /// code was (or is about to be) evaluated in that isolate, roots and transitive `smudgy://`
     /// dependencies alike. Because each isolate has its own provider, this is the isolate's
-    /// package set. The host reads it after module loading to detect code-imported copies of
-    /// packages whose interop home is another isolate (the session-store "stumble" diagnostic).
+    /// complete package code-load set; [`Self::entry_loaded_packages`] is the narrower diagnostic
+    /// footprint.
     ///
     /// The default (empty) simply disables that diagnostic for providers that don't track
     /// resolutions.
@@ -1681,13 +1690,24 @@ pub trait PackageProvider {
         Vec::new()
     }
 
+    /// Record that `key`'s entry module was served for code evaluation. Resolving a
+    /// side-effect-free subpath is deliberately not an entry load: dual-use packages may run
+    /// their installed entry once while consumers import helper modules in their own isolates.
+    fn note_entry_load(&self, _key: &PackageKey) {}
+
+    /// Packages whose entry modules were served through this provider (see
+    /// [`Self::note_entry_load`]). The host uses this narrower footprint for the duplicate-entry
+    /// stumble diagnostic; [`Self::loaded_packages`] remains the complete code-load set.
+    fn entry_loaded_packages(&self) -> Vec<PackageKey> {
+        Vec::new()
+    }
+
     /// Resolve a producer package for link-time consumer-stub synthesis (the `smudgy:state/` /
     /// `smudgy:events/` schemes). Semantically a *read of the producer's declarations*, not a
-    /// code load: implementations must not record the fetch in [`Self::loaded_packages`] (it
-    /// would misfire the code-import stumble diagnostic at a consumer who never code-imported
-    /// anything) nor treat it as an install (consuming an uninstalled producer must leave it
-    /// uninstalled). The default delegates to [`Self::resolve_package`], which over-reports on
-    /// both counts — tracking providers override.
+    /// code load: implementations must not record the fetch in [`Self::loaded_packages`] or treat
+    /// it as an install (consuming an uninstalled producer must leave it uninstalled). The default
+    /// delegates to [`Self::resolve_package`], which over-reports on both counts — tracking
+    /// providers override.
     ///
     /// # Errors
     /// Returns [`PackageError`] on resolution, network, integrity, or manifest failure.
@@ -1751,6 +1771,9 @@ fn serve_text<'a>(
     text: &'a str,
     is_entry: bool,
 ) -> std::borrow::Cow<'a, str> {
+    if is_entry {
+        provider.note_entry_load(key);
+    }
     if !is_entry || provider.is_home_load(key) {
         return std::borrow::Cow::Borrowed(text);
     }
@@ -1797,10 +1820,10 @@ pub(crate) async fn load_marker_module(
     // isolate trust: trust grants permissions, it does not bypass another package's import-deny.
     if !fetched.manifest.importable {
         if let Some(referrer) = spec.referrer() {
-            if referrer.key.owner != key.owner {
+            if referrer.key.owner != fetched.key.owner {
                 return Err(crate::generic_loader_error(format!(
                     "package {}/{} is not importable: it declares \"importable\": false, so {}/{} may not `import` it — consume it via the package's `requires` + its events/types instead",
-                    key.owner, key.name, referrer.key.owner, referrer.key.name
+                    fetched.key.owner, fetched.key.name, referrer.key.owner, referrer.key.name
                 )));
             }
         }
@@ -1808,11 +1831,11 @@ pub(crate) async fn load_marker_module(
     let module = fetched
         .resolve_module(spec.subpath.as_deref())
         .map_err(|err| crate::generic_loader_error(err.to_string()))?;
-    let canonical = canonical_url(&key, &fetched.resolved_version, &module.subpath);
+    let canonical = canonical_url(&fetched.key, &fetched.resolved_version, &module.subpath);
     let is_entry = fetched
         .resolve_module(None)
         .is_ok_and(|entry| entry.subpath == module.subpath);
-    let text = serve_text(&provider, &key, &canonical, &module.text, is_entry);
+    let text = serve_text(&provider, &fetched.key, &canonical, &module.text, is_entry);
     let (code, _source_map) = crate::transpiler::transpile(&canonical, &text).map_err(|err| {
         crate::generic_loader_error(format!("failed transpiling {canonical}: {err}"))
     })?;
@@ -2464,7 +2487,7 @@ pub(crate) async fn load_kind_scheme_module(
     let parsed = parse_kind_scheme_url(url)
         .ok_or_else(|| crate::generic_loader_error(format!("invalid kind-scheme url {url}")))?;
     let display = kind_scheme_display(parsed.kind);
-    let producer_spec = kind_scheme_producer_spec(&parsed.target);
+    let mut producer_spec = kind_scheme_producer_spec(&parsed.target);
 
     let (handles, other_kind_names): (HandleExports, Vec<(InteropKind, Vec<String>)>) =
         match &parsed.target {
@@ -2532,13 +2555,18 @@ pub(crate) async fn load_kind_scheme_module(
                     key.owner, key.name
                 ))
             })?;
+                // A local same-leaf override owns the interop identity too. Keeping the
+                // requested foreign specifier here would route reads/events through a foreign
+                // home and let local code impersonate that publisher.
+                producer_spec = fetched.key.to_user_specifier();
                 let entry = fetched.resolve_module(None).map_err(|err| {
                     crate::generic_loader_error(format!(
                         "cannot consume {display}/{}/{}: {err}",
                         key.owner, key.name
                     ))
                 })?;
-                let entry_url = canonical_url(key, &fetched.resolved_version, &entry.subpath);
+                let entry_url =
+                    canonical_url(&fetched.key, &fetched.resolved_version, &entry.subpath);
                 let extraction = crate::interop_extract::extract_interop_handles(
                     &entry_url,
                     &entry.text,
@@ -2743,6 +2771,8 @@ pub struct InMemoryPackageProvider {
     /// first-served order. Version stays in the key so a worker-source snapshot preserves
     /// coexisting versions; [`PackageProvider::loaded_packages`] folds it back to package keys.
     served: std::cell::RefCell<Vec<(PackageKey, String)>>,
+    /// Package entries served through this provider, for entry-sensitive diagnostics.
+    entry_loads: std::cell::RefCell<Vec<PackageKey>>,
     /// The packages whose interop home is this provider's isolate (folded keys). `None`
     /// means homes were never configured: every load is home, nothing is scrubbed.
     homes: std::cell::RefCell<Option<std::collections::HashSet<PackageKey>>>,
@@ -2850,8 +2880,19 @@ impl PackageProvider for InMemoryPackageProvider {
         keys
     }
 
+    fn note_entry_load(&self, key: &PackageKey) {
+        let mut entries = self.entry_loads.borrow_mut();
+        if !entries.contains(key) {
+            entries.push(key.clone());
+        }
+    }
+
+    fn entry_loaded_packages(&self) -> Vec<PackageKey> {
+        self.entry_loads.borrow().clone()
+    }
+
     /// A stub fetch is a read of the producer's declarations, not a code load — serve it
-    /// without recording the key in `served` (which would misfire the stumble diagnostic).
+    /// without recording the key in `served`.
     async fn resolve_package_for_stub(
         &self,
         key: &PackageKey,

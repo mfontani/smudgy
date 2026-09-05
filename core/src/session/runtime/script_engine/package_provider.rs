@@ -23,16 +23,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smudgy_cloud::{
-    CloudError, PackageApiClient, ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire,
+    CloudError, DependencyKind, PackageApiClient, ResolvedDependency, ResolvedModuleWire,
+    ResolvedPackageWire, highest_satisfying_version,
 };
 use smudgy_script::{
-    PackageError, PackageKey, PackageManifest, PackageModuleSource, PackageParameter,
-    PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage, canonical_url,
+    PackageDependency, PackageError, PackageKey, PackageManifest, PackageModuleSource,
+    PackageParameter, PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage,
+    canonical_url,
 };
 
-use super::package_cache::{
-    CachedModule, CachedResolution, PackageCache, is_code_module, package_integrity,
-};
+#[cfg(test)]
+use super::package_cache::{CachedModule, CachedResolution};
+use super::package_cache::{PackageCache, is_code_module, package_integrity, resolution_from_wire};
 use super::package_solver::{self, DepEdge, DepRequirement, Solve};
 use crate::models::shared_packages::{self, LockedPackage, SharedPackageLock, UpdateMode};
 
@@ -45,8 +47,25 @@ use crate::models::shared_packages::{self, LockedPackage, SharedPackageLock, Upd
 pub fn build_package_provider(
     client: Option<PackageApiClient>,
     server_name: Arc<String>,
+    profile_name: Arc<String>,
+    lock: SharedPackageLock,
+    local_owner: String,
+    local_names: Arc<HashMap<String, String>>,
+    local_snapshots: LocalSnapshots,
+    local_catalog_error: Option<Arc<str>>,
 ) -> Option<Rc<SmudgyPackageProvider>> {
-    client.map(|client| Rc::new(SmudgyPackageProvider::new(client, server_name)))
+    client.map(|client| {
+        Rc::new(SmudgyPackageProvider::new_for_profile_with_local_inventory(
+            client,
+            server_name,
+            profile_name,
+            lock,
+            local_owner,
+            local_names,
+            local_snapshots,
+            local_catalog_error,
+        ))
+    })
 }
 
 /// One auto-update notice: a package whose resolved version changed since last load.
@@ -72,9 +91,18 @@ pub enum CapRefusal {
     NoVersions,
 }
 
-/// One resolved package instance's locked dependencies: dependency package →
-/// `(locked version, is_exact_pin)`.
-type LockedDeps = HashMap<PackageKey, (String, bool)>;
+/// One resolved package instance's locked code dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockedDep {
+    version: String,
+    is_exact_pin: bool,
+    /// The author's original semver requirement. Retained so a local leaf-name override can
+    /// explain when its on-disk version does not satisfy what the importer requested.
+    range: String,
+}
+
+/// One resolved package instance's locked **code dependencies**: dependency package → lock.
+type LockedDeps = HashMap<PackageKey, LockedDep>;
 
 /// Staleness bound on the wire-metadata memo: the wire carries *presigned* module URLs
 /// (900 s server TTL), so a memo hit older than this refetches rather than hand an
@@ -86,11 +114,57 @@ const WIRE_MEMO_TTL: Duration = Duration::from_mins(10);
 /// bound) and the resolve wire itself, keyed by `(package, concrete version)`.
 type WireMemo = HashMap<(PackageKey, String), (Instant, Rc<ResolvedPackageWire>)>;
 
+/// One local-folder read for the lifetime of an engine build. Forked isolate providers share this
+/// snapshot so permission solving, parameter gates, and served source cannot observe different
+/// edits from the same reload.
+#[derive(Clone)]
+pub(super) enum LocalSnapshot {
+    Missing,
+    Invalid(Arc<str>),
+    Loaded(Rc<crate::models::local_packages::LocalPackage>),
+}
+
+/// Immutable local-package catalog captured with the lock snapshot that assigns isolate trust.
+/// Every provider fork shares these exact bytes for the lifetime of one engine generation.
+pub(super) type LocalSnapshots = Rc<HashMap<String, LocalSnapshot>>;
+
+pub(super) fn snapshot_local_packages_in(
+    home: &std::path::Path,
+    server_name: &str,
+    local_names: &HashMap<String, String>,
+) -> LocalSnapshots {
+    let snapshots = local_names
+        .iter()
+        .map(|(leaf, actual_name)| {
+            let snapshot = match crate::models::local_packages::load_local_package_in(
+                home,
+                server_name,
+                actual_name,
+            ) {
+                Ok(Some(local)) => LocalSnapshot::Loaded(Rc::new(local)),
+                Ok(None) => LocalSnapshot::Invalid(Arc::from(format!(
+                    "local package '{actual_name}' disappeared while the session snapshot was captured"
+                ))),
+                Err(error) => LocalSnapshot::Invalid(Arc::from(error.to_string())),
+            };
+            (leaf.clone(), snapshot)
+        })
+        .collect();
+    Rc::new(snapshots)
+}
+
 /// The slice of a resolve wire the metadata walks consume: the concrete version, the
 /// parsed manifest, and the locked dependency edges. Divorcing the walks from the full
-/// wire lets a cached [`CachedResolution`] serve them without the network — see
+/// wire lets a cached [`CachedResolution`](super::package_cache::CachedResolution) serve them
+/// without the network — see
 /// [`fetch_walk_meta`](SmudgyPackageProvider::fetch_walk_meta).
 struct WalkMeta {
+    /// Canonical runtime identity. This differs from the requested key when a local
+    /// same-leaf package shadows a published coordinate.
+    key: PackageKey,
+    /// Durable settings namespace. Local packages execute under the current nickname but always
+    /// read activation/parameter state from the reserved `local` coordinate.
+    state_specifier: String,
     version: String,
     manifest: Option<PackageManifest>,
     dependencies: Vec<ResolvedDependency>,
@@ -102,6 +176,7 @@ struct WalkMeta {
 pub struct SmudgyPackageProvider {
     client: PackageApiClient,
     server_name: Arc<String>,
+    profile_name: Arc<String>,
     /// In-memory view of the server lockfile (modes + last-resolved versions). **Shared** across
     /// every isolate's provider (one `Rc` per session) so partitioned lockfile writes stay
     /// consistent: each install belongs to exactly one isolate (`PACKAGE-ISOLATES-RESOLUTION.md`),
@@ -118,11 +193,12 @@ pub struct SmudgyPackageProvider {
     cache: RefCell<HashMap<(PackageKey, String), Rc<ResolvedPackage>>>,
     /// The version each package resolved to in this isolate (so repeated imports within it agree).
     resolved_versions: RefCell<HashMap<PackageKey, String>>,
-    /// Each resolved package *instance*'s locked deps: importing `(package, version)` →
+    /// Each resolved package *instance*'s locked code deps: importing `(package, version)` →
     /// (dependency package → `(locked version, is_exact_pin)`). Keyed by version too so two
     /// coexisting versions of one importer keep distinct dep maps; the pin flag (author
     /// `@=x`) marks deps exempt from the closure's upgrade-collapse. Populated from each
-    /// resolve's wire `dependencies`; drives referrer-aware selection.
+    /// resolve's wire `kind = dependency` edges; drives referrer-aware selection. A
+    /// `requires` relationship is a separate installed root and never enters this map.
     locked_deps: RefCell<HashMap<(PackageKey, String), LockedDeps>>,
     /// This isolate's cross-tree coexistence solve, computed by the `solve_closure`
     /// pre-pass over *this isolate's* closure before module loading. `None` until the pre-pass
@@ -137,6 +213,9 @@ pub struct SmudgyPackageProvider {
     /// warning means an **intra-isolate** collision; a cross-isolate duplicate never appears here
     /// because it lives in two different providers' closures (`PACKAGE-ISOLATES-RESOLUTION.md`).
     duplicate_warnings: RefCell<Vec<(PackageKey, Vec<String>)>>,
+    /// User-facing warnings produced when an unconditional local leaf-name override does not
+    /// satisfy a requesting dependency range or root pin. Drained after the isolate loads.
+    local_override_warnings: RefCell<Vec<String>>,
     /// Each top-level install's declared params `(specifier, params)`, collected during the
     /// `solve_closure` pre-pass so the host can run the required-param load-gate before
     /// evaluation. Published installs only; a local dev package is the author's own.
@@ -163,10 +242,21 @@ pub struct SmudgyPackageProvider {
     /// **Shared** across forks like `disk_cache`: the memoized facts are
     /// isolate-independent even though each isolate solves its closure independently.
     wire_memo: Rc<RefCell<WireMemo>>,
-    /// The current account's nickname, for the local-package dev-override
-    /// (resolve `smudgy://<yourhandle>/<name>` to a local folder). `None` when
-    /// logged out / no handle allocated.
+    /// The current account's nickname, used as the canonical owner for every local
+    /// leaf-name override. `None` when logged out / no handle allocated, in which case
+    /// local packages use the reserved `local` owner.
     account_nickname: Option<String>,
+    /// Eager, per-leaf local-folder snapshots shared by every provider fork in this engine build.
+    /// The engine captures these while it also owns the package transaction that materializes and
+    /// reads the governing lock rows, so recreated code cannot inherit a predecessor's trust.
+    local_snapshots: LocalSnapshots,
+    /// Case-folded leaf name to the catalog's actual on-disk spelling. Resolution is
+    /// case-insensitive on every platform, while filesystem lookup on Linux is not.
+    local_names: Arc<HashMap<String, String>>,
+    /// A corrupt local folder catalog (notably two names differing only by case) invalidates every
+    /// package resolution for this engine build. Failing the whole catalog closed prevents a lazy
+    /// request spelling from selecting one folder while activation/trust came from the other.
+    local_catalog_error: Option<Arc<str>>,
     /// The packages whose interop home is this provider's isolate (interop.md §3), folded
     /// like the home registry's keys. `None` until the engine calls
     /// [`set_home_packages`](PackageProvider::set_home_packages): every load is home, no
@@ -175,6 +265,8 @@ pub struct SmudgyPackageProvider {
     /// Non-home loads that had interop-handle exports scrubbed — read by the engine to
     /// dress a subsequent link failure with the scheme-import hint.
     scrubbed: RefCell<Vec<PackageKey>>,
+    /// Package entries served through this provider, for the duplicate-entry diagnostic.
+    entry_loads: RefCell<Vec<PackageKey>>,
     /// User-level (`file://`-referred) code imports of packages — read by the engine to
     /// warn when the target declares interop handles (interop.md §1/§3 residual).
     user_imports: RefCell<Vec<PackageKey>>,
@@ -187,16 +279,129 @@ pub struct SmudgyPackageProvider {
 }
 
 impl SmudgyPackageProvider {
+    /// Applies the required-parameter gate against the package's configured durable scope.
+    ///
+    /// Storage and settings-row failures are deliberately distinct from an inspected, unset
+    /// value. Treating either failure as merely "unset" hides corrupt/unreadable package state
+    /// and can send the user toward editing values in the wrong scope.
+    fn check_required_params(
+        &self,
+        display_specifier: &str,
+        state_specifier: &str,
+        params: &[PackageParameter],
+    ) -> Result<(), PackageError> {
+        let missing = self
+            .missing_required_params(state_specifier, params)
+            .map_err(|error| {
+                PackageError::Other(format!(
+                    "{display_specifier} not loaded for profile {}: package settings are unavailable; reload Automations and try again ({error:#})",
+                    self.profile_name
+                ))
+            })?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(PackageError::Other(format!(
+            "{display_specifier} not loaded for profile {}: required param(s) {} are unset; configure them in settings",
+            self.profile_name,
+            missing.join(", ")
+        )))
+    }
+
+    /// The required parameters of `state_specifier` that are unset in the package's configured
+    /// scope for this profile (a package without a lock row reads the global scope).
+    ///
+    /// # Errors
+    /// Returns an error when the package's settings storage cannot be inspected.
+    pub fn missing_required_params(
+        &self,
+        state_specifier: &str,
+        params: &[PackageParameter],
+    ) -> anyhow::Result<Vec<String>> {
+        shared_packages::missing_required_params_for_profile_checked(
+            &self.server_name,
+            &self.profile_name,
+            state_specifier,
+            params,
+        )
+    }
+
     /// Creates a provider, seeding the lockfile view from disk.
     #[must_use]
+    #[cfg(test)]
     pub fn new(client: PackageApiClient, server_name: Arc<String>) -> Self {
-        let lock = shared_packages::load_lock(&server_name).unwrap_or_else(|err| {
-            warn!("Failed to load package lockfile for {server_name}: {err:#}");
-            SharedPackageLock::default()
-        });
+        Self::new_for_profile(client, server_name, Arc::new(String::new()))
+    }
+
+    /// Creates a provider for one session profile.
+    #[must_use]
+    #[cfg(test)]
+    pub fn new_for_profile(
+        client: PackageApiClient,
+        server_name: Arc<String>,
+        profile_name: Arc<String>,
+    ) -> Self {
+        let authority = crate::models::local_packages::with_local_package_transaction(
+            &server_name,
+            |home, transaction| {
+                let names =
+                    crate::models::local_packages::list_local_packages_in(home, &server_name)?;
+                let local_names = Arc::new(
+                    names
+                        .into_iter()
+                        .map(|name| (name.to_ascii_lowercase(), name))
+                        .collect::<HashMap<_, _>>(),
+                );
+                let local_snapshots = snapshot_local_packages_in(home, &server_name, &local_names);
+                let lock = transaction.load_lock()?;
+                Ok((local_names, local_snapshots, lock))
+            },
+        );
+        let (local_names, local_snapshots, lock, local_catalog_error) = match authority {
+            Ok((local_names, local_snapshots, lock)) => (local_names, local_snapshots, lock, None),
+            Err(error) => {
+                warn!("Failed to capture package authority for {server_name}: {error:#}");
+                (
+                    Arc::new(HashMap::new()),
+                    Rc::new(HashMap::new()),
+                    SharedPackageLock::default(),
+                    Some(Arc::from(error.to_string())),
+                )
+            }
+        };
+        let local_owner = crate::models::auth::load_account()
+            .and_then(|account| account.nickname)
+            .unwrap_or_else(|| crate::models::local_packages::LOCAL_OWNER.to_string());
+        Self::new_for_profile_with_local_inventory(
+            client,
+            server_name,
+            profile_name,
+            lock,
+            local_owner,
+            local_names,
+            local_snapshots,
+            local_catalog_error,
+        )
+    }
+
+    /// Creates a provider from the exact local-folder inventory used to partition this engine's
+    /// roots. A reload is the only point at which this inventory can change; independent
+    /// filesystem reads during provider construction could otherwise swap local and published
+    /// authority inside one engine generation.
+    fn new_for_profile_with_local_inventory(
+        client: PackageApiClient,
+        server_name: Arc<String>,
+        profile_name: Arc<String>,
+        lock: SharedPackageLock,
+        local_owner: String,
+        local_names: Arc<HashMap<String, String>>,
+        local_snapshots: LocalSnapshots,
+        local_catalog_error: Option<Arc<str>>,
+    ) -> Self {
         Self {
             client,
             server_name,
+            profile_name,
             lock: Rc::new(RefCell::new(lock)),
             version_changes: RefCell::new(Vec::new()),
             cache: RefCell::new(HashMap::new()),
@@ -205,14 +410,21 @@ impl SmudgyPackageProvider {
             solve: RefCell::new(None),
             top_level_solved: RefCell::new(HashMap::new()),
             duplicate_warnings: RefCell::new(Vec::new()),
+            local_override_warnings: RefCell::new(Vec::new()),
             installed_params: RefCell::new(Vec::new()),
             installed_min_versions: RefCell::new(Vec::new()),
             closure_permission_union: RefCell::new(PackagePermissions::default()),
             disk_cache: PackageCache::new().ok(),
             wire_memo: Rc::new(RefCell::new(HashMap::new())),
-            account_nickname: crate::models::auth::load_account().and_then(|a| a.nickname),
+            account_nickname: (!local_owner
+                .eq_ignore_ascii_case(crate::models::local_packages::LOCAL_OWNER))
+            .then_some(local_owner),
+            local_snapshots,
+            local_names,
+            local_catalog_error,
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
+            entry_loads: RefCell::new(Vec::new()),
             user_imports: RefCell::new(Vec::new()),
             image_hosted: RefCell::new(None),
         }
@@ -246,12 +458,16 @@ impl SmudgyPackageProvider {
         Self {
             client: self.client.clone(),
             server_name: Arc::clone(&self.server_name),
+            profile_name: Arc::clone(&self.profile_name),
             lock: Rc::clone(&self.lock),
             disk_cache: self.disk_cache.clone(),
             // Shared like the disk cache: wire metadata is an isolate-independent,
             // immutable fact, so one fetch serves every isolate's walk.
             wire_memo: Rc::clone(&self.wire_memo),
             account_nickname: self.account_nickname.clone(),
+            local_snapshots: Rc::clone(&self.local_snapshots),
+            local_names: Arc::clone(&self.local_names),
+            local_catalog_error: self.local_catalog_error.clone(),
             // Per-isolate solve state — each starts empty and solves its own closure.
             version_changes: RefCell::new(Vec::new()),
             cache: RefCell::new(HashMap::new()),
@@ -260,6 +476,7 @@ impl SmudgyPackageProvider {
             solve: RefCell::new(None),
             top_level_solved: RefCell::new(HashMap::new()),
             duplicate_warnings: RefCell::new(Vec::new()),
+            local_override_warnings: RefCell::new(Vec::new()),
             installed_params: RefCell::new(Vec::new()),
             installed_min_versions: RefCell::new(Vec::new()),
             closure_permission_union: RefCell::new(PackagePermissions::default()),
@@ -267,53 +484,101 @@ impl SmudgyPackageProvider {
             // each fork for the isolate it serves.
             home_packages: RefCell::new(None),
             scrubbed: RefCell::new(Vec::new()),
+            entry_loads: RefCell::new(Vec::new()),
             user_imports: RefCell::new(Vec::new()),
             // Per-isolate: the engine wires each fork to its own isolate's image policy.
             image_hosted: RefCell::new(None),
         }
     }
 
-    /// If the current account is authoring a local package matching `key`, resolve it
-    /// from `<server>/packages/<name>/` (npm-link-style override) so it's tested under
-    /// its real specifier before publishing. On a code load (`track`) it's cached like a
-    /// normal resolution so install + import share one instance; a stub fetch
-    /// (`track == false`) leaves the cache untouched, so consuming a local producer over
-    /// `smudgy:state|events/…` records no code-load footprint (`loaded_packages()` /
-    /// the stumble diagnostic stays quiet) — the same contract the network + offline
-    /// branches keep.
+    fn local_snapshot(&self, key: &PackageKey) -> LocalSnapshot {
+        let leaf = key.name.to_ascii_lowercase();
+        if let Some(error) = &self.local_catalog_error {
+            return LocalSnapshot::Invalid(Arc::clone(error));
+        }
+        self.local_snapshots.get(&leaf).cloned().unwrap_or_else(|| {
+            match self.local_names.get(&leaf) {
+                None => LocalSnapshot::Missing,
+                Some(actual_name) => LocalSnapshot::Invalid(Arc::from(format!(
+                    "local package '{actual_name}' was not captured in the session snapshot"
+                ))),
+            }
+        })
+    }
+
+    /// The canonical local identity and package snapshot for `key`'s leaf name, if that package
+    /// exists and parsed successfully.
     ///
-    /// Known gap: a local package's `locked_deps` are **not** populated here — its
-    /// manifest carries dependency *ranges*, not the concrete versions a published resolve
-    /// supplies, so deriving them would need the same async range-resolution `publish`
-    /// does. So a locally-developed package's transitive `smudgy://` imports resolve via
-    /// the lockfile / latest rather than referrer-locked versions until it is published.
+    /// Package names are globally unique in the service. A local package is therefore an
+    /// unconditional npm-link-style override by leaf name: `smudgy://any-author/tools`
+    /// resolves to this user's local `tools`. Returning the local owner here is load-bearing:
+    /// foreign trust, parameters, storage, permissions, and provenance must never be attached
+    /// to locally-authored code merely because the request used a foreign owner segment.
+    fn local_override(
+        &self,
+        key: &PackageKey,
+    ) -> Option<(PackageKey, Rc<crate::models::local_packages::LocalPackage>)> {
+        let LocalSnapshot::Loaded(local) = self.local_snapshot(key) else {
+            return None;
+        };
+        Some((
+            PackageKey {
+                owner: self.local_owner().to_string(),
+                name: local.name.clone(),
+            },
+            local,
+        ))
+    }
+
+    /// Canonical runtime identity for a requested coordinate. Published packages retain their
+    /// full coordinate; an existing local same-leaf package always returns the local identity.
+    #[must_use]
+    pub fn canonical_key(&self, key: &PackageKey) -> PackageKey {
+        match self.local_snapshot(key) {
+            LocalSnapshot::Missing => key.clone(),
+            LocalSnapshot::Loaded(local) => PackageKey {
+                owner: self.local_owner().to_string(),
+                name: local.name.clone(),
+            },
+            // A malformed local package still owns this leaf. Keep its local identity and fail
+            // the eventual resolve; never escape the override by loading published code.
+            LocalSnapshot::Invalid(_) => PackageKey {
+                owner: self.local_owner().to_string(),
+                name: key.name.clone(),
+            },
+        }
+    }
+
+    /// Resolve any package coordinate with a locally-authored same-leaf package from
+    /// `<server>/packages/<name>/`. On a code load (`track`) it is cached under its
+    /// **canonical local identity**, so every author alias redirects to one module instance;
+    /// a stub fetch
+    /// (`track == false`) leaves the cache untouched, so consuming a local producer over
+    /// `smudgy:state|events/…` records no code-load footprint (`loaded_packages()`) — the
+    /// same contract the network + offline branches keep.
+    ///
     /// The `resolved_versions` write is left to the caller so it can gate on top-level.
     fn try_local_override(&self, key: &PackageKey, track: bool) -> Option<Rc<ResolvedPackage>> {
-        if !self.is_local_owner_segment(&key.owner) {
-            return None;
-        }
-        let local = crate::models::local_packages::load_local_package(&self.server_name, &key.name)
-            .ok()
-            .flatten()?;
+        let (local_key, local) = self.local_override(key)?;
         let version = local.manifest.version.clone();
         let modules = local
             .modules
-            .into_iter()
+            .iter()
             // Local modules are loaded as text; a binary local module (any bytes are stored, but
             // loading binaries is out of scope) is SKIPPED rather than fed lossy garbage to v8.
             .filter_map(|m| {
-                String::from_utf8(m.content)
+                String::from_utf8(m.content.clone())
                     .ok()
                     .map(|text| PackageModuleSource {
-                        subpath: m.subpath,
+                        subpath: m.subpath.clone(),
                         text,
                     })
             })
             .collect();
         let resolved = Rc::new(ResolvedPackage {
-            key: key.clone(),
+            key: local_key.clone(),
             resolved_version: version.clone(),
-            manifest: local.manifest,
+            manifest: local.manifest.clone(),
             integrity: "local".to_string(),
             modules,
         });
@@ -321,20 +586,17 @@ impl SmudgyPackageProvider {
         // local producer must leave no code-load footprint, exactly as the network +
         // offline branches gate their inserts on `track`. Otherwise consuming a
         // locally-authored producer over `smudgy:events/…` would land it in this isolate's
-        // `cache`, and the code-import stumble diagnostic would misfire on a consumer that
-        // never imported the producer's code.
+        // `cache` despite the consumer never importing the producer's code.
         if track {
             self.cache
                 .borrow_mut()
-                .insert((key.clone(), version.clone()), resolved.clone());
+                .insert((local_key, version.clone()), resolved.clone());
         }
         Some(resolved)
     }
 
-    /// Whether `key` resolves to a **local dev-override** — the account (or, signed out, the
-    /// reserved [`LOCAL_OWNER`](crate::models::local_packages::LOCAL_OWNER) placeholder)
-    /// authoring its own package under `<server>/packages/<name>/` (the [`try_local_override`]
-    /// shadow path). The engine reads this to (a) skip version-capping — the local folder is the
+    /// Whether `key` resolves to a **local dev-override** by leaf name. The engine reads this
+    /// to (a) skip version-capping — the local folder is the
     /// version on disk — and (b) source the isolate's enforced grant from the package's OWN
     /// on-disk manifest rather than a consented closure union (a local package has no consent
     /// record; the manifest IS its grant table). A local package therefore still runs
@@ -345,11 +607,7 @@ impl SmudgyPackageProvider {
     /// [`try_local_override`]: Self::try_local_override
     #[must_use]
     pub fn is_local_override(&self, key: &PackageKey) -> bool {
-        self.is_local_owner_segment(&key.owner)
-            && crate::models::local_packages::load_local_package(&self.server_name, &key.name)
-                .ok()
-                .flatten()
-                .is_some()
+        !matches!(self.local_snapshot(key), LocalSnapshot::Missing)
     }
 
     /// The owner segment local packages run under: the account nickname when signed in, else the
@@ -362,22 +620,179 @@ impl SmudgyPackageProvider {
             .unwrap_or(crate::models::local_packages::LOCAL_OWNER)
     }
 
-    /// Whether `owner` addresses this account's own local packages: the current
-    /// [`local_owner`](Self::local_owner), or the reserved `local` placeholder regardless of
-    /// sign-in state. An install written signed out (`smudgy://local/<name>`) must keep
-    /// resolving to its folder after the account gains a nickname — the owner segment records
-    /// the sign-in state at install time, not a different package. The placeholder is reserved
-    /// server-side, so accepting it never shadows a real cloud package.
-    fn is_local_owner_segment(&self, owner: &str) -> bool {
-        owner == crate::models::local_packages::LOCAL_OWNER || owner == self.local_owner()
+    fn local_state_specifier(name: &str) -> String {
+        format!(
+            "smudgy://{}/{name}",
+            crate::models::local_packages::LOCAL_OWNER
+        )
+    }
+
+    /// Whether `version` satisfies `range`. A missing/empty range accepts any version;
+    /// malformed ranges reject rather than accidentally suppressing the mismatch warning.
+    fn version_satisfies(version: &str, range: Option<&str>) -> bool {
+        let Some(range) = range.filter(|range| !range.trim().is_empty()) else {
+            return true;
+        };
+        let Ok(version) = semver::Version::parse(version) else {
+            return false;
+        };
+        semver::VersionReq::parse(range).is_ok_and(|requirement| requirement.matches(&version))
+    }
+
+    /// Record one comprehensible warning when unconditional local shadowing ignores a range.
+    fn note_local_range_mismatch(
+        &self,
+        requested: &PackageKey,
+        local: &PackageKey,
+        local_version: &str,
+        range: Option<&str>,
+    ) {
+        let Some(range) = range.filter(|range| !range.trim().is_empty()) else {
+            return;
+        };
+        if Self::version_satisfies(local_version, Some(range)) {
+            return;
+        }
+        let warning = format!(
+            "[package] Local {} {} replaces {}, but the requester needs {}. Smudgy uses the local copy.",
+            local.name,
+            local_version,
+            requested.to_user_specifier(),
+            range
+        );
+        let mut warnings = self.local_override_warnings.borrow_mut();
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+
+    /// Resolve one locally-authored manifest dependency to a concrete version for this load.
+    /// A same-leaf local target wins unconditionally. Published targets prefer the registry's
+    /// newest satisfying version and fall back to an installed staged version while offline.
+    async fn resolve_local_dependency(
+        &self,
+        dependency: &PackageDependency,
+    ) -> Result<ResolvedDependency, String> {
+        if let LocalSnapshot::Invalid(error) = self.local_snapshot(&dependency.key) {
+            return Err(format!(
+                "declared dependency {} cannot be loaded because its local override is invalid: {error}",
+                dependency.key.to_user_specifier()
+            ));
+        }
+        if let Some((local_key, local)) = self.local_override(&dependency.key) {
+            self.note_local_range_mismatch(
+                &dependency.key,
+                &local_key,
+                &local.manifest.version,
+                dependency.range.as_deref(),
+            );
+            return Ok(ResolvedDependency {
+                // Preserve the author's declared coordinate in the edge. Consumers of
+                // this metadata canonicalize it before loading, while retaining the alias
+                // here keeps diagnostics tied to what the manifest actually requested.
+                owner_nickname: dependency.key.owner.clone(),
+                name: dependency.key.name.clone(),
+                range: dependency.range.clone().unwrap_or_default(),
+                resolved_version: local.manifest.version.clone(),
+                kind: DependencyKind::Dependency,
+            });
+        }
+
+        let fallback = || {
+            let specifier = dependency.key.to_user_specifier();
+            self.lock
+                .borrow()
+                .find(&specifier)
+                .and_then(|locked| locked.staged_version().map(str::to_string))
+                .filter(|version| Self::version_satisfies(version, dependency.range.as_deref()))
+        };
+        let requested = dependency.key.to_user_specifier();
+        let range = dependency.range.as_deref().unwrap_or("*");
+        let unresolved = |detail: &str| {
+            format!(
+                "declared dependency {requested}@{range} has no version that Smudgy can resolve ({detail})"
+            )
+        };
+        let resolved_version = match self.fetch_wire(&dependency.key, None).await {
+            Ok(latest) if Self::version_satisfies(&latest.version, dependency.range.as_deref()) => {
+                latest.version.clone()
+            }
+            Ok(latest) => match self.client.list_versions(latest.package_id).await {
+                Ok(versions) => highest_satisfying_version(&versions, dependency.range.as_deref())
+                    .map_err(|error| unresolved(&format!("the version list is invalid: {error}")))?
+                    .ok_or_else(|| unresolved("the registry has no matching version"))?,
+                Err(error) => fallback()
+                    .ok_or_else(|| unresolved(&format!("version enumeration failed: {error}")))?,
+            },
+            Err(error) => fallback()
+                .ok_or_else(|| unresolved(&format!("package resolution failed: {error}")))?,
+        };
+        Ok(ResolvedDependency {
+            owner_nickname: dependency.key.owner.clone(),
+            name: dependency.key.name.clone(),
+            range: dependency.range.clone().unwrap_or_default(),
+            resolved_version,
+            kind: DependencyKind::Dependency,
+        })
+    }
+
+    /// Metadata for a local same-leaf override. Its manifest is authoritative and its
+    /// `smudgy://` code dependencies are resolved for this load, so solver, permission,
+    /// version-floor, and referrer-aware paths all see the local tree rather than the
+    /// shadowed published manifest.
+    async fn local_walk_meta(&self, key: &PackageKey) -> Result<Option<WalkMeta>, String> {
+        let Some((local_key, local)) = self.local_override(key) else {
+            return Ok(None);
+        };
+        let mut dependencies = Vec::new();
+        for dependency in local.manifest.smudgy_dependencies() {
+            dependencies.push(self.resolve_local_dependency(&dependency).await?);
+        }
+        Ok(Some(WalkMeta {
+            key: local_key,
+            state_specifier: Self::local_state_specifier(&local.name),
+            version: local.manifest.version.clone(),
+            manifest: Some(local.manifest.clone()),
+            dependencies,
+        }))
+    }
+
+    /// Whether the lockfile's verified stamp for `key` contradicts a cached resolution of
+    /// `version`. An install's `integrity` describes exactly its `last_resolved_version`, so a
+    /// stamped entry staging this version whose stamp differs from the cached file's means the
+    /// two disagree about the same immutable content, and the cache file is not served. An
+    /// unstamped entry (a background stage, a never-verified install), an entry staging another
+    /// version, or no entry at all says nothing about the file.
+    fn lock_stamp_contradicts(&self, key: &PackageKey, version: &str, cached: &str) -> bool {
+        let lock = self.lock.borrow();
+        let Some(entry) = lock.find(&key.to_user_specifier()) else {
+            return false;
+        };
+        let contradicts = entry.last_resolved_version.as_deref() == Some(version)
+            && entry
+                .integrity
+                .as_deref()
+                .is_some_and(|stamp| stamp != cached);
+        if contradicts {
+            warn!(
+                "Ignoring cached package metadata for {}@{version}: its fingerprint does not match the lockfile's verified stamp",
+                key.to_user_specifier()
+            );
+        }
+        contradicts
     }
 
     /// Build a resolved package entirely from the on-disk cache (for offline use). `None`
     /// unless the version's metadata and every **code** module body are cached (assets are
-    /// lazy — see the resolve loop — and must not hold offline loads hostage).
+    /// lazy — see the resolve loop — and must not hold offline loads hostage) and the
+    /// lockfile's verified stamp, if any, agrees with the cached metadata
+    /// ([`lock_stamp_contradicts`](Self::lock_stamp_contradicts)).
     fn build_from_cache(&self, key: &PackageKey, version: &str) -> Option<Rc<ResolvedPackage>> {
         let cache = self.disk_cache.as_ref()?;
         let meta = cache.read_meta(key, version)?;
+        if self.lock_stamp_contradicts(key, version, &meta.integrity) {
+            return None;
+        }
         if !cache.has_all_code_blobs(&meta) {
             return None;
         }
@@ -409,7 +824,8 @@ impl SmudgyPackageProvider {
     /// and `resolve_impl` all ask for the same nodes; a published version's metadata is
     /// immutable, so one fetch serves them all (entries age out after [`WIRE_MEMO_TTL`]
     /// to keep the wire's presigned module URLs live). Every successful fetch also
-    /// persists the version's [`CachedResolution`] — metadata walks warm the offline
+    /// persists the version's [`CachedResolution`](super::package_cache::CachedResolution) —
+    /// metadata walks warm the offline
     /// cache, not just code loads. `None` asks the network unconditionally: what
     /// "latest" means is a mutable fact, though the concrete answer still lands in the
     /// memo for later versioned asks.
@@ -459,28 +875,37 @@ impl SmudgyPackageProvider {
         let Ok(manifest) = PackageManifest::parse(&wire.manifest.to_string()) else {
             return;
         };
-        let meta = CachedResolution {
-            version: wire.version.clone(),
-            integrity: package_integrity(&wire.modules),
+        let meta = match resolution_from_wire(
+            key,
+            &wire.version,
             manifest,
-            modules: wire
-                .modules
-                .iter()
-                .map(|module| CachedModule {
-                    subpath: module.subpath.clone(),
-                    content_hash: module.content_hash.clone(),
-                    media_type: module.media_type.clone(),
-                })
-                .collect(),
-            dependencies: wire.dependencies.clone(),
+            &wire.modules,
+            &wire.dependencies,
+        ) {
+            Ok(meta) => meta,
+            Err(error) => {
+                warn!(
+                    "Not caching package metadata for {}@{}: {error:#}",
+                    key.to_user_specifier(),
+                    wire.version
+                );
+                return;
+            }
         };
-        let _ = cache.refresh_meta(key, &wire.version, &meta);
+        if let Err(error) = cache.refresh_meta(key, &wire.version, &meta) {
+            warn!(
+                "Failed to cache package metadata for {}@{}: {error:#}",
+                key.to_user_specifier(),
+                wire.version
+            );
+        }
     }
 
     /// Resolve the metadata slice the closure walks consume — the concrete version, the
     /// parsed manifest (`None` when it won't parse; the walk degrades, never aborts),
     /// and the locked dependency edges — **cache-first**: a concrete `version` whose
-    /// [`CachedResolution`] is on disk is served from it, because a published version's
+    /// [`CachedResolution`](super::package_cache::CachedResolution) is on disk is served from
+    /// it, because a published version's
     /// metadata is immutable and the cached copy IS the network's answer. Only a cache
     /// gap, or `version == None` (what "latest" means is a mutable question), reaches
     /// [`fetch_wire`](Self::fetch_wire). Module URLs are the one thing the cache cannot
@@ -491,6 +916,22 @@ impl SmudgyPackageProvider {
         key: &PackageKey,
         version: Option<&str>,
     ) -> Result<WalkMeta, CloudError> {
+        if let LocalSnapshot::Invalid(error) = self.local_snapshot(key) {
+            return Err(CloudError::InvalidInput(format!(
+                "local package {} is invalid: {error}",
+                key.name
+            )));
+        }
+        // A local package shadows every author coordinate with this leaf name. Ignore the
+        // published version selector and walk the snapshotted local manifest under its canonical
+        // identity; local range mismatches are advisory, never an escape from the override.
+        if let Some(local) = self
+            .local_walk_meta(key)
+            .await
+            .map_err(CloudError::InvalidInput)?
+        {
+            return Ok(local);
+        }
         if let Some(version) = version
             && let Some(meta) = self
                 .disk_cache
@@ -498,6 +939,8 @@ impl SmudgyPackageProvider {
                 .and_then(|cache| cache.read_meta(key, version))
         {
             return Ok(WalkMeta {
+                key: key.clone(),
+                state_specifier: key.to_user_specifier(),
                 version: meta.version,
                 manifest: Some(meta.manifest),
                 dependencies: meta.dependencies,
@@ -505,6 +948,8 @@ impl SmudgyPackageProvider {
         }
         let wire = self.fetch_wire(key, version).await?;
         Ok(WalkMeta {
+            key: key.clone(),
+            state_specifier: key.to_user_specifier(),
             version: wire.version.clone(),
             manifest: PackageManifest::parse(&wire.manifest.to_string()).ok(),
             dependencies: wire.dependencies.clone(),
@@ -533,17 +978,11 @@ impl SmudgyPackageProvider {
     /// the pending stage, so the entry — disk and in-memory view alike — is left
     /// exactly as staged. A stamped entry records as always, downgrades included.
     fn record_resolution(&self, specifier: &str, version: &str, verified_integrity: Option<&str>) {
-        let fresh_entry = || LockedPackage {
-            specifier: specifier.to_string(),
-            mode: UpdateMode::Auto,
-            last_resolved_version: Some(version.to_string()),
-            integrity: verified_integrity.map(str::to_string),
-            dismissed_update_version: None,
-            trusted: false,
-            consented_permissions: None,
-            enabled: true,
-            installed_as_requirement: false,
-            audio_used: false,
+        let fresh_entry = || {
+            let mut entry = LockedPackage::new(specifier.to_string(), UpdateMode::Auto);
+            entry.last_resolved_version = Some(version.to_string());
+            entry.integrity = verified_integrity.map(str::to_string);
+            entry
         };
         // How an existing entry adopts this resolution: the version always lands; the
         // integrity stamp only from a verified load. An unverified serve that MOVES
@@ -584,7 +1023,13 @@ impl SmudgyPackageProvider {
                 Ok(((), false))
             } else {
                 // Not an install at all (a top-level resolve outside the lockfile): record it
-                // on disk the same way it is recorded in memory.
+                // on disk the same way it is recorded in memory. A fresh row must not inherit
+                // coordinate-keyed settings that cleanup left behind for a retired install.
+                shared_packages::ensure_new_package_rows_have_no_retired_parameter_state(
+                    &self.server_name,
+                    disk,
+                    std::iter::once(specifier),
+                )?;
                 disk.upsert(fresh_entry());
                 Ok(((), true))
             }
@@ -615,30 +1060,38 @@ impl SmudgyPackageProvider {
         }
     }
 
-    /// Record a resolved package instance's locked deps (keyed by `(package, version)`), so
+    /// Record a resolved package instance's locked code deps (keyed by `(package, version)`), so
     /// a later import made from inside *that version* resolves at the version it locked.
     /// Each dep's declared range is classified into an exact-pin flag (author `@=x`).
     fn store_locked_deps(&self, importer: &PackageKey, version: &str, deps: &[ResolvedDependency]) {
-        if deps.is_empty() {
-            return;
-        }
         let map: LockedDeps = deps
             .iter()
+            .filter(|dep| dep.kind == DependencyKind::Dependency)
             .filter_map(|dep| {
-                let key = dep_package_key(&dep.owner_nickname, &dep.name)?;
+                let requested = dep_package_key(&dep.owner_nickname, &dep.name)?;
+                let (key, selected_version) = self.local_override(&requested).map_or_else(
+                    || (requested.clone(), dep.resolved_version.clone()),
+                    |(local_key, local)| (local_key, local.manifest.version.clone()),
+                );
                 Some((
                     key,
-                    (
-                        dep.resolved_version.clone(),
-                        package_solver::is_exact_pin(&dep.range),
-                    ),
+                    LockedDep {
+                        version: selected_version,
+                        is_exact_pin: package_solver::is_exact_pin(&dep.range),
+                        range: dep.range.clone(),
+                    },
                 ))
             })
             .collect();
-        if !map.is_empty() {
-            self.locked_deps
-                .borrow_mut()
-                .insert((importer.clone(), version.to_string()), map);
+        let instance = (self.canonical_key(importer), version.to_string());
+        let mut locked_deps = self.locked_deps.borrow_mut();
+        if map.is_empty() {
+            // Explicitly clear any prior live-local manifest shape. A package with only
+            // `requires` has no code-import locks; retaining an older map would silently
+            // authorize and version-select a dependency it no longer declares.
+            locked_deps.remove(&instance);
+        } else {
+            locked_deps.insert(instance, map);
         }
     }
 
@@ -648,7 +1101,7 @@ impl SmudgyPackageProvider {
         &self,
         referrer: &ReferrerRef,
         target: &PackageKey,
-    ) -> Option<(String, bool)> {
+    ) -> Option<LockedDep> {
         self.locked_deps
             .borrow()
             .get(&(referrer.key.clone(), referrer.version.clone()))?
@@ -735,28 +1188,24 @@ impl SmudgyPackageProvider {
             stack.push((spec.package_key(), forced, is_pin, true));
         }
 
-        while let Some((key, forced, is_pin, is_top_level)) = stack.pop() {
-            // Dedup BEFORE the fetch when the node arrives with a concrete version
-            // (every dep edge does): a diamond reached by N paths costs one fetch, not
-            // N. The duplicate requirement is still counted — the solver weighs every
-            // edge. Top-level roots fall through: they also register as roots and
-            // collect params/floors from the manifest (their fetch is a cache or memo
-            // hit when a dep edge got there first).
-            if !is_top_level
-                && let Some(version) = &forced
-                && seen.contains(&(key.clone(), version.clone()))
-            {
-                requirements.push(DepRequirement {
-                    package: key.clone(),
-                    version: version.clone(),
-                    is_pin,
-                });
-                continue;
-            }
-            let Ok(meta) = self.fetch_walk_meta(&key, forced.as_deref()).await else {
+        while let Some((requested_key, forced, is_pin, is_top_level)) = stack.pop() {
+            let Ok(meta) = self
+                .fetch_walk_meta(&requested_key, forced.as_deref())
+                .await
+            else {
                 continue;
             };
+            let key = meta.key.clone();
             let version = meta.version.clone();
+            if is_pin && self.is_local_override(&requested_key) {
+                let requested_range = forced.as_deref().map(|version| format!("={version}"));
+                self.note_local_range_mismatch(
+                    &requested_key,
+                    &key,
+                    &version,
+                    requested_range.as_deref(),
+                );
+            }
             let requirement = DepRequirement {
                 package: key.clone(),
                 version: version.clone(),
@@ -771,7 +1220,8 @@ impl SmudgyPackageProvider {
                 if let Some(manifest) = &manifest {
                     // Collect the install's declared params for the required-param load-gate.
                     if !manifest.params.is_empty() {
-                        installed_params.push((key.to_user_specifier(), manifest.params.clone()));
+                        installed_params
+                            .push((meta.state_specifier.clone(), manifest.params.clone()));
                     }
                     // And its declared version floor for the version-floor load-gate.
                     if let Some(min) = &manifest.min_smudgy_version {
@@ -788,24 +1238,42 @@ impl SmudgyPackageProvider {
             if let Some(manifest) = &manifest {
                 permissions_union.merge(&manifest.permissions);
             }
-            for dep in &meta.dependencies {
-                let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) else {
+            self.store_locked_deps(&key, &version, &meta.dependencies);
+            for dep in meta
+                .dependencies
+                .iter()
+                .filter(|dep| dep.kind == DependencyKind::Dependency)
+            {
+                let Some(requested_dep_key) = dep_package_key(&dep.owner_nickname, &dep.name)
+                else {
                     continue;
                 };
+                let (dep_key, dep_version) = self.local_override(&requested_dep_key).map_or_else(
+                    || (requested_dep_key.clone(), dep.resolved_version.clone()),
+                    |(local_key, local)| {
+                        self.note_local_range_mismatch(
+                            &requested_dep_key,
+                            &local_key,
+                            &local.manifest.version,
+                            Some(&dep.range),
+                        );
+                        (local_key, local.manifest.version.clone())
+                    },
+                );
                 let dep_pin = package_solver::is_exact_pin(&dep.range);
                 requirements.push(DepRequirement {
                     package: dep_key.clone(),
-                    version: dep.resolved_version.clone(),
+                    version: dep_version.clone(),
                     is_pin: dep_pin,
                 });
                 edges.push(DepEdge {
                     importer: key.clone(),
                     importer_version: version.clone(),
                     dep: dep_key.clone(),
-                    dep_version: dep.resolved_version.clone(),
+                    dep_version: dep_version.clone(),
                     dep_is_pin: dep_pin,
                 });
-                stack.push((dep_key, Some(dep.resolved_version.clone()), dep_pin, false));
+                stack.push((dep_key, Some(dep_version), dep_pin, false));
             }
         }
 
@@ -863,16 +1331,45 @@ impl SmudgyPackageProvider {
         };
         let key = spec.package_key();
 
-        let pin = self
-            .lock
-            .borrow()
-            .find(specifier)
-            .and_then(|locked| locked.pinned_version().map(str::to_string));
+        if matches!(self.local_snapshot(&key), LocalSnapshot::Invalid(_)) {
+            return Err(CapRefusal::NoVersions);
+        }
+
+        // Local leaf-name overrides do not shop the registry or inherit the published
+        // package's consent record. Their on-disk manifest is authoritative and the engine
+        // builds their sandbox grant from the live local closure.
+        if let Some((local_key, local)) = self.local_override(&key) {
+            let state_specifier = Self::local_state_specifier(&local.name);
+            let pin = self
+                .lock
+                .borrow()
+                .find(&state_specifier)
+                .and_then(|locked| locked.pinned_version().map(str::to_string));
+            let requested_range = pin.as_deref().map(|version| format!("={version}"));
+            self.note_local_range_mismatch(
+                &key,
+                &local_key,
+                &local.manifest.version,
+                requested_range.as_deref(),
+            );
+            return Ok(local.manifest.version.clone());
+        }
+
+        let (pin, staged) = {
+            let lock = self.lock.borrow();
+            let entry = lock.find(specifier);
+            (
+                entry.and_then(|locked| locked.pinned_version().map(str::to_string)),
+                entry.and_then(|locked| locked.staged_version().map(str::to_string)),
+            )
+        };
         let candidates: Vec<String> = if let Some(pin) = pin {
             vec![pin]
         } else {
             // Resolve once to learn the package id (and a latest-version fallback), then list its
-            // versions newest-first. If listing fails, fall back to just the latest.
+            // versions newest-first. A partial list failure keeps both the newly resolved latest
+            // and the distinct staged version: the latter may still fit the persisted consent or
+            // running-smudgy floor even when the former does not.
             match self.fetch_wire(&key, None).await {
                 Ok(latest) => match self.client.list_versions(latest.package_id).await {
                     Ok(list) => {
@@ -888,22 +1385,24 @@ impl SmudgyPackageProvider {
                         versions.reverse();
                         versions.into_iter().map(|v| v.to_string()).collect()
                     }
-                    Err(_) => vec![latest.version.clone()],
+                    Err(_) => {
+                        let mut candidates = vec![latest.version.clone()];
+                        if let Some(staged) = &staged
+                            && staged != &latest.version
+                        {
+                            candidates.push(staged.clone());
+                        }
+                        candidates
+                    }
                 },
                 // Offline, or signed out and the package isn't public (the anonymous viewer
                 // can't see it): we can't shop for a newer version, so fall back to the last
-                // version we resolved. It's cached and already consented, so an installed
-                // auto-update package keeps running without the cloud instead of silently
-                // dropping out. (Its closure union is recomputed below; when the cloud is
-                // unreachable that resolves to the empty set, which fits the prior consent,
-                // so the cached version loads with exactly the permissions already granted.)
-                Err(_) => self
-                    .lock
-                    .borrow()
-                    .find(specifier)
-                    .and_then(|locked| locked.last_resolved_version.clone())
-                    .into_iter()
-                    .collect(),
+                // version we resolved. The closure gate below still applies: cached
+                // metadata can prove a permission or version-floor mismatch while the
+                // cloud is down and will keep that version blocked. Nodes whose metadata is
+                // unavailable retain the legacy best-effort fold; the sandbox still grants no
+                // more than the user's persisted consent.
+                Err(_) => staged.into_iter().collect(),
             }
         };
 
@@ -951,18 +1450,24 @@ impl SmudgyPackageProvider {
         let mut seen: HashSet<(PackageKey, String)> = HashSet::new();
         let mut stack: Vec<(PackageKey, String)> =
             vec![(root_key.clone(), root_version.to_string())];
-        while let Some((key, version)) = stack.pop() {
-            if !seen.insert((key.clone(), version.clone())) {
-                continue;
-            }
-            let Ok(wire) = self.fetch_wire(&key, Some(&version)).await else {
+        while let Some((requested_key, version)) = stack.pop() {
+            let Ok(meta) = self.fetch_walk_meta(&requested_key, Some(&version)).await else {
                 continue;
             };
-            if let Ok(manifest) = PackageManifest::parse(&wire.manifest.to_string()) {
+            let key = meta.key;
+            let version = meta.version;
+            if !seen.insert((key.clone(), version)) {
+                continue;
+            }
+            if let Some(manifest) = meta.manifest {
                 union.merge(&manifest.permissions);
                 floor.fold(&key.name, manifest.min_smudgy_version.as_deref());
             }
-            for dep in &wire.dependencies {
+            for dep in meta
+                .dependencies
+                .iter()
+                .filter(|dep| dep.kind == DependencyKind::Dependency)
+            {
                 if let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) {
                     stack.push((dep_key, dep.resolved_version.clone()));
                 }
@@ -974,7 +1479,8 @@ impl SmudgyPackageProvider {
     /// The fold of [`closure_union_for`](Self::closure_union_for) computed **entirely
     /// from the disk cache** — the staged-version consent verification at session
     /// start. Walks `root_key@root_version`'s dependency closure over cached
-    /// [`CachedResolution`]s at their locked versions, unioning each distinct node's
+    /// [`CachedResolution`](super::package_cache::CachedResolution)s at their locked versions,
+    /// unioning each distinct node's
     /// manifest permissions and folding its `min_smudgy_version` floor. Returns `None`
     /// on ANY missing meta (or no disk cache at all): an incomplete fold proves
     /// nothing, and the caller must fall back to the network path, which keeps the
@@ -994,13 +1500,23 @@ impl SmudgyPackageProvider {
         let mut stack: Vec<(PackageKey, String)> =
             vec![(root_key.clone(), root_version.to_string())];
         while let Some((key, version)) = stack.pop() {
+            // A live local package changes this leaf's manifest, permissions, and dependency
+            // graph. Cached published metadata cannot prove the active closure; force the
+            // caller onto the local-aware network/live-manifest fold.
+            if self.is_local_override(&key) {
+                return None;
+            }
             if !seen.insert((key.clone(), version.clone())) {
                 continue;
             }
             let meta = cache.read_meta(&key, &version)?;
             union.merge(&meta.manifest.permissions);
             floor.fold(&key.name, meta.manifest.min_smudgy_version.as_deref());
-            for dep in &meta.dependencies {
+            for dep in meta
+                .dependencies
+                .iter()
+                .filter(|dep| dep.kind == DependencyKind::Dependency)
+            {
                 if let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) {
                     stack.push((dep_key, dep.resolved_version.clone()));
                 }
@@ -1013,6 +1529,9 @@ impl SmudgyPackageProvider {
     /// `solve_closure` — the required-param load-gate's input.
     #[must_use]
     pub fn installed_params(&self) -> Vec<(String, Vec<PackageParameter>)> {
+        // Every root is reported, including one whose settings storage cannot be read: the
+        // engine's gate blocks that root with a notice naming the storage error, so a bad
+        // keyring never reaches resolution and fails the whole isolate load.
         self.installed_params.borrow().clone()
     }
 
@@ -1034,6 +1553,14 @@ impl SmudgyPackageProvider {
     /// to ≥2 coexisting versions — the shared-isolate side-effect-collision risk).
     pub fn take_duplicate_warnings(&self) -> Vec<(PackageKey, Vec<String>)> {
         self.duplicate_warnings.borrow_mut().drain(..).collect()
+    }
+
+    /// Drain local-override range/pin warnings collected while solving or loading.
+    pub fn take_local_override_warnings(&self) -> Vec<String> {
+        self.local_override_warnings
+            .borrow_mut()
+            .drain(..)
+            .collect()
     }
 }
 
@@ -1064,25 +1591,44 @@ impl SmudgyPackageProvider {
     // body cache, and metadata persistence.
     //
     // `track` separates a code load from a kind-scheme stub fetch: a code load records the
-    // instance in `cache` (whose keys are `loaded_packages()`, the stumble diagnostic's
-    // input) and, top-level, reports the resolution into the lockfile; a stub fetch
+    // instance in `cache` (whose keys are `loaded_packages()`) and, top-level, reports the
+    // resolution into the lockfile; a stub fetch
     // (`track == false`) must leave no code-load or install footprint — notably,
     // `record_resolution` would UPSERT a lock entry for an unknown package, silently
     // installing a producer someone merely consumed.
     #[allow(clippy::too_many_lines)]
     async fn resolve_impl(
         &self,
-        key: &PackageKey,
+        requested_key: &PackageKey,
         referrer: Option<&ReferrerRef>,
         track: bool,
     ) -> Result<Rc<ResolvedPackage>, PackageError> {
+        if let LocalSnapshot::Invalid(error) = self.local_snapshot(requested_key) {
+            let local = PackageKey {
+                owner: self.local_owner().to_string(),
+                name: requested_key.name.clone(),
+            };
+            return Err(PackageError::InvalidManifest(format!(
+                "{}: {error}",
+                local.to_user_specifier()
+            )));
+        }
+        // Resolve every author alias for a locally-authored leaf under one local identity.
+        // All subsequent lock/param/cache/provenance work uses this key, so a foreign request
+        // cannot lend its trust or persistent state to local code.
+        let key = self.canonical_key(requested_key);
         let specifier = key.to_user_specifier();
+        let state_specifier = if self.is_local_override(requested_key) {
+            Self::local_state_specifier(&key.name)
+        } else {
+            specifier.clone()
+        };
 
         // Mode + staged version from the lockfile (don't hold the borrow over the
         // awaits below).
         let (pinned, staged) = {
             let lock = self.lock.borrow();
-            let entry = lock.find(&specifier);
+            let entry = lock.find(&state_specifier);
             (
                 entry.and_then(|p| p.pinned_version().map(str::to_string)),
                 entry.and_then(|p| p.staged_version().map(str::to_string)),
@@ -1098,9 +1644,9 @@ impl SmudgyPackageProvider {
         // Either falls back to the lockfile pin, then latest, when the solve has no entry.
         let solved = match referrer {
             Some(r) => self
-                .referrer_locked_version(r, key)
-                .map(|(version, is_pin)| self.solve_resolve(key, &version, is_pin)),
-            None => self.top_level_solved.borrow().get(key).cloned(),
+                .referrer_locked_version(r, &key)
+                .map(|locked| self.solve_resolve(&key, &locked.version, locked.is_exact_pin)),
+            None => self.top_level_solved.borrow().get(&key).cloned(),
         };
         let selected = solved.or_else(|| pinned.clone());
 
@@ -1118,20 +1664,49 @@ impl SmudgyPackageProvider {
         // selection (auto-latest), fall back to the prior session resolve for this key.
         let dedup_version = selected
             .clone()
-            .or_else(|| self.resolved_versions.borrow().get(key).cloned());
+            .or_else(|| self.resolved_versions.borrow().get(&key).cloned());
         if let Some(version) = dedup_version
             && let Some(package) = self.cache.borrow().get(&(key.clone(), version)).cloned()
         {
             return Ok(package);
         }
 
-        // Local dev-override: a package you're authoring under <server>/packages/<name>/
-        // shadows the published one, so you test it under its real specifier first.
-        if let Some(local) = self.try_local_override(key, track) {
+        // Local leaf-name override: any requested owner resolves to this user's canonical
+        // local identity. A root pin or dependency range is advisory while the folder exists.
+        // Populate its referrer locks from the live manifest even when this is a user import
+        // with no closure pre-pass.
+        if let Some(meta) = self
+            .local_walk_meta(requested_key)
+            .await
+            .map_err(|error| PackageError::InvalidManifest(format!("{specifier}: {error}")))?
+        {
+            self.store_locked_deps(&meta.key, &meta.version, &meta.dependencies);
+            let requested_range = referrer
+                .and_then(|r| self.referrer_locked_version(r, &key))
+                .map(|locked| locked.range)
+                .or_else(|| pinned.as_ref().map(|version| format!("={version}")));
+            self.note_local_range_mismatch(
+                requested_key,
+                &meta.key,
+                &meta.version,
+                requested_range.as_deref(),
+            );
+            let manifest = meta
+                .manifest
+                .as_ref()
+                .expect("local walk metadata always carries its parsed local manifest");
+            self.check_required_params(&specifier, &meta.state_specifier, &manifest.params)?;
+            let local = self
+                .try_local_override(requested_key, track)
+                .ok_or_else(|| {
+                    PackageError::Other(format!(
+                        "{specifier} changed while Smudgy was loading it; reload the session"
+                    ))
+                })?;
             if track && referrer.is_none() {
                 self.resolved_versions
                     .borrow_mut()
-                    .insert(key.clone(), local.resolved_version.clone());
+                    .insert(local.key.clone(), local.resolved_version.clone());
             }
             return Ok(local);
         }
@@ -1145,7 +1720,7 @@ impl SmudgyPackageProvider {
         // actually runs (its staged/pinned/solved version, not latest) — while their
         // no-footprint contract is kept by the `track` gates below.
         if let Some(version) = &determined
-            && let Some(package) = self.build_from_cache(key, version)
+            && let Some(package) = self.build_from_cache(&key, version)
         {
             // The cached meta was written by a resolve that passed the version-floor
             // gate — but under a possibly NEWER smudgy since downgraded, so re-check
@@ -1159,17 +1734,7 @@ impl SmudgyPackageProvider {
             // The required-param load-gate the network path applies at resolution time:
             // a cached package with unset required params must not evaluate
             // misconfigured just because it was served from disk.
-            let missing = crate::models::shared_packages::missing_required_params(
-                &self.server_name,
-                &specifier,
-                &package.manifest.params,
-            );
-            if !missing.is_empty() {
-                return Err(PackageError::Other(format!(
-                    "{specifier} not loaded: required param(s) {} are unset; configure them in settings",
-                    missing.join(", ")
-                )));
-            }
+            self.check_required_params(&specifier, &specifier, &package.manifest.params)?;
             // Track exactly as the network path would for the same version — the
             // served set (`loaded_packages()`), the reported version, and the
             // lockfile's staged version — EXCEPT the integrity stamp: it records the
@@ -1193,7 +1758,7 @@ impl SmudgyPackageProvider {
         // The network resolve targets the DETERMINED version where one exists (the
         // cache-first serve above had a gap to fill) — only genuine discovery (a
         // never-resolved Auto root) asks what latest means.
-        let wire = match self.fetch_wire(key, determined.as_deref()).await {
+        let wire = match self.fetch_wire(&key, determined.as_deref()).await {
             Ok(wire) => wire,
             Err(err) => {
                 // Offline: serve from the in-memory session cache, then the persistent
@@ -1208,7 +1773,7 @@ impl SmudgyPackageProvider {
                     {
                         return Ok(package);
                     }
-                    if let Some(package) = self.build_from_cache(key, &version) {
+                    if let Some(package) = self.build_from_cache(&key, &version) {
                         // The disk cache was written by a resolve that passed the version-floor
                         // gate — but under a possibly NEWER smudgy since downgraded, so re-check
                         // the cached manifest's floor before serving it.
@@ -1217,6 +1782,11 @@ impl SmudgyPackageProvider {
                                 "{specifier} not loaded: {reason}"
                             )));
                         }
+                        self.check_required_params(
+                            &specifier,
+                            &specifier,
+                            &package.manifest.params,
+                        )?;
                         if track {
                             self.cache
                                 .borrow_mut()
@@ -1239,7 +1809,7 @@ impl SmudgyPackageProvider {
 
         let version = wire.version.clone();
         // Record this instance's locked deps so imports IT makes resolve referrer-aware.
-        self.store_locked_deps(key, &version, &wire.dependencies);
+        self.store_locked_deps(&key, &version, &wire.dependencies);
         if let Some(package) = self
             .cache
             .borrow()
@@ -1272,17 +1842,7 @@ impl SmudgyPackageProvider {
         // blocked package that's also a dependency would otherwise evaluate misconfigured).
         // A package with unmet required params must not evaluate; failing here surfaces a
         // clear load error (and fails any dependent that needs it).
-        let missing = crate::models::shared_packages::missing_required_params(
-            &self.server_name,
-            &specifier,
-            &manifest.params,
-        );
-        if !missing.is_empty() {
-            return Err(PackageError::Other(format!(
-                "{specifier} not loaded: required param(s) {} are unset; configure them in settings",
-                missing.join(", ")
-            )));
-        }
+        self.check_required_params(&specifier, &specifier, &manifest.params)?;
 
         let mut modules = Vec::with_capacity(wire.modules.len());
         for module in &wire.modules {
@@ -1350,6 +1910,10 @@ impl SmudgyPackageProvider {
 
 #[async_trait::async_trait(?Send)]
 impl PackageProvider for SmudgyPackageProvider {
+    fn canonical_key(&self, key: &PackageKey) -> PackageKey {
+        Self::canonical_key(self, key)
+    }
+
     async fn resolve_package(
         &self,
         key: &PackageKey,
@@ -1373,9 +1937,8 @@ impl PackageProvider for SmudgyPackageProvider {
     }
 
     /// A stub fetch is a read of the producer's declarations, not a code load: nothing lands
-    /// in the served set (`loaded_packages()` / the stumble diagnostic stays quiet) and
-    /// nothing is recorded as an install — consuming an uninstalled producer leaves it
-    /// uninstalled.
+    /// in the served set (`loaded_packages()`) and nothing is recorded as an install — consuming
+    /// an uninstalled producer leaves it uninstalled.
     async fn resolve_package_for_stub(
         &self,
         key: &PackageKey,
@@ -1384,15 +1947,17 @@ impl PackageProvider for SmudgyPackageProvider {
     }
 
     fn get_cached(&self, key: &PackageKey, version: &str) -> Option<Rc<ResolvedPackage>> {
+        let key = self.canonical_key(key);
         self.cache
             .borrow()
-            .get(&(key.clone(), version.to_string()))
+            .get(&(key, version.to_string()))
             .cloned()
     }
 
     fn get_resolved(&self, key: &PackageKey) -> Option<Rc<ResolvedPackage>> {
-        let version = self.resolved_versions.borrow().get(key).cloned()?;
-        self.cache.borrow().get(&(key.clone(), version)).cloned()
+        let key = self.canonical_key(key);
+        let version = self.resolved_versions.borrow().get(&key).cloned()?;
+        self.cache.borrow().get(&(key, version)).cloned()
     }
 
     /// Copy the package archives fetched for this isolate into an owned, `Send` source map.
@@ -1420,8 +1985,7 @@ impl PackageProvider for SmudgyPackageProvider {
 
     /// Every package fetched-for-import through this provider so far. `cache` is only populated
     /// on the resolve paths (an import asked for the package), never by the `solve_closure`
-    /// manifest walk, so its keys are this isolate's actually-served package set — what the
-    /// engine's code-import stumble diagnostic inspects after module loading.
+    /// manifest walk, so its keys are this isolate's complete code-load set.
     fn loaded_packages(&self) -> Vec<PackageKey> {
         let mut keys: Vec<PackageKey> = self
             .cache
@@ -1434,16 +1998,28 @@ impl PackageProvider for SmudgyPackageProvider {
         keys
     }
 
+    fn note_entry_load(&self, key: &PackageKey) {
+        let mut entries = self.entry_loads.borrow_mut();
+        if !entries.contains(key) {
+            entries.push(key.clone());
+        }
+    }
+
+    fn entry_loaded_packages(&self) -> Vec<PackageKey> {
+        self.entry_loads.borrow().clone()
+    }
+
     fn set_home_packages(&self, homes: Vec<PackageKey>) {
         *self.home_packages.borrow_mut() = Some(
             homes
                 .iter()
-                .map(smudgy_script::PackageKey::folded)
+                .map(|key| self.canonical_key(key).folded())
                 .collect(),
         );
     }
 
     fn is_home_load(&self, key: &PackageKey) -> bool {
+        let key = self.canonical_key(key);
         self.home_packages
             .borrow()
             .as_ref()
@@ -1451,9 +2027,10 @@ impl PackageProvider for SmudgyPackageProvider {
     }
 
     fn note_scrubbed(&self, key: &PackageKey) {
+        let key = self.canonical_key(key);
         let mut scrubbed = self.scrubbed.borrow_mut();
-        if !scrubbed.contains(key) {
-            scrubbed.push(key.clone());
+        if !scrubbed.contains(&key) {
+            scrubbed.push(key);
         }
     }
 
@@ -1462,9 +2039,10 @@ impl PackageProvider for SmudgyPackageProvider {
     }
 
     fn note_user_code_import(&self, key: &PackageKey) {
+        let key = self.canonical_key(key);
         let mut imports = self.user_imports.borrow_mut();
-        if !imports.contains(key) {
-            imports.push(key.clone());
+        if !imports.contains(&key) {
+            imports.push(key);
         }
     }
 
@@ -1516,6 +2094,22 @@ mod tests {
             name: name.into(),
             range: range.into(),
             resolved_version: version.into(),
+            kind: DependencyKind::Dependency,
+        }
+    }
+
+    fn required(name: &str, range: &str, version: &str) -> ResolvedDependency {
+        ResolvedDependency {
+            kind: DependencyKind::Requires,
+            ..dep(name, range, version)
+        }
+    }
+
+    fn locked(version: &str, range: &str) -> LockedDep {
+        LockedDep {
+            version: version.into(),
+            is_exact_pin: package_solver::is_exact_pin(range),
+            range: range.into(),
         }
     }
 
@@ -1554,11 +2148,11 @@ mod tests {
         // locked, with the declared range classified into the exact-pin flag.
         assert_eq!(
             provider.referrer_locked_version(&referrer("app", "1.0.0"), &util),
-            Some(("1.3.0".to_string(), false))
+            Some(locked("1.3.0", "^1.3"))
         );
         assert_eq!(
             provider.referrer_locked_version(&referrer("other", "1.0.0"), &util),
-            Some(("2.0.0".to_string(), true)),
+            Some(locked("2.0.0", "=2.0.0")),
             "an author =x dep is captured as an exact pin"
         );
         // An importer with no lock for the target falls through (None -> lockfile/latest).
@@ -1570,6 +2164,703 @@ mod tests {
             provider.referrer_locked_version(&referrer("unknown", "1.0.0"), &util),
             None
         );
+    }
+
+    #[test]
+    fn requires_edges_never_become_referrer_code_locks() {
+        let provider = test_provider();
+        provider.store_locked_deps(
+            &pkg_key("app"),
+            "1.0.0",
+            &[
+                dep("helper", "^1", "1.2.0"),
+                required("events", "^2", "2.1.0"),
+            ],
+        );
+
+        assert!(
+            provider
+                .referrer_locked_version(&referrer("app", "1.0.0"), &pkg_key("events"))
+                .is_none(),
+            "requires runs in its own root; app cannot import it through a locked code edge"
+        );
+        assert_eq!(
+            provider.referrer_locked_version(&referrer("app", "1.0.0"), &pkg_key("helper")),
+            Some(locked("1.2.0", "^1"))
+        );
+
+        provider.store_locked_deps(
+            &pkg_key("app"),
+            "1.0.0",
+            &[required("events", "^2", "2.1.0")],
+        );
+        assert!(
+            provider
+                .referrer_locked_version(&referrer("app", "1.0.0"), &pkg_key("helper"))
+                .is_none(),
+            "a refreshed requires-only manifest clears old code dependency locks"
+        );
+    }
+
+    /// The required-param gate reads a local package's `smudgy://local/<name>` state row,
+    /// while the engine's root list names it under the signed-in account. The gate must block
+    /// by the canonical root key, or the root survives the prune and its resolution failure
+    /// takes the whole main isolate down with it.
+    #[tokio::test]
+    async fn blocked_local_root_is_keyed_by_its_canonical_owner() {
+        use_temp_smudgy_home();
+        let server = "BlockedLocalRootCanonicalKeyTest";
+        crate::models::local_packages::scaffold_local_package(server, "tools")
+            .expect("scaffold local package");
+        crate::models::local_packages::write_local_file(
+            server,
+            "tools",
+            "smudgy.package.json",
+            r#"{"version":"1.0.0","params":[{"key":"token","required":true}]}"#,
+        )
+        .unwrap();
+        let local_state = SmudgyPackageProvider::local_state_specifier("tools");
+        let mut row = LockedPackage::new(&local_state, UpdateMode::Auto);
+        row.trusted = true;
+        shared_packages::save_lock(
+            server,
+            &SharedPackageLock {
+                packages: vec![row],
+            },
+        )
+        .expect("seed local package settings row");
+
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Work".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let root = PackageKey {
+            owner: "developer".into(),
+            name: "tools".into(),
+        };
+        provider.solve_closure(&[root.to_user_specifier()]).await;
+        assert_eq!(
+            provider.installed_params().len(),
+            1,
+            "the local root's declared params reach the gate"
+        );
+
+        let (ui_tx, _ui_rx) = futures::channel::mpsc::channel(64);
+        let emitted = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let blocked = super::super::ScriptEngine::blocked_by_required_params(
+            &provider,
+            "Work",
+            &ui_tx,
+            crate::session::SessionId(1),
+            &std::rc::Rc::downgrade(&emitted),
+        );
+        assert!(
+            blocked.contains(&root),
+            "blocked set names the canonical root {root:?}, got {blocked:?}"
+        );
+        assert!(
+            emitted.get() > 0,
+            "the user is told why the root did not load"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_coordinate_resolves_as_one_canonical_local_closure() {
+        use_temp_smudgy_home();
+        let server = "CanonicalForeignLeafOverrideTest";
+        for name in ["tools", "base", "peer"] {
+            crate::models::local_packages::scaffold_local_package(server, name)
+                .expect("scaffold local package");
+        }
+        crate::models::local_packages::write_local_file(
+            server,
+            "tools",
+            "smudgy.package.json",
+            r#"{
+                "version":"2.3.4",
+                "dependencies":["smudgy://publisher/base@^9"],
+                "requires":["smudgy://publisher/peer"],
+                "params":[{"key":"token","required":true}],
+                "permissions":{"net":["root.example"]}
+            }"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            "base",
+            "smudgy.package.json",
+            r#"{"version":"1.0.0","permissions":{"net":["base.example"]}}"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            "peer",
+            "smudgy.package.json",
+            r#"{"version":"8.0.0","permissions":{"net":["peer-must-run-separately.example"]}}"#,
+        )
+        .unwrap();
+
+        // The local state row is the sole parameter-scope authority. A local folder without
+        // this row is incomplete transactional state and must fail closed.
+        let local_state = SmudgyPackageProvider::local_state_specifier("tools");
+        shared_packages::save_lock(
+            server,
+            &SharedPackageLock {
+                packages: vec![LockedPackage::new(&local_state, UpdateMode::Auto)],
+            },
+        )
+        .expect("seed local package settings row");
+
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Work".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: "tools".into(),
+        };
+        let canonical = PackageKey {
+            owner: "developer".into(),
+            name: "tools".into(),
+        };
+
+        assert_eq!(provider.canonical_key(&requested), canonical);
+        provider
+            .solve_closure(&[requested.to_user_specifier()])
+            .await;
+        assert_eq!(
+            provider
+                .top_level_solved
+                .borrow()
+                .get(&canonical)
+                .map(String::as_str),
+            Some("2.3.4")
+        );
+        let permissions = provider.closure_permissions();
+        assert!(permissions.net.contains(&"root.example".to_string()));
+        assert!(permissions.net.contains(&"base.example".to_string()));
+        assert!(
+            !permissions
+                .net
+                .contains(&"peer-must-run-separately.example".to_string()),
+            "requires is a separate root and must not enlarge the importing closure"
+        );
+
+        // A value stored for the shadowed foreign coordinate cannot configure local code.
+        shared_packages::save_param_value(
+            server,
+            &requested.to_user_specifier(),
+            "token",
+            serde_json::json!("foreign-value"),
+        )
+        .unwrap();
+        let error = provider
+            .resolve_package(&requested, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required param(s) token are unset")
+        );
+        assert!(
+            provider.loaded_packages().is_empty(),
+            "a rejected local load must not leave a cached code-load footprint"
+        );
+
+        shared_packages::save_param_value(
+            server,
+            &local_state,
+            "token",
+            serde_json::json!("local-value"),
+        )
+        .unwrap();
+        let resolved = provider
+            .resolve_package(&requested, None)
+            .await
+            .expect("the canonical local parameter config permits the load");
+        assert_eq!(resolved.key, canonical);
+        assert_eq!(resolved.resolved_version, "2.3.4");
+        assert_eq!(resolved.integrity, "local");
+        assert_eq!(provider.loaded_packages(), vec![canonical]);
+
+        let warnings = provider.take_local_override_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the repeated metadata walks dedupe warnings"
+        );
+        assert!(warnings[0].contains("Local base 1.0.0 replaces smudgy://publisher/base"));
+        assert!(warnings[0].contains("requester needs ^9"));
+    }
+
+    #[test]
+    fn required_param_gate_honors_the_configured_profile_scope() {
+        use_temp_smudgy_home();
+        let server = "RequiredParamCheckedScopeTest";
+        let profile = "Work";
+        let specifier = "smudgy://wbk/mapper";
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new(profile.to_string()),
+        );
+        let params = PackageManifest::parse(
+            r#"{"version":"1.0.0","params":[{"key":"token","required":true}]}"#,
+        )
+        .expect("manifest")
+        .params;
+
+        // No lock row yet: the package reads the global scope, where nothing is configured.
+        let unset = provider
+            .check_required_params(specifier, specifier, &params)
+            .expect_err("an unset required param blocks the package")
+            .to_string();
+        assert!(unset.contains("required param(s) token are unset"));
+        assert!(!unset.contains("settings are unavailable"));
+
+        provider
+            .installed_params
+            .borrow_mut()
+            .push((specifier.to_string(), params.clone()));
+
+        let mut row = LockedPackage::new(specifier, UpdateMode::Auto);
+        row.parameter_scope = shared_packages::ParameterScope::Profile;
+        shared_packages::save_lock(
+            server,
+            &SharedPackageLock {
+                packages: vec![row],
+            },
+        )
+        .expect("seed profile-scoped package settings");
+        shared_packages::save_param_value(
+            server,
+            specifier,
+            "token",
+            serde_json::json!("global-must-not-leak"),
+        )
+        .expect("seed global value");
+
+        let missing = provider
+            .check_required_params(specifier, specifier, &params)
+            .expect_err("a global value cannot satisfy profile-scoped settings")
+            .to_string();
+        assert!(missing.contains("required param(s) token are unset"));
+        assert!(!missing.contains("settings are unavailable"));
+
+        shared_packages::save_param_value_scoped(
+            server,
+            shared_packages::ParamValueScope::Profile(profile),
+            specifier,
+            "token",
+            serde_json::json!("profile-value"),
+        )
+        .expect("seed profile value");
+        provider
+            .check_required_params(specifier, specifier, &params)
+            .expect("the configured profile value permits the package");
+        assert_eq!(provider.installed_params().len(), 1);
+    }
+
+    #[test]
+    fn local_override_lookup_uses_catalog_spelling_on_case_sensitive_filesystems() {
+        use_temp_smudgy_home();
+        let server = "CaseFoldedLocalOverrideTest";
+        let actual_name = "ToolsCaseFold";
+        if let Ok(packages) = crate::models::local_packages::packages_dir(server) {
+            let _ = std::fs::remove_dir_all(packages.join(actual_name));
+        }
+        crate::models::local_packages::scaffold_local_package(server, actual_name)
+            .expect("scaffold mixed-case local package");
+
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: actual_name.to_ascii_lowercase(),
+        };
+
+        let canonical = provider.canonical_key(&requested);
+        assert_eq!(canonical.owner, "developer");
+        assert_eq!(canonical.name, actual_name);
+        assert!(matches!(
+            provider.local_snapshot(&requested),
+            LocalSnapshot::Loaded(_)
+        ));
+
+        std::fs::remove_dir_all(
+            crate::models::local_packages::packages_dir(server)
+                .unwrap()
+                .join(actual_name),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_manifest_permissions_and_source_share_one_reload_snapshot() {
+        use_temp_smudgy_home();
+        let server = "LocalPackageSnapshotConsistencyTest";
+        let name = "snapshot-tools";
+        crate::models::local_packages::scaffold_local_package_with_state(server, name, "developer")
+            .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "smudgy.package.json",
+            r#"{"version":"1.0.0","permissions":{"net":["old.example"]}}"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "index.ts",
+            "export const generation = 'old';",
+        )
+        .unwrap();
+
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client.clone(),
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: name.into(),
+        };
+
+        // Change both the requested permission and executable source immediately after provider
+        // construction, before its first lookup. This provider and every fork must stay on the
+        // eagerly captured old pair until the engine reloads.
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "smudgy.package.json",
+            r#"{"version":"2.0.0","permissions":{"net":["new.example"]}}"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "index.ts",
+            "export const generation = 'new';",
+        )
+        .unwrap();
+
+        let (_, first) = provider.local_override(&requested).expect("local snapshot");
+        assert_eq!(first.manifest.version, "1.0.0");
+
+        provider
+            .solve_closure(&[requested.to_user_specifier()])
+            .await;
+        let permissions = provider.closure_permissions();
+        assert!(permissions.net.contains(&"old.example".to_string()));
+        assert!(!permissions.net.contains(&"new.example".to_string()));
+        let resolved = provider.resolve_package(&requested, None).await.unwrap();
+        assert_eq!(resolved.resolved_version, "1.0.0");
+        assert!(resolved.modules[0].text.contains("'old'"));
+
+        let fork = provider.fork();
+        let forked = fork.resolve_package(&requested, None).await.unwrap();
+        assert_eq!(forked.resolved_version, "1.0.0");
+        assert!(forked.modules[0].text.contains("'old'"));
+
+        let mut reloaded = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        reloaded.account_nickname = Some("developer".into());
+        reloaded
+            .solve_closure(&[requested.to_user_specifier()])
+            .await;
+        assert!(
+            reloaded
+                .closure_permissions()
+                .net
+                .contains(&"new.example".to_string())
+        );
+        let resolved = reloaded.resolve_package(&requested, None).await.unwrap();
+        assert_eq!(resolved.resolved_version, "2.0.0");
+        assert!(resolved.modules[0].text.contains("'new'"));
+
+        crate::models::local_packages::delete_local_package(server, name).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recreated_local_package_cannot_inherit_a_predecessors_trusted_generation() {
+        use_temp_smudgy_home();
+        let server = "RecreatedLocalPackageGenerationTest";
+        let name = "generation-tools";
+        let state_specifier = SmudgyPackageProvider::local_state_specifier(name);
+        crate::models::local_packages::scaffold_local_package_with_state(server, name, "developer")
+            .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "smudgy.package.json",
+            r#"{"version":"1.0.0"}"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "index.ts",
+            "export const generation = 'trusted-old';",
+        )
+        .unwrap();
+        shared_packages::set_trusted(server, &state_specifier, true).unwrap();
+
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut old_generation = SmudgyPackageProvider::new_for_profile(
+            client.clone(),
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        old_generation.account_nickname = Some("developer".into());
+        assert!(
+            old_generation
+                .lock
+                .borrow()
+                .find(&state_specifier)
+                .expect("captured predecessor row")
+                .trusted
+        );
+
+        // A completed delete removes the predecessor's governing row. Recreating the same leaf
+        // creates a fresh, untrusted row and different executable bytes.
+        crate::models::local_packages::delete_local_package(server, name).unwrap();
+        crate::models::local_packages::scaffold_local_package_with_state(server, name, "developer")
+            .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "smudgy.package.json",
+            r#"{"version":"2.0.0"}"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "index.ts",
+            "export const generation = 'untrusted-new';",
+        )
+        .unwrap();
+        assert!(
+            !shared_packages::load_lock(server)
+                .unwrap()
+                .find(&state_specifier)
+                .expect("recreated package row")
+                .trusted,
+            "a recreated package starts untrusted"
+        );
+
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: name.into(),
+        };
+        let resolved = old_generation
+            .resolve_package(&requested, None)
+            .await
+            .expect("the old engine generation still resolves its immutable snapshot");
+        assert_eq!(resolved.resolved_version, "1.0.0");
+        assert!(resolved.modules[0].text.contains("'trusted-old'"));
+        assert!(!resolved.modules[0].text.contains("'untrusted-new'"));
+
+        let mut next_generation = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        next_generation.account_nickname = Some("developer".into());
+        assert!(
+            !next_generation
+                .lock
+                .borrow()
+                .find(&state_specifier)
+                .expect("captured recreated row")
+                .trusted
+        );
+        let resolved = next_generation
+            .resolve_package(&requested, None)
+            .await
+            .expect("the next engine generation sees the recreated package");
+        assert_eq!(resolved.resolved_version, "2.0.0");
+        assert!(resolved.modules[0].text.contains("'untrusted-new'"));
+
+        crate::models::local_packages::delete_local_package(server, name).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_local_leaf_fails_instead_of_falling_back_to_published_code() {
+        use_temp_smudgy_home();
+        let server = "InvalidLocalOverrideFailClosedTest";
+        let name = "invalid-local";
+        crate::models::local_packages::scaffold_local_package_with_state(server, name, "developer")
+            .unwrap();
+        crate::models::local_packages::write_local_file(
+            server,
+            name,
+            "smudgy.package.json",
+            "{ not json",
+        )
+        .unwrap();
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: name.into(),
+        };
+
+        assert_eq!(provider.canonical_key(&requested).owner, "developer");
+        let error = provider
+            .resolve_package(&requested, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PackageError::InvalidManifest(_)));
+        assert!(provider.loaded_packages().is_empty());
+
+        crate::models::local_packages::delete_local_package(server, name).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_local_manifest_fails_instead_of_falling_back_to_published_code() {
+        use_temp_smudgy_home();
+        let server = "MissingLocalManifestFailClosedTest";
+        let name = "repairing-local";
+        crate::models::local_packages::scaffold_local_package_with_state(server, name, "developer")
+            .unwrap();
+        let manifest = crate::models::local_packages::packages_dir(server)
+            .unwrap()
+            .join(name)
+            .join("smudgy.package.json");
+        std::fs::remove_file(manifest).unwrap();
+
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(server.to_string()),
+            Arc::new("Main".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: name.into(),
+        };
+
+        assert_eq!(provider.canonical_key(&requested).owner, "developer");
+        let error = provider
+            .resolve_package(&requested, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PackageError::InvalidManifest(_)));
+        assert!(provider.loaded_packages().is_empty());
+
+        crate::models::local_packages::delete_local_package(server, name).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_declared_local_dependency_range_fails_closed() {
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "range-target",
+            version: "2.0.0",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const target = 2;",
+        }]);
+        use_temp_smudgy_home();
+        let name = "range-app";
+        crate::models::local_packages::scaffold_local_package_with_state(
+            &registry.server_name,
+            name,
+            "developer",
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            &registry.server_name,
+            name,
+            "smudgy.package.json",
+            r#"{"version":"1.0.0","dependencies":["smudgy://wbk/range-target@^1"]}"#,
+        )
+        .unwrap();
+        crate::models::local_packages::write_local_file(
+            &registry.server_name,
+            name,
+            "index.ts",
+            "import 'smudgy://wbk/range-target'; export const app = 1;",
+        )
+        .unwrap();
+
+        let client = PackageApiClient::new(
+            registry.base_url.clone(),
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+        let mut provider = SmudgyPackageProvider::new_for_profile(
+            client,
+            Arc::new(registry.server_name.clone()),
+            Arc::new("Main".to_string()),
+        );
+        provider.account_nickname = Some("developer".into());
+        let requested = PackageKey {
+            owner: "publisher".into(),
+            name: name.into(),
+        };
+
+        let error = provider
+            .resolve_package(&requested, None)
+            .await
+            .expect_err("the declared ^1 edge must not disappear and resolve latest unconstrained");
+        let PackageError::InvalidManifest(message) = error else {
+            panic!("expected a fail-closed local manifest error, got {error}");
+        };
+        assert!(message.contains("smudgy://wbk/range-target@^1"));
+        assert!(message.contains("no version that Smudgy can resolve"));
+        assert!(provider.loaded_packages().is_empty());
+
+        crate::models::local_packages::delete_local_package(&registry.server_name, name).unwrap();
     }
 
     #[tokio::test]
@@ -1755,17 +3046,17 @@ mod tests {
         use_temp_smudgy_home();
         let server = "RecordResolutionStageGuardTest";
         let specifier = "smudgy://wbk/mapper";
-        shared_packages::mutate_lock(server, |lock| {
-            let mut entry = LockedPackage::new(specifier, UpdateMode::Auto);
-            entry.last_resolved_version = Some("1.3.0".into());
-            entry.integrity = None;
-            lock.upsert(entry);
-            Ok(((), true))
-        })
-        .expect("seed the staged entry");
         let mut loaded = LockedPackage::new(specifier, UpdateMode::Auto);
         loaded.last_resolved_version = Some("1.2.0".into());
         loaded.integrity = Some("stamped-at-load".into());
+        let mut staged = loaded.clone();
+        staged.last_resolved_version = Some("1.3.0".into());
+        staged.integrity = None;
+        shared_packages::mutate_lock(server, |lock| {
+            lock.upsert(staged);
+            Ok(((), true))
+        })
+        .expect("seed the staged entry");
         let provider = provider_with_view(server, vec![loaded]);
 
         provider.record_resolution(specifier, "1.2.0", Some("net-integrity"));
@@ -1804,17 +3095,14 @@ mod tests {
         let specifier = "smudgy://wbk/mapper";
         // A stamped entry records as always — a legitimate downgrade included: the
         // guard keys on the unstamped fresh-stage signature, nothing else.
-        shared_packages::mutate_lock(server, |lock| {
-            let mut entry = LockedPackage::new(specifier, UpdateMode::Auto);
-            entry.last_resolved_version = Some("1.3.0".into());
-            entry.integrity = Some("verified-1.3.0".into());
-            lock.upsert(entry);
-            Ok(((), true))
-        })
-        .expect("seed the stamped entry");
         let mut loaded = LockedPackage::new(specifier, UpdateMode::Auto);
         loaded.last_resolved_version = Some("1.3.0".into());
         loaded.integrity = Some("verified-1.3.0".into());
+        shared_packages::mutate_lock(server, |lock| {
+            lock.upsert(loaded.clone());
+            Ok(((), true))
+        })
+        .expect("seed the stamped entry");
         let provider = provider_with_view(server, vec![loaded]);
 
         provider.record_resolution(specifier, "1.2.0", Some("verified-1.2.0"));
@@ -1826,11 +3114,13 @@ mod tests {
 
         // An initial install — version and integrity both None — records too.
         let fresh = "smudgy://wbk/fresh";
+        let fresh_entry = LockedPackage::new(fresh, UpdateMode::Auto);
         shared_packages::mutate_lock(server, |lock| {
-            lock.upsert(LockedPackage::new(fresh, UpdateMode::Auto));
+            lock.upsert(fresh_entry.clone());
             Ok(((), true))
         })
         .expect("seed the fresh install");
+        provider.lock.borrow_mut().upsert(fresh_entry);
         provider.record_resolution(fresh, "0.1.0", Some("verified-0.1.0"));
         let disk = shared_packages::load_lock(server).expect("lock loads");
         let entry = disk.find(fresh).expect("the entry survives");
@@ -1918,11 +3208,11 @@ mod tests {
 
         assert_eq!(
             provider.referrer_locked_version(&referrer("app", "1.0.0"), &util),
-            Some(("2.0.0".to_string(), false))
+            Some(locked("2.0.0", "^2"))
         );
         assert_eq!(
             provider.referrer_locked_version(&referrer("app", "2.0.0"), &util),
-            Some(("2.5.0".to_string(), false))
+            Some(locked("2.5.0", "^2.5"))
         );
     }
 
@@ -1952,6 +3242,7 @@ mod tests {
     /// provider's cache/memo/dedup layers exist to eliminate.
     struct MockRegistry {
         base_url: String,
+        server_name: String,
         resolve_hits: Arc<AtomicUsize>,
         body_hits: Arc<AtomicUsize>,
     }
@@ -2053,6 +3344,7 @@ mod tests {
         });
         MockRegistry {
             base_url,
+            server_name: format!("CacheFirstProviderTest-{port}"),
             resolve_hits,
             body_hits,
         }
@@ -2064,15 +3356,67 @@ mod tests {
     /// loaded lockfile are dropped — hit counting must start from a blank slate. Tests
     /// that need a disk cache or lock entries inject their own.
     fn provider_for(registry: &MockRegistry) -> SmudgyPackageProvider {
+        use_temp_smudgy_home();
         let client = PackageApiClient::new(
             registry.base_url.clone(),
             CredentialSource::new(Some(Credential::ApiKey("test".into()))),
         );
         let mut provider =
-            SmudgyPackageProvider::new(client, Arc::new("CacheFirstProviderTest".to_string()));
+            SmudgyPackageProvider::new(client, Arc::new(registry.server_name.clone()));
         provider.disk_cache = None;
         provider.lock.borrow_mut().packages.clear();
         provider
+    }
+
+    /// Persist one installed-package row and give the provider the same authoritative view.
+    /// Resolution consults durable settings even when a manifest declares no parameters, so an
+    /// in-memory-only lock entry is intentionally incomplete production state.
+    fn persist_installed_entry(provider: &SmudgyPackageProvider, entry: LockedPackage) {
+        let lock = SharedPackageLock {
+            packages: vec![entry],
+        };
+        shared_packages::save_lock(&provider.server_name, &lock)
+            .expect("persist authoritative installed-package settings row");
+        *provider.lock.borrow_mut() = lock;
+    }
+
+    #[tokio::test]
+    async fn cap_version_retains_distinct_staged_fallback_when_enumeration_fails() {
+        // The mock intentionally has no version-list route. Latest is 2.0.0 and asks for a new
+        // permission, while the prior staged 1.0.0 still fits the persisted empty grant.
+        let registry = spawn_registry(&[
+            MockPackage {
+                owner: "wbk",
+                name: "partial-list",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[],
+                body: "export const version = 1;",
+            },
+            MockPackage {
+                owner: "wbk",
+                name: "partial-list",
+                version: "2.0.0",
+                manifest_extra: r#","permissions":{"net":["new.example"]}"#,
+                deps: &[],
+                body: "export const version = 2;",
+            },
+        ]);
+        let provider = provider_for(&registry);
+        let mut entry = LockedPackage::new("smudgy://wbk/partial-list", UpdateMode::Auto);
+        entry.last_resolved_version = Some("1.0.0".into());
+        persist_installed_entry(&provider, entry);
+
+        let capped = provider
+            .cap_version("smudgy://wbk/partial-list", &PackagePermissions::default())
+            .await;
+
+        assert_eq!(capped.as_deref(), Ok("1.0.0"));
+        assert_eq!(
+            registry.resolve_hits.load(Ordering::SeqCst),
+            2,
+            "latest is checked once, then the distinct staged candidate is checked exactly"
+        );
     }
 
     /// A ready-to-serve disk cache entry for `owner/name@version`: the meta (with the
@@ -2101,6 +3445,8 @@ mod tests {
                 subpath: "index.ts".to_string(),
                 content_hash: hash,
                 media_type: "application/typescript".to_string(),
+                byte_size: body.len() as i64,
+                is_entry: true,
             }],
             dependencies: deps.to_vec(),
         };
@@ -2108,10 +3454,16 @@ mod tests {
         cache
     }
 
-    /// An installed Auto lock entry whose staged (`last_resolved_version`) is `version`.
-    fn staged_lock_entry(specifier: &str, version: &str) -> LockedPackage {
+    /// An installed Auto lock entry whose staged (`last_resolved_version`) is `version`,
+    /// stamped with the cached fingerprint the way a prior network-verified load leaves it.
+    fn staged_lock_entry(cache: &PackageCache, specifier: &str, version: &str) -> LockedPackage {
         let mut entry = LockedPackage::new(specifier, UpdateMode::Auto);
         entry.last_resolved_version = Some(version.to_string());
+        let spec = smudgy_script::SmudgySpecifier::parse(specifier).unwrap();
+        let meta = cache
+            .read_meta(&spec.package_key(), version)
+            .expect("cached test meta");
+        entry.integrity = Some(meta.integrity);
         entry
     }
 
@@ -2190,6 +3542,10 @@ mod tests {
             body: "export const solo = 1;",
         }]);
         let provider = provider_for(&registry);
+        persist_installed_entry(
+            &provider,
+            LockedPackage::new("smudgy://wbk/solo", UpdateMode::Auto),
+        );
 
         let capped = provider
             .cap_version("smudgy://wbk/solo", &PackagePermissions::default())
@@ -2284,11 +3640,13 @@ mod tests {
             "export const x = 1;",
             &[],
         ));
-        provider
-            .lock
-            .borrow_mut()
-            .packages
-            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+        let entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        let expected_integrity = entry.integrity.clone();
+        persist_installed_entry(&provider, entry);
 
         let resolved = provider
             .resolve_package(&pkg_key("app"), None)
@@ -2326,9 +3684,8 @@ mod tests {
                 .borrow()
                 .find("smudgy://wbk/app")
                 .and_then(|entry| entry.integrity.as_deref()),
-            None,
-            "integrity records what a load VERIFIED; a cache-first serve verifies \
-             nothing, so the stamp stays absent until a network-verified load"
+            expected_integrity.as_deref(),
+            "a cache-first serve leaves the prior verified stamp untouched"
         );
     }
 
@@ -2348,9 +3705,13 @@ mod tests {
             "export const x = 1;",
             &[],
         ));
-        let mut entry = staged_lock_entry("smudgy://wbk/app", "1.2.0");
-        entry.integrity = Some("verified-earlier".into());
-        provider.lock.borrow_mut().packages.push(entry);
+        let entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        let expected = entry.integrity.clone();
+        persist_installed_entry(&provider, entry);
 
         provider
             .resolve_package(&pkg_key("app"), None)
@@ -2363,9 +3724,55 @@ mod tests {
                 .borrow()
                 .find("smudgy://wbk/app")
                 .and_then(|e| e.integrity.as_deref().map(str::to_string)),
-            Some("verified-earlier".into()),
+            expected,
             "the last VERIFIED stamp survives an unverified cache serve"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cached_version_the_lock_stamp_contradicts_is_not_served_from_cache() {
+        // The lock's `integrity` describes `last_resolved_version`; a cache file for that
+        // version carrying a different fingerprint disagrees with the last verified load,
+        // so the cache-first serve declines and the resolve reaches for the network.
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "app",
+            version: "1.2.0",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const fresh = 1;",
+        }]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().expect("tempdir");
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.2.0",
+            "",
+            "export const x = 1;",
+            &[],
+        ));
+        let mut entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        entry.integrity = Some("index.ts=verified-elsewhere".into());
+        persist_installed_entry(&provider, entry);
+
+        assert!(
+            provider
+                .build_from_cache(&pkg_key("app"), "1.2.0")
+                .is_none(),
+            "a contradicted cache file is not served"
+        );
+        let resolved = provider
+            .resolve_package(&pkg_key("app"), None)
+            .await
+            .expect("the network serves the staged version");
+        assert_eq!(resolved.resolved_version, "1.2.0");
+        assert!(resolved.modules[0].text.contains("fresh"));
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2385,11 +3792,12 @@ mod tests {
             "export const x = 1;",
             &[],
         ));
-        provider
-            .lock
-            .borrow_mut()
-            .packages
-            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+        let entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        persist_installed_entry(&provider, entry);
 
         let err = provider
             .resolve_package(&pkg_key("app"), None)
@@ -2433,11 +3841,13 @@ mod tests {
             "export const x = 1;",
             &[],
         ));
-        provider
-            .lock
-            .borrow_mut()
-            .packages
-            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+        let mut entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        entry.integrity = None;
+        persist_installed_entry(&provider, entry);
 
         let resolved = provider
             .resolve_package_for_stub(&pkg_key("app"))
@@ -2493,19 +3903,31 @@ mod tests {
             "export const base = 1;",
             &[],
         );
+        warm_cache(
+            dir.path(),
+            &pkg_key("events"),
+            "2.0.0",
+            r#","permissions":{"net":["must-not-enter-importer.example"]}"#,
+            "export const event = 1;",
+            &[],
+        );
         provider.disk_cache = Some(warm_cache(
             dir.path(),
             &pkg_key("app"),
             "1.2.0",
             "",
             "export const x = 1;",
-            &[dep("base", "^1", "1.0.0")],
+            &[
+                dep("base", "^1", "1.0.0"),
+                required("events", "^2", "2.0.0"),
+            ],
         ));
-        provider
-            .lock
-            .borrow_mut()
-            .packages
-            .push(staged_lock_entry("smudgy://wbk/app", "1.2.0"));
+        let entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        persist_installed_entry(&provider, entry);
 
         provider
             .solve_closure(&["smudgy://wbk/app".to_string()])
@@ -2544,14 +3966,31 @@ mod tests {
             "export const base = 1;",
             &[],
         );
+        warm_cache(
+            dir.path(),
+            &pkg_key("events"),
+            "2.0.0",
+            r#","permissions":{"net":["must-not-enter-importer.example"]}"#,
+            "export const event = 1;",
+            &[],
+        );
         provider.disk_cache = Some(warm_cache(
             dir.path(),
             &pkg_key("app"),
             "1.2.0",
             r#","min_smudgy_version":"0.1.0""#,
             "export const x = 1;",
-            &[dep("base", "^1", "1.0.0")],
+            &[
+                dep("base", "^1", "1.0.0"),
+                required("events", "^2", "2.0.0"),
+            ],
         ));
+        let entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.2.0",
+        );
+        persist_installed_entry(&provider, entry);
 
         let (union, floor) = provider
             .closure_union_from_cache(&pkg_key("app"), "1.2.0")
@@ -2559,7 +3998,7 @@ mod tests {
         assert_eq!(
             union.net,
             vec!["example.com".to_string()],
-            "the dep's manifest permissions joined the union"
+            "the code dependency joins the union; the separately-running requires root does not"
         );
         assert_eq!(
             floor.refusal(&semver::Version::new(0, 0, 1)).as_deref(),

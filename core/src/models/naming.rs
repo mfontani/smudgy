@@ -8,7 +8,7 @@
 //!   are illegal or unsafe in a cross-platform filename. This lets folders,
 //!   scripts, aliases, triggers, hotkeys, and modules use spaces and friendly
 //!   punctuation — these names only ever land on disk.
-//! - [`validate_package_name`] stays **slug-like** (letters, digits, `-`, `_`):
+//! - [`validate_package_name`] stays **slug-like** (letters, digits, `.`, `-`, `_`):
 //!   package names are published, globally-addressable coordinates embedded in
 //!   `smudgy://owner/name` import URLs, so they avoid spaces and other characters
 //!   that would need percent-encoding.
@@ -131,8 +131,9 @@ pub fn validate_module_subpath(path: &str) -> Result<(), String> {
 
 /// Validates a package name. Stricter than [`validate_name`]: package names are
 /// published, globally-addressable coordinates embedded in `smudgy://owner/name`
-/// import URLs, so they stay slug-like — letters, digits, `-`, and `_`, with no
-/// spaces, dots, or other punctuation.
+/// import URLs. This matches the package service grammar: an ASCII letter or
+/// digit first, followed by at most 63 ASCII letters, digits, dots, dashes, or
+/// underscores.
 ///
 /// # Errors
 ///
@@ -148,11 +149,18 @@ pub fn validate_package_name(name: &str) -> Result<(), String> {
             "Package name cannot be longer than {MAX_NAME_LEN} characters"
         ));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        || !characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
     {
-        return Err("Package names may only contain letters, digits, '-' and '_'".to_string());
+        return Err(
+            "Package names must start with a letter or digit and may only contain letters, digits, '.', '-' and '_'"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -230,7 +238,10 @@ mod tests {
     fn package_names_stay_slug_like() {
         assert!(validate_package_name("my-combat_pack").is_ok());
         assert!(validate_package_name("with space").is_err());
-        assert!(validate_package_name("with.dot").is_err());
+        assert!(validate_package_name("with.dot").is_ok());
+        assert!(validate_package_name("-leading-dash").is_err());
+        assert!(validate_package_name("_leading-underscore").is_err());
+        assert!(validate_package_name("éclair").is_err());
         assert!(validate_package_name("with/slash").is_err());
     }
 

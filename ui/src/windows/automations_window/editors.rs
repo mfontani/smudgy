@@ -1,7 +1,7 @@
 //! The script editors (alias / trigger / hotkey), the folder editor, and the
 //! module pane — both the update-side logic and the views.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use iced::alignment::Vertical;
@@ -17,8 +17,12 @@ use smudgy_core::models::matchers::{
     self, ArgKind, CmdMode, CommandOutcome, CommandSpec, MatcherColor, MatcherColorChannel,
     MatcherColorMatch, MatcherHsv, MatcherHsvRange, MatcherSyntax, MatcherTextAttribute,
 };
+use smudgy_core::models::modules::ModuleFileWriteOutcome;
+use smudgy_core::models::profile_activation::ProfileActivation;
 use smudgy_core::models::server;
+use smudgy_core::models::shared_packages::LockedPackage;
 use smudgy_core::models::{ScriptLang, aliases, hotkeys, naming, packages, triggers};
+use smudgy_core::session::runtime::AutomationKind;
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::components::color_picker::ColorPicker;
@@ -37,14 +41,15 @@ use super::keyboard_control::{
     KeyAction, KeyboardControl, activation, grid_selection, linear_selection, publish_selection,
 };
 use super::model::{
-    AliasKind, AliasMatcherDraft, ArgKindChoice, ColorRangeEndpoint, MatcherColorKind, NodeStatus,
-    ParseModeChoice, PatternKind, Script, ScriptKey, SyntaxChoice, TriggerCard, TriggerRow,
-    TruecolorComponent, parse_matcher_hex, pattern_error_text, rows_into_trigger, trigger_rows,
-    upsert_script_folder,
+    AliasKind, AliasMatcherDraft, ArgKindChoice, AutomationSaveStatus, ColorRangeEndpoint,
+    MatcherColorKind, NodeStatus, ParseModeChoice, PatternKind, Script, ScriptKey, SyntaxChoice,
+    TriggerCard, TriggerRow, TruecolorComponent, parse_matcher_hex, pattern_error_text,
+    rows_into_trigger, trigger_rows, upsert_script_folder,
 };
 use super::{
     AutomationsWindow, EditNode, EditorMode, EditorState, Elem, Event, FolderState, Message,
-    ModuleMode, ModuleState, Pane, Selection, matcher_hsv_to_picker, matcher_truecolor_range,
+    ModuleMode, ModuleState, ModuleTab, Pane, Selection, matcher_hsv_to_picker,
+    matcher_truecolor_range,
 };
 
 const LABEL_WIDTH: f32 = 92.0;
@@ -89,6 +94,69 @@ fn warn_none(msg: String) -> Update<Message, Event> {
     Update::none()
 }
 
+fn action_tab_key_action(
+    key: &Key,
+    language: ScriptLang,
+    script_language: ScriptLang,
+) -> KeyAction<Message> {
+    let current = usize::from(language != ScriptLang::Plaintext);
+    publish_selection(linear_selection(key, current, 2), |index| {
+        Message::SetBehavior(if index == 0 {
+            ScriptLang::Plaintext
+        } else {
+            script_language
+        })
+    })
+}
+
+fn activation_profile_order(profile_names: &[String]) -> Vec<&str> {
+    // `load_profile_names` already sorts by display caption and then storage
+    // name. Keep that stable order here; the Current badge is enough emphasis
+    // without making every session switch reshuffle the checklist.
+    profile_names.iter().map(String::as_str).collect()
+}
+
+pub(super) fn activation_profile_label(
+    profile_name: &str,
+    profile_names: &[String],
+    captions: &HashMap<String, String>,
+) -> String {
+    let caption = captions
+        .get(profile_name)
+        .map(|caption| caption.trim())
+        .filter(|caption| !caption.is_empty())
+        .unwrap_or(profile_name);
+    let duplicate = profile_names.iter().any(|other| {
+        other != profile_name
+            && captions
+                .get(other)
+                .map(|other_caption| other_caption.trim())
+                .filter(|other_caption| !other_caption.is_empty())
+                .unwrap_or(other)
+                .eq_ignore_ascii_case(caption)
+    });
+    if duplicate && caption != profile_name {
+        format!("{caption} ({profile_name})")
+    } else {
+        caption.to_string()
+    }
+}
+
+fn activation_control_key_action(key: &Key, repeat: bool, message: Message) -> KeyAction<Message> {
+    activation(key, repeat, message)
+}
+
+fn keyboard_activation_control<'a>(content: Elem<'a>, id: Id, message: Message) -> Elem<'a> {
+    let focus_id = id.clone();
+    KeyboardControl::new(
+        content,
+        id,
+        move || Message::FocusColorControl(focus_id.clone()),
+        move |key, repeat| activation_control_key_action(key, repeat, message.clone()),
+    )
+    .into()
+}
+
 // ============================================================================
 // Update-side: open / create / save / delete
 // ============================================================================
@@ -117,6 +185,11 @@ impl AutomationsWindow {
                 code_editor::CodeDocument::Trigger,
             ),
             Script::Hotkey(h) => {
+                self.action_script_lang = if h.language == ScriptLang::TS {
+                    ScriptLang::TS
+                } else {
+                    ScriptLang::JS
+                };
                 let text = h.script.as_deref().unwrap_or_default();
                 if h.language == ScriptLang::Plaintext {
                     self.hotkey_text_content = text_editor::Content::with_text(text);
@@ -352,6 +425,7 @@ impl AutomationsWindow {
     pub(super) fn new_hotkey(&mut self) -> Update<Message, Event> {
         self.clear_selection();
         self.selection = Selection::None;
+        self.action_script_lang = ScriptLang::JS;
         self.hotkey_text_content = text_editor::Content::new();
         self.hotkey_state.clear();
         self.pane = Pane::Editor(EditorState {
@@ -380,7 +454,7 @@ impl AutomationsWindow {
                 .current_folder()
                 .map(|p| format!("{p}/"))
                 .unwrap_or_default(),
-            enabled: true,
+            activation: ProfileActivation::All,
             error: None,
         });
         Update::none()
@@ -388,13 +462,17 @@ impl AutomationsWindow {
 
     pub(super) fn new_module(&mut self) -> Update<Message, Event> {
         self.clear_selection();
+        self.module_source_baseline = None;
         self.selection = Selection::None;
-        let text = "// A local module: shared helpers, private to this profile.\n";
+        let text = "// A local module for shared helpers and automation setup.\n";
         self.pane = Pane::Module(ModuleState {
             mode: ModuleMode::Create,
             subpath: String::new(),
             path: None,
             name: String::new(),
+            tab: ModuleTab::Source,
+            activation: ProfileActivation::All,
+            activation_touched: false,
             error: None,
         });
         Update::with_task(self.bind_code_editor(
@@ -406,16 +484,60 @@ impl AutomationsWindow {
 
     pub(super) fn open_folder(&mut self, path: String) -> Update<Message, Event> {
         self.clear_selection();
-        let enabled = packages::folder_enabled(&self.packages, &path);
+        let folder_paths = packages::collect_folder_paths(&self.packages);
+        let stored_path = packages::canonical_folder_path(&self.packages, &path);
+        let ambiguous_case = stored_path.is_none()
+            && folder_paths
+                .iter()
+                .any(|existing| naming::names_conflict(existing, &path));
+        let activation = packages::folder_activation(
+            &self.packages,
+            stored_path.as_deref().unwrap_or(path.as_str()),
+        );
+        let needs_legacy_repair =
+            self.folder_state_error.is_none() && stored_path.is_none() && !ambiguous_case;
+        let mut repaired = false;
+        let mut repair_conflict = false;
+        let mut repair_error =
+            ambiguous_case.then(|| crate::i18n::t!("automation-folder-case-ambiguous"));
+        if needs_legacy_repair {
+            // Script package fields predate explicit folder rows. Preserve their historical
+            // enabled behavior by materializing the missing All row as soon as the user opens it;
+            // otherwise the pane would say All while runtime correctly fails the missing path
+            // closed, and the already-selected Enable Everywhere action could not be pressed.
+            let previous = self.packages.clone();
+            packages::insert_folder(&mut self.packages, &path);
+            match self.serialize_scripts() {
+                Ok(AutomationSaveStatus::Saved) => repaired = true,
+                Ok(AutomationSaveStatus::Conflict) => {
+                    self.packages = previous;
+                    repair_conflict = true;
+                }
+                Err(error) => {
+                    self.packages = previous;
+                    repair_error = Some(error.to_string());
+                }
+            }
+        }
         self.selection = Selection::Folder(path.clone());
         self.pane = Pane::Folder(FolderState {
             mode: EditorMode::Edit,
             original_path: Some(path.clone()),
             path,
-            enabled,
-            error: None,
+            activation,
+            error: repair_error,
         });
-        Update::none()
+        let task = if repair_conflict {
+            self.automation_save_conflict_task()
+        } else {
+            Task::none()
+        };
+        Update::new(
+            task,
+            repaired.then_some(Event::UserAutomationsChanged {
+                server_name: self.server_name.clone(),
+            }),
+        )
     }
 
     pub(super) fn open_module(&mut self, subpath: String) -> Update<Message, Event> {
@@ -429,12 +551,23 @@ impl AutomationsWindow {
         if let Some(path) = path {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
+                    self.module_source_baseline = Some(content.clone());
                     let language = code_editor::path_language(&subpath);
+                    let tab = if smudgy_core::models::modules::is_script_module(&subpath) {
+                        ModuleTab::Settings
+                    } else {
+                        ModuleTab::Source
+                    };
+                    let activation =
+                        smudgy_core::models::modules::activation(&self.module_settings, &subpath);
                     self.pane = Pane::Module(ModuleState {
                         mode: ModuleMode::View,
                         subpath,
                         path: Some(path),
                         name: String::new(),
+                        tab,
+                        activation,
+                        activation_touched: false,
                         error: None,
                     });
                     return Update::with_task(self.bind_code_editor(
@@ -594,19 +727,27 @@ impl AutomationsWindow {
             }
         };
         folder.insert(name.to_owned(), script);
-        if let Err(error) = self.serialize_scripts() {
-            self.scripts = previous_scripts;
-            return Err(crate::i18n::t!(
-                "editor-failed-save",
-                "error" => error.to_string()
-            ));
+        match self.serialize_scripts() {
+            Ok(AutomationSaveStatus::Saved) => {}
+            Ok(AutomationSaveStatus::Conflict) => {
+                self.scripts = previous_scripts;
+                return Ok(self.automation_save_conflict());
+            }
+            Err(error) => {
+                self.scripts = previous_scripts;
+                return Err(crate::i18n::t!(
+                    "editor-failed-save",
+                    "error" => error.to_string()
+                ));
+            }
         }
         self.selection = Selection::Script(ScriptKey {
             folder_name,
             script_name: name.to_owned(),
         });
+        let toast = self.show_toast(crate::i18n::t!("editor-saved", "name" => name));
         Ok(Update::new(
-            self.show_toast(crate::i18n::t!("editor-saved", "name" => name)),
+            toast,
             Some(Event::UserAutomationsChanged {
                 server_name: self.server_name.clone(),
             }),
@@ -614,23 +755,270 @@ impl AutomationsWindow {
     }
 
     fn toggle_folder_enabled(&mut self) -> Update<Message, Event> {
-        let Pane::Folder(state) = &mut self.pane else {
-            return Update::none();
+        let enabled = match &self.pane {
+            Pane::Folder(state) => state.activation.is_enabled_for(&self.profile_name),
+            _ => return Update::none(),
         };
-        let Some(path) = state.original_path.clone() else {
-            return Update::none();
-        };
-        let next = !state.enabled;
-        state.enabled = next;
-        packages::set_folder_enabled(&mut self.packages, &path, next);
-        if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
-            return warn_none(
-                crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()),
-            );
-        }
-        Update::with_event(Event::UserAutomationsChanged {
-            server_name: self.server_name.clone(),
+        self.set_open_activation(if enabled {
+            ProfileActivation::None
+        } else {
+            ProfileActivation::All
         })
+    }
+
+    pub(super) fn toggle_open_activation_profile(
+        &mut self,
+        profile_name: String,
+    ) -> Update<Message, Event> {
+        if !self.open_activation_storage_available() {
+            return Update::none();
+        }
+        let Some(current) = self.open_activation() else {
+            return Update::none();
+        };
+        // Canonicalizing a selected set against the profiles known at open time would turn
+        // "every profile I could see" into `All`, silently enabling a profile created since. Read
+        // the inventory again right before the write and refuse it when the read fails.
+        if let Err(reason) = self.refresh_profile_inventory() {
+            match &mut self.pane {
+                Pane::Folder(state) => state.error = Some(reason),
+                Pane::Module(state) => state.error = Some(reason),
+                Pane::InstalledPackage | Pane::OwnedPackage => self.manage_feedback = Some(reason),
+                _ => {}
+            }
+            return Update::none();
+        }
+        let known = self.profile_names.iter().cloned().collect::<BTreeSet<_>>();
+        let enabled = current.is_enabled_for(&profile_name);
+        self.set_open_activation(current.with_profile(&profile_name, !enabled, &known))
+    }
+
+    /// Replaces the profile inventory with a fresh strict read of the server's profiles.
+    ///
+    /// # Errors
+    /// Returns the user-facing reason when any profile cannot be read; the previous inventory is
+    /// kept for display but marked incomplete so no activation write canonicalizes against it.
+    pub(super) fn refresh_profile_inventory(&mut self) -> Result<(), String> {
+        match Self::load_profile_choices(&self.server_name) {
+            Ok((profile_names, profile_captions)) => {
+                self.profile_names = profile_names;
+                self.profile_captions = profile_captions;
+                self.profile_inventory_complete = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.profile_inventory_complete = false;
+                log::warn!(
+                    "Failed to load the complete profile inventory for {}: {error}",
+                    self.server_name
+                );
+                Err(crate::i18n::t!("activation-profile-inventory-error"))
+            }
+        }
+    }
+
+    fn open_activation(&self) -> Option<ProfileActivation> {
+        match &self.pane {
+            Pane::Folder(state) => Some(state.activation.clone()),
+            Pane::Module(state) => Some(state.activation.clone()),
+            Pane::InstalledPackage => self.installed_open.as_deref().map(|package| {
+                let governing = self.governing_specifier(&package.specifier);
+                self.installed_packages
+                    .iter()
+                    .find(|locked| locked.specifier == governing)
+                    .map_or_else(|| package.activation(), LockedPackage::activation)
+            }),
+            Pane::OwnedPackage => self.local_package.as_ref().map(|package| {
+                let specifier = self.local_own_spec(&package.name);
+                self.installed_packages
+                    .iter()
+                    .find(|locked| locked.specifier == specifier)
+                    .map_or(ProfileActivation::None, LockedPackage::activation)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether the open pane's activation storage accepts writes. Derived from
+    /// [`Self::open_activation_storage_error`] so the controls the view enables are exactly the
+    /// writes the model performs.
+    pub(super) fn open_activation_storage_available(&self) -> bool {
+        self.open_activation_storage_error().is_none()
+    }
+
+    /// The single reason activation writes are refused for the open pane, shown by the view in
+    /// place of enabled controls. Every activation write consults this same predicate.
+    pub(super) fn open_activation_storage_error(&self) -> Option<String> {
+        match &self.pane {
+            Pane::Folder(_) if self.folder_state_error.is_some() => {
+                Some(crate::i18n::t!("activation-folder-state-error"))
+            }
+            // A failed folder write leaves its explanation in the pane; the activation rows must
+            // not advertise a write that would fail the same way.
+            Pane::Folder(state) if state.error.is_some() => {
+                Some(crate::i18n::t!("activation-folder-error-blocked"))
+            }
+            Pane::Module(_) if self.module_state_error.is_some() => {
+                Some(crate::i18n::t!("activation-module-state-error"))
+            }
+            Pane::InstalledPackage | Pane::OwnedPackage => self
+                .local_package_state_error
+                .clone()
+                .or_else(|| self.installed_package_state_error.clone()),
+            _ => None,
+        }
+    }
+
+    /// Unsaved executable/configuration drafts must not be confused with the code and values that
+    /// a newly enabled profile will actually load. Disabling remains available as a safety action.
+    fn activation_enable_block_reason(&self) -> Option<String> {
+        match &self.pane {
+            Pane::Module(state) if state.mode != ModuleMode::Create && self.dirty => {
+                Some(crate::i18n::t!("module-save-before-activation"))
+            }
+            Pane::OwnedPackage
+                if self.dirty
+                    || self.manifest_dirty
+                    || self
+                        .param_config
+                        .as_ref()
+                        .is_some_and(|config| !config.touched.is_empty()) =>
+            {
+                Some(crate::i18n::t!("package-save-before-activation"))
+            }
+            Pane::InstalledPackage
+                if self
+                    .param_config
+                    .as_ref()
+                    .is_some_and(|config| !config.touched.is_empty()) =>
+            {
+                Some(crate::i18n::t!("package-save-before-activation"))
+            }
+            _ => None,
+        }
+    }
+
+    fn activation_change_enables_more_profiles(
+        &self,
+        current: &ProfileActivation,
+        requested: &ProfileActivation,
+    ) -> bool {
+        let enables_known_profile = self
+            .profile_names
+            .iter()
+            .any(|profile| !current.is_enabled_for(profile) && requested.is_enabled_for(profile));
+        let enables_future_profiles = !matches!(current, ProfileActivation::All)
+            && matches!(requested, ProfileActivation::All);
+        enables_known_profile || enables_future_profiles
+    }
+
+    pub(super) fn set_open_activation(
+        &mut self,
+        activation: ProfileActivation,
+    ) -> Update<Message, Event> {
+        if !self.open_activation_storage_available() {
+            return Update::none();
+        }
+        if let Some(reason) = self.activation_enable_block_reason()
+            && self.open_activation().is_some_and(|current| {
+                self.activation_change_enables_more_profiles(&current, &activation)
+            })
+        {
+            match &mut self.pane {
+                Pane::Module(state) => state.error = Some(reason),
+                Pane::InstalledPackage | Pane::OwnedPackage => self.manage_feedback = Some(reason),
+                _ => {}
+            }
+            return Update::none();
+        }
+        if matches!(&self.pane, Pane::Folder(_)) {
+            let (previous_activation, path) = match &mut self.pane {
+                Pane::Folder(state) => {
+                    let previous_activation = state.activation.clone();
+                    state.activation = activation.clone();
+                    (previous_activation, state.original_path.clone())
+                }
+                _ => unreachable!("folder pane was checked above"),
+            };
+            let Some(path) = path else {
+                self.dirty = true;
+                return Update::none();
+            };
+            let previous_packages = self.packages.clone();
+            if !packages::set_folder_activation(&mut self.packages, &path, activation.clone()) {
+                // Older script files can refer to a folder before it has an explicit
+                // `packages.json` row. Materialize that row on the first activation edit instead
+                // of pretending a mutation of the missing node succeeded.
+                packages::insert_folder(&mut self.packages, &path);
+                if !packages::set_folder_activation(&mut self.packages, &path, activation) {
+                    self.packages = previous_packages;
+                    if let Pane::Folder(state) = &mut self.pane {
+                        state.activation = previous_activation;
+                        state.error = Some(crate::i18n::t!("automation-folder-case-ambiguous"));
+                    }
+                    return Update::none();
+                }
+            }
+            match self.serialize_scripts() {
+                Ok(AutomationSaveStatus::Saved) => {}
+                Ok(AutomationSaveStatus::Conflict) => {
+                    self.packages = previous_packages;
+                    if let Pane::Folder(state) = &mut self.pane {
+                        state.activation = previous_activation;
+                    }
+                    return self.automation_save_conflict();
+                }
+                Err(error) => {
+                    self.packages = previous_packages;
+                    if let Pane::Folder(state) = &mut self.pane {
+                        state.activation = previous_activation;
+                    }
+                    return warn_none(crate::i18n::t!(
+                        "editor-failed-save-folders",
+                        "error" => error.to_string()
+                    ));
+                }
+            }
+            return Update::with_event(Event::UserAutomationsChanged {
+                server_name: self.server_name.clone(),
+            });
+        }
+
+        match &mut self.pane {
+            Pane::Module(state) => {
+                let previous_activation = state.activation.clone();
+                state.activation = activation.clone();
+                if state.mode == ModuleMode::Create {
+                    state.activation_touched = true;
+                    self.dirty = true;
+                    return Update::none();
+                }
+                if let Err(error) = smudgy_core::models::modules::set_activation(
+                    &self.server_name,
+                    &state.subpath,
+                    activation,
+                ) {
+                    state.activation = previous_activation;
+                    state.error = Some(error.to_string());
+                    return Update::none();
+                }
+                state.error = None;
+                match smudgy_core::models::modules::load_settings(&self.server_name) {
+                    Ok(settings) => self.module_settings = settings,
+                    Err(error) => {
+                        self.module_state_error = Some(error.to_string());
+                        state.error = Some(error.to_string());
+                    }
+                }
+                Update::with_event(Event::ScriptsChanged {
+                    server_name: self.server_name.clone(),
+                })
+            }
+            Pane::InstalledPackage | Pane::OwnedPackage => {
+                self.set_open_package_activation(activation)
+            }
+            _ => Update::none(),
+        }
     }
 
     pub(super) fn save_open(&mut self) -> Update<Message, Event> {
@@ -823,6 +1211,7 @@ impl AutomationsWindow {
         // duplicated under both the old and new folder. `remove_script_by_name`
         // finds it by name anywhere in the tree, so an unchanged save is a
         // harmless remove-then-reinsert in place.
+        let previous_scripts = self.scripts.clone();
         if mode == EditorMode::Edit
             && let Some(orig) = &original_name
         {
@@ -833,17 +1222,27 @@ impl AutomationsWindow {
                 folder.insert(name.clone(), final_script);
             }
             Err(e) => {
+                self.scripts = previous_scripts;
                 if let Pane::Editor(state) = &mut self.pane {
                     state.error = Some(e);
                 }
                 return Update::none();
             }
         }
-        if let Err(e) = self.serialize_scripts() {
-            if let Pane::Editor(state) = &mut self.pane {
-                state.error = Some(crate::i18n::t!("editor-failed-save", "error" => e.to_string()));
+        match self.serialize_scripts() {
+            Ok(AutomationSaveStatus::Saved) => {}
+            Ok(AutomationSaveStatus::Conflict) => {
+                self.scripts = previous_scripts;
+                return self.automation_save_conflict();
             }
-            return Update::none();
+            Err(e) => {
+                self.scripts = previous_scripts;
+                if let Pane::Editor(state) = &mut self.pane {
+                    state.error =
+                        Some(crate::i18n::t!("editor-failed-save", "error" => e.to_string()));
+                }
+                return Update::none();
+            }
         }
         // Reflect the saved state in the pane.
         if let Pane::Editor(state) = &mut self.pane {
@@ -855,7 +1254,7 @@ impl AutomationsWindow {
             script_name: name.clone(),
         });
         self.dirty = false;
-        self.pending_nav = None;
+        let released = self.release_pending_navigation();
         if saved_code {
             self.mark_code_editor_saved();
         }
@@ -887,7 +1286,7 @@ impl AutomationsWindow {
         };
         let toast = self.show_toast(crate::i18n::t!("editor-saved", "name" => name));
         Update::new(
-            Task::batch([discard_task, toast]),
+            Task::batch([discard_task, toast, released]),
             Some(Event::UserAutomationsChanged {
                 server_name: self.server_name.clone(),
             }),
@@ -929,13 +1328,22 @@ impl AutomationsWindow {
             }) => name.clone(),
             _ => return Update::none(),
         };
+        let previous_scripts = self.scripts.clone();
         self.remove_script_by_name(&original);
-        if let Err(e) = self.serialize_scripts() {
-            self.pane = Pane::Error(Arc::new(vec![crate::i18n::t!(
-                "editor-failed-save-delete",
-                "error" => e.to_string()
-            )]));
-            return Update::none();
+        match self.serialize_scripts() {
+            Ok(AutomationSaveStatus::Saved) => {}
+            Ok(AutomationSaveStatus::Conflict) => {
+                self.scripts = previous_scripts;
+                return self.automation_save_conflict();
+            }
+            Err(e) => {
+                self.scripts = previous_scripts;
+                self.pane = Pane::Error(Arc::new(vec![crate::i18n::t!(
+                    "editor-failed-save-delete",
+                    "error" => e.to_string()
+                )]));
+                return Update::none();
+            }
         }
         self.dirty = false;
         self.clear_code_editor();
@@ -958,15 +1366,18 @@ impl AutomationsWindow {
     // ---- folder save / delete ---------------------------------------------
 
     pub(super) fn save_folder(&mut self) -> Update<Message, Event> {
-        let (mode, original_path, path, enabled) = match &self.pane {
+        let (mode, original_path, path, activation) = match &self.pane {
             Pane::Folder(state) => (
                 state.mode,
                 state.original_path.clone(),
                 state.path.trim_matches('/').to_string(),
-                state.enabled,
+                state.activation.clone(),
             ),
             _ => return Update::none(),
         };
+        if let Pane::Folder(state) = &mut self.pane {
+            state.error = None;
+        }
         if let Err(message) = naming::validate_folder_path(&path) {
             if let Pane::Folder(state) = &mut self.pane {
                 state.error = Some(message);
@@ -975,15 +1386,34 @@ impl AutomationsWindow {
         }
         match mode {
             EditorMode::Create => {
-                packages::insert_folder(&mut self.packages, &path);
-                if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
+                if packages::folder_destination_conflicts(&self.packages, &path, None) {
                     if let Pane::Folder(state) = &mut self.pane {
                         state.error = Some(crate::i18n::t!(
-                            "editor-failed-save-folders",
-                            "error" => e.to_string()
+                            "editor-folder-path-conflict",
+                            "path" => &path
                         ));
                     }
                     return Update::none();
+                }
+                let previous_packages = self.packages.clone();
+                packages::insert_folder(&mut self.packages, &path);
+                packages::set_folder_activation(&mut self.packages, &path, activation.clone());
+                match self.serialize_scripts() {
+                    Ok(AutomationSaveStatus::Saved) => {}
+                    Ok(AutomationSaveStatus::Conflict) => {
+                        self.packages = previous_packages;
+                        return self.automation_save_conflict();
+                    }
+                    Err(e) => {
+                        self.packages = previous_packages;
+                        if let Pane::Folder(state) = &mut self.pane {
+                            state.error = Some(crate::i18n::t!(
+                                "editor-failed-save-folders",
+                                "error" => e.to_string()
+                            ));
+                        }
+                        return Update::none();
+                    }
                 }
                 self.merge_folders();
                 self.selection = Selection::Folder(path.clone());
@@ -991,42 +1421,73 @@ impl AutomationsWindow {
                     mode: EditorMode::Edit,
                     original_path: Some(path.clone()),
                     path,
-                    enabled,
+                    activation,
                     error: None,
                 });
-                Update::with_task(self.show_toast(crate::i18n::t!("editor-folder-created")))
+                // The path and activation drafts are now persisted; the editor is clean.
+                self.dirty = false;
+                let released = self.release_pending_navigation();
+                let toast = self.show_toast(crate::i18n::t!("editor-folder-created"));
+                Update::with_task(Task::batch([toast, released]))
             }
             EditorMode::Edit => {
                 let Some(old_path) = original_path else {
                     return Update::none();
                 };
                 if old_path == path {
+                    // Retyping the same path changed nothing on disk, so there is no draft left.
+                    self.dirty = false;
+                    return Update::with_task(self.release_pending_navigation());
+                }
+                if packages::folder_destination_conflicts(&self.packages, &path, Some(&old_path)) {
+                    if let Pane::Folder(state) = &mut self.pane {
+                        state.error = Some(crate::i18n::t!(
+                            "editor-folder-path-conflict",
+                            "path" => &path
+                        ));
+                    }
                     return Update::none();
                 }
-                packages::rename_folder(&mut self.packages, &old_path, &path);
-                self.rename_script_packages(&old_path, &path);
-                if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
-                    return warn_none(crate::i18n::t!(
-                        "editor-failed-save-folders",
-                        "error" => e.to_string()
-                    ));
+                let previous_packages = self.packages.clone();
+                let previous_scripts = self.scripts.clone();
+                if !packages::rename_folder(&mut self.packages, &old_path, &path) {
+                    if let Pane::Folder(state) = &mut self.pane {
+                        state.error = Some(crate::i18n::t!(
+                            "editor-folder-missing",
+                            "path" => &old_path
+                        ));
+                    }
+                    return Update::none();
                 }
-                if let Err(e) = self.serialize_scripts() {
-                    return warn_none(crate::i18n::t!(
-                        "editor-failed-save-scripts",
-                        "error" => e.to_string()
-                    ));
+                self.rename_script_packages(&old_path, &path);
+                match self.serialize_scripts() {
+                    Ok(AutomationSaveStatus::Saved) => {}
+                    Ok(AutomationSaveStatus::Conflict) => {
+                        self.packages = previous_packages;
+                        self.scripts = previous_scripts;
+                        return self.automation_save_conflict();
+                    }
+                    Err(e) => {
+                        self.packages = previous_packages;
+                        self.scripts = previous_scripts;
+                        return warn_none(crate::i18n::t!(
+                            "editor-failed-save-folders",
+                            "error" => e.to_string()
+                        ));
+                    }
                 }
                 self.selection = Selection::Folder(path.clone());
                 self.pane = Pane::Folder(FolderState {
                     mode: EditorMode::Edit,
                     original_path: Some(path.clone()),
                     path,
-                    enabled,
+                    activation,
                     error: None,
                 });
+                self.dirty = false;
+                let released = self.release_pending_navigation();
                 Update::new(
-                    Task_batch_reload(self),
+                    Task::batch([Task_batch_reload(self), released]),
                     Some(Event::UserAutomationsChanged {
                         server_name: self.server_name.clone(),
                     }),
@@ -1044,7 +1505,11 @@ impl AutomationsWindow {
             }) => path.clone(),
             _ => return Update::none(),
         };
-        packages::remove_folder(&mut self.packages, &path);
+        let previous_packages = self.packages.clone();
+        let previous_scripts = self.scripts.clone();
+        if !packages::remove_folder(&mut self.packages, &path) {
+            return warn_none(crate::i18n::t!("editor-folder-missing", "path" => &path));
+        }
         if delete_scripts {
             for name in self.scripts_under(&path) {
                 self.remove_script_by_name(&name);
@@ -1054,15 +1519,20 @@ impl AutomationsWindow {
             self.reparent_scripts(&path, parent);
         }
         self.confirm_folder_delete = false;
-        if let Err(e) = packages::save_packages(&self.server_name, &self.packages) {
-            return warn_none(
-                crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()),
-            );
-        }
-        if let Err(e) = self.serialize_scripts() {
-            return warn_none(
-                crate::i18n::t!("editor-failed-save-scripts", "error" => e.to_string()),
-            );
+        match self.serialize_scripts() {
+            Ok(AutomationSaveStatus::Saved) => {}
+            Ok(AutomationSaveStatus::Conflict) => {
+                self.packages = previous_packages;
+                self.scripts = previous_scripts;
+                return self.automation_save_conflict();
+            }
+            Err(e) => {
+                self.packages = previous_packages;
+                self.scripts = previous_scripts;
+                return warn_none(
+                    crate::i18n::t!("editor-failed-save-folders", "error" => e.to_string()),
+                );
+            }
         }
         self.selection = Selection::Dashboard;
         self.pane = Pane::Dashboard;
@@ -1077,29 +1547,59 @@ impl AutomationsWindow {
     // ---- module save / create ---------------------------------------------
 
     pub(super) fn save_module(&mut self) -> Update<Message, Event> {
-        let path = match &self.pane {
+        let subpath = match &self.pane {
             Pane::Module(ModuleState {
-                path: Some(path), ..
-            }) => path.clone(),
+                subpath,
+                path: Some(_),
+                ..
+            }) => subpath.clone(),
             _ => return Update::none(),
         };
         if !self.code_editor_is_modified() {
             self.dirty = false;
-            self.pending_nav = None;
+            return Update::with_task(self.release_pending_navigation());
+        }
+        let Some(expected) = self.module_source_baseline.as_deref() else {
+            if let Pane::Module(state) = &mut self.pane {
+                state.error = Some(crate::i18n::t!("editor-file-changed-outside"));
+            }
             return Update::none();
+        };
+        let content = self.code_editor_text();
+        match smudgy_core::models::modules::save_module_if_unchanged(
+            &self.server_name,
+            &subpath,
+            expected,
+            &content,
+        ) {
+            Ok(ModuleFileWriteOutcome::Saved) => {}
+            Ok(ModuleFileWriteOutcome::Conflict) => {
+                if let Pane::Module(state) = &mut self.pane {
+                    state.error = Some(crate::i18n::t!("editor-file-changed-outside"));
+                }
+                return Update::none();
+            }
+            Err(e) => {
+                if let Pane::Module(state) = &mut self.pane {
+                    state.error = Some(crate::i18n::t!(
+                        "editor-failed-save-module",
+                        "error" => e.to_string()
+                    ));
+                }
+                return Update::none();
+            }
         }
-        if let Err(e) = std::fs::write(&path, self.code_editor_text()) {
-            return warn_none(
-                crate::i18n::t!("editor-failed-save-module", "error" => e.to_string()),
-            );
+        if let Pane::Module(state) = &mut self.pane {
+            state.error = None;
         }
+        self.module_source_baseline = Some(content);
         self.dirty = false;
-        self.pending_nav = None;
+        let released = self.release_pending_navigation();
         self.mark_code_editor_saved();
         self.refresh_language_project();
         let toast = self.show_toast(crate::i18n::t!("editor-module-saved"));
         Update::new(
-            toast,
+            Task::batch([toast, released]),
             Some(Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             }),
@@ -1107,13 +1607,19 @@ impl AutomationsWindow {
     }
 
     pub(super) fn create_module(&mut self) -> Update<Message, Event> {
-        let name = match &self.pane {
-            Pane::Module(state) => state.name.trim().to_string(),
+        let (name, activation) = match &self.pane {
+            Pane::Module(state) => (state.name.trim().to_string(), state.activation.clone()),
             _ => return Update::none(),
         };
         if let Err(message) = naming::validate_module_subpath(&name) {
             if let Pane::Module(state) = &mut self.pane {
                 state.error = Some(message);
+            }
+            return Update::none();
+        }
+        if !smudgy_core::models::modules::is_script_module(&name) {
+            if let Pane::Module(state) = &mut self.pane {
+                state.error = Some(crate::i18n::t!("module-script-extension-required"));
             }
             return Update::none();
         }
@@ -1130,55 +1636,64 @@ impl AutomationsWindow {
             }
         };
         let target = dir.join(&name);
-        if let Some(parent) = target.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
+        let content = self.code_editor_text();
+        if let Err(error) = smudgy_core::models::modules::create_module(
+            &self.server_name,
+            &name.replace('\\', "/"),
+            &content,
+            activation.clone(),
+        ) {
             if let Pane::Module(state) = &mut self.pane {
-                state.error =
-                    Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
-            }
-            return Update::none();
-        }
-        if let Err(e) = std::fs::write(&target, self.code_editor_text()) {
-            if let Pane::Module(state) = &mut self.pane {
-                state.error =
-                    Some(crate::i18n::t!("editor-failed-create-module", "error" => e.to_string()));
+                state.error = Some(crate::i18n::t!(
+                    "editor-failed-create-module",
+                    "error" => error.to_string()
+                ));
             }
             return Update::none();
         }
         self.dirty = false;
-        self.clear_code_editor();
-        self.selection = Selection::Dashboard;
-        self.pane = Pane::Dashboard;
-        let toast = self.show_toast(crate::i18n::t!("editor-module-created", "name" => name));
+        self.module_source_baseline = Some(content);
+        let released = self.release_pending_navigation();
+        self.mark_code_editor_saved();
+        self.selection = Selection::Module(name.clone());
+        self.pane = Pane::Module(ModuleState {
+            mode: ModuleMode::View,
+            subpath: name.clone(),
+            path: Some(target),
+            name: String::new(),
+            tab: ModuleTab::Settings,
+            activation,
+            activation_touched: false,
+            error: None,
+        });
+        self.refresh_language_project();
+        let toast = self.show_toast(crate::i18n::t!("editor-module-created", "name" => &name));
         Update::new(
-            Task_batch_module_reload(toast),
+            Task_batch_module_reload(Task::batch([toast, released])),
             Some(Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             }),
         )
     }
-
     // ---- tree mutation helpers (folder rename/delete) ---------------------
 
     fn scripts_under(&self, folder: &str) -> Vec<String> {
-        let folder_slash = format!("{folder}/");
         let mut names = Vec::new();
-        collect_scripts_under(&self.scripts, folder, &folder_slash, &mut names);
+        collect_scripts_under(&self.scripts, folder, &mut names);
         names
     }
 
     fn rename_script_packages(&mut self, old: &str, new: &str) {
-        let old_slash = format!("{old}/");
         for_each_script_mut(&mut self.scripts, &mut |script| {
             if let Some(pkg) = script_package_field(script) {
-                let updated = pkg.as_deref().and_then(|p| {
-                    if p == old {
-                        Some(new.to_owned())
-                    } else {
-                        p.strip_prefix(&old_slash)
-                            .map(|suffix| format!("{new}/{suffix}"))
-                    }
+                let updated = pkg.as_deref().and_then(|path| {
+                    folder_relative_suffix(path, old).map(|suffix| {
+                        if suffix.is_empty() {
+                            new.to_owned()
+                        } else {
+                            format!("{new}/{suffix}")
+                        }
+                    })
                 });
                 if let Some(updated) = updated {
                     *pkg = Some(updated);
@@ -1188,12 +1703,11 @@ impl AutomationsWindow {
     }
 
     fn reparent_scripts(&mut self, folder: &str, target: Option<String>) {
-        let folder_slash = format!("{folder}/");
         for_each_script_mut(&mut self.scripts, &mut |script| {
             if let Some(pkg) = script_package_field(script) {
                 let under = pkg
                     .as_deref()
-                    .is_some_and(|p| p == folder || p.starts_with(&folder_slash));
+                    .is_some_and(|path| folder_relative_suffix(path, folder).is_some());
                 if under {
                     *pkg = target.clone();
                 }
@@ -1240,22 +1754,40 @@ fn for_each_script_mut(scripts: &mut BTreeMap<String, Script>, f: &mut impl FnMu
     }
 }
 
-fn collect_scripts_under(
-    scripts: &BTreeMap<String, Script>,
-    folder: &str,
-    folder_slash: &str,
-    out: &mut Vec<String>,
-) {
+fn collect_scripts_under(scripts: &BTreeMap<String, Script>, folder: &str, out: &mut Vec<String>) {
     for (name, script) in scripts {
         if let Script::Folder(_, children) = script {
-            collect_scripts_under(children, folder, folder_slash, out);
+            collect_scripts_under(children, folder, out);
         } else {
             let pkg = script.folder_name();
-            if pkg == Some(folder) || pkg.is_some_and(|p| p.starts_with(folder_slash)) {
+            if pkg.is_some_and(|path| folder_relative_suffix(path, folder).is_some()) {
                 out.push(name.clone());
             }
         }
     }
+}
+
+/// Returns the segment-wise suffix of `path` below the exact stored `folder`. Unambiguous legacy
+/// case variants are canonicalized when the script tree merges with packages.json; exact matching
+/// here preserves still-distinct legacy case-only sibling folders during rename and delete.
+fn folder_relative_suffix(path: &str, folder: &str) -> Option<String> {
+    let path_components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let folder_components = folder
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if path_components.len() < folder_components.len()
+        || !path_components
+            .iter()
+            .zip(&folder_components)
+            .all(|(path, folder)| path == folder)
+    {
+        return None;
+    }
+    Some(path_components[folder_components.len()..].join("/"))
 }
 
 #[allow(non_snake_case)]
@@ -1398,26 +1930,6 @@ impl AutomationsWindow {
             );
         }
         Some(container(bar).width(Length::Fill).into())
-    }
-
-    fn behavior_radios<'a>(&self, current: ScriptLang) -> Elem<'a> {
-        row![
-            radio(
-                crate::i18n::t!("editor-send-text"),
-                ScriptLang::Plaintext,
-                Some(current),
-                Message::SetBehavior
-            ),
-            radio(
-                "JavaScript",
-                ScriptLang::JS,
-                Some(current),
-                Message::SetBehavior
-            ),
-        ]
-        .spacing(24.0)
-        .align_y(Vertical::Center)
-        .into()
     }
 
     /// The "When it runs" module behind its disclosure: hidden as a text link
@@ -1660,55 +2172,47 @@ impl AutomationsWindow {
     /// the body editor it labels — the tab IS the field's label. Each tab has
     /// its own draft, so switching never destroys work; a TS automation opens
     /// under (and saves from) the JavaScript tab as TS.
-    fn action_module<'a>(&'a self, language: ScriptLang, references: Vec<String>) -> Elem<'a> {
+    fn action_tab_strip<'a>(
+        &'a self,
+        language: ScriptLang,
+        control_name: &'static str,
+    ) -> Elem<'a> {
         let text_active = language == ScriptLang::Plaintext;
-        let tab = |label: &'static str, active: bool, message: Message| {
-            button(
-                column![
-                    text(label).size(13.0).style(if active {
-                        common::regular
-                    } else {
-                        common::muted
-                    }),
-                    container(Space::new())
-                        .height(Length::Fixed(2.0))
-                        .width(Length::Fill)
-                        .style(move |_theme: &Theme| iced::widget::container::Style {
-                            background: Some(iced::Background::Color(if active {
-                                common::KIND_PATTERN
-                            } else {
-                                iced::Color::TRANSPARENT
-                            })),
-                            ..Default::default()
-                        }),
-                ]
-                .spacing(4.0),
-            )
-            .style(|_theme: &Theme, _status| iced::widget::button::Style {
-                background: None,
-                ..Default::default()
-            })
-            .padding(Padding {
-                top: 4.0,
-                bottom: 0.0,
-                left: 2.0,
-                right: 2.0,
-            })
-            .on_press(message)
-        };
+        let script_language = self.action_script_lang;
         let strip = row![
-            tab(
+            common::tab(
                 crate::i18n::ts!("editor-tab-send-text"),
                 text_active,
                 Message::SetBehavior(ScriptLang::Plaintext),
             ),
-            tab(
+            common::tab(
                 crate::i18n::ts!("editor-tab-run-js"),
                 !text_active,
                 Message::SetBehavior(self.action_script_lang),
             ),
         ]
         .spacing(16.0);
+
+        let id = Id::from(format!("automation-action-tabs:{control_name}"));
+        let focus_id = id.clone();
+        KeyboardControl::new(
+            strip,
+            id,
+            move || Message::FocusColorControl(focus_id.clone()),
+            move |key, _repeat| action_tab_key_action(key, language, script_language),
+        )
+        .focus_color(iced::Color::TRANSPARENT)
+        .into()
+    }
+
+    fn action_module<'a>(
+        &'a self,
+        language: ScriptLang,
+        references: Vec<String>,
+        control_name: &'static str,
+    ) -> Elem<'a> {
+        let text_active = language == ScriptLang::Plaintext;
+        let strip = self.action_tab_strip(language, control_name);
 
         let editor: Elem<'a> = if text_active {
             let mut known = references;
@@ -1722,33 +2226,44 @@ impl AutomationsWindow {
                 .size(13.0)
                 .padding(10.0)
                 .on_action(Message::SendTextAction)
+                .height(Length::Fill)
                 .min_height(120.0)
                 .into()
         } else {
-            self.code_editor_view(220.0)
+            self.code_editor_view(Length::Fill)
         };
-        column![strip, container(editor).style(common::code_surface_style)]
-            .spacing(0.0)
-            .into()
+        column![
+            strip,
+            container(editor)
+                .height(Length::Fill)
+                .style(common::code_surface_style)
+        ]
+        .spacing(0.0)
+        .into()
     }
 
-    /// The hotkey body editor. Plaintext keeps the legacy widget; writable
-    /// JavaScript and TypeScript use the upstream code editor.
-    fn code_editor<'a>(&'a self, language: ScriptLang) -> Elem<'a> {
+    /// The hotkey action editor uses the same tab contract as aliases and triggers.
+    fn hotkey_action_module<'a>(&'a self, language: ScriptLang) -> Elem<'a> {
+        let strip = self.action_tab_strip(language, "hotkey");
         let editor: Elem<'a> = if language == ScriptLang::Plaintext {
             text_editor(&self.hotkey_text_content)
                 .font(fonts::GEIST_MONO_VF)
+                .size(13.0)
+                .padding(10.0)
                 .on_action(Message::HotkeyTextAction)
-                .height(Length::Fixed(220.0))
+                .height(Length::Fill)
+                .min_height(120.0)
                 .into()
         } else {
-            self.code_editor_view(220.0)
+            self.code_editor_view(Length::Fill)
         };
         column![
-            common::section_label(crate::i18n::ts!("editor-script")),
-            container(editor).style(common::code_surface_style),
+            strip,
+            container(editor)
+                .height(Length::Fill)
+                .style(common::code_surface_style)
         ]
-        .spacing(6.0)
+        .spacing(0.0)
         .into()
     }
 
@@ -1760,10 +2275,16 @@ impl AutomationsWindow {
             .into()
     }
 
-    pub(super) fn view_editor<'a>(&'a self, state: &'a EditorState) -> Elem<'a> {
+    /// `viewport_height` is the scroll viewport the pane renders into; the action editor grows
+    /// into whatever of it the rest of the pane leaves.
+    pub(super) fn view_editor<'a>(
+        &'a self,
+        state: &'a EditorState,
+        viewport_height: f32,
+    ) -> Elem<'a> {
         match &state.node {
-            EditNode::Alias(alias) => self.view_alias_editor(state, alias),
-            EditNode::Hotkey(hotkey) => self.view_hotkey_editor(state, hotkey),
+            EditNode::Alias(alias) => self.view_alias_editor(state, alias, viewport_height),
+            EditNode::Hotkey(hotkey) => self.view_hotkey_editor(state, hotkey, viewport_height),
             EditNode::Trigger {
                 enabled,
                 language,
@@ -1780,6 +2301,7 @@ impl AutomationsWindow {
                 *priority,
                 *fallthrough,
                 rows,
+                viewport_height,
             ),
         }
     }
@@ -1824,6 +2346,7 @@ impl AutomationsWindow {
         &'a self,
         state: &'a EditorState,
         alias: &'a aliases::AliasDefinition,
+        viewport_height: f32,
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
         let badge_label = if alias.language == ScriptLang::Plaintext {
@@ -1939,8 +2462,8 @@ impl AutomationsWindow {
         if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
         }
-        body = body.push(self.action_module(alias.language, references));
-        if let Some(bar) = self.save_bar(
+        let editor = self.action_module(alias.language, references, "alias");
+        let bar = self.save_bar(
             create,
             !create,
             if create {
@@ -1949,22 +2472,21 @@ impl AutomationsWindow {
                 crate::i18n::ts!("action-save")
             },
             Some(crate::i18n::ts!("editor-delete-this-alias")),
-        ) {
-            body = body.push(bar);
-        }
-        pane_scroll(body)
+        );
+        pane_scroll_growing(body, editor, bar, ACTION_EDITOR_MIN_HEIGHT, viewport_height)
     }
 
     fn view_hotkey_editor<'a>(
         &'a self,
         state: &'a EditorState,
         hotkey: &'a hotkeys::HotkeyDefinition,
+        viewport_height: f32,
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
-        let badge_label = if hotkey.language == ScriptLang::JS {
-            "JavaScript"
-        } else {
+        let badge_label = if hotkey.language == ScriptLang::Plaintext {
             crate::i18n::ts!("editor-text")
+        } else {
+            "JavaScript"
         };
         let title = if create {
             crate::i18n::ts!("editor-new-hotkey")
@@ -2005,12 +2527,8 @@ impl AutomationsWindow {
                     .on_action(Message::MarkHotkeyState),
             ),
         ));
-        body = body.push(field_row(
-            crate::i18n::ts!("editor-behavior"),
-            self.behavior_radios(hotkey.language),
-        ));
-        body = body.push(self.code_editor(hotkey.language));
-        if let Some(bar) = self.save_bar(
+        let editor = self.hotkey_action_module(hotkey.language);
+        let bar = self.save_bar(
             create,
             !create,
             if create {
@@ -2019,10 +2537,8 @@ impl AutomationsWindow {
                 crate::i18n::ts!("action-save")
             },
             None,
-        ) {
-            body = body.push(bar);
-        }
-        pane_scroll(body)
+        );
+        pane_scroll_growing(body, editor, bar, ACTION_EDITOR_MIN_HEIGHT, viewport_height)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2035,6 +2551,7 @@ impl AutomationsWindow {
         priority: i32,
         fallthrough: bool,
         rows: &'a [TriggerRow],
+        viewport_height: f32,
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
         let title = if create {
@@ -2247,8 +2764,8 @@ impl AutomationsWindow {
         if let Some(rail) = self.matched_values_rail(references.clone()) {
             body = body.push(rail);
         }
-        body = body.push(self.action_module(language, references));
-        if let Some(bar) = self.save_bar(
+        let editor = self.action_module(language, references, "trigger");
+        let bar = self.save_bar(
             create,
             !create,
             if create {
@@ -2257,10 +2774,8 @@ impl AutomationsWindow {
                 crate::i18n::ts!("action-save")
             },
             Some(crate::i18n::ts!("editor-delete-this-trigger")),
-        ) {
-            body = body.push(bar);
-        }
-        pane_scroll(body)
+        );
+        pane_scroll_growing(body, editor, bar, ACTION_EDITOR_MIN_HEIGHT, viewport_height)
     }
 
     /// The three alias type cards, styled per the kind palette. Selection is
@@ -3011,6 +3526,163 @@ impl AutomationsWindow {
 
     // ---- folder + module views --------------------------------------------
 
+    pub(super) fn activation_controls<'a>(
+        &'a self,
+        activation: &ProfileActivation,
+        inherited_notices: BTreeMap<String, String>,
+    ) -> Elem<'a> {
+        let all_active = matches!(activation, ProfileActivation::All);
+        let none_active = matches!(activation, ProfileActivation::None);
+        let storage_error = self.open_activation_storage_error();
+        let storage_available = storage_error.is_none();
+        let enable_block_reason = self.activation_enable_block_reason();
+        let mut profiles = Column::new().spacing(8.0);
+        if let Some(error) = storage_error {
+            profiles = profiles.push(text(error).size(12.0).style(common::danger));
+        }
+        if let Some(reason) = enable_block_reason.as_ref() {
+            profiles = profiles.push(text(reason.clone()).size(12.0).style(common::danger));
+        }
+        if !self.profile_inventory_complete {
+            profiles = profiles.push(
+                text(crate::i18n::t!("activation-profile-inventory-error"))
+                    .size(12.0)
+                    .style(common::danger),
+            );
+        }
+        for profile_name in activation_profile_order(&self.profile_names) {
+            let name = profile_name.to_string();
+            let pointer_name = name.clone();
+            let current = profile_name == self.profile_name;
+            let label =
+                activation_profile_label(profile_name, &self.profile_names, &self.profile_captions);
+            let profile_enabled = activation.is_enabled_for(profile_name);
+            let can_toggle_profile = storage_available
+                && self.profile_inventory_complete
+                && (profile_enabled || enable_block_reason.is_none());
+            let profile_checkbox = checkbox(profile_enabled)
+                .label(label)
+                .size(14.0)
+                .text_size(13.0);
+            let profile_checkbox: Elem<'a> = if can_toggle_profile {
+                profile_checkbox
+                    .on_toggle(move |_| Message::ToggleActivationProfile(pointer_name.clone()))
+                    .into()
+            } else {
+                profile_checkbox.into()
+            };
+            let profile_checkbox = if can_toggle_profile {
+                keyboard_activation_control(
+                    profile_checkbox,
+                    Id::from(format!("automation-activation-profile:{profile_name}")),
+                    Message::ToggleActivationProfile(name),
+                )
+            } else {
+                profile_checkbox
+            };
+            let mut profile_row = row![profile_checkbox]
+                .spacing(8.0)
+                .align_y(Vertical::Center);
+            if current {
+                profile_row =
+                    profile_row.push(common::badge(crate::i18n::t!("activation-current-profile")));
+            }
+            profiles = profiles.push(profile_row);
+            if let Some(notice) = inherited_notices.get(profile_name) {
+                profiles = profiles.push(
+                    container(text(notice.clone()).size(12.0).style(common::muted)).padding(
+                        Padding {
+                            top: 0.0,
+                            right: 0.0,
+                            bottom: 4.0,
+                            left: 22.0,
+                        },
+                    ),
+                );
+            }
+        }
+        if self.profile_inventory_complete && self.profile_names.is_empty() {
+            profiles = profiles.push(
+                text(crate::i18n::t!("activation-create-profile"))
+                    .size(12.0)
+                    .style(common::muted),
+            );
+        }
+
+        let enabled_count = self
+            .profile_names
+            .iter()
+            .filter(|profile| activation.is_enabled_for(profile))
+            .count();
+        let summary = if !self.profile_inventory_complete {
+            crate::i18n::t!("activation-profile-list-unavailable")
+        } else if all_active {
+            crate::i18n::t!("activation-every-profile")
+        } else if none_active {
+            crate::i18n::t!("activation-no-profile")
+        } else {
+            crate::i18n::t!(
+                "activation-profile-count",
+                "enabled" => enabled_count,
+                "total" => self.profile_names.len()
+            )
+        };
+        let enable_button: Elem<'a> =
+            button(text(crate::i18n::t!("activation-enable-everywhere")).size(13.0))
+                .style(button_style::secondary)
+                .on_press_maybe(
+                    (storage_available && enable_block_reason.is_none() && !all_active)
+                        .then_some(Message::EnableEverywhere),
+                )
+                .into();
+        let enable_button = if all_active || !storage_available || enable_block_reason.is_some() {
+            enable_button
+        } else {
+            keyboard_activation_control(
+                enable_button,
+                Id::from("automation-activation-enable-everywhere"),
+                Message::EnableEverywhere,
+            )
+        };
+        let disable_button: Elem<'a> =
+            button(text(crate::i18n::t!("activation-disable-everywhere")).size(13.0))
+                .style(button_style::secondary)
+                .on_press_maybe(
+                    (storage_available && !none_active).then_some(Message::DisableEverywhere),
+                )
+                .into();
+        let disable_button = if none_active || !storage_available {
+            disable_button
+        } else {
+            keyboard_activation_control(
+                disable_button,
+                Id::from("automation-activation-disable-everywhere"),
+                Message::DisableEverywhere,
+            )
+        };
+        let body = column![
+            row![
+                text(crate::i18n::t!("activation-title"))
+                    .size(14.0)
+                    .font(Font {
+                        weight: iced::font::Weight::Semibold,
+                        ..fonts::GEIST_VF
+                    }),
+                iced::widget::space::horizontal(),
+                text(summary).size(12.0).style(common::muted),
+            ]
+            .align_y(Vertical::Center),
+            row![enable_button, disable_button].spacing(8.0),
+            profiles,
+        ]
+        .spacing(10.0);
+        container(body)
+            .width(Length::Fill)
+            .padding(16.0)
+            .style(common::card_style)
+            .into()
+    }
+
     pub(super) fn view_folder_editor<'a>(&'a self, state: &'a FolderState) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
         let count = if let Some(path) = &state.original_path {
@@ -3033,23 +3705,27 @@ impl AutomationsWindow {
         } else {
             crate::i18n::t!("editor-folder-summary", "count" => count)
         };
-        let actions: Option<Elem<'a>> = if create {
-            None
-        } else {
-            Some(common::pill_switch(
-                state.enabled,
-                false,
-                Some(Message::ToggleEnabled),
-            ))
-        };
-        let status = if create || state.enabled {
+        let directly_enabled = state.activation.is_enabled_for(&self.profile_name);
+        let effectively_enabled = state
+            .original_path
+            .as_deref()
+            .map_or(directly_enabled, |path| {
+                packages::is_package_effectively_enabled_for(
+                    path,
+                    &self.packages,
+                    &self.profile_name,
+                )
+            });
+        let status = if self.folder_state_error.is_some() {
+            NodeStatus::Error
+        } else if create || effectively_enabled {
             NodeStatus::Ok
         } else {
             NodeStatus::Disabled
         };
 
         let mut body =
-            column![self.scene_header(Some(status), &title, Some(subtitle), actions)].spacing(16.0);
+            column![self.scene_header(Some(status), &title, Some(subtitle), None)].spacing(16.0);
 
         if let Some(error) = &state.error {
             body = body.push(error_bar(error));
@@ -3061,12 +3737,30 @@ impl AutomationsWindow {
                 .size(14.0)
                 .into(),
         ));
-        let hint = if !create && !state.enabled {
+        let hint = if !create && !effectively_enabled {
             crate::i18n::ts!("editor-folder-disabled-help")
         } else {
             crate::i18n::ts!("editor-folder-help")
         };
         body = body.push(text(hint).size(12.0).style(common::muted));
+        let inherited_notices = state
+            .original_path
+            .as_deref()
+            .map_or_else(BTreeMap::new, |path| {
+                self.profile_names
+                .iter()
+                .filter(|profile| state.activation.is_enabled_for(profile))
+                .filter_map(|profile| {
+                    packages::disabled_ancestor_for(path, &self.packages, profile).map(|ancestor| {
+                        (
+                            profile.clone(),
+                            crate::i18n::t!("activation-folder-masked", "ancestor" => ancestor),
+                        )
+                    })
+                })
+                .collect()
+            });
+        body = body.push(self.activation_controls(&state.activation, inherited_notices));
 
         // Contents.
         if let Some(path) = &state.original_path {
@@ -3134,7 +3828,12 @@ impl AutomationsWindow {
                 bar = bar.push(
                     button(text(crate::i18n::t!("action-delete")).size(13.0))
                         .style(button_style::secondary)
-                        .on_press(Message::RequestDeleteFolder),
+                        .on_press_maybe(
+                            state
+                                .error
+                                .is_none()
+                                .then_some(Message::RequestDeleteFolder),
+                        ),
                 );
             }
             bar = bar.push(iced::widget::space::horizontal());
@@ -3166,7 +3865,17 @@ impl AutomationsWindow {
         // Find the folder's child map.
         let mut current = &self.scripts;
         for segment in folder.split('/') {
-            match current.get(segment) {
+            let matched = if let Some(exact) = current.get(segment) {
+                Some(exact)
+            } else {
+                let mut matches = current
+                    .iter()
+                    .filter(|(key, _)| naming::names_conflict(key, segment))
+                    .map(|(_, script)| script);
+                let first = matches.next();
+                matches.next().is_none().then_some(first).flatten()
+            };
+            match matched {
                 Some(Script::Folder(_, children)) => current = children,
                 _ => return out,
             }
@@ -3178,7 +3887,11 @@ impl AutomationsWindow {
                     (
                         bootstrap_icons::FOLDER_PLUS,
                         Message::SelectFolder(path.clone()),
-                        if packages::is_package_effectively_enabled(&path, &self.packages) {
+                        if packages::is_package_effectively_enabled_for(
+                            &path,
+                            &self.packages,
+                            &self.profile_name,
+                        ) {
                             NodeStatus::Ok
                         } else {
                             NodeStatus::Disabled
@@ -3207,17 +3920,35 @@ impl AutomationsWindow {
         out
     }
 
-    pub(super) fn view_module<'a>(&'a self, state: &'a ModuleState) -> Elem<'a> {
+    /// `viewport_height` is the scroll viewport the pane renders into; on the Source tab the
+    /// editor grows into whatever of it the rest of the pane leaves.
+    pub(super) fn view_module<'a>(
+        &'a self,
+        state: &'a ModuleState,
+        viewport_height: f32,
+    ) -> Elem<'a> {
         let create = state.mode == ModuleMode::Create;
+        let executable = create || smudgy_core::models::modules::is_script_module(&state.subpath);
         let title = if create {
             crate::i18n::t!("editor-new-module")
         } else {
             state.subpath.clone()
         };
         let subtitle = crate::i18n::t!("editor-module-help");
-        let mut body =
-            column![self.scene_header(Some(NodeStatus::Ok), &title, Some(subtitle), None)]
-                .spacing(16.0);
+        let enabled = executable && state.activation.is_enabled_for(&self.profile_name);
+        let mut body = column![self.scene_header(
+            executable.then_some(if self.module_state_error.is_some() {
+                NodeStatus::Error
+            } else if enabled {
+                NodeStatus::Ok
+            } else {
+                NodeStatus::Disabled
+            }),
+            &title,
+            Some(subtitle),
+            None
+        )]
+        .spacing(16.0);
         if let Some(error) = &state.error {
             body = body.push(error_bar(error));
         }
@@ -3229,16 +3960,113 @@ impl AutomationsWindow {
                     .size(14.0)
                     .into(),
             ));
+            body = body.push(self.activation_controls(&state.activation, BTreeMap::new()));
         }
 
-        let editor = self.code_editor_view(360.0);
-        body = body.push(
+        if !create {
+            let source_tab_label =
+                common::unsaved_tab_label(crate::i18n::t!("module-tab-source"), self.dirty);
+            let tabs = row![
+                module_tab_button(
+                    state.tab,
+                    ModuleTab::Settings,
+                    crate::i18n::ts!("module-tab-settings"),
+                ),
+                module_tab_button(state.tab, ModuleTab::Source, source_tab_label),
+            ]
+            .spacing(16.0);
+            let current = usize::from(state.tab == ModuleTab::Source);
+            let id = Id::from(format!("module-tabs:{}", state.subpath));
+            let focus_id = id.clone();
+            body = body.push(
+                KeyboardControl::new(
+                    tabs,
+                    id,
+                    move || Message::FocusColorControl(focus_id.clone()),
+                    move |key, _repeat| {
+                        publish_selection(linear_selection(key, current, 2), |index| {
+                            Message::SelectModuleTab(if index == 0 {
+                                ModuleTab::Settings
+                            } else {
+                                ModuleTab::Source
+                            })
+                        })
+                    },
+                )
+                .focus_color(iced::Color::TRANSPARENT),
+            );
+        }
+
+        if state.tab == ModuleTab::Settings {
+            if executable {
+                body = body.push(self.activation_controls(&state.activation, BTreeMap::new()));
+            } else {
+                body = body.push(
+                    container(
+                        text(crate::i18n::t!("module-import-only-help"))
+                            .size(12.0)
+                            .style(common::muted),
+                    )
+                    .padding(12.0)
+                    .width(Length::Fill)
+                    .style(common::banner_style),
+                );
+            }
+            if executable && state.subpath.contains('/') {
+                body = body.push(
+                    text(crate::i18n::t!("module-nested-load-help"))
+                        .size(12.0)
+                        .style(common::muted),
+                );
+            }
+            if let Some(automations) = self.live.module(&state.subpath) {
+                let total = automations.aliases.len() + automations.triggers.len();
+                if total > 0 {
+                    let creator_id = format!("module:{}", state.subpath);
+                    let mut created = Column::new()
+                        .spacing(4.0)
+                        .push(common::section_label(crate::i18n::ts!(
+                            "module-created-automations"
+                        )))
+                        .push(
+                            text(crate::i18n::t!(
+                                "automations-created-count",
+                                "count" => total as i64
+                            ))
+                            .size(12.0)
+                            .style(common::muted),
+                        );
+                    for (name, automation) in &automations.aliases {
+                        created = created.push(module_automation_row(
+                            &creator_id,
+                            AutomationKind::Alias,
+                            name,
+                            automation.enabled,
+                        ));
+                    }
+                    for (name, automation) in &automations.triggers {
+                        created = created.push(module_automation_row(
+                            &creator_id,
+                            AutomationKind::Trigger,
+                            name,
+                            automation.enabled,
+                        ));
+                    }
+                    body = body.push(created);
+                }
+            }
+        }
+        let source_editor = (create || state.tab == ModuleTab::Source).then(|| {
             column![
                 common::section_label(crate::i18n::ts!("editor-source")),
-                container(editor).style(common::code_surface_style),
+                container(self.code_editor_view(Length::Fill))
+                    .height(Length::Fill)
+                    .style(common::code_surface_style),
             ]
-            .spacing(6.0),
-        );
+            .spacing(6.0)
+            .height(Length::Fill)
+            .into()
+        });
 
         let mut bar = row![]
             .spacing(12.0)
@@ -3250,30 +4078,89 @@ impl AutomationsWindow {
                 right: 0.0,
             });
         bar = bar.push(iced::widget::space::horizontal());
-        bar = bar.push(
-            button(text(crate::i18n::t!("editor-discard")).size(13.0))
-                .style(button_style::secondary)
-                .on_press(Message::Discard),
-        );
+        if create || state.tab == ModuleTab::Source {
+            bar = bar.push(
+                button(text(crate::i18n::t!("editor-discard")).size(13.0))
+                    .style(button_style::secondary)
+                    .on_press(Message::Discard),
+            );
+        }
         if create {
             bar = bar.push(
                 button(text(crate::i18n::t!("editor-create-module")).size(13.0))
                     .style(button_style::primary)
                     .on_press(Message::CreateModule),
             );
-        } else {
+        } else if state.tab == ModuleTab::Source {
             bar = bar.push(
                 button(text(crate::i18n::t!("action-save")).size(13.0))
                     .style(button_style::primary)
                     .on_press(Message::SaveModule),
             );
         }
-        body = body.push(bar);
-        pane_scroll(body)
+        match source_editor {
+            Some(editor) => pane_scroll_growing(
+                body,
+                editor,
+                Some(bar.into()),
+                MODULE_EDITOR_MIN_HEIGHT,
+                viewport_height,
+            ),
+            None => {
+                body = body.push(bar);
+                pane_scroll(body)
+            }
+        }
     }
 }
 
 // ---- view helpers ----------------------------------------------------------
+
+fn module_tab_button<'a>(active: ModuleTab, tab: ModuleTab, label: impl Into<String>) -> Elem<'a> {
+    common::tab(label, active == tab, Message::SelectModuleTab(tab))
+}
+
+fn module_automation_row<'a>(
+    creator_id: &str,
+    kind: AutomationKind,
+    name: &str,
+    enabled: bool,
+) -> Elem<'a> {
+    let (icon, label) = match kind {
+        AutomationKind::Alias => (bootstrap_icons::AT, crate::i18n::ts!("automations-aliases")),
+        AutomationKind::Trigger => (
+            bootstrap_icons::LIGHTNING,
+            crate::i18n::ts!("automations-triggers"),
+        ),
+        AutomationKind::Hotkey => (
+            bootstrap_icons::DPAD,
+            crate::i18n::ts!("automations-hotkeys"),
+        ),
+    };
+    button(
+        row![
+            common::status_dot(if enabled {
+                NodeStatus::Ok
+            } else {
+                NodeStatus::Disabled
+            }),
+            text(icon).font(fonts::BOOTSTRAP_ICONS).size(14.0),
+            text(name.to_string()).size(13.0),
+            iced::widget::space::horizontal(),
+            common::badge(label),
+        ]
+        .spacing(8.0)
+        .align_y(Vertical::Center),
+    )
+    .style(button_style::list_item)
+    .on_press(Message::SelectCreatorAutomation {
+        creator_id: creator_id.to_string(),
+        kind,
+        name: name.to_string(),
+    })
+    .width(Length::Fill)
+    .into()
+}
 
 fn subtitle_for(create: bool, kind: &str, package: Option<&str>) -> String {
     if create {
@@ -4574,7 +5461,7 @@ fn dot_with_tooltip<'a>(status: NodeStatus, role: PatternKind) -> Elem<'a> {
         NodeStatus::Error if role == PatternKind::Anti => crate::i18n::t!("editor-dot-blocks"),
         NodeStatus::Disabled => crate::i18n::t!("editor-dot-no-match"),
         // A compile error already reads inline; the dot stays bare.
-        NodeStatus::Error | NodeStatus::Warning => return dot.into(),
+        NodeStatus::Neutral | NodeStatus::Error | NodeStatus::Warning => return dot.into(),
     };
     tip(dot.into(), label)
 }
@@ -4776,6 +5663,7 @@ fn error_slot<'a>(message: Option<&str>) -> Elem<'a> {
 
 fn verdict_style(status: NodeStatus) -> fn(&Theme) -> iced::widget::text::Style {
     match status {
+        NodeStatus::Neutral => common::muted,
         NodeStatus::Ok => common::success,
         NodeStatus::Error => common::danger,
         NodeStatus::Warning => common::warning,
@@ -4969,7 +5857,23 @@ fn alias_verdict(pattern: &str, sample: &str) -> (String, NodeStatus) {
 
 /// Wraps a pane body in the standard padded, width-capped column.
 pub(super) fn pane_scroll<'a>(body: Column<'a, Message, Theme>) -> Elem<'a> {
-    container(body.max_width(860.0).width(Length::Fill))
+    pane_scroll_element(body.width(Length::Fill).into())
+}
+
+/// The smallest height an alias, trigger, or hotkey action editor (tab strip included) takes
+/// before the pane starts scrolling.
+const ACTION_EDITOR_MIN_HEIGHT: f32 = 260.0;
+/// The smallest height a module's source editor (section label included) takes before the pane
+/// starts scrolling.
+const MODULE_EDITOR_MIN_HEIGHT: f32 = 400.0;
+
+/// Vertical room the pane wrapper's own padding takes from the scroll viewport.
+const PANE_PADDING_HEIGHT: f32 = 26.0 + 32.0;
+
+/// The pane wrapper for already-built content: the same padding as [`pane_scroll`], the full
+/// width of the window.
+pub(super) fn pane_scroll_element(body: Elem<'_>) -> Elem<'_> {
+    container(body)
         .padding(Padding {
             top: 26.0,
             bottom: 32.0,
@@ -4980,12 +5884,137 @@ pub(super) fn pane_scroll<'a>(body: Column<'a, Message, Theme>) -> Elem<'a> {
         .into()
 }
 
+/// A pane whose `editor` takes every pixel of `viewport_height` the rest of the pane leaves,
+/// down to `min_editor_height`; below that the pane scrolls. `top` is everything above the
+/// editor, `bottom` everything below it (a save bar, usually).
+pub(super) fn pane_scroll_growing<'a>(
+    top: Column<'a, Message, Theme>,
+    editor: Elem<'a>,
+    bottom: Option<Elem<'a>>,
+    min_editor_height: f32,
+    viewport_height: f32,
+) -> Elem<'a> {
+    let mut children: Vec<Elem<'a>> = vec![top.width(Length::Fill).into(), editor];
+    children.extend(bottom);
+    pane_scroll_element(
+        crate::widgets::grow_column::GrowColumn::new(
+            children,
+            1,
+            min_editor_height,
+            viewport_height - PANE_PADDING_HEIGHT,
+        )
+        .spacing(16.0)
+        .into(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use iced::advanced::Widget;
     use iced::advanced::widget::tree::Tree;
+    use iced::keyboard::key::Named;
 
     use super::*;
+
+    #[test]
+    fn folder_subtree_matching_preserves_exact_case_siblings() {
+        assert_eq!(
+            folder_relative_suffix("Combat/Healing/Fast", "Combat/Healing").as_deref(),
+            Some("Fast")
+        );
+        assert_eq!(folder_relative_suffix("COMBAT", "combat"), None);
+        assert_eq!(folder_relative_suffix("combatant", "combat"), None);
+    }
+
+    #[test]
+    fn action_tabs_support_keyboard_navigation_in_both_directions() {
+        let to_script = action_tab_key_action(
+            &Key::Named(Named::ArrowRight),
+            ScriptLang::Plaintext,
+            ScriptLang::TS,
+        );
+        assert!(matches!(
+            to_script,
+            KeyAction::Publish(Message::SetBehavior(ScriptLang::TS))
+        ));
+
+        let to_text = action_tab_key_action(
+            &Key::Named(Named::ArrowLeft),
+            ScriptLang::JS,
+            ScriptLang::JS,
+        );
+        assert!(matches!(
+            to_text,
+            KeyAction::Publish(Message::SetBehavior(ScriptLang::Plaintext))
+        ));
+    }
+
+    #[test]
+    fn activation_profiles_preserve_caption_order() {
+        let profiles = vec![
+            "Testing".to_string(),
+            "Builder".to_string(),
+            "Main".to_string(),
+            "healer".to_string(),
+        ];
+
+        assert_eq!(
+            activation_profile_order(&profiles),
+            vec!["Testing", "Builder", "Main", "healer"]
+        );
+    }
+
+    #[test]
+    fn activation_controls_publish_bulk_and_profile_actions_from_the_keyboard() {
+        let bulk = activation_control_key_action(
+            &Key::Named(Named::Space),
+            false,
+            Message::EnableEverywhere,
+        );
+        assert!(matches!(
+            bulk,
+            KeyAction::Publish(Message::EnableEverywhere)
+        ));
+
+        let profile = activation_control_key_action(
+            &Key::Named(Named::Enter),
+            false,
+            Message::ToggleActivationProfile("Main".to_string()),
+        );
+        assert!(matches!(
+            profile,
+            KeyAction::Publish(Message::ToggleActivationProfile(name)) if name == "Main"
+        ));
+    }
+
+    #[test]
+    fn unsaved_package_drafts_block_only_activation_that_enables_execution() {
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "activation-draft-test".to_string(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.pane = Pane::OwnedPackage;
+        window.dirty = true;
+        window.profile_names = vec!["Main".to_string(), "Alt".to_string()];
+
+        assert!(window.activation_enable_block_reason().is_some());
+        assert!(window.activation_change_enables_more_profiles(
+            &ProfileActivation::None,
+            &ProfileActivation::All,
+        ));
+        assert!(!window.activation_change_enables_more_profiles(
+            &ProfileActivation::All,
+            &ProfileActivation::None,
+        ));
+        assert!(!window.activation_change_enables_more_profiles(
+            &ProfileActivation::All,
+            &ProfileActivation::Selected {
+                profiles: ["Main".to_string()].into_iter().collect(),
+            },
+        ));
+    }
 
     #[test]
     fn color_control_ids_and_palette_labels_are_stable_and_locale_neutral() {

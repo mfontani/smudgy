@@ -121,6 +121,24 @@ pub type Renderer = iced::Renderer;
 /// verbatim in that banner's label (single-sourced here so the two stay in sync).
 pub(crate) const DOWNLOAD_URL: &str = "https://www.smudgy.org/download";
 
+/// The session binding requested for the app-wide Automations window. While the OS window is
+/// still opening, later requests replace this value so one delayed `window::open` result cannot
+/// create a second window or land on an obsolete session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutomationsContext {
+    server_name: String,
+    session_id: SessionId,
+    profile_name: String,
+}
+
+/// An Automations native window whose asynchronous `window::open` completion has not registered
+/// application state yet. Keeping its id lets an intervening native close cancel the exact open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpeningAutomationsWindow {
+    id: window::Id,
+    context: AutomationsContext,
+}
+
 // Main application state
 struct Smudgy {
     #[cfg(feature = "web-audio-cpal")]
@@ -152,7 +170,18 @@ struct Smudgy {
     pending_ordered_pane_closes: HashSet<PaneRef>,
     last_ui_command_seq: HashMap<SessionId, u64>,
     smudgy_windows: BTreeMap<window::Id, SmudgyWindow>,
-    automations_windows: BTreeMap<window::Id, AutomationsWindow>,
+    /// Main native windows requested through `window::open` but not registered by their deferred
+    /// completion yet. A close that overtakes `NewSmudgyWindow` removes the id here so the late
+    /// completion cannot resurrect an unclaimed application window.
+    opening_smudgy_windows: HashSet<window::Id>,
+    /// The app owns one Automations window; opening it for another session rebuilds the state
+    /// inside this same native window.
+    automations_window: Option<(window::Id, AutomationsWindow)>,
+    /// The latest requested context while the singleton OS window is being created.
+    automations_window_opening: Option<OpeningAutomationsWindow>,
+    /// Stamped on every task and subscription message produced by an Automations state. Rebuilding
+    /// the window increments it, so a result from a task started before the rebuild is dropped.
+    automations_context_generation: u64,
     map_editor_windows: BTreeMap<window::Id, MapEditorWindow>,
     settings_windows: BTreeMap<window::Id, SettingsWindow>,
     /// Areas the user excludes from room identification, mirrored from
@@ -206,6 +235,9 @@ struct Smudgy {
     /// — otherwise two windows emptied in separate updates can each close and
     /// leave zero windows, exiting the app against the keep-one-alive rule.
     closing_windows: HashSet<window::Id>,
+    /// The last main window that is waiting for the Automations terminal guard. It remains alive
+    /// until that guard confirms close; cancellation releases it back to ordinary use.
+    main_window_close_after_automations: Option<window::Id>,
     /// The live-workspace mirror's scheduling state and runtime↔durable
     /// identity maps (stable window/slot ids, polled geometry, snapshot
     /// generations). Windows and sessions raise cheap dirty flags; the
@@ -417,6 +449,7 @@ enum AudioTarget {
 
 #[derive(Debug, Clone)]
 enum Message {
+    RequestCloseWindow(window::Id),
     CloseWindow(window::Id),
     Account(cloud_account::Message),
     /// ~24h cloud-session keep-alive: slide the session's idle deadline so a
@@ -500,15 +533,18 @@ enum Message {
     // the other `Create*Window` variants; no sender currently emits it.
     #[allow(dead_code)]
     CreateSmudgyWindow,
-    AutomationsWindowMessage(window::Id, windows::automations_window::Message),
-    NewAutomationsWindow {
+    AutomationsWindowMessage {
         id: window::Id,
-        server_name: Arc<String>,
-        session_id: smudgy_core::session::SessionId,
+        generation: u64,
+        message: windows::automations_window::Message,
     },
+    NewAutomationsWindow(window::Id),
     CreateAutomationsWindow {
         server_name: Arc<String>,
         session_id: smudgy_core::session::SessionId,
+        /// Captured with the originating session request. Do not look it up again after this
+        /// queued message runs: the session may have closed or changed in the meantime.
+        profile_name: String,
     },
     MapEditorWindowMessage(window::Id, windows::map_editor_window::Message),
     NewMapEditorWindow {
@@ -626,7 +662,9 @@ fn smudgy_window_settings() -> window::Settings {
     window::Settings {
         decorations: cfg!(target_os = "macos"),
         min_size: Some(Size::new(640.0, 400.0)),
-        exit_on_close_request: true,
+        // The daemon closes main windows explicitly so the last one can first route through the
+        // singleton Automations window's unsaved/durability terminal guard.
+        exit_on_close_request: false,
         // Alpha surface so the pixels outside the self-drawn frame's corner
         // arcs stay empty (Wayland only; the X11 surface stays opaque).
         #[cfg(target_os = "linux")]
@@ -667,6 +705,15 @@ fn secondary_window_settings(min_size: Size) -> window::Settings {
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+/// The Automations singleton must receive a close request before the native window disappears so
+/// its existing unsaved-draft guard can decide whether to close it.
+fn automations_window_settings() -> window::Settings {
+    window::Settings {
+        exit_on_close_request: false,
+        ..secondary_window_settings(Size::new(900.0, 560.0))
     }
 }
 
@@ -781,7 +828,7 @@ fn init(
     let restore_state = workspace::restore::RestoreState::default();
     let smudgy_windows: BTreeMap<window::Id, SmudgyWindow> = BTreeMap::new();
     let mut open_tasks: Vec<Task<Message>> = Vec::new();
-    let (_id, open) = window::open(smudgy_window_settings());
+    let (id, open) = window::open(smudgy_window_settings());
     open_tasks.push(open.map(Message::NewSmudgyWindow));
     #[cfg(feature = "web-audio-cpal")]
     let audio_output_failure_task = audio_output_failure_task(audio_output_failures);
@@ -812,7 +859,10 @@ fn init(
             pending_ordered_pane_closes: HashSet::new(),
             last_ui_command_seq: HashMap::new(),
             smudgy_windows,
-            automations_windows: BTreeMap::new(),
+            opening_smudgy_windows: HashSet::from([id]),
+            automations_window: None,
+            automations_window_opening: None,
+            automations_context_generation: 0,
             map_editor_windows: BTreeMap::new(),
             settings_windows: BTreeMap::new(),
             disabled_map_areas,
@@ -826,6 +876,7 @@ fn init(
             tab_drag: None,
             tab_press: None,
             closing_windows: HashSet::new(),
+            main_window_close_after_automations: None,
             workspace: workspace_mirror,
             restore: restore_state,
             layout_saver: workspace::layouts::DebouncedSaver::new(),
@@ -987,7 +1038,7 @@ pub fn run() -> anyhow::Result<()> {
     let iced_result = daemon
         .theme(|smudgy: &Smudgy, window_id| {
             if smudgy.smudgy_windows.contains_key(&window_id)
-                || smudgy.automations_windows.contains_key(&window_id)
+                || smudgy.automations_window_id() == Some(window_id)
             {
                 // Palette-aware: re-evaluated per frame, so theme changes in
                 // the Preferences tab apply live. Automations joins the main
@@ -1034,7 +1085,7 @@ pub fn run() -> anyhow::Result<()> {
         .font(assets::fonts::FIXEDSYS_EX_BYTES)
         .default_font(assets::fonts::GEIST_VF)
         .title(|smudgy: &Smudgy, window_id: window::Id| {
-            if let Some(window) = smudgy.automations_windows.get(&window_id) {
+            if let Some(window) = smudgy.automations_window(window_id) {
                 i18n::t!("window-automations", "server" => window.server_name())
             } else if let Some(window) = smudgy.map_editor_windows.get(&window_id) {
                 window.title()
@@ -1104,13 +1155,19 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
                 .map(|(id, window)| window.subscription().with(*id)),
         )
         .map(|(id, msg)| Message::MapEditorWindowMessage(id, msg)),
-        Subscription::batch(
-            smudgy
-                .automations_windows
-                .iter()
-                .map(|(id, window)| window.subscription().with(*id)),
-        )
-        .map(|(id, msg)| Message::AutomationsWindowMessage(id, msg)),
+        Subscription::batch(smudgy.automations_window.iter().map(|(id, window)| {
+            window
+                .subscription()
+                .with((*id, smudgy.automations_context_generation))
+        }))
+        .map(
+            |((id, generation), message)| Message::AutomationsWindowMessage {
+                id,
+                generation,
+                message,
+            },
+        ),
+        window::close_requests().map(Message::RequestCloseWindow),
         window::close_events().map(Message::CloseWindow),
         // Window geometry + cursor tracking for pane drags. `listen_with`
         // (not `listen`): captured events must still reach the tracker. The
@@ -2942,6 +2999,136 @@ fn begin_workspace_quit_flush(smudgy: &mut Smudgy) -> Option<Task<Message>> {
     ))
 }
 
+/// A requested Automations context is usable only while its session is still open.
+fn automations_context_is_live(smudgy: &Smudgy, context: &AutomationsContext) -> bool {
+    smudgy.sessions.get(context.session_id).is_some()
+}
+
+fn all_main_windows_are_closing(
+    registered: impl IntoIterator<Item = window::Id>,
+    opening: impl IntoIterator<Item = window::Id>,
+    closing: &HashSet<window::Id>,
+) -> bool {
+    let mut any = false;
+    for id in registered.into_iter().chain(opening) {
+        any = true;
+        if !closing.contains(&id) {
+            return false;
+        }
+    }
+    any
+}
+
+fn cancel_opening_automations_window(
+    opening: &mut Option<OpeningAutomationsWindow>,
+    id: window::Id,
+) -> bool {
+    if opening.as_ref().is_some_and(|pending| pending.id == id) {
+        *opening = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn take_opening_automations_context(
+    opening: &mut Option<OpeningAutomationsWindow>,
+    id: window::Id,
+) -> Option<AutomationsContext> {
+    let pending = opening.take()?;
+    if pending.id == id {
+        Some(pending.context)
+    } else {
+        // A cancelled old native open can complete after a replacement was requested. Preserve
+        // the newer exact id/context so only its own completion may claim it.
+        *opening = Some(pending);
+        None
+    }
+}
+
+fn automations_account_identity(
+    account: &CloudAccount,
+) -> (u64, bool, Option<smudgy_cloud::Uuid>, Option<String>) {
+    let handles = account.handles();
+    let snapshot = handles.snapshot.get();
+    (
+        handles.credentials.generation(),
+        snapshot.signed_in,
+        snapshot.profile.as_ref().map(|profile| profile.id),
+        snapshot.nickname_text(),
+    )
+}
+
+fn notify_automations_account_changed(smudgy: &mut Smudgy) -> Task<Message> {
+    let generation = smudgy.automations_context_generation;
+    let Some((id, window)) = smudgy.automations_window.as_mut() else {
+        return Task::none();
+    };
+    let id = *id;
+    // Clear private account-scoped state in this daemon turn. A queued notification leaves a gap
+    // in which an old authenticated read can arrive after the credential already changed.
+    let update = window.update(windows::automations_window::Message::AccountChanged);
+    debug_assert!(update.event.is_none());
+    update
+        .task
+        .map(move |message| Message::AutomationsWindowMessage {
+            id,
+            generation,
+            message,
+        })
+}
+
+/// Install a fresh Automations state in an existing or newly-created OS window. The generation is
+/// advanced before any initialization task is mapped; therefore no result minted by the replaced
+/// state can enter the new one, even though both states share the same iced window id.
+fn install_automations_context(
+    smudgy: &mut Smudgy,
+    id: window::Id,
+    context: AutomationsContext,
+) -> Option<Task<Message>> {
+    // The request and any dirty-state confirmation cross daemon turns. A session can close during
+    // either gap, so check it at the last point before replacing window state.
+    if !automations_context_is_live(smudgy, &context) {
+        return None;
+    }
+    smudgy.automations_context_generation = smudgy.automations_context_generation.wrapping_add(1);
+    let generation = smudgy.automations_context_generation;
+    let window = AutomationsWindow::new_for_profile(
+        id,
+        context.server_name,
+        smudgy.account.handles(),
+        context.session_id,
+        context.profile_name,
+    );
+    let task = window.init();
+    smudgy.automations_window = Some((id, window));
+    Some(task.map(move |message| Message::AutomationsWindowMessage {
+        id,
+        generation,
+        message,
+    }))
+}
+
+impl Smudgy {
+    fn automations_window_id(&self) -> Option<window::Id> {
+        self.automations_window.as_ref().map(|(id, _)| *id)
+    }
+
+    fn automations_window(&self, id: window::Id) -> Option<&AutomationsWindow> {
+        self.automations_window
+            .as_ref()
+            .filter(|(current, _)| *current == id)
+            .map(|(_, window)| window)
+    }
+
+    fn automations_window_mut(&mut self, id: window::Id) -> Option<&mut AutomationsWindow> {
+        self.automations_window
+            .as_mut()
+            .filter(|(current, _)| *current == id)
+            .map(|(_, window)| window)
+    }
+}
+
 fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     // QA forensics (debug builds only): change-gated OS capture-owner
     // sampling. Runs for every message; during a drag the motion message
@@ -3197,9 +3384,84 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::RequestCloseWindow(id) => {
+            if let Some(window) = smudgy.automations_window_mut(id) {
+                // A close request supersedes any queued session switch.
+                window.cancel_pending_context_switch();
+                // Route the close in this daemon turn so a newer open request cannot overtake it.
+                return update_body(
+                    smudgy,
+                    Message::AutomationsWindowMessage {
+                        id,
+                        generation: smudgy.automations_context_generation,
+                        message: windows::automations_window::Message::RequestClose,
+                    },
+                );
+            }
+            if cancel_opening_automations_window(&mut smudgy.automations_window_opening, id) {
+                // The native request can overtake `NewAutomationsWindow`. Cancel the exact open;
+                // its late completion will be unclaimed and cannot resurrect the singleton.
+                smudgy.automations_window_opening = None;
+                return window::close(id);
+            }
+            if smudgy.smudgy_windows.contains_key(&id) {
+                if !smudgy.closing_windows.insert(id) {
+                    return Task::none();
+                }
+                let is_last_main = all_main_windows_are_closing(
+                    smudgy.smudgy_windows.keys().copied(),
+                    smudgy.opening_smudgy_windows.iter().copied(),
+                    &smudgy.closing_windows,
+                );
+                if is_last_main {
+                    if let Some((automations_id, window)) = smudgy.automations_window.as_mut() {
+                        let automations_id = *automations_id;
+                        window.cancel_pending_context_switch();
+                        smudgy.main_window_close_after_automations = Some(id);
+                        let generation = smudgy.automations_context_generation;
+                        return Task::batch([
+                            window::gain_focus(automations_id),
+                            update_body(
+                                smudgy,
+                                Message::AutomationsWindowMessage {
+                                    id: automations_id,
+                                    generation,
+                                    message: windows::automations_window::Message::RequestClose,
+                                },
+                            ),
+                        ]);
+                    }
+                    if let Some(opening) = smudgy.automations_window_opening.take() {
+                        // No Automations state exists yet, so there is no draft to confirm. Close
+                        // the pending native tool window before allowing the last main to exit.
+                        return Task::batch([window::close(opening.id), window::close(id)]);
+                    }
+                }
+                return window::close(id);
+            }
+            if smudgy.opening_smudgy_windows.remove(&id) {
+                // As with the Automations singleton, a native close may arrive before the open
+                // completion registers application state.
+                let close = window::close(id);
+                if smudgy.smudgy_windows.is_empty()
+                    && smudgy.opening_smudgy_windows.is_empty()
+                    && smudgy.automations_window.is_none()
+                    && smudgy.automations_window_opening.is_none()
+                {
+                    return Task::batch([close, iced::exit()]);
+                }
+                return close;
+            }
+            // Other tool windows retain the default native close behavior; their `CloseWindow`
+            // event performs model cleanup below.
+            Task::none()
+        }
         Message::CloseWindow(id) => {
             smudgy.window_tracker.remove(id);
             smudgy.closing_windows.remove(&id);
+            if smudgy.main_window_close_after_automations == Some(id) {
+                smudgy.main_window_close_after_automations = None;
+            }
             #[cfg(feature = "web-audio-cpal")]
             smudgy.audio_panel.focused_widgets.remove(&id);
             // The source window dying mid-drag ends the drag: its model is
@@ -3221,12 +3483,18 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // here, ahead of the removal below; the teardown that follows can
             // no longer mark or build (the schedule latches shut), so no
             // emptied state can overwrite the flush.
-            let quit_flush =
-                if smudgy.smudgy_windows.len() == 1 && smudgy.smudgy_windows.contains_key(&id) {
-                    begin_workspace_quit_flush(smudgy)
-                } else {
-                    None
-                };
+            let opening_main_survives = smudgy
+                .opening_smudgy_windows
+                .iter()
+                .any(|opening| !smudgy.closing_windows.contains(opening));
+            let quit_flush = if smudgy.smudgy_windows.len() == 1
+                && smudgy.smudgy_windows.contains_key(&id)
+                && !opening_main_survives
+            {
+                begin_workspace_quit_flush(smudgy)
+            } else {
+                None
+            };
             if let Some(window) = smudgy.smudgy_windows.remove(&id) {
                 smudgy.workspace.forget_window(id);
                 // Window-close cascade: closing a window closes every session
@@ -3246,6 +3514,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     .collect();
                 for session_id in &victims {
                     smudgy.sessions.shutdown_and_remove(*session_id);
+                    retire_automations_session_binding(smudgy, *session_id);
                     forget_session_pane_commands(smudgy, *session_id);
                 }
                 let purge_task = purge_sessions_from_windows(smudgy, &victims);
@@ -3266,7 +3535,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         },
                     );
                 }
-                if smudgy.smudgy_windows.is_empty() {
+                if smudgy.smudgy_windows.is_empty() && !opening_main_survives {
                     for editor in smudgy.map_editor_windows.values() {
                         editor.prepare_to_close();
                     }
@@ -3282,9 +3551,31 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     smudgy.workspace.schedule.mark();
                     purge_task
                 }
-            } else if smudgy.automations_windows.contains_key(&id) {
-                smudgy.automations_windows.remove(&id);
+            } else if smudgy.automations_window_id() == Some(id) {
+                smudgy.automations_window = None;
+                // A forced/unexpected native close is not confirmation to discard Automations
+                // state. Release a last main window that was waiting on that confirmation.
+                if let Some(main_id) = smudgy.main_window_close_after_automations.take() {
+                    smudgy.closing_windows.remove(&main_id);
+                }
+                // Drop every in-flight result from the closed window: none may enter a later
+                // window that happens to reuse this OS id.
+                smudgy.automations_context_generation =
+                    smudgy.automations_context_generation.wrapping_add(1);
                 Task::none()
+            } else if cancel_opening_automations_window(&mut smudgy.automations_window_opening, id)
+            {
+                Task::none()
+            } else if smudgy.opening_smudgy_windows.remove(&id) {
+                if smudgy.smudgy_windows.is_empty()
+                    && smudgy.opening_smudgy_windows.is_empty()
+                    && smudgy.automations_window.is_none()
+                    && smudgy.automations_window_opening.is_none()
+                {
+                    iced::exit()
+                } else {
+                    Task::none()
+                }
             } else if smudgy.settings_windows.contains_key(&id) {
                 smudgy.settings_windows.remove(&id);
                 Task::none()
@@ -3296,7 +3587,16 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Task::none()
             }
         }
-        Message::Account(msg) => smudgy.account.update(msg).map(Message::Account),
+        Message::Account(msg) => {
+            let before = automations_account_identity(&smudgy.account);
+            let task = smudgy.account.update(msg).map(Message::Account);
+            let after = automations_account_identity(&smudgy.account);
+            if before == after {
+                task
+            } else {
+                Task::batch([task, notify_automations_account_changed(smudgy)])
+            }
+        }
         Message::SmudgyWindowMessage(id, msg) => {
             let Some(window) = smudgy.smudgy_windows.get_mut(&id) else {
                 log::warn!("Received message for unknown window index: {}", id);
@@ -3308,16 +3608,25 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 .map(move |message| Message::SmudgyWindowMessage(id, message));
 
             let handled = match update.event {
+                Some(SmudgyWindowEvent::RequestCloseWindow) => Task::batch([
+                    task,
+                    // Route custom chrome through the same daemon-owned close path as an OS
+                    // request. Closing the last main window must first honor Automations guards.
+                    update_body(smudgy, Message::RequestCloseWindow(id)),
+                ]),
                 Some(SmudgyWindowEvent::CreateNewScriptEditorWindow {
                     server_name,
                     session_id,
-                }) => Task::batch([
-                    task,
-                    Task::done(Message::CreateAutomationsWindow {
-                        server_name,
-                        session_id,
-                    }),
-                ]),
+                }) => {
+                    let open = smudgy.sessions.get(session_id).map(|session| {
+                        Task::done(Message::CreateAutomationsWindow {
+                            server_name,
+                            session_id,
+                            profile_name: session.profile_name.clone(),
+                        })
+                    });
+                    Task::batch([Some(task), open].into_iter().flatten())
+                }
                 Some(SmudgyWindowEvent::CreateNewMapEditorWindow {
                     mapper,
                     server_name,
@@ -3493,66 +3802,64 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 }
                 Some(SmudgyWindowEvent::PackageUpdateDismissed {
                     server_name,
+                    expected,
                     specifier,
                     version,
                 }) => {
-                    if let Err(e) =
-                        smudgy_core::models::shared_packages::set_dismissed_update_version(
+                    match smudgy_core::models::shared_packages::set_dismissed_update_version_if_unchanged(
                             &server_name,
-                            &specifier,
+                            &expected,
                             &version,
-                        )
-                    {
-                        log::warn!("failed to record the dismissed update for {specifier}: {e}");
+                        ) {
+                        Ok(true) => {}
+                        Ok(false) => log::info!(
+                            "ignored a stale update dismissal for {specifier}: package state changed"
+                        ),
+                        Err(e) => log::warn!(
+                            "failed to record the dismissed update for {specifier}: {e}"
+                        ),
                     }
                     task
                 }
                 Some(SmudgyWindowEvent::PackageUpdatePinned {
                     server_name,
+                    expected,
                     specifier,
                     version,
                 }) => {
-                    if let Err(e) = smudgy_core::models::shared_packages::set_update_mode(
+                    match smudgy_core::models::shared_packages::set_update_mode_if_unchanged(
                         &server_name,
-                        &specifier,
+                        &expected,
                         smudgy_core::models::shared_packages::UpdateMode::Pinned { version },
                     ) {
-                        log::warn!("failed to pin {specifier}: {e}");
+                        Ok(smudgy_core::models::shared_packages::Cas::Applied) => {}
+                        Ok(smudgy_core::models::shared_packages::Cas::StateChanged) => log::info!(
+                            "ignored a stale update pin for {specifier}: package state changed"
+                        ),
+                        Err(e) => log::warn!("failed to pin {specifier}: {e}"),
                     }
                     task
                 }
                 Some(SmudgyWindowEvent::PackageUpdateGranted { offer }) => {
-                    // Consent lands first — enforcement reads the lockfile, so the
-                    // staged closure union must already sit within it before any
-                    // reload can serve the new version.
-                    match smudgy_core::models::shared_packages::record_consent(
-                        &offer.server_name,
-                        &offer.specifier,
-                        &offer.new_union,
-                    ) {
-                        Ok(()) => {
-                            let handles = smudgy.account.handles();
-                            let client = smudgy_cloud::package_api::PackageApiClient::new(
-                                handles.base_url.as_str(),
-                                handles.credentials.clone(),
-                            );
-                            let server_name = offer.server_name.clone();
-                            let name = offer.name.clone();
-                            let stage = Task::perform(
-                                package_update_checker::stage_offer(client, *offer),
-                                move |result| Message::PackageUpdateStaged {
-                                    server_name: server_name.clone(),
-                                    name: name.clone(),
-                                    result,
-                                },
-                            );
-                            Task::batch([task, stage])
-                        }
-                        Err(e) => {
-                            log::warn!("failed to record consent for {}: {e}", offer.specifier);
-                            task
-                        }
-                    }
+                    // Prefetch first, then compare the complete evaluated lock row and commit the
+                    // new consent + staged version together. An old toast cannot change a package
+                    // the user edited, uninstalled, or reinstalled while it was visible.
+                    let handles = smudgy.account.handles();
+                    let client = smudgy_cloud::package_api::PackageApiClient::new(
+                        handles.base_url.as_str(),
+                        handles.credentials.clone(),
+                    );
+                    let server_name = offer.server_name.clone();
+                    let name = offer.name.clone();
+                    let stage = Task::perform(
+                        package_update_checker::stage_offer(client, *offer),
+                        move |result| Message::PackageUpdateStaged {
+                            server_name: server_name.clone(),
+                            name: name.clone(),
+                            result,
+                        },
+                    );
+                    Task::batch([task, stage])
                 }
                 Some(SmudgyWindowEvent::OpenAutomationsForServer { server_name }) => {
                     // The collapsed toast points at the Automations window, where
@@ -3562,10 +3869,11 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         .sessions
                         .iter()
                         .find(|(_, session)| session.server_name.as_str() == server_name.as_str())
-                        .map(|(session_id, _)| {
+                        .map(|(session_id, session)| {
                             Task::done(Message::CreateAutomationsWindow {
                                 server_name: Arc::new(server_name.clone()),
                                 session_id,
+                                profile_name: session.profile_name.clone(),
                             })
                         });
                     match open {
@@ -3988,6 +4296,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::PackageCheckCompleted { session_id, report } => {
+            let reload_server = report.reload_server.clone();
             if let Some(session) = smudgy.sessions.get(session_id) {
                 for notice in &report.notices {
                     session.echo_notice(notice.clone());
@@ -4009,7 +4318,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     log::info!("package-update toasts dropped: no window hosts the session");
                 }
             }
-            Task::none()
+            match reload_server {
+                Some(server_name) => Task::batch(
+                    smudgy
+                        .sessions
+                        .iter()
+                        .filter(|(_, session)| session.server_name == server_name)
+                        .map(|(session_id, _)| {
+                            Task::done(Message::SessionAction(
+                                session_id,
+                                session_store::Message::Reload,
+                            ))
+                        }),
+                ),
+                None => Task::none(),
+            }
         }
         Message::PackageUpdateStaged {
             server_name,
@@ -4032,11 +4355,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Task::batch(reload_tasks)
             }
             Err(e) => {
-                // The lockfile was left unmoved, so nothing is half-staged; the
-                // consent record is simply ahead of the staged version, which a
-                // later check cycle reconciles as a plain within-consent update.
-                // The user GRANTED, though, so the failure must be visible: toast
-                // the window hosting one of the server's sessions.
+                // Prefetch failure or stale package state leaves the complete lock row unmoved.
+                // The user GRANTED, though, so the failure must be visible: toast the window
+                // hosting one of the server's sessions.
                 log::warn!("failed to stage the granted update for {server_name}: {e}");
                 let hosting_window = smudgy
                     .sessions
@@ -4098,13 +4419,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::CreateSmudgyWindow => {
-            let (_, task) = window::open(smudgy_window_settings());
+            let (id, task) = window::open(smudgy_window_settings());
+            smudgy.opening_smudgy_windows.insert(id);
             task.map(Message::NewSmudgyWindow)
         }
         Message::NewSmudgyWindow(id) => {
             // Tear-out inserts its window synchronously (it must adopt the
             // transplanted pane before the open task completes), so this may
             // find the entry already present.
+            if !smudgy.smudgy_windows.contains_key(&id)
+                && !smudgy.opening_smudgy_windows.remove(&id)
+            {
+                log::warn!("Closing an unclaimed main window completion: {id}");
+                return window::close(id);
+            }
+            smudgy.opening_smudgy_windows.remove(&id);
             smudgy.smudgy_windows.entry(id).or_insert_with(|| {
                 windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles())
             });
@@ -4146,7 +4475,8 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                                     .map(move |msg| Message::SmudgyWindowMessage(id, msg)),
                             );
                         }
-                        let (_, open_second) = window::open(smudgy_window_settings());
+                        let (second_id, open_second) = window::open(smudgy_window_settings());
+                        smudgy.opening_smudgy_windows.insert(second_id);
                         tasks.push(open_second.map(Message::NewSmudgyWindow));
                         Task::batch(tasks)
                     }
@@ -4214,78 +4544,210 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             win_chrome::hook_window(id, raw_id);
             Task::none()
         }
-        Message::AutomationsWindowMessage(id, msg) => {
-            if let Some(window) = smudgy.automations_windows.get_mut(&id) {
-                let update = window
-                    .update(msg)
-                    .map_message(move |msg| Message::AutomationsWindowMessage(id, msg));
-
-                match update.event {
-                    Some(AutomationsWindowEvent::UserAutomationsChanged { server_name }) => {
-                        let sync_tasks = smudgy
-                            .sessions
-                            .iter()
-                            .filter(|(_, session)| {
-                                session.server_name.as_str() == server_name.as_str()
-                            })
-                            .map(|(session_id, _)| {
-                                Task::done(Message::SessionAction(
-                                    session_id,
-                                    session_store::Message::SyncUserAutomations,
-                                ))
-                            });
-
-                        Task::batch([update.task, Task::batch(sync_tasks)])
-                    }
-                    Some(AutomationsWindowEvent::ScriptsChanged { server_name }) => {
-                        let reload_tasks = smudgy
-                            .sessions
-                            .iter()
-                            .filter(|(_, session)| {
-                                session.server_name.as_str() == server_name.as_str()
-                            })
-                            .map(|(session_id, _)| {
-                                Task::done(Message::SessionAction(
-                                    session_id,
-                                    session_store::Message::Reload,
-                                ))
-                            });
-
-                        Task::batch([update.task, Task::batch(reload_tasks)])
-                    }
-                    None => update.task,
-                }
-            } else {
+        Message::AutomationsWindowMessage {
+            id,
+            generation,
+            message,
+        } => {
+            if generation != smudgy.automations_context_generation {
+                log::debug!(
+                    "Dropping Automations message from generation {generation} (current {})",
+                    smudgy.automations_context_generation,
+                );
+                return Task::none();
+            }
+            let Some(window) = smudgy.automations_window_mut(id) else {
                 log::warn!("Received message for unknown window index: {}", id);
-                Task::none()
+                return Task::none();
+            };
+            let update = window.update(message).map_message(move |message| {
+                Message::AutomationsWindowMessage {
+                    id,
+                    generation,
+                    message,
+                }
+            });
+
+            match update.event {
+                Some(AutomationsWindowEvent::UserAutomationsChanged { server_name }) => {
+                    let sync_tasks = smudgy
+                        .sessions
+                        .iter()
+                        .filter(|(_, session)| session.server_name.as_str() == server_name.as_str())
+                        .map(|(session_id, _)| {
+                            Task::done(Message::SessionAction(
+                                session_id,
+                                session_store::Message::SyncUserAutomations,
+                            ))
+                        });
+
+                    Task::batch([update.task, Task::batch(sync_tasks)])
+                }
+                Some(AutomationsWindowEvent::ScriptsChanged { server_name }) => {
+                    let reload_tasks = smudgy
+                        .sessions
+                        .iter()
+                        .filter(|(_, session)| session.server_name.as_str() == server_name.as_str())
+                        .map(|(session_id, _)| {
+                            Task::done(Message::SessionAction(
+                                session_id,
+                                session_store::Message::Reload,
+                            ))
+                        });
+
+                    Task::batch([update.task, Task::batch(reload_tasks)])
+                }
+                Some(AutomationsWindowEvent::SwitchContext {
+                    server_name,
+                    session_id,
+                    profile_name,
+                }) => {
+                    let old_context_task = update.task;
+                    let requested = AutomationsContext {
+                        server_name,
+                        session_id,
+                        profile_name,
+                    };
+                    let Some(init) = install_automations_context(smudgy, id, requested.clone())
+                    else {
+                        // Keep the old state, including its drafts. The target session closed
+                        // while the switch was queued or awaiting the user's confirmation.
+                        log::warn!(
+                            "Ignoring Automations switch to closed session {} ({}/{})",
+                            requested.session_id,
+                            requested.server_name,
+                            requested.profile_name,
+                        );
+                        return old_context_task;
+                    };
+                    Task::batch([old_context_task, init])
+                }
+                Some(AutomationsWindowEvent::ContextSwitchCancelled) => update.task,
+                Some(AutomationsWindowEvent::CloseCancelled) => {
+                    if let Some(main_id) = smudgy.main_window_close_after_automations.take() {
+                        smudgy.closing_windows.remove(&main_id);
+                    }
+                    update.task
+                }
+                Some(AutomationsWindowEvent::CloseRequested) => {
+                    smudgy.automations_window = None;
+                    smudgy.window_tracker.remove(id);
+                    smudgy.closing_windows.remove(&id);
+                    #[cfg(feature = "web-audio-cpal")]
+                    smudgy.audio_panel.focused_widgets.remove(&id);
+                    // Drop all work mapped by the state that is being discarded.
+                    smudgy.automations_context_generation =
+                        smudgy.automations_context_generation.wrapping_add(1);
+                    let close_main = smudgy
+                        .main_window_close_after_automations
+                        .take()
+                        .map(window::close);
+                    Task::batch(
+                        [Some(update.task), Some(window::close(id)), close_main]
+                            .into_iter()
+                            .flatten(),
+                    )
+                }
+                None => update.task,
             }
         }
         Message::CreateAutomationsWindow {
             server_name,
             session_id,
+            profile_name,
         } => {
-            let (_, task) = window::open(secondary_window_settings(Size::new(900.0, 560.0)));
-            task.map(move |id| Message::NewAutomationsWindow {
-                id,
-                server_name: server_name.clone(),
+            let requested = AutomationsContext {
+                server_name: server_name.to_string(),
                 session_id,
-            })
-        }
-        Message::NewAutomationsWindow {
-            id,
-            server_name,
-            session_id,
-        } => {
-            let window = AutomationsWindow::new(
-                id,
-                server_name.to_string(),
-                smudgy.account.handles(),
-                session_id,
+                profile_name,
+            };
+            let last_main_is_closing = all_main_windows_are_closing(
+                smudgy.smudgy_windows.keys().copied(),
+                smudgy.opening_smudgy_windows.iter().copied(),
+                &smudgy.closing_windows,
             );
-            let task = window.init();
-            smudgy.automations_windows.insert(id, window);
+            if smudgy.main_window_close_after_automations.is_some() || last_main_is_closing {
+                // Once application exit owns the terminal Automations prompt, a later open/switch
+                // request must not replace it. Keep the exact close confirmation visible; if the
+                // user cancels it, a subsequent request can switch normally.
+                return smudgy
+                    .automations_window_id()
+                    .map_or_else(Task::none, window::gain_focus);
+            }
+            if !automations_context_is_live(smudgy, &requested) {
+                log::warn!(
+                    "Ignoring Automations request for closed session {} ({}/{})",
+                    requested.session_id,
+                    requested.server_name,
+                    requested.profile_name,
+                );
+                return smudgy
+                    .automations_window_id()
+                    .map_or_else(Task::none, window::gain_focus);
+            }
+            if let Some((id, window)) = smudgy.automations_window.as_mut() {
+                let id = *id;
+                if window.session_id() == session_id {
+                    window.cancel_pending_context_switch();
+                    return window::gain_focus(id);
+                }
+                // The window runs its unsaved-changes guard and answers with
+                // `Event::SwitchContext`, which rebuilds it for the requested session.
+                let generation = smudgy.automations_context_generation;
+                return Task::batch([
+                    window::gain_focus(id),
+                    Task::done(Message::AutomationsWindowMessage {
+                        id,
+                        generation,
+                        message: windows::automations_window::Message::SwitchContext {
+                            server_name: requested.server_name,
+                            session_id: requested.session_id,
+                            profile_name: requested.profile_name,
+                        },
+                    }),
+                ]);
+            }
 
-            task.map(move |message| Message::AutomationsWindowMessage(id, message))
+            // `window::open` completes asynchronously. A second request during that interval updates
+            // the target rather than starting another native window; the sole completion consumes
+            // whichever exact context was requested most recently.
+            if let Some(opening) = smudgy.automations_window_opening.as_mut() {
+                opening.context = requested;
+                return Task::none();
+            }
+            let (id, task) = window::open(automations_window_settings());
+            smudgy.automations_window_opening = Some(OpeningAutomationsWindow {
+                id,
+                context: requested,
+            });
+            task.map(Message::NewAutomationsWindow)
+        }
+        Message::NewAutomationsWindow(id) => {
+            let Some(context) =
+                take_opening_automations_context(&mut smudgy.automations_window_opening, id)
+            else {
+                log::warn!("Closing an unclaimed Automations window completion: {id}");
+                return window::close(id);
+            };
+            if let Some(existing) = smudgy.automations_window_id() {
+                log::warn!(
+                    "An Automations window already exists; closing duplicate native window {id}"
+                );
+                return Task::batch([window::close(id), window::gain_focus(existing)]);
+            }
+            let Some(init) = install_automations_context(smudgy, id, context.clone()) else {
+                // `take_opening_automations_context` already unclaimed this native id. Closing it
+                // ensures a dead request cannot leave an empty singleton window behind, and a late
+                // duplicate close event remains harmless.
+                log::warn!(
+                    "Closing Automations window {id} because session {} ({}/{}) is no longer live",
+                    context.session_id,
+                    context.server_name,
+                    context.profile_name,
+                );
+                return window::close(id);
+            };
+            init
         }
         Message::MapEditorWindowMessage(id, msg) => {
             if let Some(window) = smudgy.map_editor_windows.get_mut(&id) {
@@ -4436,16 +4898,20 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         // A fresh session can carry fresh grants, so parked
                         // pushes get another attempt.
                         smudgy.area_prefs_push_parked.clear();
-                        Task::batch([task, reconcile_area_prefs(smudgy)])
+                        Task::batch([
+                            task,
+                            reconcile_area_prefs(smudgy),
+                            notify_automations_account_changed(smudgy),
+                        ])
                     }
                     Some(SettingsWindowEvent::SignOut { everywhere }) => {
                         let task = smudgy.account.sign_out(everywhere).map(Message::Account);
                         poke_all_mappers(smudgy);
-                        task
+                        Task::batch([task, notify_automations_account_changed(smudgy)])
                     }
                     Some(SettingsWindowEvent::ProfileUpdated(profile)) => {
                         smudgy.account.absorb_profile(*profile);
-                        Task::none()
+                        notify_automations_account_changed(smudgy)
                     }
                     Some(SettingsWindowEvent::Poke) => smudgy.account.poke().map(Message::Account),
                     Some(SettingsWindowEvent::SettingsChanged(settings)) => {
@@ -4490,7 +4956,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         // out to every live session (scrollback, span
                         // restyle, runtime separator/prefix/logging).
                         prefs::apply(&settings);
-                        for window in smudgy.automations_windows.values_mut() {
+                        if let Some((_, window)) = smudgy.automations_window.as_mut() {
                             window.sync_code_editor_theme();
                         }
                         let fan_out: Vec<Task<Message>> = smudgy
@@ -4589,6 +5055,12 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
     }
 }
 
+fn retire_automations_session_binding(smudgy: &mut Smudgy, session_id: SessionId) {
+    if let Some((_, window)) = smudgy.automations_window.as_mut() {
+        window.retire_session_binding(session_id);
+    }
+}
+
 /// Close one session (the user's explicit ✕): shut its runtime down and
 /// remove it from the store *first* — so events still in flight for the id
 /// are dropped at the daemon — then **vacate** its slot rather than delete
@@ -4622,7 +5094,11 @@ fn close_session(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
             descriptors,
         )
     });
-    if !smudgy.sessions.shutdown_and_remove(session_id) {
+    let removed = smudgy.sessions.shutdown_and_remove(session_id);
+    // A repeated close still proves that this id has no live UI binding, so retire a defensive
+    // pre-registration subscription even when another teardown path removed the session first.
+    retire_automations_session_binding(smudgy, session_id);
+    if !removed {
         return Task::none();
     }
     forget_session_pane_commands(smudgy, session_id);
@@ -4766,12 +5242,7 @@ fn start_package_update_check(smudgy: &Smudgy, session_id: SessionId) -> Task<Me
     );
     let ctx = package_update_checker::CheckContext {
         server_name: session.server_name.clone(),
-        account_nickname: handles
-            .snapshot
-            .get()
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.nickname.clone()),
+        profile_name: session.profile_name.clone(),
     };
     Task::perform(
         package_update_checker::run_session_check(client, ctx),
@@ -7181,11 +7652,16 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
             content.into()
         };
     }
-    let content: Element<'_, Message> = if let Some(window) = smudgy.automations_windows.get(&id) {
+    let content: Element<'_, Message> = if let Some(window) = smudgy.automations_window(id) {
+        let generation = smudgy.automations_context_generation;
         center(
             window
                 .view()
-                .map(move |message| Message::AutomationsWindowMessage(id, message)),
+                .map(move |message| Message::AutomationsWindowMessage {
+                    id,
+                    generation,
+                    message,
+                }),
         )
         .into()
     } else if let Some(window) = smudgy.map_editor_windows.get(&id) {
@@ -7217,7 +7693,93 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_cloud::Uuid;
+
+    #[test]
+    fn automations_window_defers_native_close_requests() {
+        assert!(!automations_window_settings().exit_on_close_request);
+    }
+
+    #[test]
+    fn main_window_defers_native_close_requests_for_terminal_guards() {
+        assert!(!smudgy_window_settings().exit_on_close_request);
+    }
+
+    #[test]
+    fn main_exit_waits_until_every_registered_and_opening_window_is_closing() {
+        let first = window::Id::unique();
+        let second = window::Id::unique();
+        let opening = window::Id::unique();
+        let mut closing = HashSet::from([first]);
+
+        assert!(!all_main_windows_are_closing(
+            [first, second],
+            std::iter::empty(),
+            &closing,
+        ));
+        closing.insert(second);
+        assert!(all_main_windows_are_closing(
+            [first, second],
+            std::iter::empty(),
+            &closing,
+        ));
+        assert!(!all_main_windows_are_closing(
+            [first, second],
+            [opening],
+            &closing,
+        ));
+        closing.insert(opening);
+        assert!(all_main_windows_are_closing(
+            [first, second],
+            [opening],
+            &closing,
+        ));
+        assert!(!all_main_windows_are_closing(
+            std::iter::empty(),
+            std::iter::empty(),
+            &closing,
+        ));
+    }
+
+    #[test]
+    fn automations_open_completion_requires_its_exact_pending_native_id() {
+        let stale_id = window::Id::unique();
+        let current_id = window::Id::unique();
+        let context = AutomationsContext {
+            server_name: "Arctic".to_string(),
+            session_id: SessionId::from(7),
+            profile_name: "main".to_string(),
+        };
+        let mut opening = Some(OpeningAutomationsWindow {
+            id: current_id,
+            context: context.clone(),
+        });
+
+        assert!(take_opening_automations_context(&mut opening, stale_id).is_none());
+        assert_eq!(opening.as_ref().map(|pending| pending.id), Some(current_id));
+        assert!(!cancel_opening_automations_window(&mut opening, stale_id));
+        assert_eq!(
+            take_opening_automations_context(&mut opening, current_id),
+            Some(context)
+        );
+        assert!(opening.is_none());
+    }
+
+    #[test]
+    fn close_before_registration_cancels_only_the_matching_automations_open() {
+        let id = window::Id::unique();
+        let mut opening = Some(OpeningAutomationsWindow {
+            id,
+            context: AutomationsContext {
+                server_name: "Arctic".to_string(),
+                session_id: SessionId::from(7),
+                profile_name: "main".to_string(),
+            },
+        });
+
+        assert!(cancel_opening_automations_window(&mut opening, id));
+        assert!(opening.is_none());
+        assert!(take_opening_automations_context(&mut opening, id).is_none());
+    }
 
     #[cfg(feature = "web-audio-cpal")]
     #[derive(Clone, Debug, PartialEq)]
@@ -8342,7 +8904,7 @@ mod tests {
     }
 
     fn area(n: u128) -> AreaId {
-        AreaId(Uuid::from_u128(n))
+        AreaId(smudgy_cloud::Uuid::from_u128(n))
     }
 
     fn ts(secs: i64) -> DateTime<Utc> {

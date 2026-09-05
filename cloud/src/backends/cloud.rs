@@ -99,6 +99,17 @@ impl CredentialSource {
         self.slot.load().credential.clone()
     }
 
+    /// Returns one detached credential source and the exact generation captured with it.
+    ///
+    /// The detached source never follows later login changes. Multi-request operations use this
+    /// to keep one principal across every await, while the generation lets their caller reject a
+    /// result after the shared account changes.
+    #[must_use]
+    pub fn freeze(&self) -> (u64, Self) {
+        let snapshot = self.slot.load_full();
+        (snapshot.generation, Self::new(snapshot.credential.clone()))
+    }
+
     #[must_use]
     fn snapshot(&self) -> (u64, Option<Credential>) {
         let snapshot = self.slot.load();
@@ -656,4 +667,21 @@ impl MapperBackend for CloudMapper {
 
     // `move_area_to_atlas` uses the trait default (PUT /areas/{id} with only
     // `atlas_id`), routed through `update_area` above.
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_credentials_do_not_follow_later_account_changes() {
+        let source = CredentialSource::new(Some(Credential::Session("first".to_string())));
+        let (generation, frozen) = source.freeze();
+
+        source.set(Some(Credential::Session("second".to_string())));
+
+        assert_ne!(source.generation(), generation);
+        assert_eq!(frozen.get(), Some(Credential::Session("first".to_string())));
+        assert_eq!(frozen.generation(), 0);
+    }
 }

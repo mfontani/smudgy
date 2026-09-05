@@ -391,7 +391,7 @@ async fn non_home_writes_are_inert_with_teaching_diagnostics() {
         "the refused write must explain itself once; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "you code-imported smudgy://wbk/tracker"),
+        has_line(&lines, "entry module of installed smudgy://wbk/tracker"),
         "the code-import stumble notice must appear at load; transcript:\n{lines:#?}"
     );
     // The home instance's write is the one that survives.
@@ -522,7 +522,7 @@ async fn consumer_schemes_read_watch_and_subscribe_cross_isolate() {
         "the consumer's sync snapshot must see the producer's published state; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "you code-imported smudgy://wbk/prompt"),
+        !has_line(&lines, "entry module of installed smudgy://wbk/prompt"),
         "consuming through the schemes must NOT trip the code-import stumble notice; transcript:\n{lines:#?}"
     );
     assert!(
@@ -1079,7 +1079,7 @@ async fn importable_false_blocks_code_import_but_not_interop_consumption() {
         "interop consumption must not trip the import-deny gate; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "you code-imported smudgy://wbk/lib"),
+        !has_line(&lines, "entry module of installed smudgy://wbk/lib"),
         "consuming events must not be mistaken for a code import; transcript:\n{lines:#?}"
     );
 }

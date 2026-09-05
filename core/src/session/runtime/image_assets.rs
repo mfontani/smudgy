@@ -65,7 +65,7 @@ impl PackageAssetCache {
             .map(|m| m.content_hash.clone())
     }
 
-    /// A cached asset body by content hash (content-addressed; trusted without re-hashing).
+    /// A cached asset body whose bytes still match the content hash.
     #[must_use]
     pub fn read_blob_bytes(&self, content_hash: &str) -> Option<Vec<u8>> {
         self.cache.read_blob_bytes(content_hash)

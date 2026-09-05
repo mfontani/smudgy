@@ -13,19 +13,21 @@
 //! staged versions always come from the server being checked, and only entries the
 //! facts cannot answer cost the network.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use smudgy_cloud::CloudError;
 use smudgy_cloud::package_api::{
     CheckUpdatesEntry, CheckUpdatesHave, CheckUpdatesResult, PackageApiClient, UpdateCheckLatest,
 };
+use smudgy_cloud::{CloudError, DependencyKind};
 use smudgy_core::models::local_packages;
 use smudgy_core::models::package_updates::{self, PackageVersionRef, facts_key};
 use smudgy_core::models::shared_packages::{
     self, LockedPackage, PackageManifest, PackagePermissions, SmudgyVersionFloor,
 };
+#[cfg(test)]
+use smudgy_core::session::runtime::package_cache::CachedModule;
 use smudgy_core::session::runtime::package_cache::{
-    CachedModule, CachedResolution, PackageCache, PackageKey, is_code_module, package_integrity,
+    CachedResolution, PackageCache, PackageKey, is_code_module, resolution_from_wire,
 };
 
 use crate::components::toast::{Toast, UpdateOffer};
@@ -39,9 +41,9 @@ const HAVE_CAP: usize = 512;
 /// What one session's check needs to know about its world.
 pub struct CheckContext {
     pub server_name: String,
-    /// The signed-in account's nickname, for recognizing local dev-overrides
-    /// installed under it (mirroring the engine's owner-segment rule).
-    pub account_nickname: Option<String>,
+    /// The open session profile. Packages disabled for this profile do not run and do not need
+    /// a foreground update check for this session.
+    pub profile_name: String,
 }
 
 /// What one check cycle produced for the owning session: toasts for its window
@@ -50,6 +52,9 @@ pub struct CheckContext {
 pub struct CheckReport {
     pub toasts: Vec<Toast>,
     pub notices: Vec<String>,
+    /// A successful dead-package removal changed executable state. Reload every live session on
+    /// this server so the removed package stops running; `None` when the sweep made no such commit.
+    pub reload_server: Option<String>,
 }
 
 /// Run the whole once-per-open check for one server. Never fails outward — a broken
@@ -63,7 +68,21 @@ pub async fn run_session_check(client: PackageApiClient, ctx: CheckContext) -> C
             return CheckReport::default();
         }
     };
+    // A local package directory reserves its leaf even while its manifest is missing or damaged.
+    // Inventory failure is also fail-closed: the background checker must not update or remove a
+    // dormant published fallback when it cannot prove that no local override exists.
+    let local_packages = match local_packages::list_local_packages(&ctx.server_name) {
+        Ok(packages) => packages,
+        Err(error) => {
+            log::warn!(
+                "package update check skipped for {} because local package inventory is unavailable: {error:#}",
+                ctx.server_name
+            );
+            return CheckReport::default();
+        }
+    };
     let cache = PackageCache::new().ok();
+    let conflicting_published_leaves = conflicting_published_leaves(&lock.packages);
     let meta_view = |owner: &str, name: &str, version: &str| -> Option<CachedResolution> {
         cache.as_ref()?.read_meta(
             &PackageKey {
@@ -82,19 +101,27 @@ pub async fn run_session_check(client: PackageApiClient, ctx: CheckContext) -> C
         server_name: &ctx.server_name,
         ready_count: 0,
         offers: Vec::new(),
-        notices: Vec::new(),
+        attention: Vec::new(),
+        reload_scripts: false,
+        notices: conflicting_published_leaves
+            .values()
+            .map(|name| crate::i18n::t!("package-remote-leaf-conflict", "name" => name))
+            .collect(),
     };
     // Entries that need the network this cycle, with their parsed owner/name.
     let mut to_check: Vec<(LockedPackage, String, String)> = Vec::new();
 
     for entry in &lock.packages {
-        if !entry.enabled {
+        if !lock.is_effectively_enabled_for(&entry.specifier, &ctx.profile_name) {
             continue;
         }
         let Some((owner, name)) = parse_specifier(&entry.specifier) else {
             continue;
         };
-        if is_local_override(&ctx, &owner, &name) {
+        if conflicting_published_leaves.contains_key(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        if has_local_override(&local_packages, &name) {
             continue;
         }
         // Fresh facts settle the network question, but never the decision: THIS
@@ -161,10 +188,19 @@ pub async fn run_session_check(client: PackageApiClient, ctx: CheckContext) -> C
     }
 
     let mut toasts = Vec::new();
-    if cycle.ready_count >= 1 {
+    // A committed deletion requires an immediate reload. That same reload also picks up any
+    // within-consent versions staged during this sweep, so a second "Reload scripts" toast would
+    // be stale as soon as it appeared.
+    if cycle.ready_count >= 1 && !cycle.reload_scripts {
         toasts.push(Toast::UpdatesReady {
             server_name: ctx.server_name.clone(),
             count: cycle.ready_count,
+        });
+    }
+    if !cycle.attention.is_empty() {
+        toasts.push(Toast::NeedsAttention {
+            server_name: ctx.server_name.clone(),
+            specifiers: cycle.attention,
         });
     }
     toasts.extend(
@@ -176,7 +212,31 @@ pub async fn run_session_check(client: PackageApiClient, ctx: CheckContext) -> C
     CheckReport {
         toasts,
         notices: cycle.notices,
+        reload_server: cycle.reload_scripts.then(|| ctx.server_name.clone()),
     }
+}
+
+/// Published package leaf names are globally unique. More than one non-local lock row for the
+/// same folded leaf is contradictory state, regardless of owner or spelling. Return one stable
+/// display spelling per bad leaf so callers can fail every candidate closed and report it once.
+fn conflicting_published_leaves(packages: &[LockedPackage]) -> BTreeMap<String, String> {
+    let mut published_leaf_counts = HashMap::<String, (String, usize)>::new();
+    for package in packages {
+        let Some((owner, name)) = parse_specifier(&package.specifier) else {
+            continue;
+        };
+        if owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER) {
+            continue;
+        }
+        let entry = published_leaf_counts
+            .entry(name.to_ascii_lowercase())
+            .or_insert((name, 0));
+        entry.1 += 1;
+    }
+    published_leaf_counts
+        .into_iter()
+        .filter_map(|(folded, (display, count))| (count > 1).then_some((folded, display)))
+        .collect()
 }
 
 /// One check cycle's mutable state: what the executed plans accumulate for the
@@ -187,6 +247,11 @@ struct CheckCycle<'a> {
     server_name: &'a str,
     ready_count: usize,
     offers: Vec<UpdateOffer>,
+    /// Updates whose `requires` set changed. They remain unstaged until the Automations install
+    /// planner checks peer ranges and materializes every independent root.
+    attention: Vec<String>,
+    /// At least one exact-row dead-package uninstall committed during this sweep.
+    reload_scripts: bool,
     notices: Vec<String>,
 }
 
@@ -198,9 +263,19 @@ impl CheckCycle<'_> {
         match plan.action {
             EntryAction::None => {}
             EntryAction::Offer(offer) => self.offers.push(*offer),
+            EntryAction::ReviewRequirements => {
+                if !self.attention.contains(&entry.specifier) {
+                    self.attention.push(entry.specifier.clone());
+                }
+                self.notices.push(crate::i18n::t!(
+                    "notice-package-requirements-review",
+                    "name" => name
+                ));
+            }
             EntryAction::Uninstall => {
-                match shared_packages::uninstall_package(self.server_name, &entry.specifier) {
-                    Ok(()) => {
+                match shared_packages::uninstall_package_if_unchanged(self.server_name, entry) {
+                    Ok(true) => {
+                        self.reload_scripts = true;
                         // The uninstall is scoped to THIS server's lock entry; every
                         // cached meta and blob stays. The cache is machine-global —
                         // another server still installing this package keeps its
@@ -210,6 +285,12 @@ impl CheckCycle<'_> {
                             "notice-package-deleted-uninstalled",
                             "name" => name
                         ));
+                    }
+                    Ok(false) => {
+                        log::debug!(
+                            "did not uninstall stale {} because its lock row changed",
+                            entry.specifier
+                        );
                     }
                     Err(e) => {
                         log::warn!("failed to uninstall deleted {}: {e}", entry.specifier);
@@ -232,30 +313,16 @@ impl CheckCycle<'_> {
                     self.client,
                     cache,
                     self.server_name,
-                    &entry.specifier,
+                    entry,
                     owner,
                     name,
                     &to,
                     &closure,
+                    shrink_consent.as_ref(),
                 )
                 .await
                 {
-                    Ok(()) => {
-                        // The shrink auto-accept lands only once the smaller
-                        // union's version is actually staged, so consent never
-                        // narrows under a still-staged older version.
-                        if let Some(union) = shrink_consent
-                            && let Err(e) = shared_packages::record_consent(
-                                self.server_name,
-                                &entry.specifier,
-                                &union,
-                            )
-                        {
-                            log::warn!(
-                                "failed to record the shrunk consent for {}: {e}",
-                                entry.specifier
-                            );
-                        }
+                    Ok(true) => {
                         self.notices.push(match &from {
                             Some(from) => crate::i18n::t!(
                                 "notice-package-update-ready",
@@ -271,6 +338,12 @@ impl CheckCycle<'_> {
                         });
                         self.ready_count += 1;
                     }
+                    Ok(false) => {
+                        log::debug!(
+                            "did not stage {} {to} because its lock row changed",
+                            entry.specifier
+                        );
+                    }
                     Err(e) => {
                         // The lockfile was left unmoved, so the next cycle's
                         // evaluation reaches the same plan and retries.
@@ -282,22 +355,12 @@ impl CheckCycle<'_> {
     }
 }
 
-/// Whether an installed specifier is a local dev-override for this account — the
-/// engine's rule replicated from UI-visible facts: the owner segment is the reserved
-/// `local` placeholder or the signed-in nickname, AND the package's own folder exists
-/// under `<server>/packages/<name>/`. Local overrides resolve purely from disk and are
-/// never checked.
-fn is_local_override(ctx: &CheckContext, owner: &str, name: &str) -> bool {
-    let owner_is_local = owner == local_packages::LOCAL_OWNER
-        || ctx
-            .account_nickname
-            .as_deref()
-            .is_some_and(|nickname| owner == nickname);
-    owner_is_local
-        && local_packages::load_local_package(&ctx.server_name, name)
-            .ok()
-            .flatten()
-            .is_some()
+/// Owner is deliberately irrelevant: the existence of a local directory reserves its leaf even
+/// when the manifest is temporarily missing or invalid.
+fn has_local_override(local_packages: &[String], name: &str) -> bool {
+    local_packages
+        .iter()
+        .any(|local| smudgy_core::models::naming::names_conflict(local, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +379,9 @@ pub(crate) enum CheckOutcome {
     /// A newer version asks for permissions beyond the consented grant, so it needs
     /// an explicit user decision (grant, pin, or dismiss).
     NeedsPermissions { latest: String },
+    /// The update adds or changes independently-running `requires` roots. It must pass through the
+    /// full install planner instead of being staged by the background dependency-only updater.
+    NeedsRequirementsReview { latest: String },
     /// A newer version (or its closure) requires a newer smudgy than this one.
     /// Passive: the Automations pane already surfaces version-floor refusals.
     NeedsSmudgy { latest: String, required: String },
@@ -346,6 +412,8 @@ pub(crate) enum EntryAction {
     Stage(Box<StagePlan>),
     /// A needs-permissions update: queue the offer toast.
     Offer(Box<UpdateOffer>),
+    /// Keep the current version staged and direct the user to the Automations review flow.
+    ReviewRequirements,
     /// The definitive deletion signal: uninstall this server's lock entry.
     Uninstall,
 }
@@ -430,6 +498,21 @@ pub(crate) fn evaluate_entry(
         return EntryPlan {
             outcome,
             action: EntryAction::None,
+        };
+    }
+    // `requires` roots are not import-closure nodes: each has independent activation, consent,
+    // settings, and peer-version constraints. The background updater cannot safely materialize or
+    // upgrade them. When the offered version declares requirements, compare them with the trusted
+    // cached metadata for the staged version. Any difference (or an unavailable baseline) holds
+    // the update for the full Automations install planner. An empty offered set is safe to stage:
+    // removing a requirement never leaves a missing runtime root, and the former root deliberately
+    // retains its independent user state until an explicit orphan-removal decision.
+    if latest_requires_review(entry, latest, cached_meta) {
+        return EntryPlan {
+            outcome: CheckOutcome::NeedsRequirementsReview {
+                latest: latest.version.clone(),
+            },
+            action: EntryAction::ReviewRequirements,
         };
     }
     // A TRUSTED entry runs allow-all on the main isolate, so consent is moot (the
@@ -527,6 +610,7 @@ pub(crate) fn evaluate_entry(
     } else {
         EntryAction::Offer(Box::new(UpdateOffer {
             server_name: server_name.to_string(),
+            expected: entry.clone(),
             specifier: entry.specifier.clone(),
             name: package_display_name(&entry.specifier).to_string(),
             current: staged.map(str::to_string),
@@ -538,6 +622,81 @@ pub(crate) fn evaluate_entry(
         }))
     };
     EntryPlan { outcome, action }
+}
+
+/// Whether an offered version must be reviewed because its independent `requires` declaration is
+/// not byte-for-byte equivalent at the semantic coordinate/range level to the staged version.
+fn latest_requires_review(
+    entry: &LockedPackage,
+    latest: &UpdateCheckLatest,
+    cached_meta: &impl Fn(&str, &str, &str) -> Option<CachedResolution>,
+) -> bool {
+    let Some(latest_requirements) = normalized_wire_requirements(&latest.dependencies) else {
+        return true;
+    };
+    if latest_requirements.is_empty() {
+        return false;
+    }
+    let Some(staged) = entry.staged_version() else {
+        return true;
+    };
+    let Some((owner, name)) = parse_specifier(&entry.specifier) else {
+        return true;
+    };
+    let Some(current) = cached_meta(&owner, &name, staged) else {
+        return true;
+    };
+    normalized_cached_requirements(&current.dependencies)
+        .is_none_or(|current_requirements| current_requirements != latest_requirements)
+}
+
+fn normalized_wire_requirements(
+    dependencies: &[smudgy_cloud::package_api::UpdateCheckDependency],
+) -> Option<Vec<(String, String, String)>> {
+    let mut requirements = Vec::new();
+    for dependency in dependencies {
+        match dependency.kind.as_str() {
+            "dependency" => continue,
+            "requires" => requirements.push((
+                dependency.owner.to_ascii_lowercase(),
+                dependency.name.to_ascii_lowercase(),
+                normalized_requirement_range(&dependency.range)?,
+            )),
+            _ => return None,
+        }
+    }
+    requirements.sort_unstable();
+    requirements.dedup();
+    Some(requirements)
+}
+
+fn normalized_cached_requirements(
+    dependencies: &[smudgy_cloud::ResolvedDependency],
+) -> Option<Vec<(String, String, String)>> {
+    let mut requirements = dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Requires)
+        .map(|dependency| {
+            Some((
+                dependency.owner_nickname.to_ascii_lowercase(),
+                dependency.name.to_ascii_lowercase(),
+                normalized_requirement_range(&dependency.range)?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    requirements.sort_unstable();
+    requirements.dedup();
+    Some(requirements)
+}
+
+fn normalized_requirement_range(range: &str) -> Option<String> {
+    let range = range.trim();
+    if range.is_empty() {
+        return Some(String::new());
+    }
+    semver::VersionReq::parse(range)
+        .ok()
+        .map(|range| range.to_string())
 }
 
 /// A folded offer closure: the whole-closure permission union, the folded
@@ -770,52 +929,63 @@ pub(crate) fn cached_have(
 // Staging (shared by the checker and the review modal's grant path)
 // ---------------------------------------------------------------------------
 
-/// Stage an accepted update offer: prefetch the offered version and its whole closure
-/// into the cache, then advance the lockfile's staged version. The caller records
-/// consent before staging (the staged closure union must sit within the consented
-/// grant).
+/// Stage an accepted update offer: prefetch the offered version and its whole closure into the
+/// cache, then atomically record its consent and advance the lockfile's staged version if the
+/// complete row still matches the snapshot from which the offer was built.
 ///
 /// # Errors
 /// Returns a display-ready message when any resolve, fetch, cache write, or the
 /// lockfile advance fails; the lockfile is left unmoved on any prefetch failure.
 pub async fn stage_offer(client: PackageApiClient, offer: UpdateOffer) -> Result<(), String> {
+    if offer.expected.specifier != offer.specifier {
+        return Err("the update offer does not match its package state".into());
+    }
     let cache = PackageCache::new().map_err(|e| format!("package cache unavailable: {e}"))?;
     let (owner, name) = parse_specifier(&offer.specifier)
         .ok_or_else(|| format!("not a package specifier: {}", offer.specifier))?;
-    stage_update(
+    let staged = stage_update(
         &client,
         &cache,
         &offer.server_name,
-        &offer.specifier,
+        &offer.expected,
         &owner,
         &name,
         &offer.latest,
         &offer.closure,
+        Some(&offer.new_union),
     )
-    .await
+    .await?;
+    if !staged {
+        return Err(format!(
+            "{} changed after this update offer was prepared",
+            offer.specifier
+        ));
+    }
+    Ok(())
 }
 
-/// The staging primitive: prefetch the root version and every closure node, then
-/// advance the lockfile. Ordering is the safety — the lockfile only ever points at
-/// content the cache can already serve.
+/// The background staging primitive: prefetch the root version and every closure node, then
+/// advance the lockfile only if the complete row still matches the one the checker evaluated.
+/// Ordering is the safety — the lockfile only ever points at content the cache can already serve,
+/// and a delayed network result cannot replace a newer pin, activation, consent, or resolution.
 #[allow(clippy::too_many_arguments)]
 async fn stage_update(
     client: &PackageApiClient,
     cache: &PackageCache,
     server_name: &str,
-    specifier: &str,
+    expected: &LockedPackage,
     owner: &str,
     name: &str,
     version: &str,
     closure: &[PackageVersionRef],
-) -> Result<(), String> {
+    shrunk_consent: Option<&PackagePermissions>,
+) -> Result<bool, String> {
     prefetch_version(client, cache, owner, name, version).await?;
     for node in closure {
         prefetch_version(client, cache, &node.owner, &node.name, &node.version).await?;
     }
-    shared_packages::stage_resolved_version(server_name, specifier, version)
-        .map_err(|e| format!("failed to stage {specifier} {version}: {e}"))?;
-    Ok(())
+    shared_packages::stage_auto_update_if_unchanged(server_name, expected, version, shrunk_consent)
+        .map_err(|e| format!("failed to stage {} {version}: {e}", expected.specifier))
 }
 
 /// Resolve one concrete version and persist everything the cache needs to serve it
@@ -849,23 +1019,22 @@ pub async fn prefetch_version(
         .resolve_package(owner, name, Some(version))
         .await
         .map_err(|e| format!("failed to resolve {owner}/{name}@{version}: {e}"))?;
+    if wire.version != version {
+        return Err(format!(
+            "registry returned {owner}/{name}@{} when {version} was requested",
+            wire.version
+        ));
+    }
     let manifest = PackageManifest::parse(&wire.manifest.to_string())
         .map_err(|e| format!("invalid manifest for {owner}/{name}@{version}: {e}"))?;
-    let meta = CachedResolution {
-        version: wire.version.clone(),
-        integrity: package_integrity(&wire.modules),
+    let meta = resolution_from_wire(
+        &key,
+        &wire.version,
         manifest,
-        modules: wire
-            .modules
-            .iter()
-            .map(|module| CachedModule {
-                subpath: module.subpath.clone(),
-                content_hash: module.content_hash.clone(),
-                media_type: module.media_type.clone(),
-            })
-            .collect(),
-        dependencies: wire.dependencies.clone(),
-    };
+        &wire.modules,
+        &wire.dependencies,
+    )
+    .map_err(|e| format!("invalid resolution for {owner}/{name}@{version}: {e:#}"))?;
     // Write-once in the common case, healing a legacy or torn cache file — the same
     // rule as the engine provider's meta writes (`PackageCache::refresh_meta`).
     cache
@@ -902,6 +1071,9 @@ pub async fn prefetch_version(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use sha2::Digest;
     use smudgy_cloud::package_api::{
         CheckUpdatesResult, UpdateCheckClosureNode, UpdateCheckDependency, UpdateCheckInstalled,
         UpdateCheckLatest,
@@ -911,11 +1083,140 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn local_override_matching_is_case_insensitive_and_owner_independent() {
+        let inventory = vec!["Repairing-Tools".to_string()];
+
+        assert!(has_local_override(&inventory, "repairing-tools"));
+        assert!(has_local_override(&inventory, "REPAIRING-TOOLS"));
+        assert!(!has_local_override(&inventory, "other-tools"));
+    }
+
+    fn use_temp_smudgy_home() -> PathBuf {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME
+            .get_or_init(|| {
+                let path = std::env::temp_dir().join(format!(
+                    "smudgy-update-checker-test-home-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&path).expect("create update-checker test home");
+                smudgy_core::set_smudgy_home(path.clone());
+                path
+            })
+            .clone()
+    }
+
     fn entry(staged: Option<&str>) -> LockedPackage {
         let mut entry = LockedPackage::new("smudgy://wbk/mapper", UpdateMode::Auto);
         entry.last_resolved_version = staged.map(str::to_string);
         entry.consented_permissions = Some(PackagePermissions::default());
         entry
+    }
+
+    #[tokio::test]
+    async fn dead_package_requests_reload_only_after_its_exact_row_is_removed() {
+        let home = use_temp_smudgy_home();
+        let committed_server = format!("checker-dead-committed-{}", std::process::id());
+        let stale_server = format!("checker-dead-stale-{}", std::process::id());
+        let specifier = "smudgy://wbk/mapper";
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        );
+
+        shared_packages::install_package(&committed_server, specifier, UpdateMode::Auto, true)
+            .unwrap();
+        let committed_entry = shared_packages::load_lock(&committed_server)
+            .unwrap()
+            .find(specifier)
+            .unwrap()
+            .clone();
+        let mut committed_cycle = CheckCycle {
+            client: &client,
+            cache: None,
+            server_name: &committed_server,
+            ready_count: 0,
+            offers: Vec::new(),
+            attention: Vec::new(),
+            reload_scripts: false,
+            notices: Vec::new(),
+        };
+        committed_cycle
+            .execute(
+                &committed_entry,
+                "wbk",
+                "mapper",
+                EntryPlan {
+                    outcome: CheckOutcome::Dead,
+                    action: EntryAction::Uninstall,
+                },
+            )
+            .await;
+        assert!(committed_cycle.reload_scripts);
+        assert!(
+            shared_packages::load_lock(&committed_server)
+                .unwrap()
+                .find(specifier)
+                .is_none()
+        );
+
+        shared_packages::install_package(&stale_server, specifier, UpdateMode::Auto, true).unwrap();
+        let stale_entry = shared_packages::load_lock(&stale_server)
+            .unwrap()
+            .find(specifier)
+            .unwrap()
+            .clone();
+        shared_packages::set_trusted(&stale_server, specifier, true).unwrap();
+        let mut stale_cycle = CheckCycle {
+            client: &client,
+            cache: None,
+            server_name: &stale_server,
+            ready_count: 0,
+            offers: Vec::new(),
+            attention: Vec::new(),
+            reload_scripts: false,
+            notices: Vec::new(),
+        };
+        stale_cycle
+            .execute(
+                &stale_entry,
+                "wbk",
+                "mapper",
+                EntryPlan {
+                    outcome: CheckOutcome::Dead,
+                    action: EntryAction::Uninstall,
+                },
+            )
+            .await;
+        assert!(!stale_cycle.reload_scripts);
+        assert!(
+            shared_packages::load_lock(&stale_server)
+                .unwrap()
+                .find(specifier)
+                .unwrap()
+                .trusted
+        );
+
+        for server in [committed_server, stale_server] {
+            let _ = std::fs::remove_dir_all(home.join(server));
+        }
+    }
+
+    #[test]
+    fn duplicate_published_leaf_detection_ignores_the_one_valid_local_shadow() {
+        let packages = vec![
+            LockedPackage::new("smudgy://first/Tools", UpdateMode::Auto),
+            LockedPackage::new("smudgy://local/tools", UpdateMode::Auto),
+            LockedPackage::new("smudgy://second/TOOLS", UpdateMode::Auto),
+            LockedPackage::new("smudgy://first/mapper", UpdateMode::Auto),
+            LockedPackage::new("smudgy://local/mapper", UpdateMode::Auto),
+        ];
+
+        let conflicts = conflicting_published_leaves(&packages);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts.get("tools").map(String::as_str), Some("Tools"));
+        assert!(!conflicts.contains_key("mapper"));
     }
 
     fn manifest_json(net: &[&str], min_smudgy: Option<&str>) -> serde_json::Value {
@@ -1028,9 +1329,10 @@ mod tests {
 
     #[test]
     fn new_asks_produce_an_offer() {
+        let entry = entry(Some("1.2.0"));
         let plan = evaluate_entry(
             "arctic",
-            &entry(Some("1.2.0")),
+            &entry,
             &ok_result(Some(latest("1.3.0", &["evil.example"]))),
             &no_meta,
             &running(),
@@ -1041,6 +1343,7 @@ mod tests {
         ));
         match plan.action {
             EntryAction::Offer(offer) => {
+                assert_eq!(offer.expected, entry);
                 assert_eq!(offer.specifier, "smudgy://wbk/mapper");
                 assert_eq!(offer.latest, "1.3.0");
                 assert_eq!(offer.added.net, vec!["evil.example".to_string()]);
@@ -1279,9 +1582,9 @@ mod tests {
     }
 
     #[test]
-    fn requires_edges_are_not_closure_edges() {
-        // A lone kind="requires" edge is a co-install, not an import: the closure
-        // fold must ignore it entirely rather than declare the closure uncoverable.
+    fn changed_requires_edges_hold_the_update_for_review() {
+        // A `requires` edge is a separately configured runtime root. Without a trusted staged
+        // baseline, the background updater cannot prove that its install plan is unchanged.
         let result = ok_result(Some(UpdateCheckLatest {
             dependencies: vec![UpdateCheckDependency {
                 owner: "wbk".into(),
@@ -1299,7 +1602,57 @@ mod tests {
             &no_meta,
             &running(),
         );
+        assert!(matches!(
+            plan.outcome,
+            CheckOutcome::NeedsRequirementsReview { .. }
+        ));
+        assert!(matches!(plan.action, EntryAction::ReviewRequirements));
+    }
+
+    #[test]
+    fn unchanged_requires_edges_do_not_join_the_import_closure() {
+        let dependency = UpdateCheckDependency {
+            owner: "wbk".into(),
+            name: "companion".into(),
+            range: "^1".into(),
+            resolved_version: "1.0.0".into(),
+            kind: "requires".into(),
+        };
+        let result = ok_result(Some(UpdateCheckLatest {
+            dependencies: vec![dependency],
+            ..latest("1.3.0", &[])
+        }));
+        let cached = |owner: &str, name: &str, version: &str| {
+            (owner == "wbk" && name == "mapper" && version == "1.2.0").then(|| CachedResolution {
+                version: version.into(),
+                integrity: "trusted by the injected test view".into(),
+                manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.2.0" }"#)
+                    .unwrap(),
+                modules: Vec::new(),
+                dependencies: vec![smudgy_cloud::ResolvedDependency {
+                    owner_nickname: "WBK".into(),
+                    name: "Companion".into(),
+                    range: "^1".into(),
+                    resolved_version: "1.0.0".into(),
+                    kind: DependencyKind::Requires,
+                }],
+            })
+        };
+        let plan = evaluate_entry(
+            "arctic",
+            &entry(Some("1.2.0")),
+            &result,
+            &cached,
+            &running(),
+        );
         assert!(matches!(plan.outcome, CheckOutcome::StagedUpdate { .. }));
+        match plan.action {
+            EntryAction::Stage(plan) => assert!(
+                plan.closure.is_empty(),
+                "requires roots never join the importing closure"
+            ),
+            other => panic!("expected Stage, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1467,6 +1820,7 @@ mod tests {
                         name: "dep-a".into(),
                         range: "^1".into(),
                         resolved_version: "1.0.0".into(),
+                        kind: smudgy_cloud::DependencyKind::Dependency,
                     }],
                     true,
                 ),
@@ -1506,7 +1860,9 @@ mod tests {
             owner: "wbk".into(),
             name: "mapper".into(),
         };
-        cache.write_blob("aa11", "export const x = 1;").unwrap();
+        let body = "export const x = 1;";
+        let hash = format!("{:x}", sha2::Sha256::digest(body.as_bytes()));
+        cache.write_blob(&hash, body).unwrap();
         cache
             .write_meta(
                 &key,
@@ -1518,8 +1874,10 @@ mod tests {
                         .unwrap(),
                     modules: vec![CachedModule {
                         subpath: "index.ts".into(),
-                        content_hash: "aa11".into(),
+                        content_hash: hash,
                         media_type: "application/typescript".into(),
+                        byte_size: body.len() as i64,
+                        is_entry: true,
                     }],
                     dependencies: Vec::new(),
                 },

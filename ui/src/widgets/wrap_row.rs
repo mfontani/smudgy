@@ -138,13 +138,8 @@ where
                     .as_widget()
                     .mouse_interaction(state, layout, cursor, viewport, renderer)
             })
-            .fold(mouse::Interaction::Idle, |acc, interaction| {
-                if acc == mouse::Interaction::Idle {
-                    interaction
-                } else {
-                    acc
-                }
-            })
+            .max()
+            .unwrap_or_default()
     }
 
     fn update(

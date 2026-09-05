@@ -5,13 +5,25 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use smudgy_cloud::DependencyKind;
 use smudgy_core::models::shared_packages::LockedPackage;
-use smudgy_core::models::{self, aliases, hotkeys, packages, triggers};
+use smudgy_core::models::{self, aliases, automation_transaction, packages, triggers};
 use smudgy_core::session::runtime::{
     AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, Origin,
 };
 
-use super::{AutomationsWindow, Message};
+use crate::update::Update;
+
+use super::{AutomationsWindow, Event, Message};
+
+/// Outcome of committing this window's automation tree against its loaded baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutomationSaveStatus {
+    Saved,
+    /// Another writer changed the persisted state after this window loaded it. Nothing was
+    /// written; the caller restores its in-memory edit and the window reloads.
+    Conflict,
+}
 
 /// Live script-created automations for the open session, kept in sync from the per-session
 /// automation broadcast and keyed by creator [`Origin`]. The sidebar nests each creator's
@@ -144,6 +156,15 @@ impl Script {
         }
     }
 
+    fn set_folder_name(&mut self, folder: Option<String>) {
+        match self {
+            Script::Alias(alias) => alias.package = folder,
+            Script::Hotkey(hotkey) => hotkey.package = folder,
+            Script::Trigger(trigger) => trigger.package = folder,
+            Script::Folder(_, _) => {}
+        }
+    }
+
     /// This node's own `enabled` flag (folders report `true`).
     pub fn own_enabled(&self) -> bool {
         match self {
@@ -165,6 +186,8 @@ pub struct ScriptKey {
 /// A node's at-a-glance health. Drives the colored status dot everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
+    /// Informational/non-runnable content with no enable state (for example an import-only file).
+    Neutral,
     /// Enabled & healthy (green).
     Ok,
     /// Enabled but broken — e.g. a pattern won't compile (red).
@@ -950,59 +973,80 @@ pub struct PackageGraph {
 pub struct DepEdge {
     pub specifier: String,
     pub range: String,
+    pub kind: DependencyKind,
 }
 
 impl PackageGraph {
-    /// Packages whose `requires` include `id`.
+    /// Packages whose `requires` include `id`. Ordinary code dependencies do
+    /// not force their target to run as a separate root.
     pub fn required_by(&self, id: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .requires
             .iter()
-            .filter(|(_, edges)| edges.iter().any(|e| e.specifier == id))
+            .filter(|(_, edges)| {
+                edges
+                    .iter()
+                    .any(|edge| edge.specifier == id && edge.kind == DependencyKind::Requires)
+            })
             .map(|(parent, _)| parent.clone())
             .collect();
         out.sort();
         out
     }
 
-    /// A dependency-only package: not directly installed, not owned, but required
-    /// by something — its on/off follows its dependents.
+    /// Packages with any declared relationship to `id`, including imported
+    /// code dependencies and separately-running `requires` roots.
+    fn parents_of(&self, id: &str) -> Vec<String> {
+        let mut out = self
+            .requires
+            .iter()
+            .filter(|(_, edges)| edges.iter().any(|edge| edge.specifier == id))
+            .map(|(parent, _)| parent.clone())
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    /// An import-only package: not directly installed or owned, and reached only through ordinary
+    /// code-dependency edges.
     pub fn is_dep_only(&self, id: &str) -> bool {
-        !self.direct.contains(id) && !self.owned.contains(id) && !self.required_by(id).is_empty()
+        !self.direct.contains(id)
+            && !self.owned.contains(id)
+            && self.required_by(id).is_empty()
+            && !self.parents_of(id).is_empty()
     }
 
-    /// Effective-enabled: the user turned it on (or owns it), or some
-    /// effectively-enabled dependent needs it. Guards against cycles.
+    /// A package runs as a root when its direct intent is active or any recursively active parent
+    /// declares it through `requires`. Ordinary dependencies execute inside their parent's isolate
+    /// and do not become roots here.
     pub fn effectively_enabled(&self, id: &str) -> bool {
-        let mut visited = HashSet::new();
-        self.eff(id, &mut visited)
+        fn visit(graph: &PackageGraph, id: &str, visiting: &mut HashSet<String>) -> bool {
+            if (graph.direct.contains(id) || graph.owned.contains(id))
+                && graph.intent.get(id).copied().unwrap_or(false)
+            {
+                return true;
+            }
+            if !visiting.insert(id.to_string()) {
+                return false;
+            }
+            let enabled = graph
+                .required_by(id)
+                .iter()
+                .any(|parent| visit(graph, parent, visiting));
+            visiting.remove(id);
+            enabled
+        }
+
+        visit(self, id, &mut HashSet::new())
     }
 
-    fn eff(&self, id: &str, visited: &mut HashSet<String>) -> bool {
-        if !visited.insert(id.to_string()) {
-            return false;
-        }
-        if self.owned.contains(id) || self.intent.get(id).copied().unwrap_or(false) {
-            return true;
-        }
-        self.required_by(id)
-            .iter()
-            .any(|parent| self.eff(parent, visited))
-    }
-
-    /// The switch is interactive only when nothing else forces it on:
-    /// not dep-only, and no *enabled* package currently requires it.
+    /// An automatically installed package whose only ownership is `required_by` has no direct
+    /// activation control. Explicit installs and authored packages do.
     pub fn controllable(&self, id: &str) -> bool {
-        if self.is_dep_only(id) {
-            return false;
-        }
-        !self
-            .required_by(id)
-            .iter()
-            .any(|parent| self.effectively_enabled(parent))
+        self.direct.contains(id) || self.owned.contains(id)
     }
 
-    /// Enabled dependents currently forcing `id` on (for the "Required by …" note).
+    /// Enabled parents that currently cause `id` to run (for the "Required by …" note).
     pub fn enabled_dependents(&self, id: &str) -> Vec<String> {
         self.required_by(id)
             .into_iter()
@@ -1015,33 +1059,48 @@ impl PackageGraph {
     /// it greys once `parent` is no longer effectively enabled, rather than reporting
     /// `child`'s global state (which stays on for a separately-installed `child` that
     /// runs on its own — that belongs to `child`'s own row, not this edge). The
-    /// operative term is the parent; the `child` term is a guard, since `parent`
-    /// requiring `child` already implies [`effectively_enabled`](Self::effectively_enabled)
-    /// of `child` whenever the parent is enabled — kept so the predicate is
-    /// self-contained for any edge it's asked about.
+    /// operative term is the parent for both ordinary imports and `requires`: an active requiring
+    /// parent is what activates an automatically installed required root.
     pub fn dep_edge_active(&self, parent: &str, child: &str) -> bool {
-        self.effectively_enabled(parent) && self.effectively_enabled(child)
+        let Some(edge) = self
+            .requires
+            .get(parent)
+            .and_then(|edges| edges.iter().find(|edge| edge.specifier == child))
+        else {
+            return false;
+        };
+        let _ = edge;
+        self.effectively_enabled(parent)
     }
 }
 
 impl AutomationsWindow {
     /// Loads aliases/triggers/hotkeys into the nested script tree.
     pub(super) fn load_scripts_message(&self) -> Message {
-        let mut errors = Vec::new();
+        let snapshot = match automation_transaction::load(&self.server_name) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Message::ScriptsLoaded {
+                    scripts: BTreeMap::new(),
+                    load: None,
+                    errors: Arc::new(vec![error.to_string()]),
+                };
+            }
+        };
 
-        let aliases = aliases::load_aliases(&self.server_name)
-            .map_err(|e| errors.push(e.to_string()))
-            .unwrap_or_default()
+        let aliases = snapshot
+            .aliases
+            .clone()
             .into_iter()
             .map(|(name, alias)| (name, Script::Alias(alias)));
-        let hotkeys = hotkeys::load_hotkeys(&self.server_name)
-            .map_err(|e| errors.push(e.to_string()))
-            .unwrap_or_default()
+        let hotkeys = snapshot
+            .hotkeys
+            .clone()
             .into_iter()
             .map(|(name, hotkey)| (name, Script::Hotkey(hotkey)));
-        let triggers = triggers::load_triggers(&self.server_name)
-            .map_err(|e| errors.push(e.to_string()))
-            .unwrap_or_default()
+        let triggers = snapshot
+            .triggers
+            .clone()
             .into_iter()
             .map(|(name, trigger)| (name, Script::Trigger(trigger)));
 
@@ -1054,21 +1113,66 @@ impl AutomationsWindow {
                 Ok(folder) => {
                     folder.insert(name, script);
                 }
-                Err(e) => errors.push(e),
+                Err(error) => {
+                    return Message::ScriptsLoaded {
+                        scripts: BTreeMap::new(),
+                        load: None,
+                        errors: Arc::new(vec![error]),
+                    };
+                }
             }
         }
-        Message::ScriptsLoaded(scripts, Arc::new(errors))
+        Message::ScriptsLoaded {
+            scripts,
+            load: Some(snapshot),
+            errors: Arc::new(Vec::new()),
+        }
     }
 
     /// Adds the folder-tree's folders (incl. empty ones) into the script map so
     /// they render with no scripts inside. Idempotent.
     pub(super) fn merge_folders(&mut self) {
+        fn collect_leaves(scripts: &BTreeMap<String, Script>, leaves: &mut Vec<(String, Script)>) {
+            for (name, script) in scripts {
+                match script {
+                    Script::Folder(_, children) => collect_leaves(children, leaves),
+                    script => leaves.push((name.clone(), script.clone())),
+                }
+            }
+        }
+
+        // Rewrite only unambiguous case variants to the packages.json spelling. Exact legacy
+        // case-only siblings remain distinct; a lone `combat` script under stored `Combat` is
+        // canonicalized so the sidebar, editor, and runtime all address the same folder.
+        let mut leaves = Vec::new();
+        collect_leaves(&self.scripts, &mut leaves);
+        let mut scripts = BTreeMap::new();
+        for (name, mut script) in leaves {
+            if let Some(folder) = script.folder_name()
+                && let Some(canonical) = packages::canonical_folder_path(&self.packages, folder)
+            {
+                script.set_folder_name(Some(canonical));
+            }
+            if let Ok(folder) = upsert_script_folder(&mut scripts, script.folder_name()) {
+                folder.insert(name, script);
+            }
+        }
+        self.scripts = scripts;
         for path in packages::collect_folder_paths(&self.packages) {
             let _ = upsert_script_folder(&mut self.scripts, Some(&path));
         }
     }
 
-    pub(super) fn serialize_scripts(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn serialize_scripts(
+        &mut self,
+    ) -> Result<AutomationSaveStatus, Box<dyn std::error::Error>> {
+        if self.folder_state_error.is_some() {
+            return Err(crate::i18n::t!("automation-folder-state-unavailable").into());
+        }
+        let expected = self
+            .automation_snapshot
+            .clone()
+            .ok_or_else(|| crate::i18n::t!("automation-state-baseline-unavailable"))?;
         let mut aliases_map = std::collections::HashMap::new();
         let mut hotkeys_map = std::collections::HashMap::new();
         let mut triggers_map = std::collections::HashMap::new();
@@ -1078,16 +1182,40 @@ impl AutomationsWindow {
             &mut hotkeys_map,
             &mut triggers_map,
         );
-        aliases::save_aliases(&self.server_name, &aliases_map).map_err(
-            |e| crate::i18n::t!("automation-save-aliases-failed", "error" => e.to_string()),
-        )?;
-        hotkeys::save_hotkeys(&self.server_name, &hotkeys_map).map_err(
-            |e| crate::i18n::t!("automation-save-hotkeys-failed", "error" => e.to_string()),
-        )?;
-        triggers::save_triggers(&self.server_name, &triggers_map).map_err(
-            |e| crate::i18n::t!("automation-save-triggers-failed", "error" => e.to_string()),
-        )?;
-        Ok(())
+        let snapshot = automation_transaction::AutomationStateSnapshot::new(
+            self.packages.clone(),
+            aliases_map,
+            hotkeys_map,
+            triggers_map,
+        );
+        let outcome =
+            automation_transaction::commit_if_unchanged(&self.server_name, &expected, &snapshot)
+                .map_err(|error| {
+                    crate::i18n::t!(
+                        "automation-save-state-failed",
+                        "error" => error.to_string()
+                    )
+                })?;
+        match outcome {
+            automation_transaction::CommitOutcome::Applied => {
+                self.automation_snapshot = Some(snapshot);
+                Ok(AutomationSaveStatus::Saved)
+            }
+            automation_transaction::CommitOutcome::Conflict => Ok(AutomationSaveStatus::Conflict),
+        }
+    }
+
+    /// Present a save that lost its compare-and-set race: nothing was written, so tell the user
+    /// and reload the authoritative tree. Callers restore their in-memory edit first.
+    pub(super) fn automation_save_conflict_task(&mut self) -> iced::Task<Message> {
+        iced::Task::batch([
+            self.show_toast(crate::i18n::t!("automation-save-state-conflict")),
+            iced::Task::done(self.load_scripts_message()),
+        ])
+    }
+
+    pub(super) fn automation_save_conflict(&mut self) -> Update<Message, Event> {
+        Update::with_task(self.automation_save_conflict_task())
     }
 
     pub(super) fn script_exists(&self, name: &str) -> bool {
@@ -1172,9 +1300,9 @@ impl AutomationsWindow {
     /// The effective status of a leaf script (its own enable + folder enable + a
     /// compile error). Folders/modules report Ok unless disabled.
     pub(super) fn script_status(&self, script: &Script) -> NodeStatus {
-        let folder_enabled = script
-            .folder_name()
-            .is_none_or(|path| packages::is_package_effectively_enabled(path, &self.packages));
+        let folder_enabled = script.folder_name().is_none_or(|path| {
+            packages::is_package_effectively_enabled_for(path, &self.packages, &self.profile_name)
+        });
         if !script.own_enabled() || !folder_enabled {
             return NodeStatus::Disabled;
         }
@@ -1283,9 +1411,123 @@ pub fn is_installed(installed: &[LockedPackage], owner: &str, name: &str) -> boo
     installed.iter().any(|p| p.specifier == specifier)
 }
 
+/// Required-parameter completeness per profile for the open profile-scoped package. Computing
+/// it reads the value store and the keyring under the server state lock, so it lives here rather
+/// than in the Settings tab's `view`, which only reads it. Kept current by
+/// [`AutomationsWindow::sync_profile_param_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileParamStatus {
+    /// The package the entries describe (`smudgy://owner/name`).
+    pub specifier: String,
+    /// The declared parameter keys the entries were computed for. A manifest save that adds or
+    /// removes a parameter re-seeds the editor with a different list and invalidates the cache.
+    pub param_keys: Vec<String>,
+    /// Missing required keys per profile, in profile inventory order.
+    pub missing: Vec<(String, Vec<String>)>,
+}
+
+impl ProfileParamStatus {
+    /// The required keys `profile` still lacks, or `None` when the profile was not in the
+    /// inventory the entries were computed for.
+    #[must_use]
+    pub fn missing_for(&self, profile: &str) -> Option<&[String]> {
+        self.missing
+            .iter()
+            .find(|(name, _)| name == profile)
+            .map(|(_, missing)| missing.as_slice())
+    }
+
+    fn matches(&self, config: &super::packages::ParamConfig, profile_names: &[String]) -> bool {
+        self.specifier == config.specifier
+            && self
+                .param_keys
+                .iter()
+                .eq(config.params.iter().map(|param| &param.key))
+            && self.missing.len() == profile_names.len()
+            && self
+                .missing
+                .iter()
+                .zip(profile_names)
+                .all(|((name, _), profile)| name == profile)
+    }
+}
+
+impl AutomationsWindow {
+    /// Keeps [`Self::profile_param_status`] aligned with the open parameter editor. Runs after
+    /// every update: the cache is dropped when no available profile-scoped editor is open,
+    /// recomputed when the editor's package, parameter list, or the profile inventory changed
+    /// (a package opening, a manifest save, a reload), and recomputed unconditionally when
+    /// `values_written` reports a message that stored or cleared parameter values without changing
+    /// that identity.
+    pub(super) fn sync_profile_param_status(&mut self, values_written: bool) {
+        let Some(config) = self.param_config.as_ref().filter(|config| {
+            config.available
+                && config.parameter_scope
+                    == smudgy_core::models::shared_packages::ParameterScope::Profile
+        }) else {
+            self.profile_param_status = None;
+            return;
+        };
+        let current = self
+            .profile_param_status
+            .as_ref()
+            .is_some_and(|status| status.matches(config, &self.profile_names));
+        if current && !values_written {
+            return;
+        }
+        let missing = self
+            .profile_names
+            .iter()
+            .map(|profile| {
+                let missing = smudgy_core::models::shared_packages::missing_required_params_scoped(
+                    &self.server_name,
+                    smudgy_core::models::shared_packages::ParamValueScope::Profile(profile),
+                    &config.specifier,
+                    &config.params,
+                );
+                (profile.clone(), missing)
+            })
+            .collect();
+        self.profile_param_status = Some(ProfileParamStatus {
+            specifier: config.specifier.clone(),
+            param_keys: config
+                .params
+                .iter()
+                .map(|param| param.key.clone())
+                .collect(),
+            missing,
+        });
+    }
+
+    /// Messages whose handling can store or clear parameter values for the open package while
+    /// leaving the editor's identity unchanged, so the completeness cache must be recomputed.
+    pub(super) fn writes_parameter_values(message: &Message) -> bool {
+        matches!(
+            message,
+            Message::ParamConfigSave
+                | Message::ParamConfigClearSecret(_)
+                | Message::SetParameterScope(_)
+                | Message::ConfirmGlobalParameterSource
+                | Message::ConfirmCopySettings
+                | Message::SelectParameterProfile(_)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DepEdge, PackageGraph};
+    use super::{DepEdge, PackageGraph, Script, upsert_script_folder};
+
+    #[test]
+    fn script_folder_tree_preserves_legacy_case_variants() {
+        let mut scripts = std::collections::BTreeMap::new();
+        upsert_script_folder(&mut scripts, Some("combat/healing")).unwrap();
+        upsert_script_folder(&mut scripts, Some("Combat/Healing")).unwrap();
+
+        assert_eq!(scripts.len(), 2);
+        assert!(matches!(scripts.get("combat"), Some(Script::Folder(_, _))));
+        assert!(matches!(scripts.get("Combat"), Some(Script::Folder(_, _))));
+    }
 
     mod matcher_drafts {
         use super::super::*;
@@ -1766,7 +2008,7 @@ mod tests {
         graph.intent.insert(spec.to_string(), enabled);
     }
 
-    /// Record that `parent` pulls `child` in (a `requires`-graph edge).
+    /// Record that `parent` imports `child` into its own isolate.
     fn imports(graph: &mut PackageGraph, parent: &str, child: &str) {
         graph
             .requires
@@ -1775,6 +2017,20 @@ mod tests {
             .push(DepEdge {
                 specifier: child.to_string(),
                 range: String::new(),
+                kind: smudgy_cloud::DependencyKind::Dependency,
+            });
+    }
+
+    /// Record that `parent` needs `child` to run as a separate root.
+    fn requires(graph: &mut PackageGraph, parent: &str, child: &str) {
+        graph
+            .requires
+            .entry(parent.to_string())
+            .or_default()
+            .push(DepEdge {
+                specifier: child.to_string(),
+                range: String::new(),
+                kind: smudgy_cloud::DependencyKind::Requires,
             });
     }
 
@@ -1838,5 +2094,29 @@ mod tests {
         graph.intent.insert("p".to_string(), false);
         assert!(!graph.effectively_enabled("l"));
         assert!(!graph.dep_edge_active("p", "l"));
+    }
+
+    #[test]
+    fn requires_edges_follow_the_active_parent_chain() {
+        let mut graph = PackageGraph::default();
+        install(&mut graph, "parent", true);
+        imports(&mut graph, "parent", "library");
+        requires(&mut graph, "parent", "worker");
+
+        assert!(!graph.effectively_enabled("library"));
+        assert!(graph.effectively_enabled("worker"));
+        assert!(graph.dep_edge_active("parent", "library"));
+        assert!(graph.dep_edge_active("parent", "worker"));
+        assert!(graph.required_by("library").is_empty());
+        assert_eq!(graph.required_by("worker"), ["parent"]);
+        assert!(!graph.controllable("worker"));
+
+        graph.intent.insert("parent".to_string(), false);
+        assert!(!graph.effectively_enabled("worker"));
+        assert!(!graph.dep_edge_active("parent", "worker"));
+
+        install(&mut graph, "worker", true);
+        assert!(graph.effectively_enabled("worker"));
+        assert!(graph.controllable("worker"));
     }
 }

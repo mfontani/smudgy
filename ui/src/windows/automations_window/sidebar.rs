@@ -1,13 +1,15 @@
 //! The navigator sidebar: New menu, search, filter chips, the status-dotted
 //! tree (SCRIPTS / MODULES / PACKAGES with dependency nesting), and the footer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use iced::alignment::Vertical;
 use iced::widget::{Column, button, column, container, row, scrollable, text, text_input};
 use iced::{Background, Border, Color, Length, Padding};
 
+use smudgy_cloud::DependencyKind;
 use smudgy_core::models::packages;
+use smudgy_core::models::shared_packages::SharedPackageLock;
 use smudgy_core::session::runtime::AutomationKind;
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -20,6 +22,27 @@ use super::model::{CreatorAutomations, NodeStatus, Script, ScriptKey, package_di
 use super::{AutomationsWindow, Chip, Elem, Message, Selection};
 
 const SIDEBAR_WIDTH: f32 = 282.0;
+
+fn partial_scope_badge<'a>(enabled: usize, total: usize) -> Option<Elem<'a>> {
+    is_partial_scope(enabled, total).then(|| common::badge(format!("{enabled}/{total}")))
+}
+
+fn is_partial_scope(enabled: usize, total: usize) -> bool {
+    enabled != 0 && enabled != total
+}
+
+fn effective_folder_profile_count(
+    path: &str,
+    tree: &packages::PackageTree,
+    profile_names: &[String],
+) -> usize {
+    profile_names
+        .iter()
+        .filter(|profile| {
+            packages::is_package_effectively_enabled_for(path, tree, profile.as_str())
+        })
+        .count()
+}
 
 impl AutomationsWindow {
     pub(super) fn view_sidebar(&self) -> Elem<'_> {
@@ -325,15 +348,34 @@ impl AutomationsWindow {
                 .filter(|m| self.name_matches(&m.subpath))
             {
                 let selected = self.selection == Selection::Module(m.subpath.clone());
+                let activation =
+                    smudgy_core::models::modules::activation(&self.module_settings, &m.subpath);
+                let executable = smudgy_core::models::modules::is_script_module(&m.subpath);
+                let enabled = executable && activation.is_enabled_for(&self.profile_name);
+                let enabled_count = self
+                    .profile_names
+                    .iter()
+                    .filter(|profile| executable && activation.is_enabled_for(profile))
+                    .count();
                 rows.push(tree_row(
                     0,
                     None,
-                    NodeStatus::Ok,
+                    if self.module_state_error.is_some() {
+                        NodeStatus::Error
+                    } else if !executable {
+                        NodeStatus::Neutral
+                    } else if enabled {
+                        NodeStatus::Ok
+                    } else {
+                        NodeStatus::Disabled
+                    },
                     bootstrap_icons::FONTS,
                     &m.subpath,
                     selected,
                     Message::SelectModule(m.subpath.clone()),
-                    None,
+                    (executable && self.profile_inventory_complete)
+                        .then(|| partial_scope_badge(enabled_count, self.profile_names.len()))
+                        .flatten(),
                 ));
                 if let Some(automations) = self.live.module(&m.subpath) {
                     self.build_creator_rows(
@@ -389,8 +431,19 @@ impl AutomationsWindow {
             // When filtering to a single leaf type, skip folder chrome entirely.
             let leaf_only = matches!(self.chip, Chip::Aliases | Chip::Triggers | Chip::Hotkeys);
             let collapsed = !searching && self.collapsed_folders.contains(&path);
-            let enabled = packages::is_package_effectively_enabled(&path, &self.packages);
-            let status = if enabled {
+            let enabled = packages::is_package_effectively_enabled_for(
+                &path,
+                &self.packages,
+                &self.profile_name,
+            );
+            let enabled_count = effective_folder_profile_count(
+                &path,
+                &self.packages,
+                self.profile_names.as_slice(),
+            );
+            let status = if self.folder_state_error.is_some() {
+                NodeStatus::Error
+            } else if enabled {
                 NodeStatus::Ok
             } else {
                 NodeStatus::Disabled
@@ -406,7 +459,9 @@ impl AutomationsWindow {
                         name,
                         selected,
                         Message::SelectFolder(path.clone()),
-                        None,
+                        self.profile_inventory_complete
+                            .then(|| partial_scope_badge(enabled_count, self.profile_names.len()))
+                            .flatten(),
                     ));
                 }
             } else if self.chip == Chip::Folders && self.name_matches(name) {
@@ -419,7 +474,9 @@ impl AutomationsWindow {
                     name,
                     selected,
                     Message::SelectFolder(path.clone()),
-                    None,
+                    self.profile_inventory_complete
+                        .then(|| partial_scope_badge(enabled_count, self.profile_names.len()))
+                        .flatten(),
                 ));
             }
             if !collapsed && self.chip != Chip::Folders {
@@ -461,50 +518,24 @@ impl AutomationsWindow {
     }
 
     fn build_package_rows<'a>(&'a self, out: &mut Vec<Elem<'a>>) {
-        // Installed specs that are a local package's OWN specifier are represented by the LOCAL row,
-        // not a second INSTALLED row — this kills the active-fork double-count.
-        let local_own_specs = self.local_own_specs();
-
-        // Same-name groups: every installed + local package sharing a leaf name (case-folded like
-        // the filesystem). Only one member of a group should run at a time, so a grouped row gets a
-        // radio to switch which is live. Grouped purely by leaf name — fork provenance is no longer
-        // tracked, so a local `boo` groups with an installed `bar/boo` simply because they're both
-        // "boo". A self-fork keeping its name shares a single specifier slot (its installed row is
-        // suppressed above), so it's a one-member group with no radio.
-        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-        for pkg in &self.installed_packages {
-            if local_own_specs.contains(&pkg.specifier) {
-                continue; // represented by its LOCAL row
-            }
-            groups
-                .entry(package_display_name(&pkg.specifier).to_ascii_lowercase())
-                .or_default()
-                .push(pkg.specifier.clone());
-        }
-        for name in &self.local_packages {
-            groups
-                .entry(name.to_ascii_lowercase())
-                .or_default()
-                .push(self.local_own_spec(name));
-        }
-        // The OTHER members of the group `spec` belongs to (the radio's siblings to disable);
-        // empty when `spec` is a lone package, in which case no radio is shown.
-        let siblings_of = |spec: &str, leaf: &str| -> Vec<String> {
-            groups
-                .get(&leaf.to_ascii_lowercase())
-                .into_iter()
-                .flatten()
-                .filter(|member| member.as_str() != spec)
-                .cloned()
-                .collect()
+        // A local package is the canonical package for its leaf name. Its remote lock record stays
+        // on disk as a fallback, but it is not a second selectable package while the local folder
+        // exists.
+        let local_leaf_names = self
+            .local_packages
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let package_lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
         };
 
         // ---- INSTALLED (cloud) ----
         let mut installed_rows: Vec<Elem<'a>> = Vec::new();
         for pkg in &self.installed_packages {
             let spec = &pkg.specifier;
-            if local_own_specs.contains(spec) {
-                continue; // shown as a LOCAL row instead
+            if local_leaf_names.contains(&package_display_name(spec).to_ascii_lowercase()) {
+                continue; // the LOCAL row is the canonical view; this record is fallback only
             }
             if !self.name_matches(package_display_name(spec))
                 && !self.package_descendant_matches(spec)
@@ -512,41 +543,26 @@ impl AutomationsWindow {
                 continue;
             }
             let status = self.package_status(spec);
+            let enabled_count = self
+                .profile_names
+                .iter()
+                .filter(|profile| package_lock.is_effectively_enabled_for(spec, profile))
+                .count();
+            let scope_badge = || {
+                self.profile_inventory_complete
+                    .then(|| partial_scope_badge(enabled_count, self.profile_names.len()))
+                    .flatten()
+            };
             let selected = self.selection == Selection::InstalledPackage(spec.clone());
             let select = Message::SelectInstalledPackage(spec.clone());
-            let siblings = siblings_of(spec, package_display_name(spec));
-            if siblings.is_empty() {
-                installed_rows.push(package_row(
-                    None,
-                    status,
-                    bootstrap_icons::CLOUD_CHECK,
-                    package_display_name(spec).to_string(),
-                    selected,
-                    select,
-                    None,
-                ));
-            } else {
-                // A same-name group member: owner-qualify the label and give it a radio so the
-                // user can pick which "<leaf>" is live.
-                let active = self.graph.effectively_enabled(spec);
-                let on_activate = (!active).then(|| Message::SetActiveMember {
-                    target_spec: spec.clone(),
-                    siblings,
-                });
-                let label = super::model::parse_specifier(spec).map_or_else(
-                    || package_display_name(spec).to_string(),
-                    |(o, n)| format!("{o}/{n}"),
-                );
-                installed_rows.push(package_row(
-                    Some((active, on_activate)),
-                    status,
-                    bootstrap_icons::CLOUD_CHECK,
-                    label,
-                    selected,
-                    select,
-                    None,
-                ));
-            }
+            installed_rows.push(package_row(
+                status,
+                bootstrap_icons::CLOUD_CHECK,
+                package_display_name(spec).to_string(),
+                selected,
+                select,
+                scope_badge(),
+            ));
             if let Some((owner, name)) = super::model::parse_specifier(spec)
                 && let Some(automations) = self.live.package(&owner, &name)
             {
@@ -570,37 +586,25 @@ impl AutomationsWindow {
             let selected = self.selection == Selection::OwnedPackage(name.clone());
             let select = Message::SelectOwnedPackage(name.clone());
             let own_spec = self.local_own_spec(name);
-            let siblings = siblings_of(&own_spec, name);
-            if siblings.is_empty() {
-                // Lone local: no in-tree toggle — enable/disable lives in its pane like cloud
-                // packages.
-                local_rows.push(package_row(
-                    None,
-                    status,
-                    bootstrap_icons::BOUNDING_BOX,
-                    name.clone(),
-                    selected,
-                    select,
-                    None,
-                ));
-            } else {
-                // Shares a name with an installed package: give it a radio within the group.
-                let active = self.local_active(name);
-                let on_activate = (!active).then(|| Message::SetActiveMember {
-                    target_spec: own_spec,
-                    siblings,
-                });
-                local_rows.push(package_row(
-                    Some((active, on_activate)),
-                    status,
-                    bootstrap_icons::BOUNDING_BOX,
-                    name.clone(),
-                    selected,
-                    select,
-                    None,
-                ));
-            }
-            self.build_dep_rows(&format!("local:{name}"), 1, &mut local_rows);
+            let enabled_count = self
+                .profile_names
+                .iter()
+                .filter(|profile| package_lock.is_effectively_enabled_for(&own_spec, profile))
+                .count();
+            let scope_badge = || {
+                self.profile_inventory_complete
+                    .then(|| partial_scope_badge(enabled_count, self.profile_names.len()))
+                    .flatten()
+            };
+            local_rows.push(package_row(
+                status,
+                bootstrap_icons::BOUNDING_BOX,
+                name.clone(),
+                selected,
+                select,
+                scope_badge(),
+            ));
+            self.build_dep_rows(&self.local_own_spec(name), 1, &mut local_rows);
         }
 
         if !installed_rows.is_empty() {
@@ -634,7 +638,11 @@ impl AutomationsWindow {
             // top-level row lit). When the edge IS live, defer to `package_status` so an
             // update-blocked dep still surfaces its Warning dot rather than a flat Ok.
             let status = if self.graph.dep_edge_active(parent, spec) {
-                self.package_status(spec)
+                if self.blocked_updates.contains(spec) {
+                    NodeStatus::Warning
+                } else {
+                    NodeStatus::Ok
+                }
             } else {
                 NodeStatus::Disabled
             };
@@ -649,7 +657,11 @@ impl AutomationsWindow {
                     parent: parent.to_string(),
                     spec: spec.clone(),
                 },
-                Some(common::dep_tag()),
+                Some(if edge.kind == DependencyKind::Requires {
+                    common::required_tag()
+                } else {
+                    common::dep_tag()
+                }),
             ));
         }
     }
@@ -861,13 +873,19 @@ impl AutomationsWindow {
         }
         walk(&self.scripts, &mut c);
         c.modules = self.modules.len();
-        // Distinct logical packages: installed (minus any that are a local's own-spec install, to
-        // avoid double-counting an active fork) + local.
-        let own = self.local_own_specs();
+        // Distinct logical packages: a local leaf replaces every same-leaf remote fallback row.
+        let local_leaf_names = self
+            .local_packages
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
         c.packages = self
             .installed_packages
             .iter()
-            .filter(|p| !own.contains(&p.specifier))
+            .filter(|package| {
+                !local_leaf_names
+                    .contains(&package_display_name(&package.specifier).to_ascii_lowercase())
+            })
             .count()
             + self.local_packages.len();
         c
@@ -1031,12 +1049,10 @@ fn tree_row<'a>(
     btn.into()
 }
 
-/// A package navigator row: like `tree_row`, but the left gutter carries an optional same-name
-/// radio (active U+25C9 / inactive U+25CB clickable) instead of a twisty. Used for the INSTALLED
-/// and LOCAL package rows.
+/// A package navigator row without a folder twisty. Local leaf-name overrides are automatic, so
+/// package rows deliberately have no same-name provider selector.
 #[allow(clippy::too_many_arguments)]
 fn package_row<'a>(
-    radio: Option<(bool, Option<Message>)>,
     status: NodeStatus,
     icon: &'static str,
     label: String,
@@ -1044,37 +1060,9 @@ fn package_row<'a>(
     on_press: Message,
     trailing: Option<Elem<'a>>,
 ) -> Elem<'a> {
-    let mut inner = row![].spacing(7.0).align_y(Vertical::Center);
-    // Left gutter: the active member's marker, an inactive member's "switch to this" button, or a
-    // spacer matching tree_row's no-twisty gap for non-colliding rows.
-    match radio {
-        Some((true, _)) => {
-            inner = inner.push(
-                container(text("\u{25C9}").size(12.0).style(common::success)).padding(Padding {
-                    top: 0.0,
-                    bottom: 0.0,
-                    left: 2.0,
-                    right: 2.0,
-                }),
-            );
-        }
-        Some((false, on_activate)) => {
-            inner = inner.push(
-                button(text("\u{25CB}").size(12.0).style(common::muted))
-                    .style(button_style::list_item)
-                    .on_press_maybe(on_activate)
-                    .padding(Padding {
-                        top: 0.0,
-                        bottom: 0.0,
-                        left: 2.0,
-                        right: 2.0,
-                    }),
-            );
-        }
-        None => {
-            inner = inner.push(iced::widget::space::horizontal().width(Length::Fixed(14.0)));
-        }
-    }
+    let mut inner = row![iced::widget::space::horizontal().width(Length::Fixed(14.0))]
+        .spacing(7.0)
+        .align_y(Vertical::Center);
     inner = inner.push(common::status_dot(status));
     let disabled = status == NodeStatus::Disabled;
     let icon_style: fn(&Theme) -> text::Style = if disabled {
@@ -1130,7 +1118,7 @@ fn creator_toggle_row<'a>(
     } else {
         bootstrap_icons::CHEVRON_RIGHT
     };
-    let label = format!("{total} automation{}", if total == 1 { "" } else { "s" });
+    let label = crate::i18n::t!("automations-created-count", "count" => total as i64);
     button(
         row![
             text(chevron)
@@ -1171,4 +1159,73 @@ fn show_more_row<'a>(indent: usize, remaining: usize, creator_id: String) -> Ele
         right: 6.0,
     })
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use smudgy_core::models::packages::{PackageNode, PackageTree};
+    use smudgy_core::models::profile_activation::ProfileActivation;
+
+    use super::{effective_folder_profile_count, is_partial_scope};
+
+    fn folder(
+        activation: ProfileActivation,
+        children: HashMap<String, PackageNode>,
+    ) -> PackageNode {
+        PackageNode {
+            enabled: activation.legacy_enabled(),
+            activation: Some(activation),
+            children,
+        }
+    }
+
+    #[test]
+    fn scope_hint_appears_only_for_a_nonempty_proper_subset() {
+        assert!(!is_partial_scope(0, 0));
+        assert!(!is_partial_scope(0, 3));
+        assert!(is_partial_scope(1, 3));
+        assert!(is_partial_scope(2, 3));
+        assert!(!is_partial_scope(3, 3));
+    }
+
+    #[test]
+    fn nested_folder_scope_count_includes_ancestor_activation() {
+        let profiles = vec!["Main".to_string(), "Alt".to_string(), "Test".to_string()];
+        let main_only = ProfileActivation::Selected {
+            profiles: ["Main".to_string()].into_iter().collect(),
+        };
+        let tree = PackageTree::from([
+            (
+                "partial-parent".to_string(),
+                folder(
+                    main_only.clone(),
+                    HashMap::from([(
+                        "all-child".to_string(),
+                        folder(ProfileActivation::All, HashMap::new()),
+                    )]),
+                ),
+            ),
+            (
+                "off-parent".to_string(),
+                folder(
+                    ProfileActivation::None,
+                    HashMap::from([(
+                        "selected-child".to_string(),
+                        folder(main_only, HashMap::new()),
+                    )]),
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            effective_folder_profile_count("partial-parent/all-child", &tree, &profiles),
+            1
+        );
+        assert_eq!(
+            effective_folder_profile_count("off-parent/selected-child", &tree, &profiles),
+            0
+        );
+    }
 }

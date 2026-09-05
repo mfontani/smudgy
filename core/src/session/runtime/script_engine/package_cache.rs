@@ -10,19 +10,24 @@
 //! - **metadata** (`meta/<owner>/<name>/<version>.json`): the manifest + module
 //!   list for a concrete version, so a *pinned* package resolves fully offline.
 //!
-//! Bodies are written only after the provider verified their hash on fetch, and the
-//! cache is content-addressed, so reads are trusted without re-hashing.
+//! Bodies are written only after the provider verified their hash on fetch. Reads verify the
+//! hash again: a content-addressed filename does not protect against later disk corruption or
+//! local tampering.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use semver::Version;
 use serde::{Deserialize, Serialize};
-use smudgy_cloud::{ResolvedDependency, package_api::ResolvedModuleWire};
+use sha2::{Digest, Sha256};
+use smudgy_cloud::{DependencyKind, ResolvedDependency, package_api::ResolvedModuleWire};
 pub use smudgy_script::PackageKey;
-use smudgy_script::PackageManifest;
+use smudgy_script::{PackageManifest, SmudgySpecifier};
 
 use crate::get_smudgy_home;
+use crate::models::naming::validate_package_name;
 use crate::models::persistence::write_atomic;
 
 /// A cached resolution of a concrete package version (no presigned URLs — those are
@@ -30,11 +35,15 @@ use crate::models::persistence::write_atomic;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedResolution {
     pub version: String,
+    /// The package-level fingerprint ([`package_integrity`]) a network-verified load stamps
+    /// into the lockfile.
     pub integrity: String,
     pub manifest: PackageManifest,
     pub modules: Vec<CachedModule>,
     /// The version's locked `smudgy://` deps, so an offline load can repopulate
-    /// referrer-aware version selection. `default` keeps older cache files readable.
+    /// referrer-aware version selection. `default` keeps older cache files readable; a file
+    /// written before relation kinds were preserved has them recovered from the manifest by
+    /// [`PackageCache::read_meta`].
     #[serde(default)]
     pub dependencies: Vec<ResolvedDependency>,
 }
@@ -50,6 +59,13 @@ pub struct CachedModule {
     /// (lazily fetched by the image side-channel).
     #[serde(default = "default_cached_media_type")]
     pub media_type: String,
+    /// Published byte count. Zero is the backward-compatible "not supplied" value for older
+    /// servers and cache files.
+    #[serde(default)]
+    pub byte_size: i64,
+    /// Whether the registry selected this module as the package entrypoint.
+    #[serde(default)]
+    pub is_entry: bool,
 }
 
 fn default_cached_media_type() -> String {
@@ -139,6 +155,61 @@ pub fn package_integrity(modules: &[ResolvedModuleWire]) -> String {
     entries.join(";")
 }
 
+/// Build cache metadata from a network resolution. This is the one recipe used by the engine
+/// and update checker, so both persist byte-for-byte compatible metadata and stamps.
+///
+/// # Errors
+/// Returns an error when the requested identity or version is not a safe cache coordinate.
+pub fn resolution_from_wire(
+    key: &PackageKey,
+    wire_version: &str,
+    manifest: PackageManifest,
+    modules: &[ResolvedModuleWire],
+    dependencies: &[ResolvedDependency],
+) -> Result<CachedResolution> {
+    validate_cache_identity(key, wire_version)?;
+    Ok(CachedResolution {
+        version: wire_version.to_string(),
+        integrity: package_integrity(modules),
+        manifest,
+        modules: modules
+            .iter()
+            .map(|module| CachedModule {
+                subpath: module.subpath.clone(),
+                content_hash: module.content_hash.clone(),
+                media_type: module.media_type.clone(),
+                byte_size: module.byte_size,
+                is_entry: module.is_entry,
+            })
+            .collect(),
+        dependencies: dependencies.to_vec(),
+    })
+}
+
+/// Rejects identities and versions that would escape (or alias) the cache's on-disk layout.
+fn validate_cache_identity(key: &PackageKey, version: &str) -> Result<()> {
+    validate_package_name(&key.owner).map_err(|error| anyhow!("invalid package owner: {error}"))?;
+    validate_package_name(&key.name).map_err(|error| anyhow!("invalid package name: {error}"))?;
+    let parsed = SmudgySpecifier::parse(&key.to_user_specifier())?;
+    if parsed.subpath.is_some()
+        || !parsed.owner.eq_ignore_ascii_case(&key.owner)
+        || !parsed.name.eq_ignore_ascii_case(&key.name)
+    {
+        bail!("invalid package cache identity {}", key.to_user_specifier());
+    }
+    let parsed_version = Version::parse(version).context("invalid package cache version")?;
+    if parsed_version.to_string() != version {
+        bail!("package cache version must be canonical semver: {version}");
+    }
+    Ok(())
+}
+
+fn normalize_sha256(value: &str) -> Option<String> {
+    let hash = value.strip_prefix("sha256-").unwrap_or(value);
+    (hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| hash.to_ascii_lowercase())
+}
+
 /// Disk cache rooted at `<smudgy_home>/cache/packages/`.
 #[derive(Debug, Clone)]
 pub struct PackageCache {
@@ -166,9 +237,10 @@ impl PackageCache {
     }
 
     fn blob_path(&self, content_hash: &str) -> PathBuf {
-        let a = content_hash.get(0..2).unwrap_or("00");
-        let b = content_hash.get(2..4).unwrap_or("00");
-        self.root.join("blobs").join(a).join(b).join(content_hash)
+        let hash = normalize_sha256(content_hash).unwrap_or_else(|| "0".repeat(64));
+        let a = &hash[0..2];
+        let b = &hash[2..4];
+        self.root.join("blobs").join(a).join(b).join(hash)
     }
 
     fn meta_path(&self, key: &PackageKey, version: &str) -> PathBuf {
@@ -179,24 +251,34 @@ impl PackageCache {
             .join(format!("{version}.json"))
     }
 
-    /// Whether a module body is already cached — presence is truth (bodies are
-    /// verified before they are written), so writers use this to skip a fetch
-    /// without reading the file.
+    /// Whether a module body is already cached and still matches its content hash.
+    /// Writers use this to skip a fetch only after the existing bytes have been verified.
     #[must_use]
     pub fn has_blob(&self, content_hash: &str) -> bool {
-        self.blob_path(content_hash).exists()
+        self.read_blob_bytes(content_hash).is_some()
     }
 
-    /// A cached module body, if present (content-addressed; trusted without re-hashing).
+    /// A cached UTF-8 module body, if present and its SHA-256 matches `content_hash`.
     #[must_use]
     pub fn read_blob(&self, content_hash: &str) -> Option<String> {
-        fs::read_to_string(self.blob_path(content_hash)).ok()
+        String::from_utf8(self.read_blob_bytes(content_hash)?).ok()
     }
 
-    /// Byte twin of [`read_blob`](Self::read_blob), for binary (asset) bodies.
+    /// Byte twin of [`read_blob`](Self::read_blob), for binary (asset) bodies. A corrupt or
+    /// tampered file is a cache miss, which lets an online caller fetch and atomically replace it.
     #[must_use]
     pub fn read_blob_bytes(&self, content_hash: &str) -> Option<Vec<u8>> {
-        fs::read(self.blob_path(content_hash)).ok()
+        let expected = normalize_sha256(content_hash)?;
+        let bytes = fs::read(self.blob_path(content_hash)).ok()?;
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if actual == expected {
+            Some(bytes)
+        } else {
+            log::warn!(
+                "Ignoring package cache blob whose bytes do not match its SHA-256 name: {content_hash}"
+            );
+            None
+        }
     }
 
     /// Store a module body under its content hash. Best-effort; a write failure is not
@@ -210,14 +292,19 @@ impl PackageCache {
 
     /// Byte twin of [`write_blob`](Self::write_blob), for binary (asset) bodies.
     ///
-    /// The write is atomic (temp sibling + rename): presence-gating trusts a blob file
-    /// forever, so a crash or full disk mid-write must never leave a torn body at a
-    /// content-addressed path — and a completed write replaces any torn file a previous
-    /// interrupted attempt left behind.
+    /// The write is atomic (temp sibling + rename): readers reject a torn body by hash, and a
+    /// completed write must still replace any corrupt file a previous interrupted attempt left
+    /// behind.
     ///
     /// # Errors
     /// Returns an error if the cache directory cannot be created or the file written.
     pub fn write_blob_bytes(&self, content_hash: &str, body: &[u8]) -> Result<()> {
+        let expected = normalize_sha256(content_hash)
+            .ok_or_else(|| anyhow!("invalid package blob SHA-256: {content_hash}"))?;
+        let actual = format!("{:x}", Sha256::digest(body));
+        if actual != expected {
+            bail!("package blob bytes do not match SHA-256 {content_hash}");
+        }
         let path = self.blob_path(content_hash);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -226,19 +313,66 @@ impl PackageCache {
         write_atomic(&path, body).with_context(|| format!("write blob {}", path.display()))
     }
 
-    /// Whether resolution metadata for a concrete version is already cached. Versions
-    /// are immutable, so presence means the write-once entry is final — writers use
+    /// Whether resolution metadata for a concrete version is already cached and readable.
+    /// Versions are immutable, so presence means the write-once entry is final — writers use
     /// this to skip a redundant serialize + write.
     #[must_use]
     pub fn has_meta(&self, key: &PackageKey, version: &str) -> bool {
-        self.meta_path(key, version).exists()
+        self.read_meta(key, version).is_some()
     }
 
-    /// The cached resolution metadata for a concrete version, if present.
+    /// The cached resolution metadata for a concrete version, if present and readable.
+    ///
+    /// Older cache files are accepted as written: a module without a media type is code, and a
+    /// dependency edge written before relation kinds were preserved has its kind recovered from
+    /// the cached manifest — an edge the manifest's `requires` list names is a
+    /// [`DependencyKind::Requires`] root, every other edge a code dependency.
     #[must_use]
     pub fn read_meta(&self, key: &PackageKey, version: &str) -> Option<CachedResolution> {
+        validate_cache_identity(key, version).ok()?;
         let content = fs::read_to_string(self.meta_path(key, version)).ok()?;
-        serde_json::from_str(&content).ok()
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let kind_less: Vec<usize> = value
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .map(|dependencies| {
+                dependencies
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, dependency)| dependency.get("kind").is_none())
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut resolution: CachedResolution = serde_json::from_value(value).ok()?;
+        if !kind_less.is_empty() {
+            let requires: BTreeSet<(String, String)> = resolution
+                .manifest
+                .smudgy_requires()
+                .into_iter()
+                .map(|required| {
+                    (
+                        required.key.owner.to_ascii_lowercase(),
+                        required.key.name.to_ascii_lowercase(),
+                    )
+                })
+                .collect();
+            for index in kind_less {
+                let Some(dependency) = resolution.dependencies.get_mut(index) else {
+                    continue;
+                };
+                let edge = (
+                    dependency.owner_nickname.to_ascii_lowercase(),
+                    dependency.name.to_ascii_lowercase(),
+                );
+                dependency.kind = if requires.contains(&edge) {
+                    DependencyKind::Requires
+                } else {
+                    DependencyKind::Dependency
+                };
+            }
+        }
+        Some(resolution)
     }
 
     /// Whether every **code** module body for a cached resolution is present (so the
@@ -250,7 +384,7 @@ impl PackageCache {
             .modules
             .iter()
             .filter(|m| is_code_module(&m.media_type, &m.subpath))
-            .all(|m| self.blob_path(&m.content_hash).exists())
+            .all(|m| self.has_blob(&m.content_hash))
     }
 
     /// Persist resolution metadata for a concrete version (immutable, so write-once).
@@ -259,13 +393,15 @@ impl PackageCache {
     /// and a completed write replaces any torn file an interrupted attempt left behind.
     ///
     /// # Errors
-    /// Returns an error if the cache directory cannot be created or the file written.
+    /// Returns an error if the identity is not a safe cache coordinate, or the cache directory
+    /// cannot be created or the file written.
     pub fn write_meta(
         &self,
         key: &PackageKey,
         version: &str,
         resolution: &CachedResolution,
     ) -> Result<()> {
+        validate_cache_identity(key, version)?;
         let path = self.meta_path(key, version);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -310,6 +446,10 @@ impl PackageCache {
 mod tests {
     use super::*;
 
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     fn cache_in(dir: &std::path::Path) -> PackageCache {
         PackageCache {
             root: dir.join("cache").join("packages"),
@@ -327,32 +467,80 @@ mod tests {
     fn blob_round_trips_and_dedupes_by_hash() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(dir.path());
-        assert!(cache.read_blob("abc123").is_none());
-        cache.write_blob("abc123", "export const x = 1;").unwrap();
-        assert_eq!(
-            cache.read_blob("abc123").as_deref(),
-            Some("export const x = 1;")
-        );
+        let body = "export const x = 1;";
+        let hash = sha256_hex(body.as_bytes());
+        assert!(cache.read_blob(&hash).is_none());
+        cache.write_blob(&hash, body).unwrap();
+        assert_eq!(cache.read_blob(&hash).as_deref(), Some(body));
         // Byte twins share the same content-addressed pool.
         assert_eq!(
-            cache.read_blob_bytes("abc123").as_deref(),
-            Some(b"export const x = 1;".as_slice())
+            cache.read_blob_bytes(&hash).as_deref(),
+            Some(body.as_bytes())
         );
-        cache
-            .write_blob_bytes("bin1", &[0u8, 159, 146, 150])
-            .unwrap();
+        let binary = [0u8, 159, 146, 150];
+        let binary_hash = sha256_hex(&binary);
+        cache.write_blob_bytes(&binary_hash, &binary).unwrap();
         assert_eq!(
-            cache.read_blob_bytes("bin1").as_deref(),
-            Some([0u8, 159, 146, 150].as_slice())
+            cache.read_blob_bytes(&binary_hash).as_deref(),
+            Some(binary.as_slice())
         );
         // A binary blob is not silently lossy-read as a string.
-        assert!(cache.read_blob("bin1").is_none());
+        assert!(cache.read_blob(&binary_hash).is_none());
+    }
+
+    #[test]
+    fn tampered_blob_is_a_cache_miss_for_every_read_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let body = b"export const safe = true;";
+        let hash = sha256_hex(body);
+        cache.write_blob_bytes(&hash, body).unwrap();
+        assert!(cache.has_blob(&hash));
+
+        fs::write(cache.blob_path(&hash), b"export const safe = false;").unwrap();
+
+        assert!(!cache.has_blob(&hash));
+        assert!(cache.read_blob(&hash).is_none());
+        assert!(cache.read_blob_bytes(&hash).is_none());
+        let resolution = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: "sum".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            modules: vec![CachedModule {
+                subpath: "index.ts".into(),
+                content_hash: hash,
+                media_type: "application/typescript".into(),
+                byte_size: body.len() as i64,
+                is_entry: true,
+            }],
+            dependencies: Vec::new(),
+        };
+        assert!(!cache.has_all_code_blobs(&resolution));
+    }
+
+    #[test]
+    fn package_integrity_is_order_independent() {
+        let module = |subpath: &str, hash: &str| ResolvedModuleWire {
+            subpath: subpath.into(),
+            content_hash: hash.into(),
+            content_url: String::new(),
+            media_type: "text/plain".into(),
+            byte_size: 0,
+            is_entry: false,
+        };
+        let forward = package_integrity(&[module("a.ts", "aa"), module("b.ts", "bb")]);
+        let reversed = package_integrity(&[module("b.ts", "bb"), module("a.ts", "aa")]);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, "a.ts=aa;b.ts=bb");
+        assert_ne!(forward, package_integrity(&[module("a.ts", "aa")]));
     }
 
     #[test]
     fn meta_round_trips_and_offline_readiness() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(dir.path());
+        let code = "export const x = 1;";
+        let code_hash = sha256_hex(code.as_bytes());
         let resolution = CachedResolution {
             version: "1.4.0".into(),
             integrity: "sum".into(),
@@ -361,14 +549,18 @@ mod tests {
             modules: vec![
                 CachedModule {
                     subpath: "index.ts".into(),
-                    content_hash: "deadbeef".into(),
+                    content_hash: code_hash.clone(),
                     media_type: "application/typescript".into(),
+                    byte_size: code.len() as i64,
+                    is_entry: true,
                 },
                 // An asset module: lazily fetched, so its blob must NOT gate offline use.
                 CachedModule {
                     subpath: "assets/logo.png".into(),
-                    content_hash: "feedface".into(),
+                    content_hash: "f".repeat(64),
                     media_type: "image/png".into(),
+                    byte_size: 0,
+                    is_entry: false,
                 },
             ],
             dependencies: Vec::new(),
@@ -377,20 +569,21 @@ mod tests {
         cache.write_meta(&key(), "1.4.0", &resolution).unwrap();
         let loaded = cache.read_meta(&key(), "1.4.0").expect("meta round-trips");
         assert_eq!(loaded.version, "1.4.0");
+        assert_eq!(loaded.integrity, "sum", "the stamp is stored as written");
 
         // Not offline-ready until the CODE body is cached; the asset never gates.
         assert!(!cache.has_all_code_blobs(&loaded));
-        cache.write_blob("deadbeef", "export const x = 1;").unwrap();
+        cache.write_blob(&code_hash, code).unwrap();
         assert!(cache.has_all_code_blobs(&loaded));
     }
 
     #[test]
     fn a_fresh_write_replaces_a_torn_file() {
-        // Presence-gating trusts cached files forever, so the atomic writers must be
-        // able to REPLACE a torn file left by an interrupted write — the old
-        // write-once early return would have trusted the garbage indefinitely.
+        // Atomic writers must be able to REPLACE a torn file left by an interrupted write.
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(dir.path());
+        let body = "export const x = 1;";
+        let hash = sha256_hex(body.as_bytes());
         let resolution = CachedResolution {
             version: "1.4.0".into(),
             integrity: "sum".into(),
@@ -407,9 +600,10 @@ mod tests {
             cache.read_meta(&key(), "1.4.0").is_none(),
             "torn JSON is unreadable"
         );
-        let blob_path = cache.blob_path("abc123");
+        let blob_path = cache.blob_path(&hash);
         fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
         fs::write(&blob_path, "export const trunc").unwrap();
+        assert!(cache.read_blob(&hash).is_none(), "torn blob is rejected");
 
         // A completed write (rename over the final path) heals both.
         cache.refresh_meta(&key(), "1.4.0", &resolution).unwrap();
@@ -417,11 +611,8 @@ mod tests {
             cache.read_meta(&key(), "1.4.0").map(|m| m.version),
             Some("1.4.0".to_string())
         );
-        cache.write_blob("abc123", "export const x = 1;").unwrap();
-        assert_eq!(
-            cache.read_blob("abc123").as_deref(),
-            Some("export const x = 1;")
-        );
+        cache.write_blob(&hash, body).unwrap();
+        assert_eq!(cache.read_blob(&hash).as_deref(), Some(body));
     }
 
     #[test]
@@ -447,6 +638,7 @@ mod tests {
                 name: "base".into(),
                 range: "^1".into(),
                 resolved_version: "1.0.0".into(),
+                kind: DependencyKind::Dependency,
             }],
             ..legacy.clone()
         };
@@ -468,6 +660,81 @@ mod tests {
             Some(1),
             "an equally-or-less-complete resolution leaves the cached copy alone"
         );
+    }
+
+    #[test]
+    fn pre_feature_meta_recovers_relation_kinds_from_the_manifest() {
+        // The exact shape written before `kind`, `byte_size`, and `is_entry` existed: every
+        // edge was persisted alike. The cached manifest still says which edges are `requires`
+        // roots, so the file stays servable offline without any repair.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let body = "export const cached = true;";
+        let hash = sha256_hex(body.as_bytes());
+        cache.write_blob(&hash, body).unwrap();
+        let path = cache.meta_path(&key(), "1.4.0");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version":"1.4.0",
+                "integrity":"index.ts={hash}",
+                "manifest":{{"version":"1.4.0","requires":["smudgy://WBK/Peer@^1"]}},
+                "modules":[{{"subpath":"index.ts","content_hash":"{hash}","media_type":"application/typescript"}}],
+                "dependencies":[
+                    {{"owner_nickname":"wbk","name":"peer","range":"^1","resolved_version":"1.0.0"}},
+                    {{"owner_nickname":"wbk","name":"base","range":"^2","resolved_version":"2.0.0"}}
+                ]
+            }}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = cache
+            .read_meta(&key(), "1.4.0")
+            .expect("a pre-feature metadata file is readable");
+        assert_eq!(loaded.integrity, format!("index.ts={hash}"));
+        assert_eq!(loaded.dependencies[0].kind, DependencyKind::Requires);
+        assert_eq!(loaded.dependencies[1].kind, DependencyKind::Dependency);
+        assert!(!loaded.modules[0].is_entry);
+        assert_eq!(loaded.modules[0].byte_size, 0);
+        assert!(cache.has_all_code_blobs(&loaded));
+
+        // A file that does carry kinds is taken at its word, whatever the manifest says.
+        let explicit = CachedResolution {
+            dependencies: vec![ResolvedDependency {
+                kind: DependencyKind::Dependency,
+                ..loaded.dependencies[0].clone()
+            }],
+            ..loaded
+        };
+        cache.write_meta(&key(), "1.4.0", &explicit).unwrap();
+        assert_eq!(
+            cache.read_meta(&key(), "1.4.0").unwrap().dependencies[0].kind,
+            DependencyKind::Dependency
+        );
+    }
+
+    #[test]
+    fn unsafe_cache_identity_and_hash_shapes_never_reach_disk_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let unsafe_key = PackageKey {
+            owner: "..".into(),
+            name: "escape".into(),
+        };
+        let resolution = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: String::new(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            modules: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        assert!(cache.write_meta(&unsafe_key, "1.0.0", &resolution).is_err());
+        assert!(cache.read_meta(&unsafe_key, "1.0.0").is_none());
+        assert!(cache.write_meta(&key(), "../escape", &resolution).is_err());
+        assert!(cache.write_blob("../escape", "code").is_err());
     }
 
     #[test]
