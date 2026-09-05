@@ -5,6 +5,15 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Double click selects a word, triple click selects a line.** In a terminal
+  pane, a double click selects the whitespace-delimited word under the pointer
+  and a triple click selects the whole line, ready to copy. A double click on a
+  link still activates the link once, on the first click.
+
 ## [0.5.7-ptb] - 2026-09-01
 
 ### Added

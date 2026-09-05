@@ -2215,24 +2215,6 @@ impl TerminalBuffer {
             .map(|link| link.action.clone())
     }
 
-    /// The raw source text at `line_number`, or `None` if it's out of the
-    /// buffer's live range (scrolled out of scrollback, or never existed).
-    /// Byte-offset based, matching `Selection`'s own `BufferPosition::column`,
-    /// backs double/triple-click word/line selection (`TerminalPane::update`).
-    pub fn line_text(&self, line_number: usize) -> Option<&str> {
-        let offset = self.last_line_number - self.lines.len();
-        if line_number <= offset || line_number > self.last_line_number {
-            return None;
-        }
-        Some(
-            self.lines
-                .get(line_number - offset - 1)?
-                .styled_line
-                .text
-                .as_str(),
-        )
-    }
-
     pub(crate) fn link_span_at(&self, line_number: usize, column: usize) -> Option<&LinkSpan> {
         if self.link_state.borrow().line_concealed(line_number) {
             return None;

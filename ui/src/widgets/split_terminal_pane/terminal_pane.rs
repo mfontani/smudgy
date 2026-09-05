@@ -1086,11 +1086,10 @@ pub(super) struct State<P: text::Paragraph> {
     /// release first and flips `Selecting` → `Selected`, so selection state alone
     /// cannot tell this pane a click just ended on it.
     pub pressed_cell: Option<BufferPosition>,
-    /// The most recent left click, kept to feed `mouse::Click::new` so a
-    /// same-spot follow-up press within its distance/time window reads as a
-    /// double (word-select) or triple (line-select) click. Same way/primitive
-    /// used by `titlebar_press.rs`'s own `State` for its "double click to
-    /// maximize" gesture.
+    /// The most recent left click. `mouse::Click::new` compares the next press
+    /// against it: a press at the same spot within iced's click window is a
+    /// double click (select word) or a triple click (select line). The
+    /// titlebar's "double click to maximize" gesture uses the same primitive.
     previous_click: Option<mouse::Click>,
     /// The terminal-owned OSC/script link context menu, anchored where it was
     /// opened. Actions are cloned with the scrollback so the popup remains
@@ -1305,6 +1304,24 @@ impl<P: text::Paragraph> State<P> {
             }
         }
         None
+    }
+
+    /// The rendered text of absolute line `line_number` and its offset map,
+    /// or `None` if the line is not in the paragraph cache (scrolled out of
+    /// view, or hidden). The text is joined from the shaped spans, so byte
+    /// offsets into it match the cursors that `Paragraph::hit_test` returns.
+    pub(super) fn rendered_line(&self, line_number: usize) -> Option<(String, &RenderedOffsets)> {
+        let line = self
+            .cache
+            .iter()
+            .find(|line| line.line_number == line_number)?;
+        let text = line
+            .spans
+            .spans()
+            .iter()
+            .map(|span| span.text.as_ref())
+            .collect::<String>();
+        Some((text, &line.offsets))
     }
 
     fn link_tooltip_anchor(
@@ -2351,9 +2368,10 @@ where
                 let mut selection = self.selection.borrow_mut();
 
                 if let Some(click_position) = cursor.position_in(layout.bounds()) {
-                    // A same-spot follow-up press within its distance/time
-                    // window reads as Double/Triple, driving word/line select
-                    // instead of starting an ordinary drag-selection.
+                    // Classify this press against the previous one. A press at
+                    // the same spot within iced's click window is a double or
+                    // triple click. Those select a word or a line instead of
+                    // starting a drag.
                     let click = mouse::Click::new(
                         click_position,
                         mouse::Button::Left,
@@ -2374,14 +2392,28 @@ where
                             state.invalidate_link_styles();
                         }
 
-                        // Double/triple click selects a whole word/line
-                        // straight away. A double click on whitespace falls
-                        // back to the ordinary single-click start below.
+                        // A double click selects the word under the caret. A
+                        // triple click selects the line. Both apply at once,
+                        // with no drag. A double click inside whitespace falls
+                        // back to the single-click path below.
+                        //
+                        // The word is found in the rendered text, which is
+                        // what the user sees. A concealed link renders as
+                        // spaces, so a double click on it selects nothing.
+                        // The result is mapped back to source offsets, which
+                        // is what `Selection` stores.
                         let word_or_line = match click.kind() {
-                            mouse::click::Kind::Double => self
-                                .terminal_buffer
-                                .line_text(position.line)
-                                .and_then(|text| word_span_at(text, position.column))
+                            mouse::click::Kind::Double => state
+                                .rendered_line(position.line)
+                                .and_then(|(text, offsets)| {
+                                    let column = offsets.source_to_rendered(position.column);
+                                    word_span_at(&text, column).map(|(start, end)| {
+                                        (
+                                            offsets.rendered_to_source(start),
+                                            offsets.rendered_to_source(end),
+                                        )
+                                    })
+                                })
                                 .map(|(start, end)| {
                                     (
                                         BufferPosition {
@@ -2408,12 +2440,12 @@ where
                         };
 
                         if let Some((from, to)) = word_or_line {
-                            // Deliberately don't set `pressed_cell` here: it's
-                            // what the release handler uses to decide "was this
-                            // a plain click on a link" -- a double/triple click
-                            // is unambiguously a select-gesture, not an
-                            // activate-gesture, even when it lands on a link
-                            // word.
+                            // `pressed_cell` stays `None` on purpose. The
+                            // release handler reads it to decide whether a
+                            // plain click activated a link. The first press of
+                            // a double click already took the single-click path
+                            // and fired any link under the word on its release.
+                            // The second press must not fire it again.
                             *selection = Selection::Selected { from, to };
                         } else {
                             state.pressed_cell = Some(position.clone());
